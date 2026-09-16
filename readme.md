@@ -91,6 +91,11 @@ Please keep in mind that this project is in very early stages. This interface cu
 - [comms-engineer/RNS_Over_Meshcore](https://github.com/comms-engineer/RNS_Over_Meshcore) — inspiration taken from this project for the discovery protocol.
 - [Akita Engineering/Akita-Zmodem-MeshCore](https://github.com/AkitaEngineering/Akita-Zmodem-MeshCore/) — source code referenced for data transfer features.
 
+## Contributing
+Packet captures from your field tests are always appreciated if you'd like to contact me or submit a pull request adding your tests to the fieldtests folder.
+
+Feel free to contribute code if you'd like to by opening a pull request :)
+
 ## AI Usage
 
 This repo makes heavy use of Claude. The majority of code is written with Claude but is human validated.
