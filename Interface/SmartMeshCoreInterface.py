@@ -774,6 +774,56 @@ channel, before the marker check even runs -- true even for a frame that
 turns out malformed or not addressed to this node, since "the channel
 was just occupied" doesn't depend on the frame being decodable.
 
+**Code review pass (2026-09-16): one real deadlock and several silent-
+failure gaps found and fixed, all verified against actual behavior
+rather than assumed.** Highest severity: `_PriorityAsyncLock.acquire()`'s
+`CancelledError` handler could leave `_locked` stuck `True` forever with
+no owner -- reachable when a waiter is granted ownership and cancelled
+in the same instant with no further waiters queued for any tier, since
+that branch called `_wake_next()` without checking its return value the
+way `release()` already does. Only reachable via `detach()`'s task-
+cancel sweep in this interface's own steady-state code, but a real
+deadlock of every future DIRECT send once hit. Also fixed: (1) both
+`ensure_contacts()` call sites were missing `follow=True`, making the
+installed `meshcore` library's own dirty-flag-driven refetch a permanent
+no-op after the first successful contact fetch -- directly contradicting
+`_refresh_contacts_and_grant_telemetry`'s own "the next periodic refresh
+retries it" claim; (2) `_send_direct_supplement` silently dropped (no
+log, no `_outgoing_dropped_total` increment) when a bound peer's contact
+couldn't be resolved, unlike every sibling drop path; (3) `_fetch_own_
+identity`'s documented reconnect-triggered retry never fires if the
+initial fetch fails and the link then simply never drops again for the
+rest of the process's life, permanently disabling the self-echo guard --
+now also retried from the existing periodic contact-refresh loop; (4)
+`_grant_telemetry_permission_if_needed`'s unguarded `flags` read sat
+outside its own `try`, so one malformed contact could abort telemetry
+refresh for every peer ordered after it in the same pass; (5) a local
+exception from `_send_direct_frame` inside `_send_direct_frame_and_
+wait_for_ack` used to skip the post-send listen window entirely, letting
+the next contender for `_direct_exchange_lock` key the radio with zero
+quiet time -- now caught, delayed, and re-raised. Also consolidated three
+independently-duplicated pieces of logic flagged by the same pass:
+`_fragment_payload`/`_fragment_direct_payload`'s identical chunking body
+(-> `_chunk_payload`), the `_wait_for_incoming_quiet`/`_throttle_for_
+duty_cycle` pair copy-pasted at all four radio-keying call sites (->
+`_pre_transmit_gate`), and `_unknown_dest_attempts`/`_unknown_dest_
+backoff_until`'s missing periodic reclaim (unlike `_dedup`/`_reassembly`/
+`_proof_correlation`, all three already swept from the same loop) -- now
+swept the same way via `_unknown_dest_backoff_sweep`. One further gap was
+found and deliberately left as a flagged comment rather than fixed live:
+`_resolve_routing_peer`'s PROOF-correlation lookup doesn't account for
+`RNS.Packet.pack()` writing a link_id (not a destination hash) into an
+outgoing LRPROOF's on-wire destination-hash field, so a Link-acceptance
+reply to a known peer never resolves via that table -- bounded to an
+efficiency loss (falls through to the existing broadcast+supplement
+path, not a delivery or security issue), and a correct fix needs
+`RNS.Link.link_id_from_lr_packet()`'s own ECPUBSIZE-based truncation
+replicated exactly, which wasn't validated against real hardware in this
+pass. All fixes re-verified against a real end-to-end run of
+`testscripts/fake_meshcore_repeater_sim.py` (bind frames, single-fragment
+and multi-fragment CHANNEL delivery) before and after, with identical
+results -- no regression from the refactors.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -1069,8 +1119,17 @@ class _PriorityAsyncLock:
                 # Already granted ownership in the same instant our own
                 # cancellation was delivered -- pass it on rather than
                 # leaving the lock permanently locked with no owner able
-                # to release it.
-                self._wake_next()
+                # to release it. Code-review fix: this used to call
+                # _wake_next() and ignore its return value, unlike
+                # release()'s own `if not self._wake_next(): self._locked
+                # = False`. When no other waiter existed (_wake_next()
+                # returns False), that left `_locked` stuck True forever
+                # with nobody holding it and nobody able to call release()
+                # for it -- a silent, permanent deadlock of every future
+                # acquire() on this lock, contradicting this class's own
+                # cancellation-safety docstring above.
+                if not self._wake_next():
+                    self._locked = False
             raise
 
     def release(self) -> None:
@@ -1678,6 +1737,16 @@ class SmartMeshCoreInterface(Interface):
         # _unknown_dest_in_backoff/_record_unknown_dest_attempt.
         self._unknown_dest_attempts = {}
         self._unknown_dest_backoff_until = {}
+        # Code-review fix: last-attempt timestamp per destination_hash,
+        # swept periodically (_unknown_dest_backoff_sweep) alongside
+        # _dedup/_reassembly/_proof_correlation -- without this, a
+        # destination that gets a few attempts and then simply stops being
+        # addressed (an ephemeral or one-off destination_hash, never
+        # succeeding and never crossing the backoff threshold either) sat
+        # in _unknown_dest_attempts/_unknown_dest_backoff_until forever;
+        # only a later success (via _clear_unknown_dest_backoff) ever
+        # removed an entry.
+        self._unknown_dest_last_attempt = {}
         # PATH_RESPONSE_RATE_LIMIT_WINDOW_S's own state -- destination_hash
         # -> time.monotonic() of the last outgoing PATH_RESPONSE actually
         # sent for it. See _path_response_rate_limited.
@@ -2693,6 +2762,23 @@ class SmartMeshCoreInterface(Interface):
             )
         return total_waited
 
+    async def _pre_transmit_gate(self, frame: str) -> None:
+        """Code-review fix: `await self._wait_for_incoming_quiet()` then
+        `await self._throttle_for_duty_cycle(frame)`, in that order, used
+        to be copy-pasted verbatim at every one of this interface's radio-
+        keying call sites (`_send_channel_fastpath_frame`, one iteration of
+        `_send_channel_multifragment_pass`'s per-fragment loop,
+        `_send_direct_frame`, `_send_bind_frame`) -- both methods' own
+        docstrings already said as much ("called at every radio-keying
+        call site"), but nothing enforced it structurally: a future fifth
+        send path could easily add a `_run_command` call without either
+        line and silently reintroduce the airtime/collision problems these
+        two mechanisms were field-fix additions for. One call here covers
+        both, in the required order, for every current and future send
+        site."""
+        await self._wait_for_incoming_quiet()
+        await self._throttle_for_duty_cycle(frame)
+
     # -------------------------------------------------------------------
     # Connection bring-up
     # -------------------------------------------------------------------
@@ -3216,14 +3302,22 @@ class SmartMeshCoreInterface(Interface):
         self._pkt_id_counter = (self._pkt_id_counter + 1) & 0xFFFF
         return pkt_id
 
+    def _chunk_payload(self, data: bytes, per_fragment: int) -> list:
+        """Shared chunking body for `_fragment_payload`/
+        `_fragment_direct_payload` below -- code-review fix: these two
+        used to carry byte-identical bodies, differing only in which
+        budget accessor supplied `per_fragment`, so a future change to the
+        chunking algorithm itself had to be applied in two places by
+        hand."""
+        return [data[i:i + per_fragment] for i in range(0, len(data), per_fragment)]
+
     def _fragment_payload(self, data: bytes) -> list:
         """Splits `data` into chunks of at most the CHANNEL multi-fragment
         per-fragment budget. Caller (_send_channel_multifragment) already
         guarantees that budget is positive and `data` is non-empty --
         this only ever runs for a packet already established to be too
         large for the fast-path single-fragment budget."""
-        per_fragment = self._channel_multifragment_payload_budget()
-        return [data[i:i + per_fragment] for i in range(0, len(data), per_fragment)]
+        return self._chunk_payload(data, self._channel_multifragment_payload_budget())
 
     def _fragment_direct_payload(self, data: bytes) -> list:
         """DIRECT's own sibling of `_fragment_payload` above -- same
@@ -3231,8 +3325,7 @@ class SmartMeshCoreInterface(Interface):
         Milestone 6, rare in practice (`wire_format_design.md`'s
         constraint one: everything but ANNOUNCE comfortably fits one
         DIRECT message, and ANNOUNCE never goes DIRECT in this design)."""
-        per_fragment = self._direct_multifragment_payload_budget()
-        return [data[i:i + per_fragment] for i in range(0, len(data), per_fragment)]
+        return self._chunk_payload(data, self._direct_multifragment_payload_budget())
 
     def _fragment_spacing_range(self, hop_count: Optional[int]) -> "tuple[float, float]":
         """The tiered inter-fragment spacing rule from
@@ -3505,6 +3598,7 @@ class SmartMeshCoreInterface(Interface):
         failure callback threaded back from the send."""
         if destination_hash is None:
             return
+        self._unknown_dest_last_attempt[destination_hash] = time.monotonic()
         attempts = self._unknown_dest_attempts.get(destination_hash, 0) + 1
         self._unknown_dest_attempts[destination_hash] = attempts
         if attempts >= self.UNKNOWN_DEST_BOOTSTRAP_FAILURE_THRESHOLD:
@@ -3528,6 +3622,29 @@ class SmartMeshCoreInterface(Interface):
     def _clear_unknown_dest_backoff(self, destination_hash: bytes) -> None:
         self._unknown_dest_attempts.pop(destination_hash, None)
         self._unknown_dest_backoff_until.pop(destination_hash, None)
+        self._unknown_dest_last_attempt.pop(destination_hash, None)
+
+    def _unknown_dest_backoff_sweep(self, now: float) -> None:
+        """Code-review fix: `_unknown_dest_attempts`/`_unknown_dest_
+        backoff_until` had no periodic reclaim, unlike `_dedup`/
+        `_reassembly`/`_proof_correlation` (all swept from
+        `_reassembly_cleanup_loop`) -- a destination_hash tried a few times
+        and then never addressed again (an ephemeral/one-off destination,
+        never resolved and never crossing the backoff threshold either)
+        sat in these dicts for the rest of the process's life; only a
+        later success (`_clear_unknown_dest_backoff`) ever removed an
+        entry. Mirrors `_proof_correlation_sweep`'s shape: idle-since-
+        last-attempt, not a fixed TTL from creation, so an actively-
+        retried destination is never pruned out from under its own
+        backoff schedule."""
+        stale = [
+            h for h, last in self._unknown_dest_last_attempt.items()
+            if now - last > self.UNKNOWN_DEST_BOOTSTRAP_MAX_COOLDOWN_S
+        ]
+        for h in stale:
+            self._unknown_dest_attempts.pop(h, None)
+            self._unknown_dest_backoff_until.pop(h, None)
+            self._unknown_dest_last_attempt.pop(h, None)
 
     def _path_response_rate_limited(self, destination_hash: Optional[bytes]) -> bool:
         """True if an outgoing PATH_RESPONSE for `destination_hash` was
@@ -3934,6 +4051,19 @@ class SmartMeshCoreInterface(Interface):
         contact = self._resolve_contact(peer_prefix)
         target = contact.get("public_key") if contact is not None else None
         if not target:
+            # Code-review fix: this used to return with no log line and no
+            # _outgoing_dropped_total increment, unlike every sibling drop
+            # path in this method and in _send_direct_packet -- violating
+            # CLAUDE.md's "every drop decision must be logged" rule for
+            # this specific case (a bound peer whose contact record can't
+            # be resolved, or has no public_key, at the moment a
+            # supplement fires).
+            self._outgoing_dropped_total += 1
+            RNS.log(
+                f"{self}: DIRECT supplement to {peer_prefix!r} dropped -- "
+                f"no resolvable contact/public_key for this bound peer.",
+                RNS.LOG_WARNING,
+            )
             return
         # Bare in the common case (a path request always fits DIRECT's
         # bare budget), but the bootstrap-supplement caller can carry an
@@ -4268,29 +4398,49 @@ class SmartMeshCoreInterface(Interface):
             async with self._direct_exchange_lock(priority):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
-                sent = await self._send_direct_frame(target, frame, attempt)
+                # Code-review fix: a local exception raised anywhere in this
+                # block (e.g. _send_direct_frame surfacing a firmware ERROR
+                # via _run_command) used to propagate straight out of this
+                # `async with`, skipping the post-send listen-window below
+                # entirely -- letting the very next contender for
+                # _direct_exchange_lock (a retry of this same attempt, or a
+                # different queued DIRECT exchange) key the radio again with
+                # zero quiet time, exactly the back-to-back-transmission
+                # problem the listen window exists to prevent everywhere
+                # else. Caught here so the listen delay still runs (using
+                # the same "something might have collided" range a missed
+                # ACK draws from -- a local send failure is at least as
+                # uncertain), then re-raised so the caller
+                # (_send_direct_with_attempts) still sees and logs it
+                # exactly as before.
+                send_exc = None
+                try:
+                    sent = await self._send_direct_frame(target, frame, attempt)
 
-                payload_dict = sent.payload if isinstance(sent.payload, dict) else {}
-                expected_ack = payload_dict.get("expected_ack")
-                if not expected_ack:
-                    ok, waited_full_timeout, ack_timeout_s = True, True, None
-                else:
-                    suggested_timeout_ms = payload_dict.get("suggested_timeout", 10000)
-                    timeout_s = max((float(suggested_timeout_ms) / 1000.0) * 1.2, self.direct_ack_min_timeout_s)
-                    # §4's routed-mode ceiling -- this interface's dispatcher
-                    # never issues a DIRECT send without already believing a
-                    # resolved path exists, so it's always in the "routed"
-                    # regime from its own point of view; see
-                    # _configure_peer_discovery's comment on why the doc's
-                    # separate flood-mode ceiling has no code path here.
-                    timeout_s = min(timeout_s, self.direct_ack_timeout_routed_max_s)
+                    payload_dict = sent.payload if isinstance(sent.payload, dict) else {}
+                    expected_ack = payload_dict.get("expected_ack")
+                    if not expected_ack:
+                        ok, waited_full_timeout, ack_timeout_s = True, True, None
+                    else:
+                        suggested_timeout_ms = payload_dict.get("suggested_timeout", 10000)
+                        timeout_s = max((float(suggested_timeout_ms) / 1000.0) * 1.2, self.direct_ack_min_timeout_s)
+                        # §4's routed-mode ceiling -- this interface's dispatcher
+                        # never issues a DIRECT send without already believing a
+                        # resolved path exists, so it's always in the "routed"
+                        # regime from its own point of view; see
+                        # _configure_peer_discovery's comment on why the doc's
+                        # separate flood-mode ceiling has no code path here.
+                        timeout_s = min(timeout_s, self.direct_ack_timeout_routed_max_s)
 
-                    ack_event = await self._mc_ready.wait_for_event(
-                        self._EventType.ACK,
-                        attribute_filters={"code": expected_ack.hex()},
-                        timeout=timeout_s,
-                    )
-                    ok, waited_full_timeout, ack_timeout_s = ack_event is not None, True, timeout_s
+                        ack_event = await self._mc_ready.wait_for_event(
+                            self._EventType.ACK,
+                            attribute_filters={"code": expected_ack.hex()},
+                            timeout=timeout_s,
+                        )
+                        ok, waited_full_timeout, ack_timeout_s = ack_event is not None, True, timeout_s
+                except Exception as exc:
+                    send_exc = exc
+                    ok, waited_full_timeout, ack_timeout_s = False, False, None
 
                 # User-requested fix (2026-09-15, generalized after a
                 # second real 2-hop field test, then split by outcome
@@ -4333,13 +4483,20 @@ class SmartMeshCoreInterface(Interface):
                     f"DIRECT attempt={attempt} to {peer_prefix!r} "
                     f"(pkt_id={pkt_id} frag_idx={frag_idx}/{frag_total}): ok={ok} "
                     f"queue_depth={queue_depth_at_acquire} lock_wait={lock_wait_s:.2f}s "
-                    f"ack_timeout={ack_timeout_s} listen_delay={listen_delay_s:.2f}s."
+                    f"ack_timeout={ack_timeout_s} listen_delay={listen_delay_s:.2f}s"
+                    + (f" (local send exception: {send_exc})" if send_exc is not None else "") + "."
                 )
                 self._capture_direct_attempt_result(
                     peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,
                     hop_count=hop_count,
                 )
+                if send_exc is not None:
+                    # Listened out the quiet window above first, same as any
+                    # other failed attempt; now let the caller
+                    # (_send_direct_with_attempts) see and log this exactly
+                    # as it did before this fix.
+                    raise send_exc
                 return ok, waited_full_timeout
         finally:
             self._direct_exchange_queue_depth -= 1
@@ -4352,7 +4509,34 @@ class SmartMeshCoreInterface(Interface):
         packet needs the separate short-TTL correlation table -- its own
         destination-hash field IS the truncated hash of the packet it
         proves, never a stable per-peer identity (§7's "PROOF
-        exception")."""
+        exception").
+
+        Known gap, flagged rather than silently guessed at (code review,
+        not yet fixed): this PROOF branch only actually correlates
+        against `_proof_correlation`'s "truncated hash of a received
+        packet" keyspace. For an outgoing LRPROOF specifically (`context
+        == RNS.Packet.LRPROOF`, i.e. a Link-establishment proof answering
+        a peer's LINKREQUEST), `RNS.Packet.pack()` writes the *link_id*
+        into this same on-wire field instead of a destination hash
+        (confirmed against `referenceprojects/Reticulum-master/RNS/
+        Packet.py`'s own `pack()`) -- a value this interface has no table
+        for at all, so `header.destination_hash` here is a link_id that
+        will never be found in `_proof_correlation`, and this always
+        returns None for LRPROOF even when the peer on the other end of
+        that Link is known and DIRECT-resolved. Effect is bounded to
+        efficiency, not correctness or security: `_dispatch_outgoing_
+        packet`'s case-3 fallback (broadcast + capped DIRECT-bootstrap-
+        supplement) still delivers it, just not via the faster known-peer
+        DIRECT-primary path this table exists to enable. A correct fix
+        needs a link_id -> peer correlation table populated when an
+        incoming LINKREQUEST is observed, computed the same way
+        `RNS.Link.link_id_from_lr_packet()` does (including its ECPUBSIZE-
+        based truncation of the hashable part for a LINKREQUEST carrying
+        more than just the peer's public key) -- deliberately not
+        attempted here without hardware validation against that exact
+        byte-level replication, per this file's own "no half-finished/
+        unvalidated crypto-adjacent implementations" precedent (see
+        record_direct_send_result's own rssi-parameter note)."""
         if header.destination_hash is None:
             return None
         if header.packet_type == RNS.Packet.PROOF:
@@ -4410,8 +4594,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_channel_fastpath_frame(self, payload: bytes, pkt_id: int, attempt: int) -> None:
         frame = self._encode_channel_fastpath(payload, pkt_id, attempt)
-        await self._wait_for_incoming_quiet()
-        await self._throttle_for_duty_cycle(frame)
+        await self._pre_transmit_gate(frame)
         try:
             await self._run_command(
                 self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
@@ -4464,8 +4647,7 @@ class SmartMeshCoreInterface(Interface):
             frame = self._encode_channel_multifragment(
                 chunks[frag_idx], pkt_id, frag_idx, frag_total, attempt
             )
-            await self._wait_for_incoming_quiet()
-            await self._throttle_for_duty_cycle(frame)
+            await self._pre_transmit_gate(frame)
             try:
                 await self._run_command(
                     self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
@@ -4527,8 +4709,7 @@ class SmartMeshCoreInterface(Interface):
         should be transmitting during it either, for the same reason
         nothing else should be transmitting during the post-send listen
         window that same caller already enforces."""
-        await self._wait_for_incoming_quiet()
-        await self._throttle_for_duty_cycle(frame)
+        await self._pre_transmit_gate(frame)
         result = await self._run_command(
             self._mc_ready.commands.send_msg(target, frame, attempt=attempt),
             "send_msg",
@@ -4553,12 +4734,31 @@ class SmartMeshCoreInterface(Interface):
         draft of this design set dropped). Feeds path discovery's own
         ensure_contacts() precondition; Milestone 5 is expected to also
         feed this same freshness into the zero-hop/known-N-hop spacing
-        tiers, which have no live data source yet."""
+        tiers, which have no live data source yet.
+
+        Code-review fix: also retries `_fetch_own_identity()` here
+        whenever `_own_pubkey_hex` is still empty. `_fetch_own_identity`'s
+        own docstring says a failed initial fetch "will be retried on the
+        next reconnect if the pubkey is still unknown by then" -- but
+        `_on_mc_connected` only ever fires that retry on an actual
+        DISCONNECTED-then-CONNECTED cycle. If the physical link comes up,
+        the very first `send_appstart` fails, and the link then simply
+        stays up for the rest of the process's life (no further CONNECTED
+        events), that retry path never runs and `_own_pubkey_prefix()`
+        stays `None` forever -- permanently disabling the self-echo guard
+        in `_handle_incoming_bind_frame`, so this node's own bind frames
+        bouncing back via a repeater or CHANNEL rebroadcast would be
+        misprocessed as a genuine external peer for the rest of the
+        session. This loop already runs periodically regardless of
+        connection-state transitions, so it's a natural place to keep
+        retrying until it finally succeeds."""
         try:
             while not self.detached:
                 await asyncio.sleep(self.contact_refresh_interval_s)
                 if self.detached:
                     break
+                if not self._own_pubkey_hex:
+                    self._spawn_background_task(self._fetch_own_identity())
                 try:
                     await self._refresh_contacts_and_grant_telemetry()
                 except Exception as exc:
@@ -4597,9 +4797,23 @@ class SmartMeshCoreInterface(Interface):
         haven't been fetched yet, so holding the lock across it doesn't
         create the multi-second stall `discover_path`'s own docstring
         warns `send_path_discovery_sync` would cause if it were
-        similarly wrapped."""
+        similarly wrapped.
+
+        Code-review fix: this used to call `ensure_contacts()` with no
+        arguments. The installed `meshcore` library's `ensure_contacts(self,
+        follow=False)` only re-fetches when `not self._contacts` OR
+        `(follow and self._contacts_dirty)` -- with the default `follow=
+        False`, every call after the very first successful fetch was a
+        permanent no-op, even though the library already tracks
+        `_contacts_dirty=True` internally on every ADVERTISEMENT/
+        PATH_UPDATE event. That directly contradicted this method's own
+        "the next periodic refresh retries it" docstring claim above: a
+        peer's contact that arrived after this node's first contact fetch
+        would never actually be pulled into `self._contacts` by any later
+        periodic refresh. Passing `follow=True` here makes this call
+        actually consult that dirty flag."""
         async with self._command_lock:
-            await self._mc_ready.ensure_contacts()
+            await self._mc_ready.ensure_contacts(follow=True)
         for peer in list(self._peers.values()):
             contact = self._resolve_contact(peer.pubkey_prefix)
             if contact is not None:
@@ -4619,12 +4833,24 @@ class SmartMeshCoreInterface(Interface):
         a message that reaches out to the peer. As of Milestone 5, called
         only for peers confirmed via this interface's own bind-frame
         protocol (peer_discovery_design.md §5) by default -- see
-        `_refresh_contacts_and_grant_telemetry` and `_register_peer`."""
-        current_flags = contact.get("flags", 0)
-        if current_flags & self.TELEM_PERM_BASE_FLAG_BIT:
-            return  # already granted
-        new_flags = current_flags | self.TELEM_PERM_BASE_FLAG_BIT
+        `_refresh_contacts_and_grant_telemetry` and `_register_peer`.
+
+        Code-review fix: the `flags` read and bitwise check below used to
+        sit outside the `try` block that follows. `_refresh_contacts_and_
+        grant_telemetry` calls this once per bound peer/contact in a plain
+        `for` loop with no per-iteration isolation -- an unguarded
+        `TypeError` here (e.g. a contact whose `flags` field is ever
+        `None` or otherwise non-int) would abort that whole loop, silently
+        skipping the telemetry-permission grant/refresh for every peer
+        ordered after the offending one, with only a generic "contact
+        refresh failed" line two frames up to show for it. Moved inside
+        the `try` so one malformed contact can't take out every other
+        peer's refresh in the same pass."""
         try:
+            current_flags = contact.get("flags", 0)
+            if current_flags & self.TELEM_PERM_BASE_FLAG_BIT:
+                return  # already granted
+            new_flags = current_flags | self.TELEM_PERM_BASE_FLAG_BIT
             await self._run_command(
                 self._mc_ready.commands.change_contact_flags(contact, new_flags),
                 "change_contact_flags",
@@ -4706,10 +4932,15 @@ class SmartMeshCoreInterface(Interface):
             # (invariant #2). Quick and only fires when contacts are
             # unresolved, so this doesn't create the stall
             # `send_path_discovery_sync` below is deliberately kept out of
-            # the lock to avoid.
+            # the lock to avoid. Code-review fix: `follow=True`, same
+            # reasoning as `_refresh_contacts_and_grant_telemetry`'s own
+            # call -- without it, this fallback refresh is a permanent
+            # no-op for any contact that arrived after the first fetch,
+            # since the library's default `follow=False` never consults
+            # its own `_contacts_dirty` flag.
             try:
                 async with self._command_lock:
-                    await self._mc_ready.ensure_contacts()
+                    await self._mc_ready.ensure_contacts(follow=True)
             except Exception as exc:
                 self._debug(f"discover_path({pubkey_prefix!r}): contact refresh failed: {exc}")
             contact = self._resolve_contact(pubkey_prefix)
@@ -5135,8 +5366,7 @@ class SmartMeshCoreInterface(Interface):
     async def _send_bind_frame(self, frame_type: int) -> None:
         attempt = next(self._bind_attempt_counter) & 0xFF
         frame = self._encode_bind_frame(frame_type, attempt)
-        await self._wait_for_incoming_quiet()
-        await self._throttle_for_duty_cycle(frame)
+        await self._pre_transmit_gate(frame)
         try:
             await self._run_command(
                 self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
@@ -5746,10 +5976,12 @@ class SmartMeshCoreInterface(Interface):
         """§5.4's idle-since-last-progress TTL, swept periodically rather
         than checked lazily -- a bucket that simply stops receiving
         fragments needs to be reclaimed even if nothing ever queries it
-        again. Also sweeps expired whole-packet dedup entries (§7) and
+        again. Also sweeps expired whole-packet dedup entries (§7),
         expired PROOF-correlation entries (§7's other table, Milestone 6
-        fix below) in the same pass, since all three live only on this
-        event loop thread and share the same natural cadence."""
+        fix below), and idle unknown-destination backoff state
+        (code-review fix, `_unknown_dest_backoff_sweep`) in the same pass,
+        since all four live only on this event loop thread and share the
+        same natural cadence."""
         try:
             while not self.detached:
                 await asyncio.sleep(self.REASSEMBLY_CLEANUP_INTERVAL_S)
@@ -5777,6 +6009,7 @@ class SmartMeshCoreInterface(Interface):
 
                 self._dedup_sweep(now)
                 self._proof_correlation_sweep(now)
+                self._unknown_dest_backoff_sweep(now)
         except asyncio.CancelledError:
             pass
 
