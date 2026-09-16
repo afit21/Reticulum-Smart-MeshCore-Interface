@@ -1,5 +1,86 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: DIRECT-supplement target selection ignored recent failure history
+
+Airtime-efficiency review (same pass that produced the completion-check
+fix below): `_select_direct_supplement_targets` (path-request DIRECT
+supplement) and `_select_bootstrap_supplement_targets` (unknown-destination
+DIRECT bootstrap supplement) both picked their capped target list by
+recency alone -- most-recently-confirmed/-seen first -- with no reference
+to `_direct_path_failures`. A peer that had just failed a DIRECT attempt,
+but hadn't yet crossed `direct_path_reset_threshold` (so was still fully
+"resolved" and eligible), could still win a scarce supplement slot purely
+on recency, ahead of an equally-recent peer this interface had no reason
+to doubt -- spending part of a capped, airtime-costing fan-out on a send
+statistically less likely to succeed.
+
+Fix: both now sort primarily by each candidate's own `_direct_path_
+failures` count (fewest first), falling back to the original recency
+ordering only as a tiebreaker among equally-healthy peers. Not a hard
+exclusion -- a struggling peer still gets picked once it's the least-bad
+option available, and the count itself naturally clears on a fresh
+success or drops the peer from candidacy entirely once a stale-path reset
+fires. Verified with dedicated unit tests (a failing-but-more-recent peer
+correctly loses its ranking to a healthier, older one in both functions)
+and a re-run of the existing CHANNEL-path fake-hardware smoke test showing
+no regression.
+
+### Added: DIRECT-fragmented delivery completion check (phantom-ACK fix)
+
+Field-data-driven addition, following a full review of a real 5-node field
+test's packet captures focused on turn-taking/collision behavior and
+reliability (not raw throughput). Cross-referencing the sender's own
+ACK bookkeeping against the receiver's capture found a concrete, provable
+case: a 3-fragment DIRECT message (`pkt_id=3`, router -> client) where 2 of
+3 fragments were logged as "never acknowledged" after both retry passes
+(4+ minutes, 8 fragment-send attempts total) -- yet the receiver had
+already fully reassembled all 3 fragments about a second *before* the
+sender's own final successful ACK for the third fragment even landed. That
+proves the first two fragments physically arrived; only their firmware
+ACKs failed to make it back on the return path. This design previously had
+no way to tell that apart from genuine non-delivery, so it kept blindly
+retrying data the receiver already had -- burning airtime and
+`_direct_exchange_lock` time other queued sends were waiting on, and
+risking a false `direct_path_reset_threshold` trip over a link that was
+actually fine.
+
+Fix: a new lightweight `"Q"`-marker control frame (distinct from `"R"`
+RNS-payload frames and `"P"` bind frames), DIRECT-only since it requires
+already knowing the peer's authenticated identity. `_send_direct_
+fragmented` sends one QUERY (`pkt_id` + `frag_total`) only as a last
+resort, once both retry passes are exhausted and fragments still appear
+missing. The receiver answers directly from its own existing whole-packet
+dedup cache (`_add_channel_fragment` already records a completed DIRECT
+reassembly there under `(mode, sender_token, pkt_id, frag_total)` -- no
+new receive-side state needed) -- correctly using the raw, uncanonicalized
+sender token to match how that cache is actually keyed, verified with a
+dedicated unit test. If the receiver answers "complete," the sender treats
+the message as fully delivered and clears its recorded failure count for
+that peer (undoing the false-failure signal already recorded per-fragment
+during the retry passes), avoiding an unwarranted stale-path reset.
+
+Fully backward-compatible and fails safe: a peer that doesn't understand
+`"Q"` frames, or whose own answer is itself lost -- the same class of loss
+this feature exists to route around, just at much lower stakes for one
+small frame -- simply never answers, and `direct_completion_check_timeout_s`
+(default 5.0s) elapses, falling back to exactly today's give-up behavior.
+New config: `direct_completion_check_enabled` (default on),
+`direct_completion_check_timeout` (default 5.0s). Deliberately scoped to
+DIRECT-fragmented sends only -- bare (single-message) DIRECT sends have no
+`pkt_id` and dedup on full payload bytes instead, which doesn't fit this
+same query shape without carrying the payload (or a hash of it) in the
+query itself; left as a known, smaller-impact gap for a future pass.
+
+Verified: a standalone round-trip test of the new frame encode/decode, a
+receive-side unit test (dedup-hit and dedup-miss query answers, answer-to-
+waiter-future correlation), and a send-side unit test (prompt-answer and
+timeout paths, including waiter cleanup) all pass; the existing
+`testscripts/fake_meshcore_repeater_sim.py` CHANNEL-path smoke tests show
+identical results before and after (this feature's own dispatch check
+sits in the DIRECT receive path and doesn't touch CHANNEL handling).
+
 ## alpha-0.1.1 (2026-09-16)
 
 Code-review pass over `Interface/SmartMeshCoreInterface.py` (the M0-M6 alpha

@@ -824,6 +824,52 @@ pass. All fixes re-verified against a real end-to-end run of
 and multi-fragment CHANNEL delivery) before and after, with identical
 results -- no regression from the refactors.
 
+**Field-data-driven addition (2026-09-17): DIRECT-fragmented delivery
+completion check, closing a real "phantom ACK loss" gap the same field
+test's captures proved.** Cross-referencing the sender's own ACK
+bookkeeping against the receiver's own capture from that 5-node test found
+a concrete case: `pkt_id=3` (router -> a client), 2 of 3 fragments logged
+"never acknowledged" after both retry passes -- 4+ minutes, 8
+fragment-attempts total -- yet the receiver had already fully reassembled
+all 3 fragments about a second *before* the sender's own final successful
+ACK for the third fragment even landed. That's direct proof the first two
+fragments physically arrived; only their firmware ACKs failed on the
+return trip, an asymmetric loss this design previously couldn't
+distinguish from genuine non-delivery, so it kept blindly re-spending
+airtime and `_direct_exchange_lock` time on data already delivered, and
+risked tripping `direct_path_reset_threshold` over a link that was
+actually fine. Fix: a new `"Q"`-marker DIRECT-only control frame (see
+`_check_remote_completion`/`_handle_incoming_completion_frame`'s own
+docstrings) -- `_send_direct_fragmented` asks, only as a last resort once
+both passes are exhausted and fragments still appear missing, whether the
+receiver already has the complete message; the receiver answers straight
+from its existing whole-packet dedup cache (no new receive-side state).
+Fully backward-compatible (an old peer simply never answers, and
+`direct_completion_check_timeout_s` falls back to exactly today's
+give-up behavior) and config-gated (`direct_completion_check_enabled`,
+default on). Deliberately scoped to fragmented DIRECT sends only -- bare
+DIRECT sends dedup on full payload bytes rather than a pkt_id and don't
+fit this same query shape without further design work, left as a known
+gap. Verified with a wire-format round-trip test and dedicated send-/
+receive-side unit tests (dedup-hit/-miss answers, future correlation,
+timeout/cleanup), plus a re-run of the CHANNEL-path fake-hardware smoke
+test showing no regression -- real-hardware field validation of the new
+frame itself is still outstanding.
+
+**Airtime-efficiency fix (2026-09-17): supplement-target selection now
+accounts for recent DIRECT failures, not just recency.**
+`_select_direct_supplement_targets`/`_select_bootstrap_supplement_targets`
+previously ranked candidates by recency alone, so a peer that had just
+failed a DIRECT attempt -- but hadn't yet crossed
+`direct_path_reset_threshold`, so was still technically eligible -- could
+still win a scarce capped supplement slot ahead of an equally-recent,
+untroubled peer. Both now sort primarily by each candidate's own
+`_direct_path_failures` count (fewest first), falling back to the
+original recency ordering only as a tiebreaker -- not a hard exclusion, a
+struggling peer still gets picked once it's the least-bad option
+available. Verified with dedicated unit tests plus a re-run of the
+CHANNEL-path fake-hardware smoke test showing no regression.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -1033,6 +1079,21 @@ class _BindFrame(NamedTuple):
     cap: int
     attempt: int
     pubkey_prefix: str
+
+
+class _CompletionFrame(NamedTuple):
+    """The decoded `"Q"`-marker DIRECT-delivery-completion-check control
+    frame (see `_encode_completion_frame`'s own docstring for why this
+    exists) -- distinct from both `_FrameHeader` (the `"R"`-marker RNS
+    frame) and `_BindFrame` (the `"P"`-marker peer-binding frame).
+    `complete` is meaningful only on an ANSWER frame (always `False` on a
+    QUERY, which is asking the question rather than answering it)."""
+
+    version: int
+    type: int
+    complete: bool
+    pkt_id: int
+    frag_total: int
 
 
 class _PeerRecord:
@@ -1493,6 +1554,25 @@ class SmartMeshCoreInterface(Interface):
     BIND_PUBKEY_PREFIX_BYTES = 6
     BIND_FRAME_RAW_SIZE = 4 + BIND_PUBKEY_PREFIX_BYTES  # ver+type+cap+attempt + prefix
 
+    # --- DIRECT-fragmented delivery completion check (field-data-driven
+    # fix, 2026-09-16: see this frame's own send/receive helpers for the
+    # full "phantom ACK loss" story that motivated it) ---
+    # A marker distinct from MARKER ("R") and PEER_MARKER ("P") -- like
+    # bind frames, this control frame carries no RNS packet bytes and must
+    # never be handed to _decode_frame. DIRECT-only by construction (it
+    # asks/answers "did you receive pkt_id X", which only makes sense
+    # once both sides already have each other's authenticated identity --
+    # bind frames are CHANNEL-only for the opposite reason, since identity
+    # isn't established yet at that point).
+    # Wire shape: "Q" + Z85([ver:1][type:1][complete:1][pkt_id_hi:1]
+    # [pkt_id_lo:1][frag_total:1]), 6 raw bytes -> 10 characters on the
+    # wire, comfortably one DIRECT bare message under any realistic budget.
+    COMPLETION_MARKER = "Q"
+    COMPLETION_PROTOCOL_VERSION = 1
+    COMPLETION_TYPE_QUERY = 0
+    COMPLETION_TYPE_ANSWER = 1
+    COMPLETION_FRAME_RAW_SIZE = 6  # ver+type+complete+pkt_id(2)+frag_total
+
     # User-requested small-mesh rule (not a config knob -- a fixed,
     # topology-driven behavior): with this few bound peers, there's no
     # ambiguity about who a CHANNEL-broadcast-shaped packet (ANNOUNCE,
@@ -1752,6 +1832,13 @@ class SmartMeshCoreInterface(Interface):
         # sent for it. See _path_response_rate_limited.
         self._path_response_last_sent_at = {}
         self._contact_refresh_task = None
+
+        # DIRECT-fragmented completion-check state (see
+        # _check_remote_completion's own docstring): one in-flight
+        # asyncio.Future per (peer_prefix, pkt_id) we've asked about,
+        # resolved by _handle_incoming_completion_frame when a matching
+        # ANSWER arrives, or left to time out if none ever does.
+        self._completion_query_waiters = {}
 
         # Milestone 6: concurrent DIRECT sends to the same not-yet-(or no
         # longer-)resolved peer share one in-flight discover_path() call
@@ -2053,6 +2140,27 @@ class SmartMeshCoreInterface(Interface):
         # is what makes passes decorrelated rather than a fixed schedule.
         self.retransmit_jitter_min_s = float(cfg.get("retransmit_jitter_min", 8.0))
         self.retransmit_jitter_max_s = float(cfg.get("retransmit_jitter_max", 20.0))
+
+        # Field-data-driven fix (2026-09-16): real capture from a 5-client
+        # field test found DIRECT-fragmented messages where the receiver
+        # had already fully reassembled every fragment while the sender
+        # was still blindly retrying individual fragments for minutes,
+        # because only the fragments' own firmware ACKs -- not the data
+        # itself -- failed to make it back (an asymmetric/return-path
+        # loss, not a forward-delivery failure). See
+        # `_check_remote_completion`'s own docstring for the full
+        # mechanism this enables: a lightweight DIRECT query, asked only
+        # once both retry passes are exhausted and fragments still appear
+        # missing, that lets the receiver's own dedup cache settle the
+        # question directly instead of the sender guessing from silence.
+        # Fully backward-compatible: a peer that doesn't understand the
+        # query frame just never answers, and this falls back to exactly
+        # today's give-up behavior once `direct_completion_check_timeout_s`
+        # elapses.
+        self.direct_completion_check_enabled = _cfg_bool(cfg.get("direct_completion_check_enabled", True))
+        self.direct_completion_check_timeout_s = float(
+            cfg.get("direct_completion_check_timeout", 5.0)
+        )
 
     def _configure_path_discovery(self, cfg):
         # docs/path_discovery_spec.md's "Retry and backoff structure" --
@@ -2442,6 +2550,23 @@ class SmartMeshCoreInterface(Interface):
             "header_type": header.header_type,
         }
 
+    def _payload_correlation_hash(self, data: bytes) -> str:
+        """Field-data-analysis fix (2026-09-17): a short, non-cryptographic
+        (for this purpose) identifier for `data`, added to every packet
+        capture record that carries a payload. Analyzing the previous
+        field test's phantom-ACK pattern required cross-referencing a
+        sender's capture against a receiver's by `pkt_id` -- which only
+        exists for DIRECT-*fragmented* sends; a bare (single-message)
+        DIRECT or CHANNEL send had no correlator at all across separate
+        capture files, making that whole analysis blind to roughly half
+        of real traffic. `RNS.Identity.truncated_hash` is reused here
+        (same primitive `_compute_truncated_hash` already uses) purely as
+        a convenient, already-available hash -- this has no security role
+        and is never compared against anything at runtime, only read back
+        by an analysis script joining two nodes' capture files on this
+        field, alongside `pkt_id` where that also exists."""
+        return RNS.Identity.truncated_hash(data).hex()[:12]
+
     def _capture_outgoing(
         self, header: Optional[_RnsHeader], data: bytes, decision: str,
         target_peer: Optional[str] = None, candidate_peers: Optional[list] = None,
@@ -2452,6 +2577,7 @@ class SmartMeshCoreInterface(Interface):
             **self._header_capture_fields(header),
             "priority": self._priority_tier(header),
             "size_bytes": len(data),
+            "payload_hash": self._payload_correlation_hash(data),
             "routing_decision": decision,
             "target_peer": target_peer,
             "candidate_peers": candidate_peers,
@@ -2493,6 +2619,34 @@ class SmartMeshCoreInterface(Interface):
             "frag_total": frag_total,
             "pkt_id": pkt_id,
             "hop_count": resolved.out_path_len if resolved is not None else None,
+            "payload_hash": self._payload_correlation_hash(data),
+        })
+
+    def _capture_fragment_received(self, mode: str, sender_token: str, pkt_id: int, frag_idx: int, frag_total: int, progress: int) -> None:
+        """Field-data-analysis fix (2026-09-17): one record per individual
+        fragment actually added to a reassembly bucket, not just the
+        single record `_capture_incoming` emits once the whole message
+        completes. The previous field test's phantom-ACK analysis (see
+        `_check_remote_completion`'s own docstring for the case that
+        prompted this) could only tell a fragment "arrived by such-and-
+        such a time" from the bucket's *completion* timestamp -- there
+        was no way to see when frag_idx 0 specifically showed up relative
+        to the sender's own retry attempts for it, only that the whole
+        bucket was done by some later point. This closes that gap
+        directly: `mode`/`sender_token`/`pkt_id`/`frag_total` match
+        `_reassembly_key`'s own tuple exactly, so a future analysis can
+        join this against the sender's `direct_attempt_result` records
+        (same `pkt_id`/`frag_idx`/`frag_total`) without guessing."""
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("in", {
+            "event": "fragment_received",
+            "mode": mode,
+            "sender_token": sender_token,
+            "pkt_id": pkt_id,
+            "frag_idx": frag_idx,
+            "frag_total": frag_total,
+            "progress": progress,
         })
 
     def _capture_direct_attempt_result(
@@ -2570,6 +2724,31 @@ class SmartMeshCoreInterface(Interface):
             "out_path_len": resolved.out_path_len,
             "out_path_hex": resolved.out_path_hex,
             "size_bytes": size_bytes,
+        })
+
+    def _capture_completion_check_result(
+        self, peer_prefix: str, pkt_id: int, frag_total: int, outcome: str, complete: bool,
+    ) -> None:
+        """Field-data-analysis fix (2026-09-17): one record per
+        `_check_remote_completion` call, so the next field test can
+        directly measure how often the phantom-ACK completion check
+        (added this same pass -- see that method's own docstring) fires,
+        and how it resolves, rather than only being inferable after the
+        fact by cross-referencing two nodes' captures by hand the way the
+        original phantom-ACK case was found. `outcome` is one of
+        `"send_failed"` (the QUERY itself never got out locally),
+        `"timeout"` (sent, but no ANSWER arrived within `direct_
+        completion_check_timeout_s`), or `"answered"` (a real ANSWER came
+        back -- `complete` is only meaningful in this case)."""
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", {
+            "event": "completion_check_result",
+            "peer_prefix": peer_prefix,
+            "pkt_id": pkt_id,
+            "frag_total": frag_total,
+            "outcome": outcome,
+            "complete": complete if outcome == "answered" else None,
         })
 
     def _load_meshcore_or_panic(self):
@@ -3293,6 +3472,44 @@ class SmartMeshCoreInterface(Interface):
         pubkey_prefix = raw[4:4 + self.BIND_PUBKEY_PREFIX_BYTES].hex()
         return _BindFrame(version=version, type=frame_type, cap=cap, attempt=attempt, pubkey_prefix=pubkey_prefix)
 
+    # --- DIRECT-fragmented completion check ("Q" marker) -----------------
+    # Own control protocol, distinct from both "R" (RNS wire format) and
+    # "P" (bind frames): different marker, no relationship to either's
+    # shape.
+
+    def _encode_completion_frame(
+        self, frame_type: int, pkt_id: int, frag_total: int, complete: bool = False,
+    ) -> str:
+        body = bytes([
+            self.COMPLETION_PROTOCOL_VERSION,
+            frame_type,
+            1 if complete else 0,
+            (pkt_id >> 8) & 0xFF,
+            pkt_id & 0xFF,
+            frag_total & 0xFF,
+        ])
+        return self.COMPLETION_MARKER + _z85_encode(body)
+
+    def _decode_completion_frame(self, marker_and_body: str) -> _CompletionFrame:
+        if not marker_and_body.startswith(self.COMPLETION_MARKER):
+            raise ValueError("missing completion-frame marker")
+        raw = _z85_decode(marker_and_body[len(self.COMPLETION_MARKER):])
+        if len(raw) != self.COMPLETION_FRAME_RAW_SIZE:
+            raise ValueError(f"completion frame wrong length: {len(raw)} (expected {self.COMPLETION_FRAME_RAW_SIZE})")
+
+        version, frame_type, complete_byte = raw[0], raw[1], raw[2]
+        if version != self.COMPLETION_PROTOCOL_VERSION:
+            raise ValueError(f"unsupported completion-frame version {version}")
+        if frame_type not in (self.COMPLETION_TYPE_QUERY, self.COMPLETION_TYPE_ANSWER):
+            raise ValueError(f"unrecognized completion-frame type {frame_type}")
+
+        pkt_id = (raw[3] << 8) | raw[4]
+        frag_total = raw[5]
+        return _CompletionFrame(
+            version=version, type=frame_type, complete=bool(complete_byte),
+            pkt_id=pkt_id, frag_total=frag_total,
+        )
+
     def _next_pkt_id(self) -> int:
         # Only ever called from this interface's own dedicated event loop
         # (via _send_channel, itself only invoked by _outgoing_worker
@@ -3918,8 +4135,26 @@ class SmartMeshCoreInterface(Interface):
         for a destination this interface has no token for yet," so
         capability is irrelevant. Most-recently-seen first, capped
         (`bootstrap_direct_supplement_cap`) so this doesn't fan out to
-        every bound peer as the peer count grows."""
-        peers = sorted(self._peers.values(), key=lambda p: p.last_seen, reverse=True)
+        every bound peer as the peer count grows.
+
+        Airtime-efficiency fix (2026-09-17): primarily ordered by this
+        peer's own `_direct_path_failures` count (fewest first), most-
+        recently-seen only as the tiebreaker among equally-healthy peers
+        -- previously recency alone decided this, so a peer with a
+        currently elevated failure count (already a full attempt budget
+        away from a stale-path reset, but not yet at
+        `direct_path_reset_threshold`) could still occupy a scarce capped
+        slot ahead of a peer this interface has no reason to doubt,
+        spending part of the bootstrap-supplement's own limited fan-out on
+        a send unlikely to succeed. A peer with no recorded failures at
+        all sorts as failure count `0`, same as one that's never been
+        tried -- this is a deprioritization signal, not a hard exclusion,
+        so a struggling link still gets a chance once it's the least-bad
+        option available."""
+        peers = sorted(
+            self._peers.values(),
+            key=lambda p: (self._direct_path_failures.get(p.pubkey_prefix, 0), -p.last_seen),
+        )
         return [p.pubkey_prefix for p in peers[: self.bootstrap_direct_supplement_cap]]
 
     async def _send_broadcast_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
@@ -4005,12 +4240,29 @@ class SmartMeshCoreInterface(Interface):
         never anything read off the MeshCore contact table, which has no
         such field at all) that already have a resolved path, capped and
         most-recently-confirmed first -- not unconditionally every known
-        router as the router count grows."""
+        router as the router count grows.
+
+        Airtime-efficiency fix (2026-09-17): primarily ordered by this
+        peer's own `_direct_path_failures` count (fewest first), most-
+        recently-confirmed only as the tiebreaker among equally-healthy
+        peers -- see `_select_bootstrap_supplement_targets`'s own note on
+        this same fix for the full reasoning (a currently-failing peer,
+        below `direct_path_reset_threshold` so still technically
+        "resolved," could otherwise still win a capped supplement slot on
+        recency alone). Not a hard exclusion: `_direct_path_failures`
+        naturally clears the moment this peer's path is confirmed working
+        again, or the peer drops out of `candidates` entirely once a
+        stale-path reset removes it from `_resolved_paths`."""
         candidates = [
             peer for peer in self._peers.values()
             if peer.has_upstream_rns and peer.pubkey_prefix in self._resolved_paths
         ]
-        candidates.sort(key=lambda p: self._resolved_paths[p.pubkey_prefix].resolved_at, reverse=True)
+        candidates.sort(
+            key=lambda p: (
+                self._direct_path_failures.get(p.pubkey_prefix, 0),
+                -self._resolved_paths[p.pubkey_prefix].resolved_at,
+            )
+        )
         return [p.pubkey_prefix for p in candidates[: self.path_request_direct_supplement_cap]]
 
     async def _send_direct_supplement(
@@ -4202,8 +4454,14 @@ class SmartMeshCoreInterface(Interface):
         cycle before starting the next -- each with its own bounded
         `direct_send_attempts` budget. **Pass 1** re-attempts only
         whatever never got ACKed in pass 0, in order, each again with a
-        fresh attempt budget. Returns True only if every fragment was
-        eventually ACKed across both passes."""
+        fresh attempt budget. If fragments still appear missing after
+        both passes, one last-resort `_check_remote_completion` asks the
+        receiver directly rather than assuming the data never arrived
+        (field-data-driven fix, 2026-09-16 -- see that method's own
+        docstring for the phantom-ACK-loss story this closes). Returns
+        True if every fragment was eventually ACKed across both passes,
+        or if the receiver later confirms it has the complete message
+        anyway."""
         chunks = self._fragment_direct_payload(payload)
         frag_total = len(chunks)
         acked = [False] * frag_total
@@ -4236,7 +4494,98 @@ class SmartMeshCoreInterface(Interface):
                 if self.detached or not self.online:
                     return False
 
-        return all(acked)
+        if all(acked):
+            return True
+
+        if self.direct_completion_check_enabled:
+            confirmed = await self._check_remote_completion(target, peer_prefix, pkt_id, frag_total)
+            if confirmed:
+                RNS.log(
+                    f"{self}: DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r} -- "
+                    f"{sum(1 for a in acked if not a)}/{frag_total} fragment(s) never got a "
+                    f"real ACK, but the receiver confirms it has the complete message "
+                    f"anyway (lost ACK on the return path, not a delivery failure). "
+                    f"Treating as delivered and clearing this peer's recorded failures.",
+                    RNS.LOG_WARNING,
+                )
+                # Undo the false failure signal record_direct_send_result
+                # already recorded per-fragment above -- a fresh success
+                # unconditionally clears _direct_path_failures for this
+                # peer, so a phantom failure here can't leave behind a
+                # false trigger for the next unrelated send's stale-path
+                # threshold check.
+                self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                return True
+
+        return False
+
+    async def _check_remote_completion(
+        self, target: str, peer_prefix: str, pkt_id: int, frag_total: int,
+    ) -> bool:
+        """Field-data-driven fix (2026-09-16): real capture from a 5-node
+        field test found a concrete case (`pkt_id=3`, router -> a client)
+        where 2 of 3 fragments were logged as "never acknowledged" by the
+        sender after exhausting both retry passes -- roughly 4+ minutes
+        and 8 fragment-attempts total -- yet the receiver's own capture
+        showed a completed reassembly of *all three* fragments about a
+        second *before* the sender's own final successful ACK for the
+        third fragment even landed. That's direct proof the first two
+        fragments physically arrived; only their ACKs failed to make it
+        back, an asymmetric/return-path loss this design previously had
+        no way to distinguish from genuine non-delivery -- so it just
+        kept blindly retrying data the receiver already had, burning
+        airtime and `_direct_exchange_lock` time other queued sends were
+        waiting on, and risking a false `direct_path_reset_threshold`
+        trip (`record_direct_send_result`) over a link that was actually
+        fine.
+
+        Called from `_send_direct_fragmented` only once both retry passes
+        are exhausted and fragments still appear missing -- never a
+        substitute for the real firmware ACK, only a last resort before
+        giving up on data that might have already arrived. Sends one
+        lightweight `"Q"`-marker QUERY frame and waits up to
+        `direct_completion_check_timeout_s` for a matching ANSWER,
+        correlated via `_completion_query_waiters` keyed by `(peer_prefix,
+        pkt_id)` (`_handle_incoming_completion_frame` resolves the future
+        on receipt). Fully backward-compatible and fails safe: a peer
+        that doesn't understand `"Q"` frames, or whose own answer is
+        itself lost -- the same class of loss this whole mechanism exists
+        to route around, just at much lower stakes for one small frame --
+        simply never resolves the future, and this returns False once
+        `direct_completion_check_timeout_s` elapses, falling back to
+        exactly today's give-up behavior. Never raises: a local send
+        failure here is treated the same as no answer, not propagated."""
+        key = (peer_prefix, pkt_id)
+        fut = asyncio.get_event_loop().create_future()
+        self._completion_query_waiters[key] = fut
+        outcome = "send_failed"
+        result = False
+        try:
+            frame = self._encode_completion_frame(self.COMPLETION_TYPE_QUERY, pkt_id, frag_total)
+            try:
+                async with self._direct_exchange_lock(self.PRIORITY_LOW):
+                    await self._send_direct_frame(target, frame)
+            except Exception as exc:
+                self._debug(
+                    f"_check_remote_completion(pkt_id={pkt_id}, peer={peer_prefix!r}): "
+                    f"query send failed locally: {exc} -- treating as no answer."
+                )
+                return False
+            try:
+                result = await asyncio.wait_for(fut, timeout=self.direct_completion_check_timeout_s)
+                outcome = "answered"
+                return result
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+                self._debug(
+                    f"_check_remote_completion(pkt_id={pkt_id}, peer={peer_prefix!r}): "
+                    f"no answer within {self.direct_completion_check_timeout_s:.1f}s -- "
+                    f"treating fragment(s) as genuinely undelivered."
+                )
+                return False
+        finally:
+            self._completion_query_waiters.pop(key, None)
+            self._capture_completion_check_result(peer_prefix, pkt_id, frag_total, outcome, result)
 
     async def _send_direct_with_attempts(
         self, target: str, frame_builder, peer_prefix: str,
@@ -5427,6 +5776,92 @@ class SmartMeshCoreInterface(Interface):
         if frame.type == self.BIND_TYPE_REQUEST:
             self._spawn_background_task(self._respond_to_bind_request(frame.pubkey_prefix))
 
+    def _handle_incoming_completion_frame(self, marker_and_body: str, sender_token: str) -> None:
+        """Receive side of the `"Q"`-marker completion check (see
+        `_check_remote_completion`'s own docstring for the full
+        mechanism/motivation). A QUERY is answered directly from the
+        existing whole-packet dedup cache -- `_add_channel_fragment`
+        already records a completed DIRECT-fragmented reassembly there
+        under exactly the key `(mode, sender_token, pkt_id, frag_total)`
+        this method rebuilds, so answering "do you have pkt_id X
+        complete" needs no new state of its own, just a lookup into state
+        that already exists for an unrelated reason (§7's dedup). Uses
+        `sender_token` as received here, uncanonicalized -- matching
+        `_reassembly_key`'s own convention of keying on the raw
+        MeshCore-native token, never this interface's canonical 6-byte
+        peer prefix, so this lookup can never silently miss due to a
+        canonicalization mismatch against how the entry was actually
+        stored."""
+        try:
+            frame = self._decode_completion_frame(marker_and_body)
+        except ValueError as exc:
+            self._debug(f"discarding malformed completion-check frame from {sender_token!r}: {exc}")
+            return
+
+        if frame.type == self.COMPLETION_TYPE_QUERY:
+            dedup_key = ("direct", sender_token or "~anon", frame.pkt_id, frame.frag_total)
+            complete = self._dedup_contains(dedup_key)
+            self._debug(
+                f"completion QUERY from {sender_token!r} for pkt_id={frame.pkt_id} "
+                f"frag_total={frame.frag_total}: answering complete={complete}."
+            )
+            if self._packet_capture_file is not None:
+                self._capture_event("in", {
+                    "event": "completion_query_received",
+                    "sender_token": sender_token,
+                    "pkt_id": frame.pkt_id,
+                    "frag_total": frame.frag_total,
+                    "answering_complete": complete,
+                })
+            self._spawn_background_task(
+                self._send_completion_answer(sender_token, frame.pkt_id, frame.frag_total, complete)
+            )
+            return
+
+        # ANSWER: correlate against our own canonical peer prefix, since
+        # that's the key _check_remote_completion registered the waiter
+        # future under.
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        if peer_prefix is None:
+            return
+        fut = self._completion_query_waiters.get((peer_prefix, frame.pkt_id))
+        if fut is not None and not fut.done():
+            fut.set_result(frame.complete)
+
+    async def _send_completion_answer(
+        self, sender_token: str, pkt_id: int, frag_total: int, complete: bool,
+    ) -> None:
+        """Best-effort ANSWER send for `_handle_incoming_completion_frame`'s
+        QUERY branch. Deliberately no retry loop and no ACK-wait of its
+        own: this is already the second half of a mechanism built to
+        route around lost ACKs, so piling another multi-attempt ACK-wait
+        cycle on top of the answer itself would just relocate the same
+        risk rather than reduce it. If this answer is lost, the querying
+        side's own `direct_completion_check_timeout_s` simply elapses and
+        it falls back to today's give-up behavior -- no worse than before
+        this feature existed. Still takes `_direct_exchange_lock` for the
+        transmission itself, so it can't collide with this node's own
+        other concurrent DIRECT activity."""
+        contact = self._resolve_contact(sender_token)
+        target = contact.get("public_key") if contact is not None else None
+        if not target:
+            self._debug(
+                f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) not sent -- "
+                f"no resolvable contact/public_key."
+            )
+            return
+        frame = self._encode_completion_frame(
+            self.COMPLETION_TYPE_ANSWER, pkt_id, frag_total, complete=complete,
+        )
+        try:
+            async with self._direct_exchange_lock(self.PRIORITY_LOW):
+                await self._send_direct_frame(target, frame)
+        except Exception as exc:
+            self._debug(
+                f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) failed "
+                f"locally: {exc}."
+            )
+
     async def _peer_ttl_sweep_loop(self) -> None:
         """§6: a peer (and any RNS-token bindings linked to it, §7) is
         dropped after no traffic of any kind for peer_ttl_s. Deliberately
@@ -5692,6 +6127,14 @@ class SmartMeshCoreInterface(Interface):
         payload = event.payload if isinstance(event.payload, dict) else {}
         text = payload.get("text", "")
         sender_token = payload.get("pubkey_prefix", "")
+        if text.startswith(self.COMPLETION_MARKER):
+            # Completion-check frames (see _check_remote_completion's own
+            # docstring) are DIRECT-only and checked here before RNS-frame
+            # handling, the same way bind frames are checked before
+            # _handle_incoming_frame on the CHANNEL side -- the two
+            # markers are disjoint by construction ("Q" vs "R").
+            self._handle_incoming_completion_frame(text, sender_token)
+            return
         self._handle_incoming_frame(text, mode="direct", sender_token=sender_token)
 
     def _handle_incoming_frame(self, marker_and_body: str, mode: str, sender_token: str) -> None:
@@ -5955,6 +6398,9 @@ class SmartMeshCoreInterface(Interface):
 
         bucket.fragments[header.frag_idx] = payload
         bucket.last_progress = time.monotonic()
+        self._capture_fragment_received(
+            key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total, len(bucket.fragments),
+        )
 
         if len(bucket.fragments) < bucket.frag_total:
             self._debug(
