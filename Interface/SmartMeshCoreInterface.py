@@ -1,0 +1,5944 @@
+"""
+SmartMeshCoreInterface.py -- Smart Meshcore Interface for Reticulum
+
+An `RNS.Interfaces.Interface` subclass that carries Reticulum (RNS) traffic
+over a MeshCore LoRa mesh. This is a from-scratch rebuild -- see CLAUDE.md
+and `docs/interface_architecture.md` (read that first; it links the rest of
+the design set) for why the previous implementation
+(`referenceprojects/MeshCore_Dynamic_Interface_old.py` /
+`_original_repo.py`) was retired rather than extended: it accumulated real,
+working functionality on top of one wrong assumption about MeshCore
+(reliable multi-packet CHANNEL delivery) that field testing showed cannot be
+tuned into working. Nothing in this file is built on that code; it is a
+fresh implementation against the design docs, referring back to the old
+implementation only as a record of what was tried and why it didn't work.
+
+STATUS -- alpha 0.1.0 (2026-09-15). Complete: Milestones 0 through 6 of
+`docs/interface_architecture.md`'s "Recommended build milestones" (M7,
+cooperative broadcast, is deliberately skipped -- see this docstring's
+own closing note for why), field-validated on real hardware, plus
+several further field-driven fixes and optimizations found through real
+alpha-0.1.0 use (search this docstring for "2026-09-15" for the dated
+account of each; `changelog.md`'s `SmartMeshCoreInterface` section has
+the summarized history). M0 built the scaffolding (base-class
+contract compliance, the sync/async bridge, config loading, observability
+plumbing). M1 added the wire format and bare single-fragment CHANNEL/
+DIRECT send/receive. M2 added outgoing fragmentation for a packet too
+large for one CHANNEL message (multi-fragment header shape, shuffled
+fragment order, tiered inter-fragment spacing -- zero-hop/known-N-hop
+tiers implemented and unit-tested, but fed `hop_count=None` for now since
+no live topology data source exists until Milestone 4/5), incoming
+reassembly (buffer keying, including the `0x40`/`"~coop"` branch
+cooperative broadcast needs even though nothing sets that bit until
+Milestone 7; bounded capacity with oldest-by-last-progress eviction; an
+idle-since-last-fragment TTL, longer for `"~coop"` buckets; byte-identity
+verification on a repeated `frag_idx`), and whole-packet dedup -- all per
+`docs/reliability_engine_design.md` §1-2 and §5-7. DIRECT fragmentation
+is still not implemented (Milestone 6): an incoming DIRECT frame with the
+multi-fragment bit set is recognized and dropped with that reason, not
+mis-parsed as CHANNEL's shape.
+
+M3, this pass, adds priority queueing and give-up-signal handling
+(`docs/reliability_engine_design.md` §3, §9), scoped exactly as the
+architecture doc's own M3 bullet names it -- "the two-tier PriorityQueue,
+the context-byte range check, and the `dest_type == LINK` retry-extra
+classification":
+
+  - **The outgoing queue is now a real two-tier `PriorityQueue`**
+    (`PRIORITY_HANDSHAKE`/`PRIORITY_NORMAL`), replacing M1/M2's plain
+    FIFO without changing the underlying queue-plus-executor-drain
+    mechanism. `LINK_REQUEST`/`PROOF` packet types, and any packet whose
+    context byte matches RNS's own give-up/connection-alive signals
+    (`RESOURCE_PRF`/`RESOURCE_ICL`/`RESOURCE_RCL`, or the
+    `KEEPALIVE(0xFA)..LRPROOF(0xFF)` range RNS core itself treats as one
+    class -- confirmed directly against `RNS/Transport.py`'s own range
+    check, not re-derived by guesswork), jump the queue ahead of ordinary
+    `DATA`.
+  - **This milestone also finally implements actual CHANNEL retry-pass
+    scheduling**, deliberately deferred out of M2's scope: `_parse_rns_header`
+    now classifies every outgoing packet (verified directly against the
+    installed `RNS.Packet.unpack()`, not the old interface's own
+    docstring paraphrase of the header layout, which grouped the flags
+    byte's bits slightly differently even though its derived masks
+    happened to still be correct), and `_retry_extra_for` picks the
+    per-traffic-class extra-pass budget from
+    `docs/reliability_engine_design.md` §2's table. **One deliberate
+    simplification, flagged rather than silently guessed at: every
+    `ANNOUNCE` gets the spontaneous-announce budget.** Distinguishing a
+    path-response announce (its own, higher budget) needs to observe an
+    in-flight path request -- peer/routing-adjacent state this interface
+    doesn't have until Milestone 5. Extra passes are scheduled as
+    independent background tasks with their own jittered delay
+    (`retransmit_jitter_min_s`/`max_s`), never blocking the outgoing
+    worker from moving on to the next queued packet.
+  - Still no routing decisions or DIRECT target resolution (Milestone 5)
+    -- `process_outgoing` still only ever sends via CHANNEL. Stale-queued-
+    fragment dropping under backlog (§3's own age-plus-depth rule) isn't
+    implemented either -- the architecture doc's M3 bullet doesn't name
+    it, so it's left for whenever backlog pressure is actually a
+    concern this design has data on, not built preemptively.
+
+M4, this pass, adds native path discovery (`docs/path_discovery_spec.md`),
+scoped exactly as the architecture doc's own M4 bullet names it -- "native
+MeshCore path discovery integration, telemetry-permission granting,
+contact persistence, and stale-path detection/reset":
+
+  - **`discover_path()`** implements the doc's own function-level spec: a
+    quick-retry burst (each attempt already naturally spaced by its own
+    request/response wait, per `send_path_discovery_sync`'s own blocking
+    shape -- no additional artificial delay layered on top), verifying a
+    `PATH_RESPONSE`'s `pubkey_pre` actually names the peer queried before
+    accepting it (the underlying wait isn't peer-filtered), then
+    exponential per-peer backoff once the burst is exhausted. **Both
+    logical-review fixes the architecture doc calls out by name are
+    implemented**: a target already inside an active backoff cooldown is
+    skipped with no transmission at all (rather than contributing another
+    failed round to the same schedule it's already respecting), and this
+    interface's own `_resolved_paths` record -- not a fresh device-table
+    read -- is authoritative for its own routing/staleness decisions, so
+    a device-persist failure can never discard a path just proven to
+    work. **Deliberately NOT routed through `_run_command`/
+    `self._command_lock`**: `send_path_discovery_sync` manages its own
+    internal concurrency (a dedicated `_mesh_request_lock`) across a
+    send-then-decoupled-wait-for-`PATH_RESPONSE` shape that can
+    legitimately take several seconds -- serializing it behind this
+    interface's own single command lock too would stall every other
+    outgoing command for that whole wait, exactly what §3's "independent
+    queues" principle argues against.
+  - **Contact persistence**: a successful discovery is written back to
+    the device's own contact table via `change_contact_path` (the
+    firmware's own path-discovery handler returns before reaching the
+    code path that would otherwise do this) -- including the "`- 1`"
+    byte-length-to-mode-index conversion the design doc flags as easy to
+    get backwards, and checking the persist call's own result rather than
+    treating it as fire-and-forget.
+  - **Telemetry-permission granting**, confirmed against the actual
+    firmware source (`examples/companion_radio/MyMesh.cpp`'s
+    `onContactRequest`, not the design doc's own paraphrase): this node's
+    `telemetry_mode_base` is set to gate per-contact via that contact's
+    `flags` bit 0x02, and a periodic contact-refresh loop grants that bit
+    to known contacts. **One deliberate simplification, flagged rather
+    than silently narrowed**: the design doc recommends granting only to
+    peers confirmed via this interface's own binding protocol, which is
+    Milestone 5's peer discovery -- not built yet. Every known contact is
+    granted by default until then (`telemetry_grant_all_contacts`),
+    exactly as open as any public MeshCore channel already is.
+  - **Stale cached-path detection/reset** (§8): `record_direct_send_result()`
+    and the reset it can trigger are implemented and directly unit-tested,
+    but -- like `_send_direct()` since Milestone 1 -- not yet called from
+    anywhere automatic. Milestone 5's routing decisions are what will
+    actually drive a DIRECT send against a cached path and call this
+    after each attempt.
+  - A live, periodic contact-table read (`_contact_refresh_loop`) is
+    reinstated per `reliability_engine_design.md` §2's "data-source gap"
+    note -- feeds path discovery's own `ensure_contacts()` precondition
+    now; Milestone 5 is expected to also feed this same freshness into
+    the zero-hop/known-N-hop spacing tiers `_fragment_spacing_range()`
+    already implements but still has no live data source for.
+
+M5, this pass, adds peer discovery and routing decisions together, exactly
+as the architecture doc's own M5 bullet pairs them -- "bind frames,
+capability exchange, persistence, and opportunistic RNS-token learning,
+paired with the CHANNEL-vs-DIRECT dispatch logic and the broadcast+DIRECT-
+supplement pattern":
+
+  - **Bind frames** (`docs/peer_discovery_design.md` §1-§3): a `"P"`-marker
+    control frame, distinct from the `"R"`-marker RNS wire format, carries
+    a protocol version, REQUEST/RESPONSE type, a capability bitfield, an
+    attempt counter, and a 6-byte pubkey prefix. A peer is bound the
+    moment one well-formed frame -- either type -- is parsed from it; both
+    REQUEST and RESPONSE convey identical content. One bootstrap REQUEST
+    is sent unconditionally at every process start regardless of what the
+    peer cache restored (the old design's own regression, made
+    structurally impossible here rather than merely avoided), with an
+    optional slow repeat while still below `peer_discovery_target_peers`.
+    Every well-formed REQUEST heard gets a RESPONSE, after per-responder
+    jitter (collision/half-duplex-deaf-repeater spacing, not suppression)
+    and subject to a much longer global minimum re-response interval
+    (real suppression: this node's own capability hasn't changed just
+    because a second REQUEST arrived soon after the first RESPONSE).
+  - **Capability** (§2): a bitfield (bit 0 = `has_upstream_rns`), not the
+    old design's single router/edge character. **Structurally enforced,
+    not just documented**: capability is only ever written by
+    `_handle_incoming_bind_frame`, parsing an actual bind frame -- no
+    other code path (a native contact-table event, cache restore without
+    an explicit stored value) can set or infer it, the fix for a real
+    shipped bug where a MeshCore contact field that didn't exist
+    (`can_route`) silently defaulted `True` on every refresh.
+  - **Persistence** (§4): the bound-peer set (pubkey prefix, capability,
+    last-seen) is persisted to a small JSON file under
+    `RNS.Reticulum.storagepath` by default, and restored at startup
+    through the exact same single entry-point function
+    (`_register_peer`) every other way a peer becomes known goes
+    through -- the old design's `force_direct_path` bug traced to
+    exactly two divergent "peer becomes known" code paths drifting
+    apart, so this design has only one. Telemetry-grant state and
+    RNS-token bindings are deliberately NOT persisted (cheap to rebuild,
+    risky to resurrect stale, per §4/§7's own reasoning).
+  - **Telemetry-permission granting is now bind-gated** (§5), superseding
+    Milestone 4's `telemetry_grant_all_contacts`-default-on
+    simplification, which was explicitly flagged there as a placeholder
+    for exactly this: granted on first bind-frame parse, re-granted
+    idempotently every time a peer becomes known (including cache
+    restore), never gated behind any further handshake step.
+    `telemetry_grant_all_contacts` still exists, defaulting off now, as
+    an explicit escape hatch back to the old open behavior.
+  - **Opportunistic RNS-token learning** (§7) is wired at the one place
+    it can structurally work: the DIRECT receive path. A CHANNEL `"R"`
+    frame carries no sender pubkey at all, so `_observe_incoming_rns_packet`
+    is only ever called from `_handle_incoming_frame`'s DIRECT branch,
+    via `_canonical_peer_prefix` (MeshCore-native prefixes of possibly-
+    differing lengths are never compared directly against this
+    interface's own 6-byte peer-key convention). Populates a normal
+    `destination_hash -> peer_pubkey` table plus a separate, short-TTL
+    PROOF-correlation table keyed by each delivered packet's own
+    truncated hash (confirmed byte-for-byte against a real
+    `RNS.Packet.generate_proof_destination().hash` while this milestone
+    was built) -- the fix for the PROOF exception §7 documents: a
+    PROOF's destination-hash field is the hash of the packet it proves,
+    never a stable per-peer identity, so it can never land in the normal
+    table no matter how much traffic is observed.
+  - **Routing decisions** (`docs/routing_decisions.md`), wired into
+    `_send_outgoing_packet`'s now-real dispatcher: a path request
+    (DATA+PLAIN) always broadcasts and additionally fires a DIRECT
+    supplement, concurrently and never gated on the broadcast's own
+    outcome, to a capped number of known router-capability peers with an
+    already-resolved path. Everything else besides ANNOUNCE goes DIRECT,
+    unconditionally, the moment this interface's own `_resolved_paths`
+    record (never a fresh device-table read) shows a resolved path to
+    the packet's peer -- resolved via the token tables above -- with no
+    CHANNEL fallback on a DIRECT failure (DIRECT is primary once
+    resolved, not a supplement); repeated failures feed Milestone 4's
+    already-built stale-path detection through a new
+    `_send_direct_and_await_ack` helper that waits for the real
+    firmware ACK (correlated by the `meshcore` library's own
+    `expected_ack`/`EventType.ACK` `code`-attribute mechanism -- genuine
+    per-request correlation, confirmed against the installed library's
+    `send_msg_with_retry`, unlike the bare-type-only matching invariant
+    #2 warns against elsewhere) rather than treating a locally-queued
+    send as success. **One deliberate, total deferral, not a partial
+    one**: the path-response-announce DIRECT supplement
+    `routing_decisions.md` describes needs DIRECT fragmentation
+    regardless (an announce never fits one message) -- Milestone 6 --
+    and this interface has no way to even detect "this outgoing
+    ANNOUNCE is answering peer X" without RNS core exposing that
+    context, so every ANNOUNCE still broadcasts only, exactly as
+    Milestones 1-4 left it.
+
+**Field-testing M5 found a real, previously-undetected bug affecting
+every milestone's receive path, not just this one**: `_start_auto_
+message_fetching()` (called from `_async_setup`, right after `
+_subscribe_data_events()`) fixes it. The `meshcore` library never pushes
+`CHANNEL_MSG_RECV`/`CONTACT_MSG_RECV` on its own -- the firmware queues
+incoming messages and only notifies a connected client that something is
+waiting (`EventType.MESSAGES_WAITING`); actually reading a queued
+message off the device (`commands.get_msg()`) requires an explicit
+client request. Without calling the library's own `start_auto_message_
+fetching()` helper (which subscribes to `MESSAGES_WAITING` and drains
+with `get_msg()` every time one fires, plus does one immediate check at
+connect time), this interface's own `_on_channel_msg_recv`/`
+_on_contact_msg_recv` subscriptions -- correct in themselves -- would
+simply never fire for real incoming traffic. Confirmed live during this
+milestone's own field test: two real MeshCore radios exchanged bind
+frames and a DIRECT test payload that physically arrived and sat queued
+on each receiving device (readable directly via `commands.get_msg()`)
+while a connected-but-not-fetching interface instance received nothing
+at all -- for however long this bug had been present, going back to
+Milestone 1. PATH_RESPONSE/ACK/OK/ERROR are unaffected by this fix
+either way, since the device pushes those directly as part of the
+request/reply they answer, never gating them behind this queue-and-poll
+message mechanism -- which is also why Milestone 4's own path-discovery
+field test could pass despite this bug already being present. See
+`_start_auto_message_fetching`'s own docstring for the full mechanism.
+Once fixed, a real zero-hop (direct RF neighbor, no repeater) field test
+between two physical MeshCore radios confirmed the entire M5 chain
+working end-to-end: bind-frame peer discovery, `discover_path()`
+resolving in one attempt at `out_path_len=0`, the routing dispatcher
+sending a DATA/SINGLE packet DIRECT, a real firmware ACK correlating
+correctly via `_send_direct_and_await_ack`, and §7's opportunistic
+token/PROOF-correlation learning populating for real off that same
+DIRECT receive.
+
+M6, this pass, adds DIRECT fragmentation and folds stale-path detection/
+reset fully into routing, exactly as the architecture doc's own M6 bullet
+names it -- "the rarer DIRECT-needs-fragmenting shape, its one-fragment-
+at-a-time ACK-gated sequencing... and folding stale-path reset fully into
+routing":
+
+  - **DIRECT fragmentation** (`docs/wire_format_design.md`): a DIRECT
+    packet too large for one message falls back to the identical
+    multi-fragment header shape CHANNEL already uses (`_encode_channel_
+    multifragment`, reused directly rather than duplicated -- the doc's
+    own claim that the shapes are byte-identical), sent via `send_msg`
+    instead of `send_chan_msg`. Rare in practice (constraint one:
+    everything but ANNOUNCE, which never goes DIRECT in this design,
+    comfortably fits one DIRECT message) but handled correctly when it
+    happens, e.g. a large Resource-transfer DATA packet.
+  - **The two-pass structure** (`docs/reliability_engine_design.md` §4,
+    the logical review's own fix for a gap that section had left
+    unstated): pass 0 sends every `frag_idx` in order, one at a time --
+    never several back-to-back without waiting, enforced for free by
+    fully awaiting each fragment's own send+ACK(+retry) cycle before
+    starting the next, the same half-duplex-derived discipline CHANNEL's
+    own spacing already reflects. Pass 1 re-attempts only whatever never
+    got ACKed in pass 0. This is what makes DIRECT fragmentation's real
+    structural advantage over CHANNEL's blind full-set resend -- only
+    re-driving what's actually still missing -- concretely true rather
+    than just claimed.
+  - **The outer `direct_send_attempts` retry loop** (§4) is now real and
+    shared: it applies identically to a bare single-message DIRECT send
+    and, per-fragment, to each fragment of a DIRECT-fragmented send, via
+    one new `_send_direct_with_attempts` helper both paths call. Exactly
+    one `record_direct_send_result` call per invocation -- success on
+    the first ACK, failure once the whole budget is exhausted -- never
+    one per individual attempt, per §4's own fix note about a fragment
+    exhausting its own attempt budget counting as one failure regardless
+    of other fragments' outcomes. For the bare shape (whose own encoding
+    never varies by attempt, per design -- that's the firmware's job)
+    this drives the firmware's own `send_msg(..., attempt=...)`
+    parameter instead; for the fragmented shape both this interface's
+    own header attempt byte and that same firmware parameter vary
+    together.
+  - **Stale-path detection is now fully integrated into routing** (§8):
+    `_send_direct_packet` no longer falls straight to CHANNEL broadcast
+    the moment a peer has no *currently* resolved path -- it first tries
+    `discover_path()` (via a new `_discover_path_coalesced` wrapper that
+    shares one in-flight discovery attempt across concurrent callers for
+    the same peer, rather than each independently kicking off its own
+    quick-attempts burst) and only falls back to broadcast if discovery
+    itself also fails. This closes the loop Milestone 4's own
+    `record_direct_send_result`/`_reset_stale_path` opened but never
+    finished: a reset path is no longer a dead end for that peer until
+    some unrelated event happens to re-resolve it -- the very next
+    DIRECT-primary send attempt is what drives recovery, exactly as §8
+    specifies. The dispatcher-level gate this replaced (Milestone 5's
+    `peer_prefix in self._resolved_paths` check, before ever calling
+    `_send_direct_packet` at all) is gone -- a known peer always reaches
+    `_send_direct_packet` now, which is the one place that decides
+    resolved-vs-discover-vs-broadcast.
+
+**Field-testing M6 over a real zero-hop link found a second real gap,
+not covered by any remaining milestone (M7 is scoped entirely to ANNOUNCE
+distribution, not point-to-point routing), so it's fixed here rather than
+deferred**: peer_discovery_design.md §7's opportunistic RNS-token learning
+only ever learns from an incoming DIRECT receive -- correct, since a
+CHANNEL frame carries no sender identity at all and there's nothing safer
+to learn from -- but that meant two bound peers that had never yet
+exchanged a single DIRECT message had no way to ever originate one:
+neither side has a token to route DIRECT with, and nothing ever creates
+one without a DIRECT receive happening first. Confirmed live: a whole
+MeshChat conversation between two freshly-bound zero-hop nodes stayed on
+`resolved_paths=0`/`rns_tokens_learned=0` for its entire session, meaning
+every message rode CHANNEL's multi-fragment path (this project's own
+long-documented reliability cliff) even though a working DIRECT link
+was one hop away the whole time.
+
+Fix, extending the same broadcast+DIRECT-supplement pattern
+`routing_decisions.md` already specifies for path requests rather than
+loosening any identity assumption: `_send_outgoing_packet` now pairs the
+mandatory broadcast for case-3 (DATA/SINGLE, LINK_REQUEST, PROOF) traffic
+with no known token with a DIRECT-bootstrap-supplement to a capped number
+of bound peers (`_select_bootstrap_supplement_targets`, any bound peer --
+unlike the path-request case, capability doesn't matter here, since the
+question isn't "who can route this" but "which bound peer might actually
+be the counterpart"). This adds no new exposure beyond what the broadcast
+already does -- RNS's own end-to-end encryption protects content
+regardless of transport, so a DIRECT copy landing on a bound peer who
+isn't actually the intended recipient is exactly as cryptographically
+inert to them as the CHANNEL copy they were already going to receive.
+It's also self-limiting: one successful delivery, from either side,
+teaches the recipient a real token immediately via §7's existing
+mechanism, and ordinary DIRECT-primary routing takes over for that
+destination from then on -- the supplement never fires for it again.
+`_register_peer` also now proactively kicks off `discover_path()` the
+moment a peer is freshly bound, rather than only reactively on the first
+outgoing send, so the very first bootstrap attempt doesn't also have to
+wait out a fresh discovery burst. See `_send_direct_payload` (the new
+shared bare-or-fragmented dispatch both the DIRECT-primary and every
+DIRECT-supplement path now call through) and `_send_direct_supplement`'s
+own `trigger_discovery` parameter for the implementation.
+
+**The same field-test session found a second, more basic gap: DIRECT
+fragmentation's receive side had never actually been built.** M6's own
+send side (`_send_direct_fragmented` and everything under it) was
+implemented and tested, but the *receive* path still carried the
+original Milestone 1 stub -- an incoming DIRECT frame with the multi-
+fragment bit set was recognized and unconditionally dropped with a
+"DIRECT fragmentation is not implemented yet (Milestone 6)" log line,
+even now that Milestone 6 was the milestone implementing it. Confirmed
+live: a peer's larger DIRECT-fragmented sends (2 fragments) were dropped
+on every single delivery attempt across multiple retries, each logged
+individually, while the connection otherwise worked fine. Fixed by
+routing an incoming DIRECT multi-fragment frame
+(`_handle_direct_multifragment_frame`) through the exact same
+reassembly/dedup machinery (`_add_channel_fragment`, now returning the
+completed payload instead of calling `process_incoming` itself, so both
+the CHANNEL and DIRECT callers can add their own post-completion step)
+CHANNEL's own multi-fragment path already used since Milestone 2 --
+safe to share because DIRECT's own `sender_token` (a peer's
+cryptographically-attested `pubkey_prefix`) can never collide with
+CHANNEL's (a node's own plaintext, unauthenticated name) for the same
+physical node. The one real difference from CHANNEL: once a DIRECT
+reassembly completes, §7's opportunistic token learning runs on the now-
+complete packet -- something CHANNEL's own multi-fragment path
+structurally can't do at all, and deliberately stays out of the shared
+helper for exactly that reason.
+
+**A third, smaller gap the same field session surfaced**: `_proof_
+correlation` (§7) had no periodic reclaim of its own, unlike `_dedup`/
+`_reassembly`, both already swept every `REASSEMBLY_CLEANUP_INTERVAL_S`
+in `_reassembly_cleanup_loop`. Its only expiry path was lazy -- checked
+on the exact lookup that would consume an entry
+(`_resolve_routing_peer`'s PROOF branch) -- but most delivered packets
+never actually get proved (an RNS Link doesn't PROOF every DATA packet),
+so an entry with no matching PROOF ever coming back had no way to ever
+be reclaimed. Confirmed live: `proof_correlations_pending` sat perfectly
+flat for minutes of real traffic in the same session -- the exact
+signature of a table with no time-based cleanup. Fixed by adding
+`_proof_correlation_sweep`, called from the same periodic pass `_dedup`
+already used.
+
+**M7 (cooperative broadcast) is deliberately skipped, not deferred.**
+Per the architecture doc's own framing, M7 was always optional and
+last, resting entirely on an untested hypothesis
+(`cooperative_broadcast_design.md`'s central open question), with an
+explicit instruction that "a fully working interface from M0-M6 should
+never be considered blocked on this milestone's outcome." M0-M6 is
+that fully working interface, field-validated at zero-hop with three
+real bugs found and fixed through actual use during this build. The
+`0x40`/`"~coop"` reassembly-key branch M2 already built for M7's sake
+(see the module docstring's M1/M2 notes and `_reassembly_key`) is
+harmless dead code in this shape -- nothing ever sets that bit -- and
+is left in place rather than torn back out, since removing a correct,
+already-unit-tested branch to chase a milestone that was never started
+would be pure churn for no benefit.
+
+**Post-M6 field-driven addition: the small-mesh DIRECT-only rule
+(2026-09-15).** Real zero-hop field testing surfaced that CHANNEL
+traffic (ANNOUNCE, path requests, and the no-known-token fallback) was
+the dominant source of airtime for a small, fixed-topology deployment --
+and this project's own field data (`reliability_engine_design.md`'s
+open question 1) already shows CHANNEL is the *less* reliable transport
+of the two, not just the noisier one. `_in_small_mesh_mode()` /
+`SMALL_MESH_DIRECT_ONLY_MAX_PEERS` (default 2) makes this self-tuning
+rather than a config knob the user has to set and maintain: with 1-2
+bound peers there's no ambiguity about who any of this traffic is for,
+so it goes DIRECT to every bound peer instead of over CHANNEL at all
+(`_send_direct_to_all_peers`), for all three of `_send_outgoing_packet`'s
+routing branches -- including ANNOUNCE, which never went DIRECT before
+this. Deliberately excludes the 0-bound-peer case (CHANNEL remains the
+only way this node's very first peer can ever be discovered) and
+re-evaluates on every send rather than caching, so the mesh growing past
+2 peers reverts to the original broadcast(+capped supplement) behavior
+automatically. Trade-off, surfaced rather than silently accepted: an
+ANNOUNCE in small-mesh mode now only ever reaches this node's own bound
+peers, never a not-yet-bound third party that might be passively
+listening on CHANNEL -- judged acceptable for a small, known,
+bind-frame-authenticated topology, where that discoverability was never
+actually being used.
+
+**Post-small-mesh field-driven fix: DIRECT exchanges now serialize
+interface-wide (2026-09-15).** Real MeshChat usage (several messages
+sent close together) surfaced that `_send_direct_packet`/
+`_send_direct_supplement`, both spawned as independent background tasks
+by design, had nothing preventing two of them from running their own
+send-then-wait-for-real-ACK cycle concurrently -- letting this node's
+radio transmit a second DIRECT frame while the first one's ACK was still
+in flight. That's exactly the half-duplex collision this design's own
+"DIRECT-fragmented send sequencing: one fragment in flight at a time"
+invariant was meant to prevent, just never extended across concurrently-
+spawned top-level sends, only within one's own pass-0 loop. Symptomatic
+in the field as six separate pkt_ids all needing pass-1 re-drives in the
+same ~30s window, repeated "no real delivery ACK" warnings, and
+cascading stale-path resets on both ends -- concurrent DIRECT exchanges
+colliding with each other, not a single slow link. Fixed with a new
+`_direct_exchange_lock`, held for the full send+ACK-wait duration in
+`_send_direct_frame_and_wait_for_ack` (see that method's own docstring
+for why this is a separate lock from `_command_lock`, and why it's a
+single interface-wide lock rather than one per peer -- there is exactly
+one physical radio).
+
+**User-requested addition: optional packet capture (2026-09-15).** Off
+by default (`packet_capture_enabled`); when on, every in/out RNS packet
+this interface handles is appended as one JSON line to a file under
+`packet_capture_dir` (default: `<RNS storage path>/packet_capture/`) --
+packet classification (type/destination type/context, with friendly
+names), the routing decision made for outgoing packets (which of
+`_dispatch_outgoing_packet`'s branches fired, and the target/candidate
+peer(s) if any), transport and sender attribution for incoming packets
+(DIRECT's authenticated `sender_peer_prefix` kept structurally distinct
+from CHANNEL's unauthenticated `channel_sender_claimed`, per this
+interface's own security model), size, and both wall-clock and
+monotonic timestamps. See `_capture_event`/`_capture_outgoing`/
+`_capture_incoming`'s own docstrings for the full record format and why
+the writes are deliberately synchronous (this transport's own real
+throughput ceiling makes that a non-issue here, unlike CHANNEL/DIRECT
+sends).
+
+**Field-diagnosed fix, found via the packet capture above (2026-09-15):
+unknown-destination DIRECT-bootstrap attempts now back off.** Real usage
+(ReticulumMeshChat running headless, periodically trying to sync an LXMF
+propagation node) showed a destination this node has no token for
+getting a full DIRECT-bootstrap attempt -- LINKREQUEST out, nothing ever
+comes back -- every single time something addresses it, forever, with
+no memory of the repeated failure. Confirmed in the capture: four full
+Link-establishment attempts to the same destination in one 8-minute
+idle window, none ever answered (that propagation node simply isn't
+reachable through this node's bound peer at all). This interface has no
+positive "it failed" signal at its own layer (a real MeshCore ACK from
+the peer only confirms *local* delivery, never that whatever it's being
+asked to relay ever replied) -- so `_record_unknown_dest_attempt` uses
+the same proxy already implicit elsewhere in this design: repeated
+attempts with §7's token still never learned for that exact destination.
+After `UNKNOWN_DEST_BOOTSTRAP_FAILURE_THRESHOLD` attempts (mirroring
+path discovery's own `path_discovery_quick_attempts` default), back off
+with the same doubling-capped shape path discovery's own backoff uses --
+see the class constants and `_unknown_dest_in_backoff`/
+`_record_unknown_dest_attempt`/`_clear_unknown_dest_backoff`'s own
+docstrings. Learning a real token for that destination (§7) clears the
+backoff immediately, so a destination that becomes reachable later isn't
+blocked forever. Scoped to case 3's "no known peer" branch only -- never
+ANNOUNCE (no reply is ever expected for one's own outgoing announce) or
+path requests (whose own `destination_hash` is a shared PLAIN pseudo-
+destination, not the actual queried target, so per-destination backoff
+wouldn't even apply meaningfully there).
+
+**Field-diagnosed fix, found jointly with another Claude session working
+a real 2-hop repeater field test (2026-09-15): outgoing PATH_RESPONSE is
+now rate-limited per destination.** An outgoing PATH_RESPONSE is RNS
+Transport's own answer to a PATH_REQUEST it decided, on its own, to
+answer -- this interface has no say over whether one gets generated, only
+over how many times it actually keys the shared half-duplex radio to
+transmit it. Packet-capture evidence from that field test found a remote
+NomadNet client stuck in a tight connection-retry loop, re-issuing
+PATH_REQUESTs for the same destination every 4-8s while its own link
+attempt kept failing -- well under `RNS.Transport`'s own
+`PATH_REQUEST_MI=20s` floor, confirming these were explicit
+`request_path()` calls from that client, not ordinary path aging. RNS
+answered every single one, each one a real multi-fragment ANNOUNCE
+transmission, landing squarely in the same ~10-minute window six unrelated
+DIRECT DATA sends were failing to get through. This interface can't fix
+the remote client's retry loop, but it can stop re-spending airtime
+re-answering a question it already just answered: `_path_response_rate_
+limited` drops a repeat PATH_RESPONSE for the same destination within
+`PATH_RESPONSE_RATE_LIMIT_WINDOW_S` of the last one actually sent -- the
+destination's path/identity cannot plausibly have changed that fast, and
+the requester already has a reply in flight.
+
+**User-requested fix (2026-09-15), generalized the same day into a
+flat post-send listen window applied after *every* DIRECT attempt.**
+First cut: a DIRECT send that got no ACK waited out a short randomized
+delay before its *own* next retry attempt only (0.5-2.0s), on the
+reasoning that retrying instantly after a collision just repeats the
+same collision window. A second real 2-hop field test then surfaced the
+sharper version of the same problem one layer up: `_direct_exchange_lock`
+released the instant one attempt resolved (ACKed or not), letting the
+very next contender -- a different queued message, not just a retry of
+this one -- key the radio again immediately, with the repeater possibly
+still settling from the previous exchange. Rather than add a second,
+separate inter-message delay on top of the existing per-retry one, the
+two were unified per direct user request into one flat rule: **every**
+attempt of **every** fragment, ACKed or not, first or last, now sleeps a
+random `direct_post_send_listen_min_s`/`max_s` (0-5s by default -- "we
+can tune this later," direct user words) before
+`_send_direct_frame_and_wait_for_ack` returns -- and critically, while
+still holding `_direct_exchange_lock`, so it's a real quiet window on the
+shared radio, not just a delay this one caller happens to observe. This
+also means a fully successful send now pauses before releasing the lock
+too, trading a little latency on the happy path for a consistent,
+easy-to-reason-about rule instead of a patchwork of "delay here, not
+there" special cases -- deliberately coarse for now, a first pass meant
+to be tuned down (or made outcome/hop-count-sensitive) once real
+capture data from the next field test shows what's actually needed.
+Because this is an `await asyncio.sleep()` on the interface's own event
+loop, it doubles as a real window for this interface to actually receive
+anything that was in flight, the same as it already does during the
+ACK-wait timeout itself.
+
+**User-requested fix (2026-09-16): the flat post-send listen window
+above is now split by outcome, one day after it shipped, once a real
+zero-hop NomadNet field session's own packet capture showed its actual
+cost.** All 176 DIRECT attempts captured across both machines that
+session were ACKed -- 100%, exactly as expected at zero-hop, nothing to
+collide with -- yet every one of them still paid the full flat 0-5s
+random tax (averaging ~2.5-2.9s) before the lock released. Worse, this
+compounds: NomadNet's page transfer spawns many small RESOURCE-related
+packets that all queue up behind `_direct_exchange_lock`, and the
+capture showed `_direct_exchange_queue_depth` reaching 14 with
+individual attempts waiting up to **48 seconds** just for their own
+turn, purely because everything ahead of them was "listening" after a
+send that had already succeeded. None of that bought any real collision
+protection -- nothing was colliding. Fixed: a missed ACK (the one case
+where "something might have collided" is a live, evidence-backed
+hypothesis) still draws from the full `direct_post_send_listen_min_s`/
+`max_s` range; a real ACK -- itself direct evidence the channel was
+clear -- now draws from the much smaller `direct_post_send_listen_
+success_min_s`/`max_s` (0-0.5s default) instead. Both stay genuinely
+randomized ranges, never a fixed value or a hard skip, per direct user
+instruction ("the waits should still be random to avoid the interfaces
+getting stuck in loops") -- the fix narrows the success-case range
+rather than special-casing it away to zero.
+
+**User-requested architectural fix (2026-09-16), following a real 1-hop
+repeater field test: `_direct_exchange_lock` is now priority-aware.**
+That test (peer's own laptop-side + this node's cross-checked capture,
+diagnosed jointly with another Claude session) found real ~50% RF loss at
+one hop and `_direct_exchange_queue_depth` reaching 14, with individual
+DIRECT attempts waiting up to 94s just for their own turn at the lock.
+Asked directly whether this design should keep being tuned or reconsider
+the underlying architecture given a half-duplex, high-latency, lossy
+medium: the answer was to keep DIRECT-primary (the fixes above are all
+real and worth keeping) but recognize that a *plain* `asyncio.Lock`
+treats every DIRECT exchange as equally urgent -- a LINK_REQUEST/PROOF-
+class exchange (already tagged `PRIORITY_HANDSHAKE` at the *outer*
+two-tier outgoing queue, docs/reliability_engine_design.md §3) arriving
+while a deep backlog of ordinary DATA/RESOURCE-fragment retries is
+already queued for this same lock has no way to jump that backlog once
+queued -- a plain lock has no "insert ahead" operation, only FIFO. Since
+establishing (or proving) a Link is usually the actual gate everything
+else is waiting on, that outer priority distinction was being silently
+discarded the moment multiple DIRECT sends started contending for the
+radio. Fixed: `_direct_exchange_lock` is now a `_PriorityAsyncLock` (see
+that class's own docstring for the full design and cancellation-safety
+reasoning) -- a higher-priority waiter is served before an earlier-
+arrived lower-priority one, FIFO within a tier, threaded down through
+the whole DIRECT send call chain (`_send_direct_packet`/`_send_direct_
+supplement`/`_send_direct_to_all_peers`/`_send_direct_payload`/
+`_send_direct_fragmented`/`_send_direct_with_attempts`) via each call
+site's own already-available `header` (`_priority_tier(header)`, the
+same classification the outer queue already used). Scoped deliberately:
+this reorders *waiting*, it doesn't reduce total demand on the shared
+radio or change how many attempts a message gets -- the "should this
+layer's own retry budget shrink in favor of RNS's own Resource-level
+recovery" question raised alongside it remains open, not addressed here.
+
+**User-requested fix (2026-09-16), the same day: that open question was
+answered -- `direct_send_attempts`' own default lowered from 3 to 2.**
+Directly requested after the confidence discussion above: under the same
+real ~50% measured 1-hop loss, a fragment that exhausts its attempt
+budget without an ACK still holds `_direct_exchange_lock` (priority-
+aware now, but still one physical radio) for the full cost of each
+failed attempt -- ack_timeout plus the post-send listen window -- before
+anything else queued behind it gets a turn. A fragment that needs a 3rd
+attempt under these conditions is no better served by getting one here
+than by falling through to `_send_direct_fragmented`'s own existing
+pass-1 re-drive (a fresh attempt budget, not a continuation of a failing
+one), or, above this interface entirely, RNS's own Resource-transfer
+layer re-requesting specifically-missing parts once a transfer stalls --
+both mechanisms already exist and have equal or better information about
+what's actually still missing. Still a flat value, not adaptive to
+measured loss -- see that config value's own comment for why an
+adaptive version was deliberately not attempted without more field data
+to justify the added complexity.
+
+**User-requested batch (2026-09-16), synthesized across all three field
+tests run that day: four further reliability/airtime fixes, all
+implemented and deployed together.**
+
+1. *Handshake-class exchanges get a larger attempt budget than ordinary
+   DATA, not the same reduced one.* `direct_send_attempts_handshake`
+   (default 4) applies when `_send_direct_with_attempts`'s own `priority`
+   parameter is `PRIORITY_HANDSHAKE`; `direct_send_attempts` (default 2)
+   applies otherwise. See `direct_send_attempts_handshake`'s own comment
+   for why a failed Link handshake -- confirmed, via direct RNS.
+   Transport.py source inspection, to force a full path rediscovery and
+   feed a self-reinforcing congestion loop -- deserves more persistence
+   than a failed DATA fragment, which pass-1 re-drive or RNS's own
+   Resource-layer recovery already exist to pick up cheaply.
+2. `PATH_RESPONSE_RATE_LIMIT_WINDOW_S` *raised from 10s to 20s* once
+   real 1-hop/2-hop field data showed the original window's actual
+   coverage against a real client's observed retry cadence (mostly
+   15-26s, not the tighter 4-8s that motivated the original 10s value).
+3. *A third priority tier, `PRIORITY_LOW`, added for PATH_RESPONSE
+   specifically.* `_priority_tier` now returns it for any
+   `context == RNS.Packet.PATH_RESPONSE` packet -- pure housekeeping,
+   below both `PRIORITY_HANDSHAKE` and `PRIORITY_NORMAL` at
+   `_PriorityAsyncLock`, so it can never block real user data even
+   during a client retry storm rate-limiting alone can't fully suppress
+   (field data: 17 real PATH_RESPONSE transmissions in one ~6.5-minute
+   window despite the rate limit).
+4. *A global transmit duty-cycle cap, direct user instruction:* "all
+   interfaces should spend the majority of their time listening...
+   transmit should only take up like a max of 30% of total airtime in a
+   10 second period." `_DutyCycleLimiter` (see its own docstring for the
+   full design -- why airtime is estimated from `bitrate` rather than
+   measured, why the wait loop wakes exactly when room frees up rather
+   than polling) enforces this across *every* actual radio-keying
+   command this interface issues -- CHANNEL fastpath/multi-fragment
+   sends, DIRECT sends, bind frames alike, via `_throttle_for_duty_
+   cycle` at each of their own call sites -- not scoped to any one
+   transport shape or priority tier, since there's exactly one physical
+   radio underneath all of them. `duty_cycle_enabled` (default on),
+   `duty_cycle_window`/`duty_cycle_max_fraction` (10s/0.30, matching the
+   user's own numbers exactly) are all configurable; the defaults are a
+   precautionary ceiling, not derived from a specific field measurement
+   the way most of this docstring's other numbers are.
+
+**User-requested observability addition (2026-09-15): two new packet-
+capture record kinds, `direct_attempt_result` and `direct_send_result`,**
+added specifically because the 2-hop field test above needed information
+this capture didn't yet carry -- out_path_len/out_path_hex (the hop path
+actually resolved for a DIRECT peer) were previously visible only in a
+one-off `RNS.log` INFO line at the moment a path was freshly discovered,
+never at the moment a message using that (possibly long-cached) path
+actually succeeds or fails; and there was no way to tell, from the
+capture alone, which individual attempt (of a fragment, of a message)
+got ACKed versus timed out, or how contended `_direct_exchange_lock` was
+at that moment. `_capture_direct_attempt_result` (one record per
+individual DIRECT send attempt -- bare, or one fragment of a fragmented
+send) carries `peer_prefix`, `attempt`, `ok`, `queue_depth` and
+`lock_wait_s` (`_direct_exchange_queue_depth`'s own live contention
+count and how long this attempt waited its turn -- direct evidence for
+or against "several concurrent messages splitting the one shared radio"
+the next time that's a live hypothesis), `ack_timeout_s`, and (when
+applicable) `pkt_id`/`frag_idx`/`frag_total`. `_capture_direct_send_
+result` (one record per whole DIRECT message, after both fragmentation
+passes if any) pairs the final ACKed/not-ACKed outcome with
+`out_path_len`/`out_path_hex`. Both carry an `event` field absent from
+every existing packet in/out record, so a script already written against
+this capture format can keep ignoring records it doesn't recognize.
+
+**User-requested addition (2026-09-16): every capture record now carries
+`hop_count` too, not just the final `direct_send_result` summary.** The
+stated goal is building tuning profiles per hop count/scenario from real
+field data -- e.g. bucketing retry counts, ack timeouts, and listen
+delays by hop count -- which the per-attempt `direct_attempt_result`
+record couldn't support without cross-referencing it against the
+matching `direct_send_result` by hand. `_capture_direct_attempt_result`
+now carries the same `out_path_len` the caller (`_send_direct_packet`/
+`_send_direct_supplement`) already had in hand from `_resolved_paths`,
+threaded down through `_send_direct_payload`/`_send_direct_fragmented`/
+`_send_direct_with_attempts` as a plain `hop_count` parameter -- never
+re-resolved at the attempt layer itself, so it always reflects whatever
+path the caller actually used for this send. `_capture_incoming` also
+gained `hop_count`, best-effort: this interface's own resolved outbound
+path length to `sender_peer_prefix` at receive time, since MeshCore
+never reports the actual inbound path a given DIRECT frame took -- only
+what this node currently has resolved for sending back to that peer.
+`None` on any record where no path is resolved yet (unauthenticated
+CHANNEL traffic, or a DIRECT exchange still establishing its first
+path) -- never coerced to 0, which would be indistinguishable from a
+genuine zero-hop link.
+
+**User-requested fix (2026-09-15, post-alpha-0.1.0 2-hop field test):
+stale-path reset now respects a minimum path age.** `direct_path_reset_
+threshold`'s default (2) meant just two consecutive full-timeout DIRECT
+failures discarded a cached path and forced a fresh `discover_path()`
+burst (up to `path_discovery_quick_attempts` real over-the-air round
+trips) on the very next send -- with no floor on how recently that exact
+path was itself successfully confirmed. Asked directly whether the
+interface might be "too trigger-happy with path requests once a message
+fails": yes, confirmed against the code -- when several DIRECT sends to
+the same peer fail close together for a reason that has nothing to do
+with the path itself (shared-radio congestion, several messages queued
+behind `_direct_exchange_lock`, a repeater mid-relay -- exactly the real
+2-hop field test scenario), this could re-discover a path confirmed only
+seconds earlier and re-run `reset_path()` on the device, adding real
+path-discovery airtime on top of an already-congested channel: a self-
+inflicted feedback loop, not a genuine stale-path recovery. Fixed:
+`record_direct_send_result` now checks `_ResolvedPath.resolved_at`
+against `direct_path_reset_min_age_s` (30s default) before resetting --
+a path confirmed more recently than that is trusted regardless of
+accumulated failures. The failure counter is deliberately NOT cleared by
+this skip, so a path that's genuinely gone bad still gets torn down and
+rediscovered the moment it's old enough for that to be plausible, just
+not before.
+
+**User-requested addition (2026-09-16), the same real zero-hop hardware
+session that found the duty-cycle miscalibration above: defer
+transmitting for a while after hearing a DIRECT frame.** Direct user
+request: "if we hear a message come in via direct, we wait 3 seconds to
+hear another before we send again... wait for the incoming interface to
+either stop sending or hit its airtime limit." This interface has no
+real-time channel-busy/CAD signal from the `meshcore` library (confirmed
+-- nothing exposes that), so a received DIRECT frame is the best
+available proxy for "someone else is transmitting nearby right now."
+`_wait_for_incoming_quiet` (see its own docstring for the full design)
+is called immediately before `_throttle_for_duty_cycle` at every one of
+that method's own call sites (CHANNEL fastpath/multi-fragment sends,
+DIRECT sends, bind frames) -- complementary to, not a replacement for,
+the duty-cycle cap: that one throttles based on this interface's own
+recent transmit history, this one defers based on what it just *heard*,
+specifically to avoid keying the radio into the middle of a peer's own
+multi-fragment DIRECT burst. `incoming_quiet_window_s` (3.0s, matching
+the user's own number exactly) is a rolling window -- hearing another
+DIRECT frame while already waiting pushes the deadline out again,
+mirroring "wait for them to stop sending." Since this interface can't
+actually observe a peer's own airtime budget, "or hit its airtime limit"
+is approximated by `incoming_quiet_defer_max_wait_s` (15.0s default) --
+a bound on this node's own patience, not a measurement of the other
+side's real limit, so a continuously-chatty peer can never starve this
+node's own outgoing traffic indefinitely. `_last_incoming_direct_at` is
+updated in `_on_contact_msg_recv` for *every* DIRECT frame heard on the
+channel, before the marker check even runs -- true even for a frame that
+turns out malformed or not addressed to this node, since "the channel
+was just occupied" doesn't depend on the frame being decodable.
+
+DESIGN INVARIANTS (carried forward from the prior implementation's own
+field-diagnosed lessons, restated here per CLAUDE.md; the full justification
+for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
+library's own send/ACK contract" section and
+`docs/reliability_engine_design.md`'s "RNS base-class contract" implementation
+notes):
+
+  1. Never trust a bare `await` of a `self._mc.commands.foo(...)` call to
+     mean success. `send_chan_msg` resolves against [OK, ERROR] and never
+     returns a delivery confirmation (CHANNEL has no ACK at all); `send_msg`
+     resolves against [MSG_SENT, ERROR] and MSG_SENT itself only confirms
+     the local radio queued the frame, not that it was delivered. Route
+     every command's result through `_run_command()`, which checks the
+     *actual* event type returned against what that specific call expected,
+     and raises on `EventType.ERROR`, no response, or an unexpected type --
+     never on "did it return without throwing."
+
+  2. Never wait on a bare event TYPE when more than one in-flight operation
+     could produce it. The `meshcore` library's `CommandHandlerBase.send()`
+     matches a reply purely by event type, with no per-request correlation
+     id -- two concurrent commands both waiting on the same type can steal
+     each other's reply. `_run_command()` serializes every actual
+     `commands.*()` call behind `self._command_lock` so only one command is
+     ever in flight and awaiting its reply at a time. A longer-lived wait
+     for something that can legitimately take tens of seconds (a DIRECT
+     delivery ACK, once M4+ adds it) must be a persistent subscription
+     matched by content identity, never a second concurrent bare-type wait
+     that could collide with the next command's own reply.
+
+  3. Every config value that's read via `cfg.get(...)` in a `_configure_*`
+     method must be used somewhere else in this file, or a user setting it
+     gets no error and no effect -- the exact bug class
+     (`firmware_text_limit` parsed, documented, and never read) this
+     project already hit once. `tests/test_smart_meshcore_interface_config.py`
+     enforces this with a static AST scan, mirroring
+     `tests/test_config_usage.py`'s pattern for the old implementation.
+"""
+
+import asyncio
+import collections
+import itertools
+import json
+import os
+import queue
+import random
+import threading
+import time
+import traceback
+from typing import NamedTuple, Optional
+
+import RNS
+from RNS.Interfaces.Interface import Interface
+
+
+def _cfg_bool(value) -> bool:
+    """Parse a ConfigObj string value as a boolean the way the rest of this
+    interface's config surface does: only an explicit falsy string turns a
+    flag off, so an unrecognized value fails safe toward the (documented)
+    default behavior rather than silently disabling something."""
+    return str(value).strip().lower() not in ("no", "false", "0")
+
+
+# -------------------------------------------------------------------------
+# Z85 codec (docs/wire_format_design.md's "constraint zero": send_chan_msg/
+# send_msg take str and encode utf-8; the receiving side decodes with
+# errors="ignore", which silently drops invalid UTF-8 sequences rather than
+# erroring. Raw binary must be encoded into a restricted, ASCII-safe
+# alphabet before it touches either call, or bytes get silently corrupted
+# on the wire with no error anywhere. Z85 was already the right choice
+# (25% expansion, close to the theoretical floor) -- kept, not reinvented.
+# Self-describing padding: the first output character is a digit 0-3
+# giving how many zero bytes were appended before encoding, so decode
+# doesn't need the original length out-of-band.
+# -------------------------------------------------------------------------
+
+_Z85_ALPHABET = (
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#"
+)
+_Z85_DECODE = {c: i for i, c in enumerate(_Z85_ALPHABET)}
+
+
+def _z85_encode(data: bytes) -> str:
+    pad = (-len(data)) % 4
+    padded = data + b"\x00" * pad
+
+    out = []
+    for i in range(0, len(padded), 4):
+        value = int.from_bytes(padded[i:i + 4], "big")
+        chars = []
+        for _ in range(5):
+            chars.append(_Z85_ALPHABET[value % 85])
+            value //= 85
+        out.append("".join(reversed(chars)))
+
+    return str(pad) + "".join(out)
+
+
+def _z85_decode(text: str) -> bytes:
+    if not text or text[0] not in "0123":
+        raise ValueError("missing/invalid Z85 pad-count prefix")
+    pad = int(text[0])
+    body = text[1:]
+
+    if len(body) % 5 != 0:
+        raise ValueError(f"Z85 body length {len(body)} not a multiple of 5")
+
+    out = bytearray()
+    for i in range(0, len(body), 5):
+        group = body[i:i + 5]
+        value = 0
+        for ch in group:
+            try:
+                value = value * 85 + _Z85_DECODE[ch]
+            except KeyError:
+                raise ValueError(f"invalid Z85 character: {ch!r}") from None
+        if value > 0xFFFFFFFF:
+            raise ValueError("Z85 group overflows 32 bits")
+        out.extend(value.to_bytes(4, "big"))
+
+    if pad:
+        out = out[:-pad]
+    return bytes(out)
+
+
+class _FrameHeader(NamedTuple):
+    """The decoded `[ver]`(`[|pkt_id|frag_idx|frag_total|attempt]`) header
+    of one MeshCore CHANNEL/DIRECT frame, per docs/wire_format_design.md.
+    `pkt_id`/`attempt` are None for a DIRECT bare (fits-in-one-message)
+    frame, which carries neither -- the firmware's own ACK and content-
+    derived attempt differentiation are that shape's reliability
+    mechanism, not this header's."""
+
+    version: int
+    multi_fragment: bool
+    coop: bool
+    pkt_id: Optional[int]
+    frag_idx: int
+    frag_total: int
+    attempt: Optional[int]
+
+
+class _ReassemblyBucket:
+    """One in-progress CHANNEL multi-fragment reassembly, keyed as
+    docs/reliability_engine_design.md §5.2 specifies (see
+    SmartMeshCoreInterface._reassembly_key). `last_progress` is a
+    `time.monotonic()` timestamp, refreshed on every accepted fragment --
+    §5.4's "time since last progress, not time since first fragment"
+    staleness metric, and also the sort key §5.3's oldest-by-last-progress
+    capacity eviction uses."""
+
+    __slots__ = ("frag_total", "coop", "fragments", "last_progress")
+
+    def __init__(self, frag_total: int, coop: bool):
+        self.frag_total = frag_total
+        self.coop = coop
+        self.fragments: dict = {}
+        self.last_progress = time.monotonic()
+
+
+class _RnsHeader(NamedTuple):
+    """The cleartext RNS packet-header fields this interface reads to
+    make priority/retry decisions and (Milestone 5) routing decisions --
+    packet_type, destination_type, the context byte (when present), the
+    header_type bit, and the destination_hash field. All sit in the
+    clear before RNS's own payload encryption begins (confirmed directly
+    against the installed `RNS.Packet.unpack()`, not the old interface's
+    own docstring paraphrase of this layout, which grouped the flags
+    byte's bits slightly differently even though its two derived masks
+    happened to still be correct) -- this interface decrypts nothing,
+    per its security model. `context`/`destination_hash` are `None` when
+    `data` is too short to contain them. `header_type`/`destination_hash`
+    default to `0`/`None` so existing keyword-only test construction of
+    this NamedTuple (pre-Milestone-5) keeps working unchanged."""
+
+    packet_type: int
+    destination_type: int
+    context: Optional[int]
+    header_type: int = 0
+    destination_hash: Optional[bytes] = None
+
+
+class _ResolvedPath(NamedTuple):
+    """This interface's own last-verified path-discovery result for one
+    peer, per docs/path_discovery_spec.md's function-level spec --
+    authoritative for this interface's own routing/staleness decisions
+    regardless of whether the device-table persist (_persist_resolved_path)
+    itself succeeds, so a persist failure can never discard a path just
+    proven to work. `out_path_hex`/`out_path_len` are empty/0 for a
+    confirmed zero-hop (direct) peer -- still a genuine, worth-persisting
+    result, not an absence of one."""
+
+    out_path_hex: str
+    out_path_len: int
+    out_path_hash_len: int
+    resolved_at: float  # time.monotonic()
+
+
+class _BindFrame(NamedTuple):
+    """The decoded `"P"`-marker peer-binding control frame
+    (docs/peer_discovery_design.md §1) -- distinct from `_FrameHeader`,
+    which decodes the `"R"`-marker RNS-carrying frame. `pubkey_prefix` is
+    a 12-hex-char (6-byte) string, this interface's own canonical peer
+    key throughout Milestone 5's peer registry/routing tables."""
+
+    version: int
+    type: int
+    cap: int
+    attempt: int
+    pubkey_prefix: str
+
+
+class _PeerRecord:
+    """One entry in this interface's own peer registry
+    (docs/peer_discovery_design.md §4) -- deliberately minimal: just
+    enough for the routing decisions this interface itself makes.
+    MeshCore's own contact table (pubkey/name/out_path) is a separate,
+    independently-owned data source this interface only ever reads
+    (`_resolve_contact`), never duplicates here. `has_upstream_rns` is
+    tri-state (`None` = no signal yet) -- §2's hard rule: only ever set
+    from an actually-parsed bind frame, never inferred or defaulted.
+    `last_seen` is a `time.time()` (wall-clock, not monotonic) timestamp
+    specifically so it survives a restart meaningfully via the peer
+    cache -- monotonic time resets to 0 on every process start and would
+    make every cache-restored peer look artificially fresh."""
+
+    __slots__ = ("pubkey_prefix", "has_upstream_rns", "last_seen")
+
+    def __init__(self, pubkey_prefix: str, has_upstream_rns: Optional[bool], last_seen: float):
+        self.pubkey_prefix = pubkey_prefix
+        self.has_upstream_rns = has_upstream_rns
+        self.last_seen = last_seen
+
+
+class _PriorityAsyncLock:
+    """User-requested architectural fix (2026-09-16, real 1-hop repeater
+    field data): `_direct_exchange_lock` (see `_send_direct_frame_and_
+    wait_for_ack`'s own docstring) used to be a plain `asyncio.Lock`,
+    strictly FIFO across every DIRECT exchange regardless of what kind of
+    packet it carried. A real 1-hop test found `_direct_exchange_queue_
+    depth` reaching 14 -- meaning a LINK_REQUEST/PROOF-class exchange
+    (already tagged `PRIORITY_HANDSHAKE` at the *outer* two-tier queue,
+    docs/reliability_engine_design.md §3) arriving while a backlog of
+    ordinary DATA/RESOURCE-fragment retries was already queued for this
+    same lock had no way to jump that backlog -- it just joined the back
+    of one shared FIFO like everything else, even though establishing (or
+    proving) a Link is usually what everything else is waiting on in the
+    first place. A plain `asyncio.Lock` cannot reorder waiters once
+    they're queued (there is no "insert ahead" operation), so preserving
+    that outer priority tier all the way down to the actual radio
+    required a real priority-aware primitive, not just a config tweak.
+
+    Behavior: a higher-priority waiter (lower `priority` integer, matching
+    `PRIORITY_HANDSHAKE < PRIORITY_NORMAL`) is served before an earlier-
+    arrived lower-priority one; waiters within the same tier stay FIFO
+    among themselves, same as the stdlib lock. Used via `async with
+    lock(priority):` (see `__call__`/`_PriorityLockContext` below).
+
+    Deliberately minimal, not a wrapper around `asyncio.Lock` -- the
+    stdlib lock's own internal waiter queue has no reordering operation
+    to hook into, so ownership here is tracked directly (`_locked`) with
+    one waiter deque per priority tier. Cancellation-safe: a waiter
+    cancelled before being granted just removes itself from its deque; a
+    waiter cancelled in the narrow window after being granted but before
+    resuming passes ownership on to the next waiter rather than leaving
+    the lock stuck locked forever with nothing able to ever acquire it
+    again (only reachable via `detach()`'s `task.cancel()` sweep in
+    practice -- this interface's own steady-state code never cancels a
+    task waiting on this lock)."""
+
+    def __init__(self):
+        self._locked = False
+        self._waiters: "dict[int, collections.deque]" = {}
+
+    def locked(self) -> bool:
+        return self._locked
+
+    async def acquire(self, priority: int) -> None:
+        if not self._locked:
+            self._locked = True
+            return
+        fut = asyncio.get_event_loop().create_future()
+        self._waiters.setdefault(priority, collections.deque()).append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            dq = self._waiters.get(priority)
+            if dq is not None and fut in dq:
+                # Never granted -- just drop out of line, lock state
+                # (owned by whoever currently holds it, if anyone) is
+                # entirely unaffected by our own departure.
+                dq.remove(fut)
+            elif fut.done() and not fut.cancelled():
+                # Already granted ownership in the same instant our own
+                # cancellation was delivered -- pass it on rather than
+                # leaving the lock permanently locked with no owner able
+                # to release it.
+                self._wake_next()
+            raise
+
+    def release(self) -> None:
+        if not self._wake_next():
+            self._locked = False
+
+    def _wake_next(self) -> bool:
+        """Hands ownership to the next waiter, highest priority (lowest
+        integer) first, FIFO within a tier. Returns whether anyone was
+        actually waiting -- the lock stays `_locked=True` (ownership
+        transferred) when True, and the caller (`release`) marks it
+        unlocked only when False."""
+        for tier in sorted(self._waiters.keys()):
+            dq = self._waiters[tier]
+            while dq:
+                fut = dq.popleft()
+                if not fut.done():
+                    fut.set_result(None)
+                    return True
+            del self._waiters[tier]
+        return False
+
+    def __call__(self, priority: int) -> "_PriorityLockContext":
+        return _PriorityLockContext(self, priority)
+
+
+class _PriorityLockContext:
+    """`async with priority_lock(priority):` sugar -- `_PriorityAsyncLock`
+    itself isn't a context manager (it needs a `priority` argument
+    `asyncio.Lock`'s own `__aenter__` has no room for), so `__call__`
+    returns one of these instead, exactly the way `asyncio.Lock` fits an
+    `async with` block despite `acquire`/`release` being its own real
+    methods."""
+
+    __slots__ = ("_lock", "_priority")
+
+    def __init__(self, lock: _PriorityAsyncLock, priority: int):
+        self._lock = lock
+        self._priority = priority
+
+    async def __aenter__(self) -> None:
+        await self._lock.acquire(self._priority)
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._lock.release()
+
+
+class _DutyCycleLimiter:
+    """User-requested fix (2026-09-16, direct user instruction following
+    the field-test synthesis above): "all interfaces should spend the
+    majority of their time listening" -- a global cap on how much of any
+    trailing `window_s` this interface spends transmitting, `max_fraction`
+    (default 0.30, i.e. at most 30% of every rolling 10s), enforced across
+    *every* actual radio-keying command this interface issues (CHANNEL
+    fastpath/multi-fragment sends, DIRECT sends, bind frames alike -- see
+    each of their own call sites for where `wait_for_budget`/`record` are
+    used) -- not a per-transport-shape or per-priority-tier budget, a
+    single shared one, since there's exactly one physical radio and every
+    one of these already funnels through it regardless of which higher-
+    level mechanism decided to send.
+
+    Airtime is *estimated*, not measured: `size_bytes * 8 /
+    duty_cycle_estimate_bitrate` -- a *separate* config value from this
+    interface's own `bitrate`, not that value reused. First shipped
+    reusing `bitrate` directly, and a real zero-hop field test the same
+    day immediately showed why that was wrong: `bitrate`'s own deployed
+    value is deliberately chosen to model CHANNEL's worst-case *sustained*
+    throughput (dominated by deliberate inter-fragment spacing) for RNS
+    core's own unrelated pacing/timeout math, not a real single-frame
+    over-the-air rate -- reusing it estimated a small ~100-char frame at
+    ~10 real seconds of airtime, instantly exhausting the budget on every
+    single exchange. `duty_cycle_estimate_bitrate` defaults to 1200 (see
+    that config value's own comment for the two-step tuning history --
+    300 was tried first and still fired on ordinary Link+Resource
+    traffic in the same real hardware test) -- a more realistic raw LoRa
+    PHY figure, the right basis for *this* estimate specifically. Neither
+    is a real PHY-layer measurement (this interface has no access to
+    actual LoRa spreading-factor/bandwidth/coding-rate timing, only what
+    the `meshcore` library exposes), and deliberately NOT the wall-clock
+    duration of the `send_msg`/`send_chan_msg` command call itself --
+    that duration is dominated by local serial/BLE/TCP round-trip
+    overhead to the companion radio, not real over-the-air time, and
+    would make this limiter's accuracy hostage to transport-specific
+    latency that has nothing to do with the actual duty cycle question.
+    Good enough for a self-imposed courtesy limit, not a regulatory
+    compliance guarantee.
+
+    Implementation: a deque of `(start_time, duration)` samples (monotonic
+    clock), pruned to the trailing window on every check. `wait_for_budget`
+    sleeps in a loop -- never a single fixed sleep -- until transmitting
+    for `estimated_duration_s` more would not push cumulative busy time
+    over `window_s * max_fraction`, each iteration waking exactly when the
+    oldest sample is due to age out of the window (not a fixed poll
+    interval), so it wakes only as often as actually necessary."""
+
+    def __init__(self, window_s: float, max_fraction: float):
+        self._window_s = window_s
+        self._max_busy_s = window_s * max_fraction
+        self._samples: "collections.deque" = collections.deque()
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self._window_s
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def _busy_s(self, now: float) -> float:
+        self._prune(now)
+        return sum(duration for _start, duration in self._samples)
+
+    async def wait_for_budget(self, estimated_duration_s: float) -> float:
+        """Sleeps until sending for `estimated_duration_s` would not push
+        the trailing window's cumulative busy time over the cap. Returns
+        the total delay actually applied (0.0 if none was needed) --
+        capture/debug-only, never affects whether the send itself
+        proceeds. A single transmission longer than the entire cap on its
+        own (shouldn't happen in practice -- every real frame this
+        interface sends is small) is let through once the window is
+        otherwise empty, rather than waiting forever for room that will
+        never exist."""
+        total_wait = 0.0
+        while True:
+            now = time.monotonic()
+            self._prune(now)
+            if self._busy_s(now) + estimated_duration_s <= self._max_busy_s or not self._samples:
+                return total_wait
+            oldest_start, _oldest_duration = self._samples[0]
+            wait_s = max(0.01, (oldest_start + self._window_s) - now)
+            await asyncio.sleep(wait_s)
+            total_wait += wait_s
+
+    def record(self, duration_s: float) -> None:
+        self._samples.append((time.monotonic(), duration_s))
+
+
+class SmartMeshCoreInterface(Interface):
+    """Milestones 0-6: scaffolding, wire format, fragmentation/reassembly,
+    priority queueing/retry passes, native path discovery, peer
+    discovery + routing decisions, and DIRECT fragmentation with full
+    stale-path/routing integration. See the module docstring above for
+    exact scope and what's still deliberately unimplemented."""
+
+    # -------------------------------------------------------------------
+    # Class-level constants
+    # -------------------------------------------------------------------
+
+    DEFAULT_IFAC_SIZE = 8
+
+    # How long __init__ blocks waiting for the async setup coroutine to
+    # finish (successfully or not) before giving up and logging an error --
+    # RNS core expects interface construction to be synchronous, so this
+    # can't be unbounded. Also reused as the teardown wait bound in
+    # detach(), since disconnecting is a comparably-bounded operation.
+    SETUP_TIMEOUT_S = 30.0
+
+    # Every EventType name this interface (this milestone or a later one
+    # already scaffolded for) relies on existing must be probed at startup
+    # rather than assumed -- design invariant #1's library-contract
+    # counterpart (`docs/meshcore_protocol_rules.md`'s library-contract
+    # rule 4): these names have already drifted across `meshcore` library
+    # versions in this project's own experience, and a fixed import-time
+    # assumption fails silently rather than loudly on a version mismatch.
+    REQUIRED_EVENT_TYPES = (
+        "OK",
+        "ERROR",
+        "MSG_SENT",
+        "ACK",
+        "CHANNEL_MSG_RECV",
+        "CONTACT_MSG_RECV",
+        "SELF_INFO",
+        "CONNECTED",
+        "DISCONNECTED",
+        "PATH_RESPONSE",
+        "MESSAGES_WAITING",
+    )
+
+    # Default, publicly-known MeshCore channel secret so two nodes running
+    # this interface with no channel config at all can find each other with
+    # zero coordination. Deliberate, not an oversight: RNS already encrypts
+    # and authenticates the actual application data end-to-end
+    # (`docs/interface_architecture.md`'s security model), so a shared,
+    # publicly-known MeshCore channel secret doesn't expose anything
+    # RNS-level -- it only decides which MeshCore LoRa channel this radio
+    # joins, the same way a WiFi SSID/password picks a network without
+    # implying anything about what's encrypted on top of it. Set
+    # channel_idx/channel_name/channel_secret explicitly for a private
+    # channel instead.
+    DEFAULT_CHANNEL_SECRET_HEX = "b99e9b45f61ab4bd4e355cf812711873"
+
+    # User-requested (2026-09-16): channel_idx/channel_name should also
+    # "just be default values", not something every install has to set --
+    # same reasoning as DEFAULT_CHANNEL_SECRET_HEX above. Deliberately NOT
+    # 0: the reference firmware pre-provisions channel slot 0 as "Public"
+    # at boot (`examples/companion_radio/MyMesh.cpp`'s
+    # `addChannel("Public", PUBLIC_GROUP_PSK)`, the very first `addChannel`
+    # call, landing at index 0 in `BaseChatMesh::channels[]`) -- a 0
+    # default here would silently overwrite a device's normal public MeshCore
+    # chat channel with this interface's own name/secret the first time it
+    # configures the radio (`commands.set_channel` replaces whatever
+    # `ChannelDetails` was at that index, per `BaseChatMesh::setChannel`).
+    # 35 is comfortably out of the way of MeshCore's own pre-provisioned
+    # slots, and is the exact value this interface's own real field
+    # testing (zero-hop through 3-hop, 2026-09-16) has been running on.
+    DEFAULT_CHANNEL_IDX = 35
+
+    # --- Wire format (docs/wire_format_design.md) -----------------------
+    # Protocol constants, not user config -- a from-scratch wire format is
+    # a clean break with no interop target, so these are fixed choices,
+    # not tunable knobs.
+
+    MARKER = "R"
+
+    # The version byte's low 6 bits are the actual protocol version
+    # number (0-63); bit 0x80 flags the multi-fragment header shape
+    # (shared meaning across CHANNEL and DIRECT); bit 0x40 flags a
+    # cooperative-dispatch fragment (CHANNEL-only, meaningless on DIRECT,
+    # Milestone 7). No frame with a different low-6-bit version number
+    # than PROTOCOL_VERSION is accepted -- treated as malformed/
+    # incompatible rather than guessed at.
+    PROTOCOL_VERSION = 1
+    VERSION_MASK = 0x3F
+    FLAG_MULTI_FRAGMENT = 0x80
+    FLAG_COOP = 0x40
+
+    # Header sizes in bytes, after Z85 decode, starting from the version
+    # byte (i.e. not counting the "R" marker itself, which is outside the
+    # Z85-encoded region).
+    CHANNEL_FASTPATH_HEADER_SIZE = 4    # [ver][pkt_id:2][attempt]
+    MULTI_FRAGMENT_HEADER_SIZE = 6      # [ver][pkt_id:2][frag_idx][frag_total][attempt]
+    DIRECT_BARE_HEADER_SIZE = 1         # [ver] -- firmware's own ACK/attempt do the rest
+
+    # MAX_TEXT_LEN, confirmed against firmware source
+    # (meshcore_protocol_rules.md shared rule 1) -- the real ceiling any
+    # single CHANNEL or DIRECT text message can occupy on the wire.
+    FIRMWARE_TEXT_LIMIT = 160
+
+    # Safety margin subtracted from every payload-budget calculation below,
+    # covering firmware variation across builds and the 4th-attempt-
+    # shrinks-by-2 quirk noted in wire_format_design.md's payload-budget
+    # section. Not a config value: a user enlarging their own margin can
+    # only make sends more conservative, never fix a real firmware-side
+    # truncation, so there's no legitimate reason to expose it as a knob.
+    PAYLOAD_MARGIN = 4
+
+    # Bound on the outgoing FIFO queue process_outgoing() feeds and
+    # _outgoing_worker() drains (see both below). Milestone 3 upgrades
+    # this same queue to a priority-tiered one rather than replacing the
+    # mechanism; sized generously for now, matching the old design's own
+    # OUTQUEUE_MAXSIZE precedent.
+    OUTQUEUE_MAXSIZE = 512
+
+    # How often the reassembly-map idle-timeout sweep runs
+    # (_reassembly_cleanup_loop). Not a documented config knob in
+    # docs/reliability_engine_design.md (only the idle timeout itself is)
+    # -- an internal granularity choice, generous relative to the 120s/
+    # 180s timeouts it enforces, the same way OUTQUEUE_MAXSIZE above is a
+    # class constant rather than user config.
+    REASSEMBLY_CLEANUP_INTERVAL_S = 10.0
+
+    # --- Priority queueing (docs/reliability_engine_design.md §3) -------
+    # Originally two tiers, lower value dequeued/served first. Not user
+    # config -- the design's own reasoning is that field data never
+    # argued for a finer-grained scheme, so exposing tier count as a knob
+    # would invite tuning with no evidence behind it. A third tier was
+    # added below once real field data *did* argue for one.
+    PRIORITY_HANDSHAKE = 0
+    PRIORITY_NORMAL = 1
+    # User-requested fix (2026-09-16, same field data as PATH_RESPONSE_
+    # RATE_LIMIT_WINDOW_S's own raise above): PATH_RESPONSE currently
+    # rides PRIORITY_NORMAL, the same tier as real user data, at both the
+    # outer two-tier outgoing queue and (via `_priority_tier`) the DIRECT
+    # exchange lock -- but it's pure housekeeping, answering a question
+    # this node didn't ask, for a destination that isn't necessarily even
+    # the traffic this node's own user is waiting on. Rate-limiting alone
+    # (above) can't suppress every repeat without also risking suppressing
+    # a legitimate one, so real PATH_RESPONSE transmissions keep
+    # happening under real client retry storms -- field data showed 17 in
+    # one ~6.5-minute window, each one a real multi-fragment DIRECT
+    # exchange competing for the same lock as actual data. PRIORITY_LOW
+    # means real DATA and PRIORITY_HANDSHAKE exchanges both jump ahead of
+    # it in `_PriorityAsyncLock`, so administrative traffic never blocks
+    # what the user is actually waiting on, even during a retry storm
+    # this interface can't fully suppress at the source.
+    PRIORITY_LOW = 2
+
+    # Outgoing-queue shutdown sentinel. A bare `None` (M1/M2's sentinel)
+    # would be unsafe now that queue items are (priority, seq, data,
+    # header) tuples in a PriorityQueue: if it ever needed comparing
+    # against a real tuple at equal priority, comparing None to a tuple
+    # raises TypeError. priority=-1 sorts before both real tiers (0, 1),
+    # so it's also dequeued at the first opportunity on shutdown; seq=-1
+    # never collides since _outqueue_seq only ever counts up from 0.
+    _OUTQUEUE_SHUTDOWN_SENTINEL = (-1, -1, None, None)
+
+    # --- Path discovery / telemetry permission (docs/path_discovery_spec.md) --
+    # Firmware constants, not user config -- confirmed directly against
+    # examples/companion_radio/NodePrefs.h and src/helpers/SensorManager.h,
+    # not the design doc's own paraphrase. TELEM_MODE_ALLOW_FLAGS tells the
+    # firmware to gate base-telemetry answers (which path discovery rides
+    # on) per-contact via that contact's own `flags` field, rather than
+    # answering everyone or no one. TELEM_PERM_BASE_FLAG_BIT is bit 1 of a
+    # contact's raw `flags` byte -- onContactRequest() computes
+    # `cp = contact.flags >> 1` then checks `cp & TELEM_PERM_BASE(0x01)`,
+    # which is bit 1 of the original, unshifted byte (bit 0 is a separate
+    # "favourite" flag, left untouched by granting this).
+    TELEM_MODE_ALLOW_FLAGS = 1
+    TELEM_PERM_BASE_FLAG_BIT = 0x02
+
+    # Human-readable names for _send_outgoing_packet's own per-packet
+    # classification debug log (code review's observability fix) --
+    # purely for log readability, not used for any actual routing logic.
+    _PACKET_TYPE_NAMES = {
+        RNS.Packet.DATA: "DATA",
+        RNS.Packet.ANNOUNCE: "ANNOUNCE",
+        RNS.Packet.LINKREQUEST: "LINKREQUEST",
+        RNS.Packet.PROOF: "PROOF",
+    }
+    _DESTINATION_TYPE_NAMES = {
+        RNS.Destination.SINGLE: "SINGLE",
+        RNS.Destination.GROUP: "GROUP",
+        RNS.Destination.PLAIN: "PLAIN",
+        RNS.Destination.LINK: "LINK",
+    }
+    # Every context value RNS.Packet defines (RNS/Packet.py) -- used for
+    # packet-capture readability (_capture_event) and covering the same
+    # KEEPALIVE..LRPROOF range _priority_tier already special-cases.
+    _CONTEXT_NAMES = {
+        RNS.Packet.NONE: "NONE",
+        RNS.Packet.RESOURCE: "RESOURCE",
+        RNS.Packet.RESOURCE_ADV: "RESOURCE_ADV",
+        RNS.Packet.RESOURCE_REQ: "RESOURCE_REQ",
+        RNS.Packet.RESOURCE_HMU: "RESOURCE_HMU",
+        RNS.Packet.RESOURCE_PRF: "RESOURCE_PRF",
+        RNS.Packet.RESOURCE_ICL: "RESOURCE_ICL",
+        RNS.Packet.RESOURCE_RCL: "RESOURCE_RCL",
+        RNS.Packet.CACHE_REQUEST: "CACHE_REQUEST",
+        RNS.Packet.REQUEST: "REQUEST",
+        RNS.Packet.RESPONSE: "RESPONSE",
+        RNS.Packet.PATH_RESPONSE: "PATH_RESPONSE",
+        RNS.Packet.COMMAND: "COMMAND",
+        RNS.Packet.COMMAND_STATUS: "COMMAND_STATUS",
+        RNS.Packet.CHANNEL: "CHANNEL",
+        RNS.Packet.KEEPALIVE: "KEEPALIVE",
+        RNS.Packet.LINKIDENTIFY: "LINKIDENTIFY",
+        RNS.Packet.LINKCLOSE: "LINKCLOSE",
+        RNS.Packet.LINKPROOF: "LINKPROOF",
+        RNS.Packet.LRRTT: "LRRTT",
+        RNS.Packet.LRPROOF: "LRPROOF",
+    }
+
+    # --- Peer discovery / bind frames (docs/peer_discovery_design.md) ---
+    # A marker distinct from MARKER ("R") -- this control frame carries no
+    # RNS packet bytes at all and must never be handed to _decode_frame.
+    # Wire shape: "P" + Z85([ver:1][type:1][cap:1][attempt:1][pubkey_prefix:6]),
+    # 10 raw bytes -> 17 characters on the wire (doc's own worked example),
+    # comfortably one CHANNEL fragment under any realistic budget.
+    PEER_MARKER = "P"
+    BIND_PROTOCOL_VERSION = 1
+    BIND_TYPE_REQUEST = 0
+    BIND_TYPE_RESPONSE = 1
+    BIND_CAP_HAS_UPSTREAM_RNS = 0x01
+    BIND_PUBKEY_PREFIX_BYTES = 6
+    BIND_FRAME_RAW_SIZE = 4 + BIND_PUBKEY_PREFIX_BYTES  # ver+type+cap+attempt + prefix
+
+    # User-requested small-mesh rule (not a config knob -- a fixed,
+    # topology-driven behavior): with this few bound peers, there's no
+    # ambiguity about who a CHANNEL-broadcast-shaped packet (ANNOUNCE,
+    # path request, or "no known token yet" traffic) is actually for, and
+    # DIRECT (real firmware ACK/retry) is strictly more reliable than
+    # CHANNEL's own unacknowledged flood-relay -- so in that regime this
+    # traffic goes DIRECT to every bound peer instead of over CHANNEL at
+    # all, rather than CHANNEL-plus-a-DIRECT-supplement. See
+    # _in_small_mesh_mode() and _send_outgoing_packet()'s three routing
+    # branches.
+    SMALL_MESH_DIRECT_ONLY_MAX_PEERS = 2
+
+    # User-requested fix (not a config knob -- see _send_outgoing_packet's
+    # own docstring for the full mechanism): delay an outgoing LRPROOF by
+    # this long before sending, so RNS's one-time Link RTT sample lands
+    # comfortably past RNS.Link.KEEPALIVE_MAX_RTT (1.75s) and every new
+    # Link gets pinned at RNS's own maximum keepalive/stale_time (360s/
+    # 720s) rather than an unrepresentatively short one measured from an
+    # uncontended handshake. Comfortably clear of 1.75s with margin for
+    # clock/measurement jitter, and trivially small next to RNS's own
+    # link-establishment timeout (6s*hops + 360s).
+    LINK_PROOF_RTT_INFLATION_DELAY_S = 2.5
+
+    # User-requested fix (not a config knob, mirroring the shape of
+    # path_discovery's own existing backoff -- see _unknown_dest_in_
+    # backoff/_record_unknown_dest_attempt): after this many DIRECT-
+    # bootstrap attempts to an unknown destination with no token ever
+    # learned for it, back off rather than trying again on every single
+    # outgoing packet still addressed to it. Threshold matches path
+    # discovery's own `path_discovery_quick_attempts` default for
+    # consistency; cooldown grows the same way (doubling, capped) so a
+    # destination that becomes reachable later is retried eventually,
+    # not blocked forever -- learning a real token for it (§7) clears
+    # this immediately regardless of where in the backoff it is.
+    UNKNOWN_DEST_BOOTSTRAP_FAILURE_THRESHOLD = 3
+    UNKNOWN_DEST_BOOTSTRAP_BASE_COOLDOWN_S = 300.0
+    UNKNOWN_DEST_BOOTSTRAP_MAX_COOLDOWN_S = 3600.0
+    UNKNOWN_DEST_BOOTSTRAP_BACKOFF_FACTOR = 2.0
+
+    # User-requested fix (2026-09-15, real 2-hop repeater field testing --
+    # diagnosed jointly with another Claude session working the same field
+    # test from the laptop side): an outgoing PATH_RESPONSE is RNS
+    # Transport's own answer to a PATH_REQUEST it decided, on its own, to
+    # answer -- this interface has no say over whether one gets generated,
+    # only over how many times it actually keys the shared half-duplex
+    # radio to transmit it. Packet-capture evidence from this exact field
+    # test found a remote NomadNet client stuck in a tight connection-retry
+    # loop, re-issuing PATH_REQUESTs for the same destination every 4-8s
+    # while its own link attempt kept failing -- well under RNS.Transport's
+    # own PATH_REQUEST_MI=20s floor, confirming these were explicit
+    # request_path() calls from that client, not ordinary path aging. RNS
+    # answered every single one, each one a real multi-fragment ANNOUNCE
+    # transmission, landing squarely in the same ~10-minute window six
+    # unrelated DIRECT DATA sends were failing to get through. This
+    # interface can't fix the remote client's retry loop, but it can stop
+    # re-spending airtime re-answering a question it already just answered
+    # -- the destination's path/identity cannot plausibly have changed
+    # within a few seconds of the last answer, and the requester already
+    # has a reply in flight. Not a config knob, same reasoning as
+    # LINK_PROOF_RTT_INFLATION_DELAY_S above: a self-throttling floor, not
+    # a per-deployment tuning value.
+    #
+    # User-requested fix (2026-09-16): raised from 10s to 20s once real
+    # 1-hop and 2-hop field data showed the original window's actual
+    # coverage. The remote client's real retry cadence in later tests was
+    # mostly 15-26s apart (not the tighter 4-8s from the original 2-hop
+    # test that motivated this fix), so a 10s window still let the large
+    # majority of repeats straight through -- one test window logged 17
+    # real PATH_RESPONSE transmissions in ~6.5 minutes with only 2
+    # suppressed. 20s covers meaningfully more of that observed cadence
+    # without getting close to RNS.Transport's own PATH_REQUEST_MI=20s
+    # floor for *automated* (non-explicit-retry) path requests, so a
+    # destination with a genuine reason to re-request outside of a tight
+    # client retry loop still gets answered promptly.
+    PATH_RESPONSE_RATE_LIMIT_WINDOW_S = 20.0
+
+    # -------------------------------------------------------------------
+    # Construction
+    # -------------------------------------------------------------------
+
+    def __init__(self, owner, configuration):
+        super().__init__()
+
+        self.owner = owner
+        cfg = configuration
+
+        self._configure_identity(cfg)
+        self._configure_transport(cfg)
+        self._configure_channel(cfg)
+        self._configure_radio(cfg)
+        self._configure_fragmentation(cfg)
+        self._configure_retry(cfg)
+        self._configure_path_discovery(cfg)
+        self._configure_peer_discovery(cfg)
+        self._configure_observability(cfg)
+
+        # --- RNS core interface-contract attributes -------------------
+        # RNS core reads these directly (Transport-layer MTU checks,
+        # announce pacing, Link-establishment timeout estimates) -- see
+        # `docs/reliability_engine_design.md`'s "RNS base-class contract"
+        # notes. Set unconditionally here (not only on a successful
+        # connection) so nothing downstream ever observes HW_MTU as the
+        # base class's None default, even if this constructor's connection
+        # attempt below fails and the interface stays offline.
+        self.HW_MTU = RNS.Reticulum.MTU
+
+        # --- Internal async/threading state -----------------------------
+        # `self._mc` itself stays a plain, genuinely-Optional attribute --
+        # unlike the other six below, its None-ness is real, recurring
+        # runtime state (no live connection yet, or a torn-down one), not
+        # just "not initialized yet"; several call sites correctly check
+        # `self._mc is None` and must keep seeing that as a real
+        # possibility. See `_mc_ready` further down for the narrow-and-
+        # return accessor used at call sites that only ever run while a
+        # connection is known to be live.
+        self._mc = None
+        # Backing fields for the `_mc_module`/`_EventType`/`_loop`/
+        # `_command_lock`/`_direct_exchange_lock`/`_duty_cycle` properties
+        # below (2026-09-16, Pylance cleanup): unlike `_mc` above, all six
+        # of these really are None only until `_async_setup`/`_load_
+        # meshcore_or_panic` run, then set exactly once and never reset to
+        # None again for the rest of this instance's life (confirmed: no
+        # other assignment site exists for any of them) -- a real
+        # invariant, not just a convention, so each property asserts it
+        # rather than every one of the many call sites needing its own
+        # None-check or `# type: ignore`. `_loop` is the one exception
+        # with a legitimate None-tolerant read (`detach()`'s teardown
+        # safety net, since detach can run before setup ever completed) --
+        # that one call site reads `_loop_impl` directly instead.
+        self._mc_module_impl = None
+        self._EventType_impl = None
+        self._loop_impl = None
+        self._loop_thread = None
+        self._command_lock_impl = None
+        # Field-diagnosed fix (2026-09-15, real MeshChat traffic): see
+        # _send_direct_frame_and_wait_for_ack's own docstring for why this
+        # exists alongside _command_lock, not instead of it.
+        self._direct_exchange_lock_impl = None
+        # User-requested fix (2026-09-16): see _DutyCycleLimiter's own
+        # docstring. Constructed in _async_setup alongside the locks above
+        # for the same reason -- no event-loop dependency at construction
+        # time, but kept consistent with this file's own pattern for
+        # per-connection state.
+        self._duty_cycle_impl = None
+        # User-requested fix (2026-09-16): time.monotonic() of the most
+        # recently received DIRECT frame (any DIRECT frame heard on this
+        # channel, not just ones addressed to or decodable by this node --
+        # see incoming_quiet_window_s's own comment for why), or None if
+        # none has arrived yet this session. Set in _on_contact_msg_recv,
+        # read by _wait_for_incoming_quiet.
+        self._last_incoming_direct_at = None
+        # User-requested observability addition (2026-09-15, post-alpha-0.1.0
+        # 2-hop field test): how many DIRECT send+ACK-wait cycles are
+        # currently either waiting for `_direct_exchange_lock` or holding
+        # it, at any instant -- a live queue-depth signal for exactly the
+        # "several concurrent messages splitting the one shared radio"
+        # scenario a real field test surfaced. Incremented/decremented
+        # around the lock acquisition in `_send_direct_frame_and_wait_for_
+        # ack`, read (never written) anywhere else.
+        self._direct_exchange_queue_depth = 0
+        self._stats_task = None
+        self._connected_since = None
+        self._outgoing_dropped_total = 0
+        self._incoming_dropped_total = 0
+        self._packet_capture_file = None
+        self._packet_capture_lock = threading.Lock()
+        self._packet_capture_seq = 0
+
+        # This node's own name, as reported by send_appstart -- feeds the
+        # CHANNEL payload-budget formula (the firmware's mandatory
+        # "<name>: " prefix eats into the usable budget). Defaults to ""
+        # (matching a genuinely nameless node) until identity fetch
+        # completes in _async_setup; see the warning logged there if that
+        # fetch fails, since "" is indistinguishable from "genuinely no
+        # name" and could understate the real prefix cost.
+        self._own_node_name = ""
+
+        # Wire-format state (docs/wire_format_design.md): a wrapping
+        # 16-bit counter for pkt_id, and the outgoing priority queue
+        # process_outgoing() feeds (called on RNS core's own thread) and
+        # _outgoing_worker() drains (on this interface's event loop) --
+        # the plain thread-safe queue plus executor-drain pattern
+        # docs/reliability_engine_design.md's sync/async bridge notes
+        # call for, so process_outgoing() never blocks RNS core's calling
+        # thread. Items are (priority, seq, data, header) tuples; `seq`
+        # is a monotonic tie-breaker from itertools.count() (atomic under
+        # the GIL -- §3's own warning against a plain `x += 1` racing
+        # between RNS's calling thread and this event loop) so two
+        # same-priority items never need Python to compare their `data`/
+        # `header` fields to break a tie.
+        self._pkt_id_counter = 0
+        self._outqueue = queue.PriorityQueue(maxsize=self.OUTQUEUE_MAXSIZE)
+        self._outqueue_seq = itertools.count()
+        self._outgoing_worker_task = None
+
+        # Reassembly (docs/reliability_engine_design.md §5) and
+        # whole-packet dedup (§7) state. Both are keyed the same way
+        # (self._reassembly_key) and both only ever touched from this
+        # interface's own event loop thread (incoming events and the
+        # cleanup sweep both run there) -- no lock needed.
+        self._reassembly = {}   # key -> _ReassemblyBucket
+        self._dedup = {}        # key -> expiry (time.monotonic())
+        self._reassembly_cleanup_task = None
+
+        # Background-scheduled CHANNEL retry passes (§1-§2): tracked so
+        # detach() can cancel any still-pending pass rather than leaving
+        # it dangling. Self-removing via add_done_callback, mirroring the
+        # `meshcore` library's own _spawn_background pattern
+        # (serial_cx.py) for the same reason -- nothing else would ever
+        # clear a normally-completed entry otherwise.
+        self._background_tasks = set()
+
+        # Path discovery (docs/path_discovery_spec.md), all keyed by
+        # peer pubkey prefix (hex string) and only ever touched from this
+        # interface's own event loop thread:
+        #   _resolved_paths       -- this interface's own last-verified
+        #                            path per peer, authoritative for its
+        #                            own routing/staleness decisions
+        #                            regardless of device-persist success.
+        #   _path_discovery_failures / _path_discovery_backoff_until --
+        #                            per-peer consecutive-failure count
+        #                            and exponential-backoff cooldown.
+        #   _direct_path_failures -- per-peer consecutive CACHED-PATH
+        #                            send failures (§8), a different
+        #                            counter than discovery failures above
+        #                            -- not yet fed by an actual DIRECT
+        #                            send path (Milestone 5+).
+        self._resolved_paths = {}
+        self._path_discovery_failures = {}
+        self._path_discovery_backoff_until = {}
+        self._direct_path_failures = {}
+        # User-requested fix (2026-09-15, real field diagnosis via packet
+        # capture): an unknown destination this node has no token for
+        # gets a DIRECT-bootstrap attempt every single time something
+        # tries to reach it, forever, with no memory of past attempts --
+        # fine for a destination that's genuinely reachable (self-
+        # limiting the moment a token is learned), wasteful airtime for
+        # one that structurally never will be (confirmed in the field: an
+        # LXMF propagation node out on the wider network, not reachable
+        # through this node's only MeshCore peer at all, retried on its
+        # own periodic schedule with zero backoff). See
+        # _unknown_dest_in_backoff/_record_unknown_dest_attempt.
+        self._unknown_dest_attempts = {}
+        self._unknown_dest_backoff_until = {}
+        # PATH_RESPONSE_RATE_LIMIT_WINDOW_S's own state -- destination_hash
+        # -> time.monotonic() of the last outgoing PATH_RESPONSE actually
+        # sent for it. See _path_response_rate_limited.
+        self._path_response_last_sent_at = {}
+        self._contact_refresh_task = None
+
+        # Milestone 6: concurrent DIRECT sends to the same not-yet-(or no
+        # longer-)resolved peer share one in-flight discover_path() call
+        # rather than each starting their own quick-attempts burst --
+        # peer pubkey_prefix -> asyncio.Future[Optional[_ResolvedPath]].
+        # See _discover_path_coalesced.
+        self._pending_path_discoveries = {}
+
+        # Peer discovery / routing (docs/peer_discovery_design.md,
+        # docs/routing_decisions.md), Milestone 5. `_peers` is this
+        # interface's own bind-protocol peer registry, keyed by the
+        # canonical 6-byte (12-hex-char) pubkey prefix
+        # (BIND_PUBKEY_PREFIX_BYTES) -- distinct from, and never
+        # constructed from, MeshCore's own contact table. `_own_pubkey_hex`
+        # is populated once identity fetch succeeds in _async_setup;
+        # "" until then (matches _own_node_name's own same-reason default).
+        self._peers = {}
+        self._own_pubkey_hex = ""
+        self._bind_attempt_counter = itertools.count()
+        self._last_bind_response_sent = None  # time.monotonic(), global per-node throttle (§3)
+        self._peer_discovery_task = None
+        self._peer_ttl_sweep_task = None
+
+        # Opportunistic RNS-token learning (§7), only ever populated from
+        # DIRECT-received traffic -- a CHANNEL "R" frame carries no sender
+        # pubkey at all (wire_format_design.md), so a reliable peer
+        # attribution is structurally only available on the DIRECT receive
+        # path. `_rns_token_peer`: destination_hash(bytes) -> pubkey_prefix,
+        # no expiry (cleared only on peer TTL expiry, §6). `_proof_correlation`:
+        # truncated_hash(bytes) -> (pubkey_prefix, expiry monotonic time),
+        # short-TTL, never persisted (§4/§7 -- a pending PROOF has no reason
+        # to still be pending after a restart).
+        self._rns_token_peer = {}
+        self._proof_correlation = {}
+
+        self._setup_done = threading.Event()
+
+        self._load_meshcore_or_panic()
+        self._start_async_bridge()
+
+        if not self._setup_done.wait(timeout=self.SETUP_TIMEOUT_S):
+            RNS.log(
+                f"{self}: setup timed out after {self.SETUP_TIMEOUT_S:.0f}s "
+                f"-- interface will remain offline.",
+                RNS.LOG_ERROR,
+            )
+        elif not self.online:
+            RNS.log(
+                f"{self}: setup completed but the interface did not come "
+                f"online -- see the specific failure logged above.",
+                RNS.LOG_ERROR,
+            )
+
+    # -------------------------------------------------------------------
+    # Connection-state accessors (2026-09-16, Pylance cleanup)
+    #
+    # `_mc_module`/`_EventType`/`_loop`/`_command_lock`/
+    # `_direct_exchange_lock`/`_duty_cycle` are all set exactly once, in
+    # `_load_meshcore_or_panic`/`_async_setup`, and never reset to None
+    # again for the rest of this instance's life -- confirmed by grep,
+    # not just assumed. Every call site that reads one of them runs only
+    # after that one-time setup has already completed, so the `assert`
+    # below is a real invariant check (documents and enforces the
+    # ordering), not a formality -- and it lets every one of the many
+    # call sites elsewhere keep its original `self._foo.bar(...)` spelling
+    # instead of needing its own None-check or `# type: ignore`.
+    #
+    # `_mc` deliberately has no such property: unlike the six above, its
+    # None-ness is real, recurring runtime state (no live connection yet,
+    # or a torn-down one), and several call sites correctly branch on
+    # `self._mc is None`. `_mc_ready` below is the narrow-and-return
+    # accessor for the *other* call sites -- the ones that only ever run
+    # while a connection is known to be live.
+    @property
+    def _mc_module(self):
+        assert self._mc_module_impl is not None
+        return self._mc_module_impl
+
+    @property
+    def _EventType(self):
+        assert self._EventType_impl is not None
+        return self._EventType_impl
+
+    @property
+    def _loop(self):
+        assert self._loop_impl is not None
+        return self._loop_impl
+
+    @property
+    def _command_lock(self):
+        assert self._command_lock_impl is not None
+        return self._command_lock_impl
+
+    @property
+    def _direct_exchange_lock(self):
+        assert self._direct_exchange_lock_impl is not None
+        return self._direct_exchange_lock_impl
+
+    @property
+    def _duty_cycle(self):
+        assert self._duty_cycle_impl is not None
+        return self._duty_cycle_impl
+
+    @property
+    def _mc_ready(self):
+        assert self._mc is not None
+        return self._mc
+
+    # -------------------------------------------------------------------
+    # Config loading (design invariant #3: every value read here must be
+    # used somewhere else in this file -- see
+    # tests/test_smart_meshcore_interface_config.py)
+    # -------------------------------------------------------------------
+
+    def _configure_identity(self, cfg):
+        self.name = cfg.get("name", "Smart MeshCore Interface")
+
+    def _configure_transport(self, cfg):
+        self.transport = cfg.get("transport", "serial").lower()
+
+        self.port = cfg.get("port", "/dev/ttyUSB0")
+        self.baudrate = int(cfg.get("baudrate", 115200))
+        self.host = cfg.get("host", "127.0.0.1")
+        self.tcp_port = int(cfg.get("tcp_port", 4403))
+        self.ble_name = cfg.get("ble_name", "")
+
+        # The meshcore library's own connection manager can detect a
+        # dropped serial/BLE/TCP link and transparently reconnect
+        # (CONNECTED/DISCONNECTED events, see _on_mc_connected/
+        # _on_mc_disconnected below). Default on: an unattended field radio
+        # should try to recover from a USB re-enumeration or a brief BLE
+        # range loss rather than sitting dead until rnsd is restarted.
+        self.auto_reconnect = _cfg_bool(cfg.get("auto_reconnect", "yes"))
+        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 3))
+
+        # RNS-facing nominal bitrate. Deliberately NOT the base class's
+        # 62500 default (`reliability_engine_design.md`'s base-class
+        # contract notes call this out explicitly): a real LoRa link run
+        # over MeshCore's default settings is far slower than that, and
+        # RNS core uses this value for its own throughput-sensitive
+        # decisions (announce pacing, Link-establishment timing). User-
+        # requested (2026-09-16): defaults to 80, not just recommended in
+        # the README/reasoned-but-unmeasured 300 this used to fall back
+        # to -- deliberately low so RNS core stays patient/tolerant of
+        # this radio's real transit time ("lowball RNS so that it acts
+        # more patient," the user's own framing from the same real-
+        # hardware session that settled on 80 as the actual deployed
+        # value everywhere this interface has been field-tested since).
+        # Set explicitly to override for a radio config known to sustain
+        # something faster.
+        self.bitrate = int(cfg.get("bitrate", 80))
+
+        # User-requested fix (2026-09-16, direct user instruction): "all
+        # interfaces should spend the majority of their time listening" --
+        # a global cap on how much of any trailing duty_cycle_window this
+        # interface spends transmitting, across every CHANNEL/DIRECT/bind-
+        # frame send alike. See _DutyCycleLimiter's own docstring for the
+        # full design (why the wait loop wakes exactly when room frees up
+        # rather than polling on a fixed interval) and each of `_send_
+        # channel_fastpath_frame`/`_send_channel_multifragment_pass`/
+        # `_send_direct_frame`/`_send_bind_frame`'s own call sites for
+        # where it's actually enforced. Defaults match the user's own
+        # stated numbers exactly (30% of a rolling 10s window) --
+        # deliberately not derived from any field measurement, a
+        # precautionary ceiling rather than a data-driven one.
+        self.duty_cycle_enabled = _cfg_bool(cfg.get("duty_cycle_enabled", "yes"))
+        self.duty_cycle_window_s = float(cfg.get("duty_cycle_window", 10.0))
+        self.duty_cycle_max_fraction = float(cfg.get("duty_cycle_max_fraction", 0.30))
+
+        # Field-diagnosed fix (2026-09-16, real zero-hop hardware test, the
+        # very next thing tried after the duty-cycle cap above shipped):
+        # deliberately a *separate* value from `bitrate` above, not reused
+        # -- and, per direct user instruction, deliberately decoupled from
+        # `bitrate`'s own "lowball it so RNS stays patient" philosophy too.
+        # First cut reused `bitrate` for the airtime estimate, and a real
+        # zero-hop probe run immediately showed why that was wrong: every
+        # exchange took a consistent, suspicious ~10.3-10.7s even fully
+        # uncontended (queue_depth=1, lock_wait=0.00s in the capture/debug
+        # log). `bitrate`'s own deployed value (80, per this file's own
+        # "bitrate tuning guidance") is deliberately chosen to model
+        # CHANNEL's *worst-case sustained* throughput and keep RNS core's
+        # own unrelated timeout math patient -- not a real single-frame
+        # over-the-air rate, and a value this interface *wants* to keep
+        # low for that separate reason regardless of what's tuned here.
+        # First fix (300, "DIRECT's real observed throughput" per
+        # `bitrate`'s own history) still wasn't enough: the same real
+        # hardware test's very next run showed a normal Link+Resource
+        # exchange (several distinct frames -- LINKREQUEST, LRPROOF,
+        # Resource parts, PROOF -- landing within a few seconds of each
+        # other) still tripped the cap repeatedly, ~8-9s waits on
+        # literally every 2-fragment exchange, because several such
+        # frames' *estimated* airtime at only 300bps still added up past
+        # the cap faster than real transmission plausibly would. Raised
+        # to 1200 -- a more realistic raw LoRa PHY figure -- so the cap
+        # still catches genuinely heavy bursts without firing on ordinary
+        # traffic. Kept independently configurable (not hardcoded) since
+        # a deployment with different real radio parameters (SF/BW/CR)
+        # would have a different real answer here too.
+        self.duty_cycle_estimate_bitrate = int(cfg.get("duty_cycle_estimate_bitrate", 1200))
+
+        # User-requested fix (2026-09-16): "if we hear a message come in
+        # via direct, we wait 3 seconds to hear another before we send
+        # again... wait for the incoming interface to either stop
+        # sending or hit its airtime limit." A real DIRECT frame arriving
+        # is direct evidence the channel was *just* occupied by another
+        # node -- this interface has no real-time channel-busy/CAD signal
+        # from the `meshcore` library (confirmed: nothing exposes that),
+        # so a received frame is the best available proxy for "someone
+        # else is transmitting nearby right now" this design has access
+        # to. Complementary to, not a replacement for, the duty-cycle cap
+        # above: that one throttles based on *this interface's own*
+        # recent transmit history; this one defers based on what it just
+        # *heard*, to avoid keying the radio into the middle of a peer's
+        # own multi-fragment burst (they're very likely mid-transfer if a
+        # fragment was just heard, not done). `incoming_quiet_window_s`
+        # (3.0s, matching the user's own number exactly) is a rolling
+        # window: hearing another DIRECT frame while already waiting
+        # extends it, mirroring "wait for them to stop sending." Since
+        # this interface can't actually observe a peer's own airtime
+        # budget or duty-cycle state, "or hit its airtime limit" is
+        # approximated by `incoming_quiet_defer_max_wait_s` (15.0s) -- a
+        # bound on this node's own patience, not a real measurement of
+        # the other side's limit, so a continuously-chatty peer can never
+        # starve this node's own outgoing traffic indefinitely.
+        self.incoming_quiet_defer_enabled = _cfg_bool(cfg.get("incoming_quiet_defer_enabled", "yes"))
+        self.incoming_quiet_window_s = float(cfg.get("incoming_quiet_window", 3.0))
+        self.incoming_quiet_defer_max_wait_s = float(cfg.get("incoming_quiet_defer_max_wait", 15.0))
+
+    def _configure_channel(self, cfg):
+        self.channel_idx = int(str(cfg.get("channel_idx", self.DEFAULT_CHANNEL_IDX)).strip())
+        self.channel_name = cfg.get("channel_name", "RNSTunnel")
+
+        raw_channel_secret = cfg.get("channel_secret")
+        self._using_default_channel_secret = raw_channel_secret is None
+        self.channel_secret_hex = (
+            raw_channel_secret
+            if raw_channel_secret is not None
+            else self.DEFAULT_CHANNEL_SECRET_HEX
+        )
+
+    def _configure_radio(self, cfg):
+        # Optional overrides applied to the connected node's radio at
+        # startup. Left at 0 (falsy), the node keeps whatever radio
+        # parameters are already stored on it.
+        self.radio_freq = float(cfg.get("freq", 0))
+        self.radio_bw = float(cfg.get("bw", 0))
+        self.radio_sf = int(cfg.get("sf", 0))
+        self.radio_cr = int(cfg.get("cr", 0))
+
+    def _configure_fragmentation(self, cfg):
+        # Inter-fragment spacing tiers (docs/reliability_engine_design.md
+        # §2). The zero-hop and known-N-hop tiers are wired into
+        # _fragment_spacing_range() and unit-tested, but this milestone
+        # has no live hop-count data source yet (Milestone 4/5's path
+        # discovery/peer-topology work) -- every real send today resolves
+        # to the flat unknown-multi-hop range below.
+        self.fragment_delay_min_s = float(cfg.get("fragment_delay_min", 8.0))
+        self.fragment_delay_max_s = float(cfg.get("fragment_delay_max", 15.0))
+        self.fragment_delay_zero_hop_min_s = float(cfg.get("fragment_delay_zero_hop_min", 0.5))
+        self.fragment_delay_zero_hop_max_s = float(cfg.get("fragment_delay_zero_hop_max", 1.5))
+        self.fragment_delay_per_hop_min_s = float(cfg.get("fragment_delay_per_hop_min", 8.0))
+        self.fragment_delay_per_hop_max_s = float(cfg.get("fragment_delay_per_hop_max", 15.0))
+
+        # Each pass sends frag_idx in a freshly shuffled order rather than
+        # always 0..N-1 -- targets the position-dependent half of the
+        # loss pattern §2 documents (whichever fragment goes out first in
+        # a pass carries no risk from a still-propagating predecessor).
+        self.fragment_order_shuffle = _cfg_bool(cfg.get("fragment_order_shuffle", "yes"))
+
+        # Reassembly lifecycle (§5.3-5.4) and whole-packet dedup (§7).
+        self.reassembly_max_keys = int(cfg.get("reassembly_max_keys", 256))
+        self.reassembly_idle_timeout_s = float(cfg.get("reassembly_idle_timeout", 120.0))
+        self.reassembly_idle_timeout_coop_s = float(cfg.get("reassembly_idle_timeout_coop", 180.0))
+        self.whole_packet_dedup_ttl_s = float(cfg.get("whole_packet_dedup_ttl", 150.0))
+
+    def _configure_retry(self, cfg):
+        # Per-traffic-class extra CHANNEL retry-pass budgets
+        # (docs/reliability_engine_design.md §2's table), keyed off the
+        # RNS header fields _parse_rns_header/_retry_extra_for read.
+        # `announce_retransmit_extra` covers every ANNOUNCE uniformly --
+        # distinguishing a path-response announce (budget 1) from a
+        # spontaneous one (budget 0) needs to observe an in-flight path
+        # request, which is peer/routing-adjacent state this interface
+        # doesn't have until Milestone 5; every announce gets the
+        # cheaper, spontaneous-announce default until then, flagged
+        # explicitly rather than silently guessed at.
+        self.announce_retransmit_extra = int(cfg.get("announce_retransmit_extra", 0))
+        self.path_req_retransmit_extra = int(cfg.get("path_req_retransmit_extra", 1))
+        self.ordinary_data_link_retransmit_extra = int(
+            cfg.get("ordinary_data_link_retransmit_extra", 0)
+        )
+        self.ordinary_data_bare_retransmit_extra = int(
+            cfg.get("ordinary_data_bare_retransmit_extra", 1)
+        )
+
+        # Independent jittered delay before each retry pass -- drawn
+        # fresh per pass, layered outside that pass's own inter-fragment
+        # spacing (_fragment_spacing_range), never derived from it. This
+        # is what makes passes decorrelated rather than a fixed schedule.
+        self.retransmit_jitter_min_s = float(cfg.get("retransmit_jitter_min", 8.0))
+        self.retransmit_jitter_max_s = float(cfg.get("retransmit_jitter_max", 20.0))
+
+    def _configure_path_discovery(self, cfg):
+        # docs/path_discovery_spec.md's "Retry and backoff structure" --
+        # a quick-retry burst (each attempt already naturally spaced by
+        # its own request/response wait, no additional artificial delay
+        # layered on top), then per-target exponential backoff.
+        self.path_discovery_quick_attempts = int(cfg.get("path_discovery_quick_attempts", 3))
+        self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 15.0))
+        self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
+        self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 2.0))
+
+        # Stale cached-DIRECT-path detection (§8) -- not yet wired into an
+        # actual DIRECT send path (Milestone 5+ adds the routing decisions
+        # that call record_direct_send_result() for real); the mechanism
+        # and its config surface exist now, unit-tested directly.
+        self.direct_path_reset_threshold = int(cfg.get("direct_path_reset_threshold", 2))
+        self.direct_path_reset_rssi_floor = float(cfg.get("direct_path_reset_rssi_floor", -105.0))
+        self.direct_path_reset_patience_multiplier = float(
+            cfg.get("direct_path_reset_patience_multiplier", 3.0)
+        )
+        # User-requested fix (2026-09-15, post-alpha-0.1.0 2-hop field test):
+        # `direct_path_reset_threshold`'s default (2) means just two
+        # consecutive full-timeout DIRECT failures discard a cached path
+        # and force a fresh `discover_path()` burst (up to
+        # `path_discovery_quick_attempts` real over-the-air round trips)
+        # on the very next send -- with no floor on how recently that path
+        # was itself successfully confirmed. When several messages fail
+        # close together for a reason that has nothing to do with the path
+        # itself (shared-radio congestion, several concurrent sends
+        # queued behind `_direct_exchange_lock`, a repeater mid-relay --
+        # exactly the real 2-hop field test scenario), this can re-discover
+        # a path that was only just confirmed seconds ago and hasn't
+        # plausibly gone stale, adding real path-discovery airtime on top
+        # of an already-congested channel -- a self-inflicted feedback
+        # loop, not a genuine stale-path recovery. A path resolved more
+        # recently than this floor is trusted regardless of how many
+        # failures have piled up since; the failure count is NOT reset by
+        # this skip (see record_direct_send_result), so a path that's
+        # genuinely gone bad is still torn down and rediscovered once it's
+        # old enough for that to be plausible, just not before.
+        self.direct_path_reset_min_age_s = float(cfg.get("direct_path_reset_min_age", 30.0))
+
+        # Live, periodic contact-table read -- reliability_engine_design.md
+        # §2's "data-source gap" fix: never served from a cached/inherited
+        # value. Feeds path discovery's own ensure_contacts() precondition
+        # now; Milestone 5 is expected to also feed this into the
+        # zero-hop/known-N-hop spacing tiers _fragment_spacing_range()
+        # already implements but has no live data source for yet.
+        self.contact_refresh_interval_s = float(cfg.get("contact_refresh_interval", 30.0))
+
+        # Milestone 4 granted base-telemetry permission to every known
+        # contact by default, flagged there as a placeholder: docs/
+        # path_discovery_spec.md recommends granting only to peers
+        # confirmed via this interface's own bind-frame protocol, which
+        # didn't exist until Milestone 5. Now that it does
+        # (_refresh_contacts_and_grant_telemetry grants bind-confirmed
+        # peers unconditionally), this defaults to "no" -- set to "yes"
+        # as an explicit escape hatch back to the old open-to-every-
+        # contact behavior (exactly as open as any public MeshCore
+        # channel already is), not because the bind-gated grant above
+        # ever needs it to function.
+        self.telemetry_grant_all_contacts = _cfg_bool(cfg.get("telemetry_grant_all_contacts", "no"))
+
+    def _configure_peer_discovery(self, cfg):
+        # Master on/off switch for the entire bind-frame subsystem (both
+        # sending this node's own REQUEST/RESPONSE and answering others').
+        # Default on -- peer_discovery_design.md §4's "must not be
+        # skippable" rule applies to *cached state* gating the bootstrap
+        # REQUEST, not to this being an explicit, deliberate operator/test
+        # override that exists independently of any cache. Tests for
+        # Milestones 1-4 behavior that don't care about peer discovery set
+        # this to "no" so a fake meshcore connection with no channel
+        # traffic expectations beyond those milestones' own isn't also
+        # asked to field an unrelated bootstrap bind-frame send.
+        self.peer_discovery_enabled = _cfg_bool(cfg.get("peer_discovery_enabled", "yes"))
+
+        # docs/peer_discovery_design.md's bind-frame protocol and routing
+        # tables. Whether THIS node advertises router capability
+        # (has_upstream_rns, §2) is a deployment fact -- whether it's also
+        # bridging to the wider Reticulum network via another interface --
+        # that this interface cannot infer on its own; defaults to edge
+        # (conservative: an edge peer never gets DIRECT-nudged for path
+        # requests it structurally can't answer, per routing_decisions.md).
+        self.declares_upstream_rns = _cfg_bool(cfg.get("declares_upstream_rns", "no"))
+
+        # Per-responder RESPONSE jitter (§3) -- collision/half-duplex-deaf-
+        # repeater spacing, not suppression (every well-formed REQUEST still
+        # gets answered). And a separate, much longer global minimum
+        # re-response interval -- the real suppression mechanism, since a
+        # peer that already heard this node's capability gains nothing from
+        # hearing it again. Both "reasoned, not measured" per the doc's own
+        # flag -- worth field-validating once there's code to test.
+        self.bind_response_jitter_min_s = float(cfg.get("bind_response_jitter_min", 10.0))
+        self.bind_response_jitter_max_s = float(cfg.get("bind_response_jitter_max", 30.0))
+        self.bind_response_min_interval_s = float(cfg.get("bind_response_min_interval", 300.0))
+
+        # Bootstrap REQUEST: always sent once, unconditionally, at process
+        # start (§4's "must not be skippable" rule -- the old design's own
+        # regression). peer_discovery_target_peers/_rerequest_interval
+        # govern only the *optional* slow repeat while below that target;
+        # never whether the first REQUEST happens at all.
+        self.peer_discovery_target_peers = int(cfg.get("peer_discovery_target_peers", 3))
+        self.peer_discovery_rerequest_interval_s = float(
+            cfg.get("peer_discovery_rerequest_interval", 1800.0)
+        )
+
+        # Peer expiry (§6) -- a day default, matching the old design's own
+        # with no specific field evidence for a different number. Sweep
+        # interval is an internal granularity choice (like
+        # REASSEMBLY_CLEANUP_INTERVAL_S), generous relative to the TTL it
+        # enforces.
+        self.peer_ttl_s = float(cfg.get("peer_ttl", 86400.0))
+        self.peer_ttl_sweep_interval_s = float(cfg.get("peer_ttl_sweep_interval", 300.0))
+
+        # PROOF-correlation table TTL (§7) -- long enough to cover a
+        # realistic PROOF round trip, short enough the table doesn't grow
+        # to track every packet ever delivered. The old design used 120s;
+        # kept as the starting point, no new field evidence for a different
+        # number.
+        self.proof_correlation_ttl_s = float(cfg.get("proof_correlation_ttl", 120.0))
+
+        # Optional override for the peer-cache JSON file's path -- defaults
+        # to a file under RNS.Reticulum.storagepath (verified populated
+        # once a real RNS.Reticulum() instance exists) when left unset.
+        self.peer_cache_path = cfg.get("peer_cache_path", None) or None
+
+        # docs/routing_decisions.md's path-request DIRECT-supplement cap --
+        # "a small number (e.g. the most-recently-confirmed few)", not
+        # unconditionally every known router as the router count grows.
+        self.path_request_direct_supplement_cap = int(cfg.get("path_request_direct_supplement_cap", 2))
+
+        # Milestone 6's DIRECT-bootstrap-supplement cap (the fix for
+        # peer_discovery_design.md §7's own bootstrap gap -- see
+        # _select_bootstrap_supplement_targets) -- same reasoning as the
+        # path-request cap above, kept as a separate knob since the two
+        # mechanisms have different target-selection rules (this one
+        # isn't filtered by router capability).
+        self.bootstrap_direct_supplement_cap = int(cfg.get("bootstrap_direct_supplement_cap", 2))
+
+        # Floor under a DIRECT send's ACK-wait timeout, in case a firmware
+        # reply's own suggested_timeout is missing or unrealistically small
+        # -- this interface's own safety margin, not a firmware constant.
+        self.direct_ack_min_timeout_s = float(cfg.get("direct_ack_min_timeout", 5.0))
+
+        # Milestone 6 (docs/reliability_engine_design.md §4): the outer
+        # multi-attempt loop for a single DIRECT message -- mirrors, not
+        # replaces, the firmware's own per-attempt ACK/content-attempt
+        # mechanism; this engine decides how many times to ask the
+        # firmware to try. Applies uniformly to a bare single-message
+        # DIRECT send and, per-fragment, to each fragment of a DIRECT-
+        # fragmented send.
+        #
+        # User-requested fix (2026-09-16, following the priority-lock
+        # change above, same real 1-hop repeater field data): default
+        # lowered from 3 to 2. At ~50% measured per-attempt loss, every
+        # fragment that exhausts its own attempt budget without success
+        # still holds `_direct_exchange_lock` (now priority-aware, but
+        # still one radio) for the full cost of each failed attempt --
+        # ack_timeout plus the post-send listen window -- before anything
+        # else queued behind it gets a turn. A fragment that's going to
+        # need more than 2 tries under these conditions isn't meaningfully
+        # more likely to succeed on a 3rd attempt than to eventually get
+        # picked up by `_send_direct_fragmented`'s own existing pass-1 re-
+        # drive (a fresh attempt budget, not a continuation of a failing
+        # one) or, above this interface entirely, RNS's own Resource-
+        # transfer layer re-requesting specifically-missing parts once a
+        # transfer stalls -- both already exist and have equal or better
+        # information about what's actually still missing than blindly
+        # spending a 3rd attempt on the same fragment does. Lowering this
+        # trades a small amount of per-fragment persistence for freeing
+        # the shared radio sooner under exactly the lossy conditions where
+        # that trade matters -- still a flat, simple value, not made
+        # adaptive to measured loss (that's a real further refinement,
+        # deliberately not done here without more field data to justify
+        # it).
+        self.direct_send_attempts = int(cfg.get("direct_send_attempts", 2))
+
+        # User-requested fix (2026-09-16), following the confidence
+        # discussion above the retry-budget cut: a LINK_REQUEST/PROOF-
+        # class exchange (PRIORITY_HANDSHAKE) is the worst candidate for
+        # the same reduced budget ordinary DATA just got. Losing a DATA
+        # fragment is comparatively cheap -- `_send_direct_fragmented`'s
+        # own pass-1 re-drive, or RNS's own Resource-layer recovery,
+        # already exist to pick it up. Losing a Link handshake is not
+        # cheap: RNS's own Transport.py confirms (source-checked the same
+        # day) that a failed local-client Link attempt tears the path
+        # down and forces a full path rediscovery -- itself more airtime,
+        # making the *next* handshake attempt less likely to succeed too.
+        # That's a self-reinforcing loop a cheap handshake budget makes
+        # worse, not better. A separate, larger budget for handshake-
+        # class exchanges specifically targets preventing that cascade,
+        # while the lower ordinary-DATA budget above still frees the
+        # (now priority-aware) shared radio sooner for everything else.
+        # See _send_direct_with_attempts's own docstring for exactly how
+        # the two budgets are picked between.
+        self.direct_send_attempts_handshake = int(cfg.get("direct_send_attempts_handshake", 4))
+
+        # User-requested fix (2026-09-15), generalized the same day after
+        # a second real 2-hop field test, then split by outcome the day
+        # after that (2026-09-16) once a real zero-hop NomadNet session
+        # showed the generalized version's actual cost: a DIRECT
+        # send+ACK-wait used to release _direct_exchange_lock the instant
+        # it resolved (ACKed or not), letting the very next contender --
+        # a retry of the same fragment, the next fragment, or a completely
+        # different queued message -- key the radio again immediately.
+        # Fine if nothing else was going on, but if the miss was a
+        # collision (a peer transmitting into us at the exact moment we
+        # sent, or vice versa -- this is a shared half-duplex radio, and a
+        # real repeater adds its own settling time on top), going again
+        # instantly just repeats the same collision window, and does so
+        # for every message queued behind it too.
+        #
+        # Applying one flat 0-5s range to *every* attempt regardless of
+        # outcome (2026-09-15's generalization) turned out to have a real
+        # cost the zero-hop field session's own packet capture made
+        # obvious: 100% of DIRECT attempts were ACKed (as expected --
+        # zero-hop, nothing to collide with), yet every single one still
+        # paid an average ~2.5s tax before the lock released, and because
+        # NomadNet's page transfer spawns many small RESOURCE-related
+        # packets that all queue up behind the same lock,
+        # _direct_exchange_queue_depth reached 14 with individual attempts
+        # waiting up to 48s just for their own turn -- none of it bought
+        # any real collision protection, since nothing was colliding.
+        # `direct_post_send_listen_min_s`/`max_s` (0-5s, unchanged) now
+        # applies ONLY when the attempt got no ACK -- the one case where
+        # "something might have collided, don't retry into it instantly"
+        # is actually a live hypothesis, independent of this node's own
+        # queue depth (the cause could be entirely external). A
+        # successful attempt -- which is itself real evidence the channel
+        # was clear for this exchange -- instead draws from the much
+        # smaller `direct_post_send_listen_success_min_s`/`max_s` (0-0.5s
+        # default): still genuinely random every time (never a fixed
+        # value, deliberately, so this can't settle into a lockstep
+        # pattern with anything else on the channel), still real spacing
+        # between successive different messages queued behind the lock,
+        # just not the same "assume something might be wrong" cost a
+        # clean ACK gives no reason to pay. Both remain simple, flat
+        # ranges for now -- "we can tune this later" still applies. See
+        # _send_direct_frame_and_wait_for_ack's own docstring for exactly
+        # where each fires.
+        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.0))
+        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 5.0))
+        self.direct_post_send_listen_success_min_s = float(cfg.get("direct_post_send_listen_success_min", 0.0))
+        self.direct_post_send_listen_success_max_s = float(cfg.get("direct_post_send_listen_success_max", 0.5))
+
+        # The routed-mode ACK-wait ceiling §4 specifies (scaled off the
+        # firmware's own hop-aware suggested_timeout, capped here). This
+        # design's own routing rule (routing_decisions.md) never issues a
+        # DIRECT send without already believing a resolved path exists --
+        # every DIRECT send this interface makes is therefore always in
+        # the "routed" regime from its own point of view, so only this
+        # ceiling is used; the doc's *flood*-mode ceiling
+        # (`direct_ack_timeout_max_s`, 10s) describes a regime this
+        # interface's own dispatcher structurally never enters (it falls
+        # back to CHANNEL broadcast instead of ever flooding a DIRECT
+        # send with no resolved path), so it's deliberately not exposed
+        # as a config value here -- there would be no code path that
+        # reads it.
+        self.direct_ack_timeout_routed_max_s = float(cfg.get("direct_ack_timeout_routed_max", 45.0))
+
+    def _configure_observability(self, cfg):
+        # Per-interface debug logging, independent of RNS core's global
+        # [logging] loglevel. RNS.log() gates every message (ours and RNS
+        # core's own) on one global level, so raising it to DEBUG to see
+        # this interface's own diagnostics would also enable RNS core's
+        # own debug firehose. Messages logged via self._debug() below are
+        # emitted at LOG_INFO, gated only by this flag.
+        self.debug_logs = str(cfg.get("debug_level", "info")).strip().lower() == "debug"
+
+        # How often the periodic structured stats snapshot (_stats_loop)
+        # is logged. Per `docs/interface_architecture.md`'s observability
+        # requirements, this mechanism exists from the first milestone
+        # that connects to anything, even though M0 has little of
+        # substance to report yet -- later milestones (queue depth,
+        # reassembly bucket counts, per-peer state) extend the same
+        # snapshot rather than inventing a second one.
+        self.stats_interval_s = float(cfg.get("stats_interval", 60.0))
+
+        # User-requested packet capture (2026-09-15): off by default,
+        # every in/out RNS packet appended as one JSON line to a file
+        # under this directory when enabled -- see _capture_event's own
+        # docstring for the record format and _async_setup for where the
+        # file actually gets opened (once this node is online and its
+        # storage path is known).
+        self.packet_capture_enabled = _cfg_bool(cfg.get("packet_capture_enabled", "no"))
+        self.packet_capture_dir = cfg.get("packet_capture_dir", None)
+
+    # -------------------------------------------------------------------
+    # Startup helpers
+    # -------------------------------------------------------------------
+
+    def _debug(self, msg: str) -> None:
+        if self.debug_logs:
+            RNS.log(f"{self}: {msg}", RNS.LOG_INFO)
+
+    # -------------------------------------------------------------------
+    # Packet capture (user-requested, 2026-09-15) -- off by default
+    # (packet_capture_enabled). One JSON object per line (JSONL: easy to
+    # tail -f, grep, or load with any per-line JSON reader) per in/out
+    # RNS packet, written to packet_capture_dir (default: a
+    # "packet_capture" subdirectory of this node's own RNS storage path).
+    # Deliberately synchronous, unbuffered writes: this transport's own
+    # real throughput ceiling (docs/reliability_engine_design.md's field
+    # data: tens of bytes/sec) means packets are inherently rare relative
+    # to normal disk I/O speed, so the "don't block the event loop"
+    # concern that applies to CHANNEL/DIRECT sends doesn't meaningfully
+    # apply here -- and flushing every line means a capture survives an
+    # ungraceful process exit, which matters more for a debugging/
+    # analysis tool than avoiding a sub-millisecond stall ever would.
+    # -------------------------------------------------------------------
+
+    def _open_packet_capture(self) -> None:
+        try:
+            capture_dir = self.packet_capture_dir
+            if not capture_dir:
+                base = getattr(RNS.Reticulum, "storagepath", None)
+                if not base:
+                    RNS.log(
+                        f"{self}: packet_capture_enabled but no packet_capture_dir "
+                        f"configured and no RNS storage path available -- capture "
+                        f"disabled for this run.",
+                        RNS.LOG_WARNING,
+                    )
+                    return
+                capture_dir = os.path.join(base, "packet_capture")
+            os.makedirs(capture_dir, exist_ok=True)
+            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.name)
+            filename = f"capture_{safe_name}_{time.strftime('%Y%m%dT%H%M%S')}.jsonl"
+            path = os.path.join(capture_dir, filename)
+            self._packet_capture_file = open(path, "a", buffering=1)
+            RNS.log(f"{self}: packet capture enabled -- writing to {path}", RNS.LOG_INFO)
+        except Exception as exc:
+            RNS.log(f"{self}: failed to open packet capture file: {exc} -- capture disabled for this run.", RNS.LOG_WARNING)
+            self._packet_capture_file = None
+
+    def _close_packet_capture(self) -> None:
+        with self._packet_capture_lock:
+            if self._packet_capture_file is not None:
+                try:
+                    self._packet_capture_file.close()
+                except Exception:
+                    pass
+                self._packet_capture_file = None
+
+    def _capture_event(self, direction: str, fields: dict) -> None:
+        """Appends one capture record. `direction` is "in" or "out";
+        `fields` carries everything call-site-specific (see
+        `_capture_outgoing`/`_capture_incoming`). Every record also gets
+        a monotonically increasing `seq` (this process's own capture
+        sequence, for unambiguous ordering independent of timestamp
+        resolution) and both wall-clock and monotonic timestamps (the
+        latter safe against system clock adjustments mid-capture)."""
+        if self._packet_capture_file is None:
+            return
+        with self._packet_capture_lock:
+            if self._packet_capture_file is None:
+                return
+            self._packet_capture_seq += 1
+            record = {
+                "seq": self._packet_capture_seq,
+                "ts": time.time(),
+                "ts_monotonic": time.monotonic(),
+                "direction": direction,
+                **fields,
+            }
+            try:
+                self._packet_capture_file.write(json.dumps(record, default=str) + "\n")
+            except Exception as exc:
+                RNS.log(f"{self}: packet capture write failed: {exc}", RNS.LOG_WARNING)
+
+    def _header_capture_fields(self, header: Optional[_RnsHeader]) -> dict:
+        if header is None:
+            return {
+                "packet_type": None, "packet_type_name": None,
+                "destination_type": None, "destination_type_name": None,
+                "destination_hash": None, "context": None, "context_name": None,
+                "header_type": None,
+            }
+        return {
+            "packet_type": header.packet_type,
+            "packet_type_name": self._PACKET_TYPE_NAMES.get(header.packet_type),
+            "destination_type": header.destination_type,
+            "destination_type_name": self._DESTINATION_TYPE_NAMES.get(header.destination_type),
+            "destination_hash": header.destination_hash.hex() if header.destination_hash else None,
+            "context": header.context,
+            "context_name": self._CONTEXT_NAMES.get(header.context) if header.context is not None else None,
+            "header_type": header.header_type,
+        }
+
+    def _capture_outgoing(
+        self, header: Optional[_RnsHeader], data: bytes, decision: str,
+        target_peer: Optional[str] = None, candidate_peers: Optional[list] = None,
+    ) -> None:
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", {
+            **self._header_capture_fields(header),
+            "priority": self._priority_tier(header),
+            "size_bytes": len(data),
+            "routing_decision": decision,
+            "target_peer": target_peer,
+            "candidate_peers": candidate_peers,
+            "small_mesh_mode": self._in_small_mesh_mode(),
+            "bound_peers": len(self._peers),
+        })
+
+    def _capture_incoming(
+        self, data: bytes, transport: str,
+        sender_peer_prefix: Optional[str] = None, channel_sender_claimed: Optional[str] = None,
+        frag_total: Optional[int] = None, pkt_id: Optional[int] = None,
+    ) -> None:
+        if self._packet_capture_file is None:
+            return
+        header = self._parse_rns_header(data)
+        # User-requested (2026-09-16, for hop-based tuning-profile
+        # analysis): this interface's own resolved outbound path length to
+        # `sender_peer_prefix`, when one is known -- the best hop-count
+        # proxy available here, since MeshCore never reports the actual
+        # inbound path a given DIRECT frame took, only what this node has
+        # resolved for sending back. Never set for CHANNEL (no sender
+        # identity to resolve against at all).
+        resolved = self._resolved_paths.get(sender_peer_prefix) if sender_peer_prefix else None
+        self._capture_event("in", {
+            **self._header_capture_fields(header),
+            "priority": self._priority_tier(header),
+            "size_bytes": len(data),
+            "transport": transport,
+            # Only ever set for DIRECT -- cryptographically tied to a
+            # bound peer via the firmware's own per-contact shared
+            # secret. Never conflate with channel_sender_claimed below.
+            "sender_peer_prefix": sender_peer_prefix,
+            # CHANNEL's own adv_name, unauthenticated and attacker-
+            # controlled (this interface's security model: CHANNEL
+            # carries no identity at all) -- included for visibility
+            # only, never treated as a real sender identity anywhere
+            # else in this interface.
+            "channel_sender_claimed": channel_sender_claimed,
+            "frag_total": frag_total,
+            "pkt_id": pkt_id,
+            "hop_count": resolved.out_path_len if resolved is not None else None,
+        })
+
+    def _capture_direct_attempt_result(
+        self, peer_prefix: Optional[str], attempt: int, ok: bool,
+        queue_depth: int, lock_wait_s: float, ack_timeout_s: Optional[float],
+        pkt_id: Optional[int] = None, frag_idx: Optional[int] = None, frag_total: Optional[int] = None,
+        listen_delay_s: Optional[float] = None, hop_count: Optional[int] = None,
+    ) -> None:
+        """User-requested observability addition (2026-09-15, post-alpha-
+        0.1.0 2-hop field test): one record per individual DIRECT send
+        attempt (bare, or one fragment of a DIRECT-fragmented send) --
+        the granularity the prior 2-hop investigation was missing, having
+        to reconstruct attempt-by-attempt outcomes from timestamps and raw
+        `send_msg` call arguments in the plain log instead. Carries an
+        `event` field (absent on every existing packet in/out record) so
+        analysis scripts already written against this capture format can
+        distinguish these from packet records without breaking. `queue_
+        depth`/`lock_wait_s` are `_direct_exchange_lock`'s own contention
+        signal -- see `_direct_exchange_queue_depth`'s docstring -- direct
+        evidence for or against "several concurrent messages splitting the
+        one shared radio" the next time that's a live hypothesis.
+        `listen_delay_s` is the post-send listen window this exact attempt
+        drew -- from `direct_post_send_listen_success_min_s`/`max_s` if
+        `ok`, `direct_post_send_listen_min_s`/`max_s` otherwise (2026-09-16
+        split, see that constant's own comment) -- still held while
+        `_direct_exchange_lock` was held -- lets a future analysis
+        directly correlate how much of the channel's idle time was this
+        deliberate listen window versus genuine gaps between traffic.
+        `hop_count` (2026-09-16, user-requested for hop-based tuning-
+        profile analysis) is this interface's own `_resolved_paths` entry
+        for `peer_prefix` at the moment this attempt was made -- the same
+        `out_path_len` `_fragment_spacing_range` itself keys spacing off
+        of -- threaded down from whichever `resolved` the caller
+        (`_send_direct_packet`/`_send_direct_supplement`) already had in
+        hand, not re-looked-up here; `None` if no path was resolved yet
+        (e.g. this attempt is itself part of establishing one)."""
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", {
+            "event": "direct_attempt_result",
+            "peer_prefix": peer_prefix,
+            "attempt": attempt,
+            "ok": ok,
+            "queue_depth": queue_depth,
+            "lock_wait_s": round(lock_wait_s, 3),
+            "ack_timeout_s": ack_timeout_s,
+            "pkt_id": pkt_id,
+            "frag_idx": frag_idx,
+            "frag_total": frag_total,
+            "listen_delay_s": round(listen_delay_s, 3) if listen_delay_s is not None else None,
+            "hop_count": hop_count,
+        })
+
+    def _capture_direct_send_result(
+        self, peer_prefix: str, destination_hash: Optional[bytes], ok: bool,
+        resolved: "_ResolvedPath", size_bytes: int,
+    ) -> None:
+        """User-requested observability addition (2026-09-15, post-alpha-
+        0.1.0 2-hop field test): one record per whole DIRECT message (every
+        fragment across both passes, for a fragmented send), pairing the
+        final ACKed/not-ACKed outcome with the hop path actually used --
+        `out_path_len`/`out_path_hex` were previously visible only in a
+        one-off RNS.log INFO line at the moment a path was freshly
+        discovered, never at the moment a message using that (possibly
+        long-cached) path actually succeeds or fails. This is the single
+        record that answers "did this message get through, and over how
+        many hops" without cross-referencing anything else."""
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", {
+            "event": "direct_send_result",
+            "peer_prefix": peer_prefix,
+            "destination_hash": destination_hash.hex() if destination_hash else None,
+            "ok": ok,
+            "out_path_len": resolved.out_path_len,
+            "out_path_hex": resolved.out_path_hex,
+            "size_bytes": size_bytes,
+        })
+
+    def _load_meshcore_or_panic(self):
+        try:
+            import meshcore as _mc_mod
+        except ImportError:
+            RNS.log(
+                f"{self}: the 'meshcore' python library is not installed -- "
+                f"cannot continue.",
+                RNS.LOG_CRITICAL,
+            )
+            RNS.panic()
+            return
+
+        self._mc_module_impl = _mc_mod
+        self._EventType_impl = _mc_mod.EventType
+        self._verify_required_event_types()
+
+    def _verify_required_event_types(self):
+        missing = [
+            event_name
+            for event_name in self.REQUIRED_EVENT_TYPES
+            if not hasattr(self._EventType, event_name)
+        ]
+        if missing:
+            RNS.log(
+                f"{self}: installed meshcore library's EventType enum is "
+                f"missing required member(s) {missing} -- this library "
+                f"version is incompatible with this interface "
+                f"(meshcore_protocol_rules.md library-contract rule 4: "
+                f"never assume these names, always probe). Refusing to "
+                f"go online.",
+                RNS.LOG_CRITICAL,
+            )
+            raise RuntimeError(f"meshcore EventType missing required member(s): {missing}")
+
+    def _start_async_bridge(self):
+        # A dedicated background thread owns its own asyncio event loop for
+        # the entire life of the interface. Interface *construction* (which
+        # RNS expects to be synchronous) blocks on that loop's async setup
+        # completing, via run_coroutine_threadsafe plus a plain
+        # threading.Event.wait() back on the constructing thread --
+        # `docs/reliability_engine_design.md`'s "sync/async bridge" notes.
+        self._loop_impl = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._run_loop, daemon=True, name=f"SMCI-loop-{self.name}"
+        )
+        self._loop_thread.start()
+
+        setup_future = asyncio.run_coroutine_threadsafe(self._async_setup(), self._loop)
+
+        def _on_setup_done(fut):
+            if fut.cancelled():
+                return
+            exc = fut.exception()
+            if exc is not None:
+                RNS.log(f"{self}: setup raised an exception: {exc}", RNS.LOG_ERROR)
+                RNS.log(
+                    "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    RNS.LOG_ERROR,
+                )
+            self._setup_done.set()
+
+        setup_future.add_done_callback(_on_setup_done)
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_forever()
+        except Exception as exc:
+            RNS.log(f"{self}: event loop crashed: {exc}", RNS.LOG_ERROR)
+
+    # -------------------------------------------------------------------
+    # Command chokepoint (design invariants #1 and #2)
+    # -------------------------------------------------------------------
+
+    async def _run_command(self, command_coro, context, expected_types):
+        """Serialize the actual `commands.*()` call behind a single lock
+        (invariant #2 -- the library matches replies by bare event type,
+        with no per-request correlation id, so two concurrent commands
+        waiting on the same type can steal each other's reply) and check
+        the returned event's actual type against what THIS call expected
+        (invariant #1 -- a non-exception return is not success; CHANNEL
+        commands in particular never return a delivery confirmation at
+        all). Raises on ERROR, no response, or an unexpected type."""
+        if not isinstance(expected_types, (list, tuple)):
+            expected_types = (expected_types,)
+
+        async with self._command_lock:
+            result = await command_coro
+
+        self._debug(f"{context} -> {getattr(result, 'type', result)!r}")
+
+        if result is None:
+            raise RuntimeError(
+                f"{context}: no event returned "
+                f"(expected one of {[t.name for t in expected_types]})"
+            )
+        if result.type == self._EventType.ERROR:
+            reason = (
+                result.payload.get("reason", result.payload)
+                if isinstance(result.payload, dict)
+                else result.payload
+            )
+            raise RuntimeError(f"{context}: firmware ERROR ({reason})")
+        if result.type not in expected_types:
+            raise RuntimeError(
+                f"{context}: unexpected event type {result.type!r} "
+                f"(expected one of {[t.name for t in expected_types]})"
+            )
+        return result
+
+    async def _throttle_for_duty_cycle(self, frame: str) -> float:
+        """User-requested fix (2026-09-16): called at every actual radio-
+        keying call site (`_send_channel_fastpath_frame`, one iteration
+        of `_send_channel_multifragment_pass`'s per-fragment loop,
+        `_send_direct_frame`, `_send_bind_frame`) immediately before the
+        `send_msg`/`send_chan_msg` command itself -- estimates `frame`'s
+        airtime from `duty_cycle_estimate_bitrate` (see that config
+        value's own comment for why this is deliberately NOT the same as
+        `bitrate`, confirmed via a real zero-hop field test the day this
+        shipped -- reusing `bitrate` massively overestimated real per-
+        frame airtime and forced an artificial ~10s wait on every single
+        exchange), waits out whatever `_DutyCycleLimiter` says is needed,
+        then records the estimate as consumed. Returns the delay actually
+        applied -- logged at debug level and available to the caller for
+        capture, never gates *whether* the send proceeds, only *when*
+        it's allowed to start. A no-op returning 0.0 immediately when
+        `duty_cycle_enabled` is off."""
+        if not self.duty_cycle_enabled or self.duty_cycle_estimate_bitrate <= 0:
+            return 0.0
+        estimated_s = (len(frame) * 8) / self.duty_cycle_estimate_bitrate
+        delay = await self._duty_cycle.wait_for_budget(estimated_s)
+        self._duty_cycle.record(estimated_s)
+        if delay > 0:
+            self._debug(
+                f"duty-cycle throttle: waited {delay:.2f}s before this "
+                f"{len(frame)}-char frame (estimated {estimated_s:.2f}s "
+                f"airtime at duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps)."
+            )
+        return delay
+
+    async def _wait_for_incoming_quiet(self) -> float:
+        """User-requested fix (2026-09-16): "if we hear a message come in
+        via direct, we wait 3 seconds to hear another before we send
+        again... wait for the incoming interface to either stop sending
+        or hit its airtime limit." Called at the same radio-keying call
+        sites as `_throttle_for_duty_cycle`, immediately before it, so
+        this interface never keys the radio into the middle of a peer's
+        own DIRECT burst it just heard evidence of (a received fragment
+        is strong evidence more are likely still coming, if the peer is
+        mid multi-fragment transfer).
+
+        A rolling window, not a single fixed sleep: hearing another
+        DIRECT frame while already waiting (`_last_incoming_direct_at`
+        moving forward, updated by `_on_contact_msg_recv` regardless of
+        this coroutine's own state) pushes the deadline out again, the
+        same "keeps checking, wakes exactly when the deadline moves"
+        shape `_DutyCycleLimiter.wait_for_budget` already uses. Since this
+        interface has no way to actually observe a peer's own airtime
+        budget or duty-cycle state, "or hit its airtime limit" is
+        approximated by `incoming_quiet_defer_max_wait_s` -- a bound on
+        this node's *own* patience, so a continuously-chatty peer can
+        never starve this node's own outgoing traffic indefinitely.
+        Returns the delay actually applied (0.0 if none was needed, e.g.
+        nothing has been heard yet this session, or the last frame was
+        already longer ago than the quiet window)."""
+        if not self.incoming_quiet_defer_enabled or self._last_incoming_direct_at is None:
+            return 0.0
+        start = time.monotonic()
+        hit_patience_ceiling = False
+        while True:
+            now = time.monotonic()
+            total_waited = now - start
+            if total_waited >= self.incoming_quiet_defer_max_wait_s:
+                hit_patience_ceiling = True
+                break
+            quiet_for = now - self._last_incoming_direct_at
+            if quiet_for >= self.incoming_quiet_window_s:
+                break
+            remaining_quiet = self.incoming_quiet_window_s - quiet_for
+            remaining_patience = self.incoming_quiet_defer_max_wait_s - total_waited
+            await asyncio.sleep(max(0.01, min(remaining_quiet, remaining_patience)))
+        if total_waited > 0:
+            self._debug(
+                f"incoming-quiet defer: waited {total_waited:.2f}s for the "
+                f"channel to go quiet after last hearing a DIRECT frame"
+                + (" (hit incoming_quiet_defer_max_wait_s ceiling)" if hit_patience_ceiling else "")
+                + "."
+            )
+        return total_waited
+
+    # -------------------------------------------------------------------
+    # Connection bring-up
+    # -------------------------------------------------------------------
+
+    def _connection_description(self) -> str:
+        if self.transport == "serial":
+            return f"serial port={self.port} baudrate={self.baudrate}"
+        if self.transport == "ble":
+            return f"ble name={self.ble_name or '<first found>'}"
+        if self.transport == "tcp":
+            return f"tcp host={self.host} port={self.tcp_port}"
+        return f"unknown transport '{self.transport}'"
+
+    async def _connect(self, MeshCore):
+        # Confirmed directly against the installed meshcore library
+        # (2.3.9.1) while building this milestone: MeshCore.connect()
+        # only cleans up its own dispatcher task on a *graceful* refusal
+        # (the underlying connection_manager.connect() returning None) --
+        # a raw OSError from the socket/serial layer itself (e.g. a
+        # refused TCP connection, no device at the port) propagates
+        # straight out of create_serial/create_ble/create_tcp without
+        # that cleanup running, and without ever handing this method a
+        # MeshCore instance to call disconnect() on. The visible symptom
+        # is a harmless "Task was destroyed but it is pending" asyncio
+        # warning logged once per failed connection attempt -- confirmed
+        # to not affect this interface's own behavior (the exception is
+        # still caught and self.online correctly stays False), but worth
+        # recording here rather than re-diagnosing it as this interface's
+        # own bug the next time it's seen in a log.
+        if self.transport == "serial":
+            return await MeshCore.create_serial(
+                self.port,
+                self.baudrate,
+                auto_reconnect=self.auto_reconnect,
+                max_reconnect_attempts=self.max_reconnect_attempts,
+            )
+        if self.transport == "ble":
+            return await MeshCore.create_ble(
+                self.ble_name or None,
+                auto_reconnect=self.auto_reconnect,
+                max_reconnect_attempts=self.max_reconnect_attempts,
+            )
+        if self.transport == "tcp":
+            return await MeshCore.create_tcp(
+                self.host,
+                self.tcp_port,
+                auto_reconnect=self.auto_reconnect,
+                max_reconnect_attempts=self.max_reconnect_attempts,
+            )
+        raise ValueError(f"unknown transport '{self.transport}' (expected serial, ble, or tcp)")
+
+    def _subscribe_connection_events(self):
+        # Only ever called from _async_setup right after its own
+        # `self._mc is None` guard passes -- `_mc_ready` documents that
+        # instead of repeating the guard here.
+        self._mc_ready.subscribe(self._EventType.CONNECTED, self._on_mc_connected)
+        self._mc_ready.subscribe(self._EventType.DISCONNECTED, self._on_mc_disconnected)
+
+    def _on_mc_connected(self, event):
+        if self.detached:
+            return
+        was_offline = not self.online
+        self.online = True
+        if was_offline:
+            RNS.log(f"{self}: MeshCore connection (re)established.", RNS.LOG_INFO)
+            # Code-review fix: _start_auto_message_fetching() was only
+            # ever called once, from _async_setup. If a reconnect's own
+            # internal get_msg() poll ever raises (plausible right as the
+            # connection drops), the installed library's own _fetch_
+            # messages_loop silently exits for good on any exception and
+            # is never restarted on its own -- confirmed directly against
+            # its source, which breaks the loop with no re-arm path.
+            # Without re-arming here, a reconnect would quietly return
+            # this interface to the exact "online but deaf" failure mode
+            # the original M5 field-test fix (this same method's sibling)
+            # exists to prevent, with no error logged anywhere.
+            self._spawn_background_task(self._rearm_auto_message_fetching())
+            if not self._own_pubkey_hex:
+                self._spawn_background_task(self._fetch_own_identity())
+
+    def _on_mc_disconnected(self, event):
+        if self.detached:
+            return
+        if self.online:
+            RNS.log(
+                f"{self}: MeshCore connection lost -- interface going "
+                f"offline until it reconnects.",
+                RNS.LOG_WARNING,
+            )
+        self.online = False
+
+    async def _fetch_own_identity(self) -> None:
+        """Code-review fix: this was previously inlined in `_async_setup`
+        and only ever attempted once, at initial connect. If `send_appstart`
+        failed there (a plausible timing issue right after the radio link
+        comes up), `_own_pubkey_hex` stayed empty for the interface's
+        entire lifetime -- and `_own_pubkey_prefix()` returning None makes
+        the self-echo guard in `_handle_incoming_bind_frame` (`own_prefix
+        is not None and frame.pubkey_prefix == own_prefix`) silently skip
+        the check forever, meaning this node's own bind frames bouncing
+        back to it (e.g. via a repeater or CHANNEL rebroadcast) would be
+        misprocessed as if from a genuine peer. Extracted into its own
+        method so `_on_mc_connected` can retry it on every reconnect, not
+        just at the very first one, closing that permanent-failure window.
+        """
+        try:
+            # Only ever called once a connection is live (from _async_setup
+            # or _on_mc_connected's reconnect path) -- see `_mc_ready`.
+            result = await self._run_command(
+                self._mc_ready.commands.send_appstart(),
+                "send_appstart",
+                self._EventType.SELF_INFO,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: could not fetch node identity: {exc} -- "
+                f"continuing anyway, but the CHANNEL payload budget below "
+                f"will assume an empty node name until this succeeds; if "
+                f"this node actually has a name configured, outgoing "
+                f"CHANNEL fragments could be silently truncated by the "
+                f"firmware as a result. This will be retried on the next "
+                f"reconnect if the pubkey is still unknown by then.",
+                RNS.LOG_WARNING,
+            )
+        else:
+            info = result.payload if isinstance(result.payload, dict) else {}
+            self._own_node_name = info.get("name", "")
+            node_key = info.get("public_key", "")
+            self._own_pubkey_hex = node_key.lower()
+            RNS.log(
+                f"{self}: node identity '{self._own_node_name}' "
+                f"key={node_key[:16]}...",
+                RNS.LOG_INFO,
+            )
+
+    async def _async_setup(self):
+        self._command_lock_impl = asyncio.Lock()
+        self._direct_exchange_lock_impl = _PriorityAsyncLock()
+        self._duty_cycle_impl = _DutyCycleLimiter(self.duty_cycle_window_s, self.duty_cycle_max_fraction)
+        MeshCore = self._mc_module.MeshCore
+
+        try:
+            self._mc = await self._connect(MeshCore)
+        except Exception as exc:
+            RNS.log(
+                f"{self}: connection failed ({self._connection_description()}): {exc}",
+                RNS.LOG_ERROR,
+            )
+            return
+
+        if self._mc is None:
+            RNS.log(
+                f"{self}: driver init returned no MeshCore instance "
+                f"({self._connection_description()}).",
+                RNS.LOG_ERROR,
+            )
+            return
+
+        RNS.log(f"{self}: connected ({self._connection_description()}).", RNS.LOG_INFO)
+        self._subscribe_connection_events()
+
+        await self._fetch_own_identity()
+
+        if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
+            try:
+                await self._run_command(
+                    self._mc_ready.commands.set_radio(
+                        self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr
+                    ),
+                    "set_radio",
+                    self._EventType.OK,
+                )
+                RNS.log(
+                    f"{self}: radio override applied (freq={self.radio_freq}MHz "
+                    f"bw={self.radio_bw}kHz sf={self.radio_sf} cr={self.radio_cr}).",
+                    RNS.LOG_INFO,
+                )
+            except Exception as exc:
+                RNS.log(
+                    f"{self}: radio override failed: {exc} -- continuing "
+                    f"with the node's currently stored radio settings.",
+                    RNS.LOG_WARNING,
+                )
+        else:
+            RNS.log(
+                f"{self}: no radio override configured -- using the "
+                f"node's currently stored radio settings.",
+                RNS.LOG_INFO,
+            )
+
+        try:
+            secret_bytes = bytes.fromhex(self.channel_secret_hex)
+            await self._run_command(
+                self._mc_ready.commands.set_channel(
+                    self.channel_idx, self.channel_name, secret_bytes
+                ),
+                "set_channel",
+                self._EventType.OK,
+            )
+            RNS.log(
+                f"{self}: channel configured (idx={self.channel_idx} "
+                f"name='{self.channel_name}').",
+                RNS.LOG_INFO,
+            )
+            if self._using_default_channel_secret:
+                RNS.log(
+                    f"{self}: no channel_secret configured -- joining the "
+                    f"shared default channel so nodes can find each other "
+                    f"with zero setup. This is fine for RNS traffic (it's "
+                    f"already encrypted end-to-end); set channel_idx/"
+                    f"channel_name/channel_secret explicitly for a private "
+                    f"channel.",
+                    RNS.LOG_INFO,
+                )
+        except Exception as exc:
+            RNS.log(f"{self}: channel setup failed: {exc}", RNS.LOG_WARNING)
+
+        try:
+            await self._run_command(
+                self._mc_ready.commands.set_telemetry_mode_base(self.TELEM_MODE_ALLOW_FLAGS),
+                "set_telemetry_mode_base",
+                self._EventType.OK,
+            )
+            RNS.log(
+                f"{self}: telemetry_mode_base set to per-contact-flags -- "
+                f"path discovery (docs/path_discovery_spec.md) is a "
+                f"telemetry request under the hood, and only answers a "
+                f"peer whose own contact entry has been granted the base "
+                f"permission bit.",
+                RNS.LOG_INFO,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: setting telemetry_mode_base failed: {exc} -- "
+                f"this node may not answer other nodes' path discovery "
+                f"requests until this is retried.",
+                RNS.LOG_WARNING,
+            )
+
+        # Code-review fix: self.online is set True here, BEFORE
+        # _load_peer_cache() below, deliberately -- _load_peer_cache()
+        # calls _register_peer() per cached entry, which (for a peer new
+        # to this process's own _peers dict, true for every cache-
+        # restored peer) schedules a proactive discover_path() background
+        # task. That task's first real chance to run is at the next
+        # await point in this same coroutine -- which used to be *before*
+        # self.online was set, so discover_path()'s own first line
+        # ("if ... not self.online: return None") silently no-opped for
+        # every single cache-restored peer, with no log line at all
+        # (unlike the backoff-skip case, which does self._debug()).
+        # Confirmed by code review: this made the Milestone 6 "proactive
+        # discovery on bind" fix quietly inert for exactly the startup
+        # case it was added for. Nothing else in this method depends on
+        # self.online being false up to this point.
+        self.online = True
+        self._connected_since = time.time()
+        RNS.log(
+            f"{self}: online (bitrate={self.bitrate}bps HW_MTU={self.HW_MTU} "
+            f"channel_budget={self._channel_payload_budget()}B "
+            f"direct_budget={self._direct_payload_budget()}B).",
+            RNS.LOG_INFO,
+        )
+
+        if self.packet_capture_enabled:
+            self._open_packet_capture()
+
+        if self.peer_discovery_enabled:
+            self._load_peer_cache()
+
+        try:
+            await self._refresh_contacts_and_grant_telemetry()
+        except Exception as exc:
+            RNS.log(f"{self}: initial contact refresh failed: {exc}", RNS.LOG_WARNING)
+
+        self._subscribe_data_events()
+        await self._start_auto_message_fetching()
+
+        self._stats_task = asyncio.ensure_future(self._stats_loop())
+        self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
+        self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
+        self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
+        if self.peer_discovery_enabled:
+            self._peer_discovery_task = asyncio.ensure_future(self._peer_discovery_bootstrap())
+            self._peer_ttl_sweep_task = asyncio.ensure_future(self._peer_ttl_sweep_loop())
+
+    # -------------------------------------------------------------------
+    # Observability: periodic structured stats snapshot
+    # -------------------------------------------------------------------
+
+    async def _stats_loop(self):
+        """Per `docs/interface_architecture.md`'s observability
+        requirements: a periodic structured snapshot of interface state,
+        queryable without correlating scattered log lines by hand, built
+        in from the first milestone that connects to anything -- not
+        bolted on once "the real logic" exists. M0 has little of substance
+        to report yet; later milestones (queue depth, reassembly bucket
+        counts, per-peer state) extend this same snapshot rather than
+        inventing a second mechanism."""
+        try:
+            while not self.detached:
+                await asyncio.sleep(self.stats_interval_s)
+                if self.detached:
+                    break
+                uptime = (
+                    time.time() - self._connected_since
+                    if self._connected_since is not None
+                    else 0.0
+                )
+                RNS.log(
+                    f"{self} [STATS] online={self.online} "
+                    f"transport={self.transport} bitrate={self.bitrate}bps "
+                    f"uptime={uptime:.0f}s "
+                    f"outgoing_queue_depth={self._outqueue.qsize()} "
+                    f"outgoing_dropped_total={self._outgoing_dropped_total} "
+                    f"incoming_dropped_total={self._incoming_dropped_total} "
+                    f"reassembly_buckets_open={len(self._reassembly)} "
+                    f"dedup_cache_size={len(self._dedup)} "
+                    f"pending_retry_passes={len(self._background_tasks)} "
+                    f"resolved_paths={len(self._resolved_paths)} "
+                    f"peers_in_discovery_backoff={len(self._path_discovery_backoff_until)} "
+                    f"contacts_known={len(self._mc.contacts) if self._mc is not None else 0} "
+                    f"bound_peers={len(self._peers)} "
+                    f"rns_tokens_learned={len(self._rns_token_peer)} "
+                    f"proof_correlations_pending={len(self._proof_correlation)}",
+                    RNS.LOG_INFO,
+                )
+                # Per-bucket fragment counts/ages (docs/interface_architecture.md's
+                # observability requirements ask for these specifically) --
+                # debug-gated so a busy channel doesn't spam the default
+                # INFO-level snapshot above.
+                if self.debug_logs and self._reassembly:
+                    now = time.monotonic()
+                    bucket_summary = ", ".join(
+                        f"{key}: {len(bucket.fragments)}/{bucket.frag_total} "
+                        f"age={now - bucket.last_progress:.0f}s"
+                        for key, bucket in self._reassembly.items()
+                    )
+                    self._debug(f"[STATS] open reassembly buckets: {bucket_summary}")
+        except asyncio.CancelledError:
+            pass
+
+    # -------------------------------------------------------------------
+    # Wire format (docs/wire_format_design.md): payload budgets and
+    # frame encode/decode
+    # -------------------------------------------------------------------
+
+    def _payload_budget(self, budget: int, header_size: int) -> int:
+        """The general form from wire_format_design.md's payload-budget
+        section, re-derived from the Z85 sizing relationship. `MARKER`'s
+        length is deliberately a symbolic term here, never a bare literal
+        -- the bug that section's own history warns against is a future
+        marker-length change silently desyncing a hard-coded constant
+        from the format it's supposed to be sizing."""
+        raw = ((budget - len(self.MARKER) - 1) // 5) * 4 - header_size - self.PAYLOAD_MARGIN
+        return max(0, raw)
+
+    def _channel_text_budget(self) -> int:
+        # "<name>: " is the firmware's own mandatory CHANNEL prefix
+        # (meshcore_protocol_rules.md CHANNEL rule 2) -- eats into the
+        # budget regardless of what this interface puts in the message,
+        # or which of CHANNEL's two header shapes ends up using it.
+        return self.FIRMWARE_TEXT_LIMIT - len(self._own_node_name) - 2
+
+    def _channel_payload_budget(self) -> int:
+        return self._payload_budget(self._channel_text_budget(), self.CHANNEL_FASTPATH_HEADER_SIZE)
+
+    def _channel_multifragment_payload_budget(self) -> int:
+        # Per-fragment usable payload when frag_total > 1 -- smaller than
+        # the fast-path budget above by exactly the extra 2 header bytes
+        # (frag_idx, frag_total) the multi-fragment shape carries.
+        return self._payload_budget(self._channel_text_budget(), self.MULTI_FRAGMENT_HEADER_SIZE)
+
+    def _direct_payload_budget(self) -> int:
+        # DIRECT text framing has no name-prefix cost at all
+        # (meshcore_protocol_rules.md DIRECT rule 1) -- full firmware
+        # limit is available.
+        return self._payload_budget(self.FIRMWARE_TEXT_LIMIT, self.DIRECT_BARE_HEADER_SIZE)
+
+    def _direct_multifragment_payload_budget(self) -> int:
+        # Per-fragment usable payload for DIRECT's needs-fragmenting shape
+        # (Milestone 6) -- same MULTI_FRAGMENT_HEADER_SIZE as CHANNEL's
+        # multi-fragment shape (wire_format_design.md: "identical shape to
+        # the CHANNEL one above"), but no name-prefix cost, same as the
+        # bare DIRECT budget above.
+        return self._payload_budget(self.FIRMWARE_TEXT_LIMIT, self.MULTI_FRAGMENT_HEADER_SIZE)
+
+    def _encode_channel_fastpath(self, payload: bytes, pkt_id: int, attempt: int = 0) -> str:
+        header = bytes([self.PROTOCOL_VERSION]) + pkt_id.to_bytes(2, "big") + bytes([attempt])
+        return self.MARKER + _z85_encode(header + payload)
+
+    def _encode_channel_multifragment(
+        self, payload: bytes, pkt_id: int, frag_idx: int, frag_total: int, attempt: int = 0
+    ) -> str:
+        header = (
+            bytes([self.PROTOCOL_VERSION | self.FLAG_MULTI_FRAGMENT])
+            + pkt_id.to_bytes(2, "big")
+            + bytes([frag_idx, frag_total, attempt])
+        )
+        return self.MARKER + _z85_encode(header + payload)
+
+    def _encode_direct_bare(self, payload: bytes) -> str:
+        header = bytes([self.PROTOCOL_VERSION])
+        return self.MARKER + _z85_encode(header + payload)
+
+    def _decode_frame(self, marker_and_body: str, mode: str) -> "tuple[_FrameHeader, bytes]":
+        """Decodes one CHANNEL or DIRECT frame's header (`mode` is
+        "channel" or "direct" -- determines the fast-path/bare header
+        shape when the multi-fragment bit is clear; the multi-fragment
+        shape itself is identical between the two modes). Raises
+        ValueError on anything malformed -- a missing marker, invalid
+        Z85, an unsupported version, or a frame too short for the header
+        its own flag bits claim. Per wire_format_design.md's own
+        reasoning for the 1-character marker: a false-positive marker
+        match on ordinary chat traffic is expected to happen sometimes,
+        and costs exactly one cheap, local decode-and-reject here -- the
+        caller logs and drops on ValueError, nothing more."""
+        if not marker_and_body.startswith(self.MARKER):
+            raise ValueError("missing marker")
+
+        raw = _z85_decode(marker_and_body[len(self.MARKER):])
+        if len(raw) < 1:
+            raise ValueError("empty frame after marker")
+
+        ver_byte = raw[0]
+        version_number = ver_byte & self.VERSION_MASK
+        multi_fragment = bool(ver_byte & self.FLAG_MULTI_FRAGMENT)
+        coop = bool(ver_byte & self.FLAG_COOP)
+
+        if version_number != self.PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version {version_number}")
+
+        if multi_fragment:
+            if len(raw) < self.MULTI_FRAGMENT_HEADER_SIZE:
+                raise ValueError("frame too short for multi-fragment header")
+            pkt_id = int.from_bytes(raw[1:3], "big")
+            frag_idx = raw[3]
+            frag_total = raw[4]
+            attempt = raw[5]
+            if frag_total < 1 or frag_idx >= frag_total:
+                # Malformed or hostile (this interface's security model
+                # assumes any transmitter on the shared channel can send
+                # anything): reject here, at decode time, rather than let
+                # it reach reassembly, where an out-of-range frag_idx set
+                # that happens to satisfy len(fragments) == frag_total
+                # would raise an unhandled KeyError trying to join indices
+                # that were never actually stored.
+                raise ValueError(
+                    f"invalid frag_idx/frag_total: {frag_idx}/{frag_total}"
+                )
+            payload = bytes(raw[self.MULTI_FRAGMENT_HEADER_SIZE:])
+            return (
+                _FrameHeader(version_number, True, coop, pkt_id, frag_idx, frag_total, attempt),
+                payload,
+            )
+
+        if mode == "channel":
+            if len(raw) < self.CHANNEL_FASTPATH_HEADER_SIZE:
+                raise ValueError("frame too short for CHANNEL fast-path header")
+            pkt_id = int.from_bytes(raw[1:3], "big")
+            attempt = raw[3]
+            payload = bytes(raw[self.CHANNEL_FASTPATH_HEADER_SIZE:])
+            return (
+                _FrameHeader(version_number, False, coop, pkt_id, 0, 1, attempt),
+                payload,
+            )
+
+        # mode == "direct": bare shape -- no pkt_id/attempt at all, the
+        # firmware's own ACK/content-derived-attempt cycle covers it.
+        payload = bytes(raw[self.DIRECT_BARE_HEADER_SIZE:])
+        return _FrameHeader(version_number, False, coop, None, 0, 1, None), payload
+
+    # -- Bind frames (docs/peer_discovery_design.md §1) -- a separate
+    # control protocol, distinct from the "R"-marker RNS wire format above:
+    # different marker, no relationship to _decode_frame's shapes.
+
+    def _bind_capability(self) -> int:
+        cap = 0
+        if self.declares_upstream_rns:
+            cap |= self.BIND_CAP_HAS_UPSTREAM_RNS
+        return cap
+
+    def _own_pubkey_prefix(self) -> Optional[str]:
+        if len(self._own_pubkey_hex) < self.BIND_PUBKEY_PREFIX_BYTES * 2:
+            return None
+        return self._own_pubkey_hex[: self.BIND_PUBKEY_PREFIX_BYTES * 2]
+
+    def _encode_bind_frame(self, frame_type: int, attempt: int) -> str:
+        own_prefix = self._own_pubkey_prefix()
+        prefix_bytes = (
+            bytes.fromhex(own_prefix) if own_prefix is not None
+            else b"\x00" * self.BIND_PUBKEY_PREFIX_BYTES
+        )
+        body = (
+            bytes([self.BIND_PROTOCOL_VERSION, frame_type, self._bind_capability(), attempt & 0xFF])
+            + prefix_bytes
+        )
+        return self.PEER_MARKER + _z85_encode(body)
+
+    def _decode_bind_frame(self, marker_and_body: str) -> _BindFrame:
+        if not marker_and_body.startswith(self.PEER_MARKER):
+            raise ValueError("missing bind-frame marker")
+        raw = _z85_decode(marker_and_body[len(self.PEER_MARKER):])
+        if len(raw) != self.BIND_FRAME_RAW_SIZE:
+            raise ValueError(f"bind frame wrong length: {len(raw)} (expected {self.BIND_FRAME_RAW_SIZE})")
+
+        version, frame_type, cap, attempt = raw[0], raw[1], raw[2], raw[3]
+        if version != self.BIND_PROTOCOL_VERSION:
+            raise ValueError(f"unsupported bind-frame version {version}")
+        if frame_type not in (self.BIND_TYPE_REQUEST, self.BIND_TYPE_RESPONSE):
+            raise ValueError(f"unrecognized bind-frame type {frame_type}")
+
+        pubkey_prefix = raw[4:4 + self.BIND_PUBKEY_PREFIX_BYTES].hex()
+        return _BindFrame(version=version, type=frame_type, cap=cap, attempt=attempt, pubkey_prefix=pubkey_prefix)
+
+    def _next_pkt_id(self) -> int:
+        # Only ever called from this interface's own dedicated event loop
+        # (via _send_channel, itself only invoked by _outgoing_worker
+        # running on that same loop) -- no lock needed, since coroutines
+        # on one asyncio loop never run concurrently with each other.
+        pkt_id = self._pkt_id_counter
+        self._pkt_id_counter = (self._pkt_id_counter + 1) & 0xFFFF
+        return pkt_id
+
+    def _fragment_payload(self, data: bytes) -> list:
+        """Splits `data` into chunks of at most the CHANNEL multi-fragment
+        per-fragment budget. Caller (_send_channel_multifragment) already
+        guarantees that budget is positive and `data` is non-empty --
+        this only ever runs for a packet already established to be too
+        large for the fast-path single-fragment budget."""
+        per_fragment = self._channel_multifragment_payload_budget()
+        return [data[i:i + per_fragment] for i in range(0, len(data), per_fragment)]
+
+    def _fragment_direct_payload(self, data: bytes) -> list:
+        """DIRECT's own sibling of `_fragment_payload` above -- same
+        chunking logic, DIRECT's own (larger, no-name-prefix-cost) budget.
+        Milestone 6, rare in practice (`wire_format_design.md`'s
+        constraint one: everything but ANNOUNCE comfortably fits one
+        DIRECT message, and ANNOUNCE never goes DIRECT in this design)."""
+        per_fragment = self._direct_multifragment_payload_budget()
+        return [data[i:i + per_fragment] for i in range(0, len(data), per_fragment)]
+
+    def _fragment_spacing_range(self, hop_count: Optional[int]) -> "tuple[float, float]":
+        """The tiered inter-fragment spacing rule from
+        docs/reliability_engine_design.md §2. `hop_count` is `0` for a
+        confirmed zero-hop (direct RF neighbor, no repeater) audience, a
+        positive int for a confirmed N-hop audience, or `None` when it's
+        unknown or the audience spans mixed depths with any unknown
+        member -- both cases the design's own standing rule ("missing
+        data always gets the conservative treatment") maps to the same
+        flat fallback. For a mixed *all-known* audience, the caller is
+        responsible for resolving that to a single `hop_count` first, by
+        the maximum hop count present (§2's mixed-known-hop rule) --
+        this method only implements per-value tier selection, since
+        Milestone 2 has no audience/topology concept yet to do that
+        resolution against (every real call today passes `None`)."""
+        if hop_count == 0:
+            return (self.fragment_delay_zero_hop_min_s, self.fragment_delay_zero_hop_max_s)
+        if hop_count is not None and hop_count >= 1:
+            return (
+                self.fragment_delay_per_hop_min_s * hop_count,
+                self.fragment_delay_per_hop_max_s * hop_count,
+            )
+        return (self.fragment_delay_min_s, self.fragment_delay_max_s)
+
+    # -------------------------------------------------------------------
+    # RNS packet-header classification (docs/reliability_engine_design.md
+    # §3, §9) -- read-only, decrypts nothing (this interface's security
+    # model: confidentiality/authentication are RNS's job one layer up).
+    # -------------------------------------------------------------------
+
+    def _parse_rns_header(self, data: bytes) -> Optional[_RnsHeader]:
+        if len(data) < 2:
+            return None
+        flags = data[0]
+        header_type = (flags & 0x40) >> 6
+        packet_type = flags & 0x03
+        destination_type = (flags >> 2) & 0x03
+        dst_len = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+        # HEADER_2 (in-transport) packets carry a transport_id field before
+        # destination_hash; HEADER_1 packets don't (confirmed directly
+        # against RNS.Packet.unpack()) -- destination_hash is Milestone 5's
+        # own addition, read here once, alongside the fields Milestone 3
+        # already reads, rather than re-parsing this same layout a second
+        # time at every routing-decision call site.
+        dst_offset = (2 + dst_len) if header_type == 1 else 2
+        context_offset = (2 + 2 * dst_len) if header_type == 1 else (2 + dst_len)
+        destination_hash = (
+            data[dst_offset:dst_offset + dst_len] if len(data) >= dst_offset + dst_len else None
+        )
+        context = data[context_offset] if len(data) > context_offset else None
+        return _RnsHeader(
+            packet_type=packet_type,
+            destination_type=destination_type,
+            context=context,
+            header_type=header_type,
+            destination_hash=destination_hash,
+        )
+
+    def _compute_truncated_hash(self, data: bytes, header_type: int) -> Optional[bytes]:
+        """Replicates `RNS.Packet.get_hashable_part()`/`getTruncatedHash()`
+        (confirmed byte-for-byte against a real constructed `RNS.Packet`
+        while this milestone was built: `packet.generate_proof_destination()
+        .hash` matched this exact computation) -- the value RNS itself
+        would use as a PROOF's own destination-hash field for `data`,
+        needed for §7's PROOF-correlation table. Calls the real
+        `RNS.Identity.truncated_hash()` rather than re-deriving the hash
+        algorithm -- only the framing (which header bytes are hashable) is
+        reimplemented here, per this interface's security model (it reads
+        cleartext header structure, never anything cryptographic)."""
+        dst_len = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+        offset = (dst_len + 2) if header_type == 1 else 2
+        if len(data) < 1 or len(data) < offset:
+            return None
+        hashable_part = bytes([data[0] & 0b00001111]) + data[offset:]
+        return RNS.Identity.truncated_hash(hashable_part)
+
+    def _priority_tier(self, header: Optional[_RnsHeader]) -> int:
+        """docs/reliability_engine_design.md §3's original two-tier
+        scheme, widened per §9 to also catch RNS's own give-up/
+        connection-alive signals by context byte, not just packet type --
+        a RESOURCE_ICL/RESOURCE_RCL/LINKCLOSE/KEEPALIVE/etc. packet is
+        packet_type=DATA with a distinguishing context, not one of the
+        LINK_REQUEST/PROOF packet *types* handled by the first check
+        below. Widened again 2026-09-16 to a third tier, `PRIORITY_LOW`,
+        for PATH_RESPONSE specifically -- see that constant's own
+        comment for the field data behind it."""
+        if header is None:
+            return self.PRIORITY_NORMAL
+        if header.packet_type in (RNS.Packet.LINKREQUEST, RNS.Packet.PROOF):
+            return self.PRIORITY_HANDSHAKE
+        if header.context is not None:
+            if header.context in (RNS.Packet.RESOURCE_PRF, RNS.Packet.RESOURCE_ICL, RNS.Packet.RESOURCE_RCL):
+                return self.PRIORITY_HANDSHAKE
+            # KEEPALIVE(0xFA)..LRPROOF(0xFF) -- RNS core's own boundary,
+            # confirmed directly against RNS/Transport.py's own
+            # `packet.context >= RNS.Packet.KEEPALIVE and packet.context
+            # <= RNS.Packet.LRPROOF` check, not re-derived by guessing
+            # which individual context values feel latency-sensitive.
+            if RNS.Packet.KEEPALIVE <= header.context <= RNS.Packet.LRPROOF:
+                return self.PRIORITY_HANDSHAKE
+            if header.context == RNS.Packet.PATH_RESPONSE:
+                return self.PRIORITY_LOW
+        return self.PRIORITY_NORMAL
+
+    def _retry_extra_for(self, header: Optional[_RnsHeader]) -> int:
+        """docs/reliability_engine_design.md §2's per-traffic-class extra
+        CHANNEL retry-pass budget. See _configure_retry's comment on why
+        every ANNOUNCE gets the spontaneous-announce default for now
+        (path-response detection is Milestone 5). `LINK_REQUEST` and a
+        CHANNEL-fallback `PROOF` correctly fall through to the bare-DATA
+        default below -- neither has `destination_type == LINK` (a
+        LINK_REQUEST addresses the target Destination directly, before
+        any Link exists to carry it; PROOF's destination type mirrors
+        whatever it's proving), exactly as §9 describes."""
+        if header is None:
+            return 0
+        if header.packet_type == RNS.Packet.ANNOUNCE:
+            return self.announce_retransmit_extra
+        if header.packet_type == RNS.Packet.DATA and header.destination_type == RNS.Destination.PLAIN:
+            return self.path_req_retransmit_extra
+        if header.destination_type == RNS.Destination.LINK:
+            return self.ordinary_data_link_retransmit_extra
+        return self.ordinary_data_bare_retransmit_extra
+
+    def _spawn_background_task(self, coro) -> "asyncio.Task":
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._log_background_task_exception)
+        return task
+
+    def _log_background_task_exception(self, task: "asyncio.Task") -> None:
+        """Code-review fix: `_outgoing_worker` wraps its own synchronously-
+        awaited `_send_outgoing_packet` call in try/except and logs any
+        exception via `RNS.log` -- but every fire-and-forget send this
+        interface spawns instead (`_send_direct_packet`,
+        `_send_direct_supplement`, the bootstrap `_discover_path_coalesced`
+        call from `_register_peer`, etc.) only ever reaches this
+        interface's own observability surface if it happens to guard its
+        own internal awaits already; an exception that does escape one is
+        otherwise only ever surfaced via asyncio's own default "Task
+        exception was never retrieved" warning at garbage-collection time
+        -- invisible to `RNS.log`, to the periodic `_stats_loop` snapshot,
+        and to anyone monitoring this interface the way CLAUDE.md's
+        observability requirement expects. This done-callback (attached to
+        every task `_spawn_background_task` creates) closes that gap."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            RNS.log(f"{self}: background task raised an unhandled exception: {exc}", RNS.LOG_ERROR)
+            RNS.log(
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                RNS.LOG_ERROR,
+            )
+
+    # -------------------------------------------------------------------
+    # Outgoing (RNS core -> this interface)
+    # -------------------------------------------------------------------
+
+    def process_outgoing(self, data):
+        # Called synchronously by RNS core on RNS's own thread -- must
+        # never block. Per docs/reliability_engine_design.md's sync/async
+        # bridge notes, this does only a plain thread-safe queue.put and
+        # returns immediately; _outgoing_worker (running on this
+        # interface's own event loop) does the actual encode/send. The
+        # RNS header is parsed once, here, and carried through the queue
+        # item -- both the priority decision (now) and the retry-extra
+        # decision (_send_outgoing_packet, once this item is dequeued)
+        # read the same parse rather than redoing it.
+        if not self.online or self.detached:
+            return
+        raw = bytes(data)
+        header = self._parse_rns_header(raw)
+        priority = self._priority_tier(header)
+        seq = next(self._outqueue_seq)
+        try:
+            self._outqueue.put_nowait((priority, seq, raw, header))
+        except queue.Full:
+            self._outgoing_dropped_total += 1
+            RNS.log(
+                f"{self}: dropping outgoing packet ({len(data)} bytes) -- "
+                f"outgoing queue is full ({self.OUTQUEUE_MAXSIZE} items "
+                f"already queued).",
+                RNS.LOG_WARNING,
+            )
+
+    async def _outgoing_worker(self):
+        """Drains self._outqueue via a thread-pool executor, so the
+        queue's blocking get() never blocks this event loop while
+        waiting for the next packet -- the other half of the
+        process_outgoing split above. Milestone 3 upgraded this from a
+        plain FIFO to the two-tier PriorityQueue docs/
+        reliability_engine_design.md §3 specifies, without changing this
+        drain pattern. Exits cleanly on _OUTQUEUE_SHUTDOWN_SENTINEL,
+        which detach() places in the queue (a plain task-cancel can't
+        interrupt the blocking get() itself, since it runs on a separate
+        executor thread)."""
+        loop = asyncio.get_running_loop()
+        while True:
+            priority, seq, data, header = await loop.run_in_executor(None, self._outqueue.get)
+            if data is None:
+                self._outqueue.task_done()
+                return
+            try:
+                await self._send_outgoing_packet(data, header)
+            except Exception as exc:
+                RNS.log(
+                    f"{self}: unexpected error sending an outgoing packet: {exc}",
+                    RNS.LOG_ERROR,
+                )
+            finally:
+                self._outqueue.task_done()
+
+    def _in_small_mesh_mode(self) -> bool:
+        """True when 1-2 peers are bound (SMALL_MESH_DIRECT_ONLY_MAX_PEERS)
+        -- deliberately False at exactly 0 bound peers, even though 0 is
+        also "<= 2": with nobody bound yet there is no DIRECT target to
+        send to at all, and CHANNEL is the only way this node's very
+        first peer can ever be discovered in the first place (bind frames
+        themselves ride CHANNEL regardless of this mode). Re-evaluated on
+        every send, not cached -- a peer expiring or a new one binding
+        moves this node in or out of small-mesh mode automatically, with
+        no restart and no config to touch."""
+        peer_count = len(self._peers)
+        return 0 < peer_count <= self.SMALL_MESH_DIRECT_ONLY_MAX_PEERS
+
+    def _all_bound_peer_prefixes(self) -> list:
+        """Every bound peer, most-recently-seen first -- deliberately
+        unfiltered (no router-capability check, no cap) and independent
+        of `bootstrap_direct_supplement_cap`/`path_request_direct_
+        supplement_cap`, which exist to bound a *supplement* riding
+        alongside a mandatory broadcast and would otherwise silently
+        under-cover this mode's job of reaching every peer once CHANNEL
+        is skipped entirely."""
+        peers = sorted(self._peers.values(), key=lambda p: p.last_seen, reverse=True)
+        return [p.pubkey_prefix for p in peers]
+
+    async def _send_direct_to_all_peers(self, data: bytes, priority: int = PRIORITY_NORMAL) -> None:
+        """Small-mesh replacement for a CHANNEL broadcast: one DIRECT
+        copy to every bound peer instead, each spawned independently
+        (never gated on another's outcome, same reasoning as every other
+        fire-and-forget send in this dispatcher). Reuses
+        `_send_direct_supplement` unchanged for the actual send -- it
+        already handles path-resolution-with-discovery, spacing, and
+        bare-vs-fragmented dispatch correctly regardless of caller."""
+        for peer_prefix in self._all_bound_peer_prefixes():
+            self._spawn_background_task(
+                self._send_direct_supplement(data, peer_prefix, trigger_discovery=True, priority=priority)
+            )
+
+    def _unknown_dest_in_backoff(self, destination_hash: Optional[bytes]) -> bool:
+        if destination_hash is None:
+            return False
+        until = self._unknown_dest_backoff_until.get(destination_hash)
+        return until is not None and time.monotonic() < until
+
+    def _record_unknown_dest_attempt(self, destination_hash: Optional[bytes]) -> None:
+        """Call once per outgoing packet that actually triggers a DIRECT-
+        bootstrap attempt for `destination_hash` (not once per packet
+        merely addressed to it while already in backoff -- see call
+        sites in `_dispatch_outgoing_packet`). No positive "it failed"
+        signal exists at this interface's own layer (a real MeshCore ACK
+        from the bound peer only confirms *local* delivery to that peer,
+        never that whatever it's being asked to relay ever replied), so
+        this uses the same proxy `_send_path_request`'s own supplement
+        selection implicitly relies on: repeated attempts with §7's token
+        still never learned for this exact destination is itself the
+        signal, checked lazily here rather than via any explicit success/
+        failure callback threaded back from the send."""
+        if destination_hash is None:
+            return
+        attempts = self._unknown_dest_attempts.get(destination_hash, 0) + 1
+        self._unknown_dest_attempts[destination_hash] = attempts
+        if attempts >= self.UNKNOWN_DEST_BOOTSTRAP_FAILURE_THRESHOLD:
+            cooldown = min(
+                self.UNKNOWN_DEST_BOOTSTRAP_BASE_COOLDOWN_S * (
+                    self.UNKNOWN_DEST_BOOTSTRAP_BACKOFF_FACTOR
+                    ** (attempts - self.UNKNOWN_DEST_BOOTSTRAP_FAILURE_THRESHOLD)
+                ),
+                self.UNKNOWN_DEST_BOOTSTRAP_MAX_COOLDOWN_S,
+            )
+            self._unknown_dest_backoff_until[destination_hash] = time.monotonic() + cooldown
+            RNS.log(
+                f"{self}: {attempts} DIRECT-bootstrap attempt(s) to destination "
+                f"{destination_hash.hex()} with no token ever learned for it -- "
+                f"backing off {cooldown:.0f}s rather than spending more airtime "
+                f"on a destination that doesn't seem reachable through this "
+                f"node's bound peer(s).",
+                RNS.LOG_WARNING,
+            )
+
+    def _clear_unknown_dest_backoff(self, destination_hash: bytes) -> None:
+        self._unknown_dest_attempts.pop(destination_hash, None)
+        self._unknown_dest_backoff_until.pop(destination_hash, None)
+
+    def _path_response_rate_limited(self, destination_hash: Optional[bytes]) -> bool:
+        """True if an outgoing PATH_RESPONSE for `destination_hash` was
+        already sent within PATH_RESPONSE_RATE_LIMIT_WINDOW_S -- see that
+        constant's own docstring for why. A `None` hash (shouldn't happen
+        for a real PATH_RESPONSE, but nothing here assumes it can't) is
+        never rate-limited, matching `_unknown_dest_in_backoff`'s same
+        fail-open convention for a missing hash. Records the send time as
+        a side effect only on the not-limited path -- the caller is
+        expected to actually send in that case, so this doubles as the
+        "record this attempt" step without a separate call."""
+        if destination_hash is None:
+            return False
+        now = time.monotonic()
+        last_sent = self._path_response_last_sent_at.get(destination_hash)
+        if last_sent is not None and now - last_sent < self.PATH_RESPONSE_RATE_LIMIT_WINDOW_S:
+            return True
+        self._path_response_last_sent_at[destination_hash] = now
+        return False
+
+    async def _send_outgoing_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+        """Entry point the outgoing worker calls for every packet -- logs
+        the classification debug line, then either delays an LRPROOF
+        (see below) or dispatches immediately via
+        `_dispatch_outgoing_packet`, which has the actual three-way
+        routing logic."""
+        # Code-review fix: CLAUDE.md's observability requirement names
+        # "transport chosen, priority tier, spacing tier" as things that
+        # "must be logged... build it in at M0/M1, don't bolt it on once
+        # the real logic is working" -- spacing tier already is (every
+        # CHANNEL/DIRECT multi-fragment send logs its own spacing), but
+        # priority tier and the DIRECT-vs-broadcast routing decision
+        # itself never were: there was no way, from logs alone, to tell
+        # which classification/route a given outgoing packet actually
+        # took. One debug line per packet, correlatable against the
+        # transport-specific send lines that already follow it.
+        self._debug(
+            f"outgoing packet classification: "
+            f"packet_type={self._PACKET_TYPE_NAMES.get(header.packet_type, header.packet_type) if header else 'unknown'} "
+            f"destination_type={self._DESTINATION_TYPE_NAMES.get(header.destination_type, header.destination_type) if header else 'unknown'} "
+            f"priority={self._priority_tier(header)} "
+            f"destination_hash={header.destination_hash.hex() if header and header.destination_hash else None}."
+        )
+
+        # User-requested fix (2026-09-15, real NomadNet field testing):
+        # RNS.Link's own keepalive/staleness timing (Link.py) is computed
+        # exactly once, from the initial LINK_REQUEST<->LRPROOF handshake
+        # round trip (`self.rtt = time.time() - self.request_time`), and
+        # never recalibrated afterward: `keepalive = clamp(rtt * 205.7,
+        # 5s, 360s)`, `stale_time = keepalive * 2`. That initial handshake
+        # is small and uncontended, so it tends to complete fast (tens of
+        # ms) -- giving RNS an optimistic RTT sample that locks in a short
+        # keepalive/stale_time (observed: ~15-18s / ~30-36s) even though
+        # this transport's real round trips, once real traffic queues up
+        # behind the DIRECT serialization fix above, routinely exceed
+        # that. The Link then looks "stale" to RNS and gets torn down and
+        # silently re-established -- re-sending already-in-flight content
+        # for no reason, with no user action. Confirmed directly against
+        # RNS/Link.py: `Link.rtt`/`keepalive` have no config-file hook at
+        # all, so this can't be fixed from ~/.reticulum/config, and
+        # `Link.py` never reads this interface's own `bitrate`.
+        #
+        # Fix: deliberately delay sending an outgoing LRPROOF (the proof
+        # that answers a LINK_REQUEST, and the exact packet whose
+        # arrival time RNS measures for that one-time RTT sample) so the
+        # measured RTT lands comfortably past `KEEPALIVE_MAX_RTT` (1.75s),
+        # pinning every new Link's keepalive/stale_time at RNS's own
+        # maximum (360s/720s) instead of an unrepresentatively short
+        # value. This targets only LRPROOF specifically -- a single small
+        # packet sent once per Link establishment, never per message --
+        # so it adds a one-time delay to establishing a *new* Link, not
+        # to any ongoing CHANNEL/DIRECT application traffic, and RNS's
+        # own establishment_timeout (`6s * hops + 360s` -- Link.py,
+        # ESTABLISHMENT_TIMEOUT_PER_HOP/KEEPALIVE) has enormous headroom
+        # over this delay, so it can never itself cause a link-
+        # establishment failure.
+        if header is not None and header.context == RNS.Packet.LRPROOF:
+            self._debug(
+                f"routing decision: LRPROOF -- delaying "
+                f"{self.LINK_PROOF_RTT_INFLATION_DELAY_S}s before send so "
+                f"RNS's own Link keepalive/staleness timing (calibrated "
+                f"from this exact round trip) reflects this transport's "
+                f"real latency rather than an optimistic handshake sample."
+            )
+            self._capture_outgoing(header, data, "lrproof_delayed")
+            self._spawn_background_task(self._send_delayed_link_proof(data, header))
+            return
+
+        # User-requested fix (2026-09-15, real 2-hop repeater field
+        # testing): see PATH_RESPONSE_RATE_LIMIT_WINDOW_S's own docstring.
+        # A remote client stuck re-requesting the same path every few
+        # seconds shouldn't get this node re-keying the radio to answer
+        # every single one -- drop the repeat, not the first answer.
+        if header is not None and header.context == RNS.Packet.PATH_RESPONSE:
+            if self._path_response_rate_limited(header.destination_hash):
+                self._outgoing_dropped_total += 1
+                self._capture_outgoing(header, data, "path_response_rate_limited")
+                self._debug(
+                    f"routing decision: PATH_RESPONSE for destination "
+                    f"{header.destination_hash.hex() if header.destination_hash else None} "
+                    f"-- dropped, already answered within "
+                    f"{self.PATH_RESPONSE_RATE_LIMIT_WINDOW_S}s."
+                )
+                return
+
+        await self._dispatch_outgoing_packet(data, header)
+
+    async def _send_delayed_link_proof(self, data: bytes, header: _RnsHeader) -> None:
+        await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
+        if self.detached or not self.online:
+            return
+        await self._dispatch_outgoing_packet(data, header)
+
+    async def _dispatch_outgoing_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+        """docs/routing_decisions.md's routing dispatcher -- the three
+        outgoing situations, in the doc's own order:
+
+        1. ANNOUNCE: broadcast only, UNLESS small-mesh mode applies (see
+           `_in_small_mesh_mode`), in which case it goes DIRECT to every
+           bound peer instead -- DIRECT fragmentation handles an
+           announce's size the same way CHANNEL's own multi-fragment
+           shape would. There's also no way for this interface to
+           actually detect "this outgoing ANNOUNCE is answering peer X's
+           path request" (RNS core doesn't expose that context to the
+           interface layer), so outside small-mesh mode this remains a
+           clean, total deferral, not a partial one.
+        2. DATA+PLAIN (path request): broadcast plus a DIRECT supplement
+           to a capped number of known router-capability peers with an
+           already-resolved path, UNLESS small-mesh mode applies, in
+           which case it goes DIRECT to every bound peer instead (no
+           router-capability filter -- see _send_path_request).
+        3. Everything else (DATA/SINGLE, LINK_REQUEST, PROOF): DIRECT,
+           unconditionally, if this interface's own record shows a
+           resolved path to the packet's peer (unaffected by small-mesh
+           mode -- already DIRECT-only). Otherwise: broadcast fallback
+           plus a capped DIRECT bootstrap-supplement, UNLESS small-mesh
+           mode applies, in which case it goes DIRECT to every bound peer
+           instead of broadcasting at all. "Resolved path known" is
+           always this interface's own `_resolved_paths` record, never a
+           fresh device-table read (routing_decisions.md's explicit
+           instruction, carried over from path_discovery_spec.md's own
+           persistence-failure note).
+        """
+        if header is not None and header.packet_type == RNS.Packet.DATA and header.destination_type == RNS.Destination.PLAIN:
+            await self._send_path_request(data, header)
+            return
+
+        if header is not None and header.packet_type != RNS.Packet.ANNOUNCE:
+            peer_prefix = self._resolve_routing_peer(header)
+            if peer_prefix is not None:
+                self._debug(f"routing decision: known peer {peer_prefix!r} -> DIRECT-primary.")
+                self._capture_outgoing(header, data, "direct_primary", target_peer=peer_prefix)
+                # A known peer routes to _send_direct_packet regardless of
+                # whether a path is *currently* resolved -- Milestone 6
+                # folds discover_path()-before-broadcast-fallback into
+                # that method itself (§8), so this dispatcher no longer
+                # gates DIRECT eligibility on _resolved_paths membership
+                # the way Milestone 5 did; a peer with no (or a freshly
+                # stale-path-reset) resolved path still belongs on the
+                # DIRECT path, not an immediate broadcast fallback.
+                # DIRECT is the primary transport here, not a supplement --
+                # its own ACK wait can take several seconds, so it's spawned
+                # rather than awaited, exactly like path discovery and the
+                # CHANNEL extra-retry passes above: one slow operation must
+                # not stall the worker from draining the next queued packet.
+                self._spawn_background_task(self._send_direct_packet(data, header, peer_prefix))
+                return
+
+            # Milestone 6 fix for a real field-diagnosed gap
+            # (peer_discovery_design.md §7): opportunistic RNS-token
+            # learning only ever learns from an incoming DIRECT receive
+            # (CHANNEL carries no sender identity at all, so there's
+            # nothing safer to learn from) -- meaning two bound peers
+            # that have never yet exchanged a single DIRECT message have
+            # no way to ever originate one, since neither side has a
+            # token yet. Fix: broadcast (below, mandatory, unchanged)
+            # plus a DIRECT-bootstrap-supplement to a capped number of
+            # bound peers. Safe: it adds no new exposure beyond what the
+            # broadcast already does (RNS's own encryption protects
+            # content regardless of transport; a DIRECT copy reaching a
+            # bound peer who isn't actually the intended recipient is
+            # exactly as cryptographically inert to them as the CHANNEL
+            # copy they were already going to receive). Self-limiting:
+            # one successful delivery teaches the recipient a real token
+            # immediately (§7's normal mechanism, via
+            # _observe_incoming_rns_packet), after which ordinary
+            # DIRECT-primary routing takes over for that destination and
+            # this supplement never fires for it again.
+            # User-requested fix (2026-09-15, field-diagnosed via packet
+            # capture): every branch below that actually attempts a
+            # DIRECT-bootstrap send for this destination_hash first
+            # checks/records against _unknown_dest_in_backoff -- see that
+            # method's own docstring and the class constants above for
+            # why (an unreachable-through-this-peer destination retried
+            # on its own schedule forever, with no memory of past
+            # attempts, confirmed costing real repeated airtime for an
+            # LXMF propagation node this node's only MeshCore peer simply
+            # has no path to).
+            backed_off = self._unknown_dest_in_backoff(header.destination_hash)
+            if self._in_small_mesh_mode():
+                if backed_off:
+                    self._debug(
+                        f"routing decision: no known peer for this destination -- "
+                        f"backing off further DIRECT attempts (repeated tries, no "
+                        f"token ever learned for it); dropping rather than "
+                        f"spending more airtime."
+                    )
+                    self._capture_outgoing(header, data, "unknown_dest_backoff_drop")
+                    self._outgoing_dropped_total += 1
+                    return
+                self._debug(
+                    f"routing decision: no known peer for this destination, "
+                    f"small mesh ({len(self._peers)} bound peer(s)) -- DIRECT "
+                    f"to every bound peer instead of CHANNEL."
+                )
+                self._capture_outgoing(
+                    header, data, "small_mesh_direct_all_unknown_dest",
+                    candidate_peers=self._all_bound_peer_prefixes(),
+                )
+                self._record_unknown_dest_attempt(header.destination_hash)
+                await self._send_direct_to_all_peers(data, priority=self._priority_tier(header))
+                return
+            bootstrap_targets = [] if backed_off else self._select_bootstrap_supplement_targets()
+            for bootstrap_peer_prefix in bootstrap_targets:
+                self._spawn_background_task(
+                    self._send_direct_supplement(
+                        data, bootstrap_peer_prefix, trigger_discovery=True,
+                        priority=self._priority_tier(header),
+                    )
+                )
+            if bootstrap_targets:
+                self._record_unknown_dest_attempt(header.destination_hash)
+            self._debug(
+                f"routing decision: no known peer for this destination -- "
+                f"CHANNEL broadcast"
+                + (f" + bootstrap DIRECT supplement to {bootstrap_targets}" if bootstrap_targets else "")
+                + (" (DIRECT supplement backed off -- repeated no-reply attempts)" if backed_off else "")
+                + "."
+            )
+            self._capture_outgoing(
+                header, data,
+                "unknown_dest_backoff_broadcast_only" if backed_off else "broadcast_bootstrap_supplement",
+                candidate_peers=bootstrap_targets,
+            )
+        elif header is not None and header.packet_type == RNS.Packet.ANNOUNCE:
+            if self._in_small_mesh_mode():
+                self._debug(
+                    f"routing decision: ANNOUNCE, small mesh "
+                    f"({len(self._peers)} bound peer(s)) -- DIRECT to every "
+                    f"bound peer instead of CHANNEL."
+                )
+                self._capture_outgoing(
+                    header, data, "small_mesh_direct_all_announce",
+                    candidate_peers=self._all_bound_peer_prefixes(),
+                )
+                await self._send_direct_to_all_peers(data, priority=self._priority_tier(header))
+                return
+            self._debug("routing decision: ANNOUNCE -> CHANNEL broadcast only (never DIRECT, by design).")
+            self._capture_outgoing(header, data, "broadcast_announce_only")
+        else:
+            self._capture_outgoing(header, data, "broadcast_fallback")
+
+        await self._send_broadcast_packet(data, header)
+
+    def _select_bootstrap_supplement_targets(self) -> list:
+        """Milestone 6's DIRECT-bootstrap-supplement target selection:
+        ANY bound peer, not filtered by router capability the way
+        `_select_direct_supplement_targets` (path requests) is -- the
+        goal here isn't "find a router to forward through," it's "this
+        specific bound peer might be the actual RNS-level counterpart
+        for a destination this interface has no token for yet," so
+        capability is irrelevant. Most-recently-seen first, capped
+        (`bootstrap_direct_supplement_cap`) so this doesn't fan out to
+        every bound peer as the peer count grows."""
+        peers = sorted(self._peers.values(), key=lambda p: p.last_seen, reverse=True)
+        return [p.pubkey_prefix for p in peers[: self.bootstrap_direct_supplement_cap]]
+
+    async def _send_broadcast_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+        """The CHANNEL broadcast send, exactly as Milestones 1-3 built it
+        -- extracted unchanged out of Milestone 3's own
+        `_send_outgoing_packet` body so Milestone 5's dispatcher above can
+        call it both as the ordinary case-1/no-resolved-path fallback
+        (awaited directly, preserving the original serialization) and as
+        one half of the path-request broadcast+DIRECT-supplement pattern
+        (spawned as an independent background task there instead --
+        see _send_path_request)."""
+        retry_extra = self._retry_extra_for(header)
+        pkt_id = self._next_pkt_id()
+
+        await self._send_channel_pass(data, pkt_id, attempt=0)
+
+        # §1-§2: each extra pass is scheduled unconditionally at send
+        # time (CHANNEL has no ACK to react to) as an independent
+        # background task, so a multi-second-to-tens-of-seconds jittered
+        # wait for pkt_id's own retry never blocks the worker from moving
+        # on to the next queued packet.
+        for attempt in range(1, retry_extra + 1):
+            self._spawn_background_task(self._delayed_retry_pass(data, pkt_id, attempt))
+
+    async def _send_path_request(self, data: bytes, header: _RnsHeader) -> None:
+        """docs/routing_decisions.md's path-request case: always
+        broadcast, plus a DIRECT copy to a capped number of known
+        router-capability peers that already have a resolved path --
+        cheap (path requests are small, comfortably one fragment) and
+        meaningfully more reliable than the broadcast alone. Never
+        triggers path discovery just to enable this supplement: only
+        already-resolved peers qualify.
+
+        **Resolved: fired concurrently, neither gated on the other's
+        outcome** (the doc's own explicit resolution) -- both the
+        broadcast and every DIRECT supplement are spawned as independent
+        background tasks rather than one awaiting the other, so this
+        coroutine (and so the outgoing worker) returns immediately. They
+        still funnel through the same single radio at the command layer
+        (`_command_lock`), and `_send_direct_supplement` still waits out
+        this design's own minimum inter-message gap before actually
+        transmitting, so they're never issued back-to-back into the same
+        half-duplex-deaf window either.
+
+        In small-mesh mode (`_in_small_mesh_mode`), this whole broadcast-
+        plus-supplement shape is replaced: DIRECT to every bound peer,
+        not just router-capability ones with an already-resolved path,
+        and no CHANNEL broadcast at all. The router-capability filter
+        exists to keep a *supplement* small as peer count grows -- with
+        only one or two peers total there's no growth to bound, and a
+        peer this node hasn't confirmed as a router yet still deserves a
+        chance to answer (CHANNEL would have reached it too); this also
+        does trigger discovery for an unresolved peer, since there is no
+        broadcast left to fall back on if it doesn't."""
+        if self._in_small_mesh_mode():
+            self._debug(
+                f"routing decision: path request, small mesh "
+                f"({len(self._peers)} bound peer(s)) -- DIRECT to every "
+                f"bound peer instead of CHANNEL."
+            )
+            self._capture_outgoing(
+                header, data, "small_mesh_direct_all_path_request",
+                candidate_peers=self._all_bound_peer_prefixes(),
+            )
+            await self._send_direct_to_all_peers(data, priority=self._priority_tier(header))
+            return
+        self._debug("routing decision: path request -> CHANNEL broadcast + router-peer DIRECT supplement.")
+        supplement_targets = self._select_direct_supplement_targets()
+        self._capture_outgoing(
+            header, data, "broadcast_path_request_supplement", candidate_peers=supplement_targets,
+        )
+        self._spawn_background_task(self._send_broadcast_packet(data, header))
+        for peer_prefix in supplement_targets:
+            self._spawn_background_task(
+                self._send_direct_supplement(data, peer_prefix, priority=self._priority_tier(header))
+            )
+
+    def _select_direct_supplement_targets(self) -> list:
+        """docs/routing_decisions.md's path-request DIRECT-supplement
+        target selection: known router-capability peers (this project's
+        own bind-frame protocol bit -- peer_discovery_design.md §2's hard
+        rule against the old design's shipped `can_route` mislabeling bug:
+        never anything read off the MeshCore contact table, which has no
+        such field at all) that already have a resolved path, capped and
+        most-recently-confirmed first -- not unconditionally every known
+        router as the router count grows."""
+        candidates = [
+            peer for peer in self._peers.values()
+            if peer.has_upstream_rns and peer.pubkey_prefix in self._resolved_paths
+        ]
+        candidates.sort(key=lambda p: self._resolved_paths[p.pubkey_prefix].resolved_at, reverse=True)
+        return [p.pubkey_prefix for p in candidates[: self.path_request_direct_supplement_cap]]
+
+    async def _send_direct_supplement(
+        self, data: bytes, peer_prefix: str, trigger_discovery: bool = False,
+        priority: int = PRIORITY_NORMAL,
+    ) -> None:
+        """A DIRECT copy of `data` to one bound peer, fired alongside a
+        mandatory broadcast this method never gates or is gated by (see
+        `_send_path_request`'s and the bootstrap-supplement dispatcher's
+        own docstrings). `trigger_discovery` distinguishes the two
+        callers' different preconditions: the path-request supplement
+        (`_select_direct_supplement_targets`) never triggers discovery
+        just to enable itself (routing_decisions.md's explicit
+        instruction -- the broadcast already covers this peer regardless);
+        the DIRECT-bootstrap-supplement (Milestone 6,
+        `_select_bootstrap_supplement_targets`) deliberately does, since
+        triggering discovery for a not-yet-token-bootstrapped peer is the
+        whole point of that mechanism."""
+        resolved = self._resolved_paths.get(peer_prefix)
+        if resolved is None:
+            if not trigger_discovery:
+                return
+            resolved = await self._discover_path_coalesced(peer_prefix)
+            if resolved is None:
+                return
+
+        # This design's own minimum inter-message gap (reliability_engine_
+        # design.md §2), scaled by this specific peer's own known hop
+        # depth when available -- routing_decisions.md's fix for the
+        # half-duplex-deaf-repeater collision risk this supplement would
+        # otherwise recreate against the broadcast's own fragment(s) if
+        # fired with zero spacing.
+        spacing_min, spacing_max = self._fragment_spacing_range(hop_count=resolved.out_path_len)
+        await asyncio.sleep(random.uniform(spacing_min, spacing_max))
+        if self.detached or not self.online:
+            return
+
+        contact = self._resolve_contact(peer_prefix)
+        target = contact.get("public_key") if contact is not None else None
+        if not target:
+            return
+        # Bare in the common case (a path request always fits DIRECT's
+        # bare budget), but the bootstrap-supplement caller can carry an
+        # arbitrary-size DATA/LINK_REQUEST/PROOF packet, so this goes
+        # through the same bare-or-fragmented dispatch _send_direct_packet
+        # uses rather than assuming bare unconditionally.
+        ok = await self._send_direct_payload(
+            target, peer_prefix, data, priority=priority, hop_count=resolved.out_path_len,
+        )
+        if ok is None:
+            # Code-review fix: _send_direct_packet's own handling of this
+            # same None-means-too-big-to-attempt contract logs and counts
+            # it; this call site used to just drop the return value,
+            # silently swallowing a supplement that never even tried to
+            # go out with no log line and no _outgoing_dropped_total
+            # increment anywhere -- violating CLAUDE.md's "every drop
+            # decision (with its reason) must be logged" requirement for
+            # this specific transport path. No CHANNEL fallback needed
+            # here (this is only ever a supplement; the mandatory
+            # broadcast this rides alongside already covers delivery).
+            self._outgoing_dropped_total += 1
+            RNS.log(
+                f"{self}: DIRECT supplement to {peer_prefix!r} for a "
+                f"{len(data)}-byte packet never attempted -- exceeds even "
+                f"the fully-fragmented DIRECT budget.",
+                RNS.LOG_WARNING,
+            )
+
+    async def _send_direct_packet(self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str) -> None:
+        """Case 3 of docs/routing_decisions.md's summary table: DIRECT is
+        the primary transport here, not a supplement -- no CHANNEL
+        fallback on an ACK failure, only on the local resolution steps
+        below failing outright (no resolved path even after trying
+        discovery, or no contact/pubkey to send to at all, which this
+        interface's own record being out of sync with the device contact
+        table can cause -- see path_discovery_spec.md's persistence
+        note)."""
+        resolved = self._resolved_paths.get(peer_prefix)
+        if resolved is None:
+            # Milestone 6: docs/reliability_engine_design.md §8's "next
+            # send attempt for this peer goes through discover_path()
+            # first" recovery policy -- covers both a freshly
+            # stale-path-reset peer and one that simply never had a path
+            # resolved yet. Only falls through to broadcast if discovery
+            # itself also fails.
+            resolved = await self._discover_path_coalesced(peer_prefix)
+        if resolved is None:
+            await self._send_broadcast_packet(data, header)
+            return
+
+        contact = self._resolve_contact(peer_prefix)
+        target = contact.get("public_key") if contact is not None else None
+        if not target:
+            await self._send_broadcast_packet(data, header)
+            return
+
+        ok = await self._send_direct_payload(
+            target, peer_prefix, data, priority=self._priority_tier(header), hop_count=resolved.out_path_len,
+        )
+        if ok is None:
+            # Too big even for the fully-fragmented DIRECT budget --
+            # _send_direct_payload already declined to attempt anything.
+            self._outgoing_dropped_total += 1
+            per_fragment_budget = self._direct_multifragment_payload_budget()
+            RNS.log(
+                f"{self}: dropping outgoing DIRECT packet to {peer_prefix!r} "
+                f"({len(data)} bytes) -- exceeds even the fully-fragmented "
+                f"DIRECT budget ({per_fragment_budget * 255} bytes across 255 "
+                f"fragments at {per_fragment_budget} bytes each); falling "
+                f"back to CHANNEL broadcast instead.",
+                RNS.LOG_WARNING,
+            )
+            await self._send_broadcast_packet(data, header)
+            return
+
+        self._capture_direct_send_result(
+            peer_prefix, header.destination_hash if header is not None else None, ok, resolved, len(data),
+        )
+        if not ok:
+            RNS.log(
+                f"{self}: DIRECT send to {peer_prefix!r} did not receive a "
+                f"real delivery ACK (out_path_len={resolved.out_path_len}) -- "
+                f"no CHANNEL fallback for this attempt (routing_decisions.md: "
+                f"DIRECT is the primary transport once a path is resolved, "
+                f"not a supplement); repeated failures will trigger stale-"
+                f"path detection/reset (§8).",
+                RNS.LOG_WARNING,
+            )
+
+    async def _send_direct_payload(
+        self, target: str, peer_prefix: str, data: bytes, priority: int = PRIORITY_NORMAL,
+        hop_count: Optional[int] = None,
+    ) -> Optional[bool]:
+        """Sends `data` DIRECT to `target`, choosing the bare or DIRECT-
+        needs-fragmenting shape automatically based on size -- shared by
+        the DIRECT-primary path (`_send_direct_packet`) and every DIRECT-
+        supplement path (`_send_direct_supplement`) alike, so a
+        supplement carrying an oversized packet fragments exactly the
+        same way a primary send would, rather than assuming bare
+        unconditionally. Returns `None` if `data` is too large even for
+        the fully-fragmented DIRECT budget (nothing was attempted),
+        otherwise whether every fragment (or the single bare message)
+        was actually ACKed."""
+        fastpath_budget = self._direct_payload_budget()
+        if len(data) <= fastpath_budget:
+            return await self._send_direct_with_attempts(
+                target, lambda attempt, d=data: self._encode_direct_bare(d), peer_prefix,
+                priority=priority, hop_count=hop_count,
+            )
+
+        # Milestone 6: DIRECT-needs-fragmenting shape
+        # (wire_format_design.md) -- rare in practice (constraint one:
+        # everything but ANNOUNCE, which never goes DIRECT here,
+        # comfortably fits one DIRECT message), but a real packet can
+        # still exceed it (e.g. a large Resource-transfer DATA packet).
+        per_fragment_budget = self._direct_multifragment_payload_budget()
+        max_total_payload = per_fragment_budget * 255  # frag_total is a 1-byte field
+        if per_fragment_budget <= 0 or len(data) > max_total_payload:
+            return None
+        pkt_id = self._next_pkt_id()
+        return await self._send_direct_fragmented(
+            target, peer_prefix, data, pkt_id, priority=priority, hop_count=hop_count,
+        )
+
+    async def _send_direct_fragmented(
+        self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+    ) -> bool:
+        """docs/reliability_engine_design.md §4's two-pass DIRECT-
+        fragmentation structure, fixed by a logical review specifically
+        to give "only re-drive the still-missing fragments" a concrete
+        trigger: **pass 0** sends every `frag_idx` in order, one at a
+        time -- never several back-to-back without waiting, the same
+        half-duplex-derived rule as CHANNEL's own spacing, here enforced
+        for free by fully awaiting each fragment's own send+ACK(+retry)
+        cycle before starting the next -- each with its own bounded
+        `direct_send_attempts` budget. **Pass 1** re-attempts only
+        whatever never got ACKed in pass 0, in order, each again with a
+        fresh attempt budget. Returns True only if every fragment was
+        eventually ACKed across both passes."""
+        chunks = self._fragment_direct_payload(payload)
+        frag_total = len(chunks)
+        acked = [False] * frag_total
+
+        async def send_one(frag_idx: int) -> bool:
+            return await self._send_direct_with_attempts(
+                target,
+                lambda attempt, c=chunks[frag_idx], fi=frag_idx, ft=frag_total: (
+                    self._encode_channel_multifragment(c, pkt_id, fi, ft, attempt)
+                ),
+                peer_prefix,
+                pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
+                hop_count=hop_count,
+            )
+
+        for frag_idx in range(frag_total):
+            acked[frag_idx] = await send_one(frag_idx)
+            if self.detached or not self.online:
+                return False
+
+        missing = [i for i in range(frag_total) if not acked[i]]
+        if missing:
+            self._debug(
+                f"DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r}: "
+                f"pass 1 re-driving {len(missing)}/{frag_total} still-missing "
+                f"fragment(s)."
+            )
+            for frag_idx in missing:
+                acked[frag_idx] = await send_one(frag_idx)
+                if self.detached or not self.online:
+                    return False
+
+        return all(acked)
+
+    async def _send_direct_with_attempts(
+        self, target: str, frame_builder, peer_prefix: str,
+        pkt_id: Optional[int] = None, frag_idx: Optional[int] = None, frag_total: Optional[int] = None,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+    ) -> bool:
+        """docs/reliability_engine_design.md §4's "outer multi-attempt
+        loop for a single DIRECT message" (`direct_send_attempts`,
+        default 3) -- applies identically to a bare single-message DIRECT
+        send and, per-fragment, to each fragment of a DIRECT-fragmented
+        send. `frame_builder(attempt)` re-encodes the frame fresh for
+        every attempt (`wire_format_design.md`'s own rule: never resend a
+        byte-identical encoded string with the attempt patched in place)
+        -- for the bare shape this returns identical bytes every time
+        (correct: `_encode_direct_bare` carries no attempt byte of its
+        own, per §4's "must NOT reimplement per-attempt content
+        variation for a single non-fragmented DIRECT message" -- dedup-
+        busting across these retries is instead the firmware's own job,
+        driven by the `attempt` integer this method threads through to
+        `commands.send_msg`'s own `attempt` parameter); for the
+        multi-fragment shape this varies both this interface's own
+        header attempt byte AND the same firmware parameter.
+
+        Exactly **one** `record_direct_send_result` call per invocation
+        -- success on the first real ACK, or failure once the whole
+        attempt budget is exhausted -- never one per individual attempt
+        (§4's own fix note: "count a fragment exhausting its own attempt
+        budget as one failure... regardless of other fragments'
+        outcomes"). A local `send_msg` failure proves nothing about the
+        path itself (§8's gate) and is retried within the same budget,
+        not counted toward it directly -- only the final exhausted-budget
+        outcome is, via whichever `waited_full_timeout` the last attempt
+        actually observed.
+
+        **User-requested fix (2026-09-16):** the attempt budget itself is
+        priority-dependent -- `direct_send_attempts_handshake` (default 4)
+        for a `PRIORITY_HANDSHAKE` exchange, `direct_send_attempts`
+        (default 2) for everything else. See `direct_send_attempts_
+        handshake`'s own comment for why a failed Link handshake deserves
+        more persistence than a failed DATA fragment, not less."""
+        attempts_budget = (
+            self.direct_send_attempts_handshake if priority == self.PRIORITY_HANDSHAKE
+            else self.direct_send_attempts
+        )
+        waited_full_timeout = False
+        for attempt in range(attempts_budget):
+            if self.detached or not self.online:
+                return False
+            frame = frame_builder(attempt)
+            try:
+                ok, waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
+                    target, frame, attempt, peer_prefix=peer_prefix,
+                    pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
+                    hop_count=hop_count,
+                )
+            except Exception as exc:
+                RNS.log(
+                    f"{self}: DIRECT send to {peer_prefix!r} failed locally "
+                    f"(attempt {attempt}): {exc}",
+                    RNS.LOG_WARNING,
+                )
+                ok, waited_full_timeout = False, False
+            if ok:
+                self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                return True
+            # No per-attempt delay here anymore -- the post-send listen
+            # window (outcome-dependent range, 2026-09-16) fires inside
+            # _send_direct_frame_and_wait_for_ack itself, before it releases
+            # _direct_exchange_lock, so it already happened before control
+            # returned here regardless of this attempt's outcome.
+            if self.detached or not self.online:
+                return False
+
+        self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=waited_full_timeout)
+        return False
+
+    async def _send_direct_frame_and_wait_for_ack(
+        self, target: str, frame: str, attempt: int = 0,
+        peer_prefix: Optional[str] = None,
+        pkt_id: Optional[int] = None, frag_idx: Optional[int] = None, frag_total: Optional[int] = None,
+        priority: int = PRIORITY_NORMAL,  # see _PriorityAsyncLock's own docstring
+        hop_count: Optional[int] = None,  # capture-only, see _capture_direct_attempt_result's docstring
+    ) -> "tuple[bool, bool]":
+        """Sends one already-encoded DIRECT `frame` string (bare or
+        multi-fragment shape) to `target` (a MeshCore pubkey) and waits
+        for the real delivery ACK the firmware sends back, correlated by
+        the `expected_ack` code the MSG_SENT event itself returns -- the
+        `meshcore` library's own per-request correlation mechanism for
+        ACK specifically (confirmed directly against the installed
+        library's `commands/messaging.py` `send_msg_with_retry`, which
+        uses this exact `wait_for_event(EventType.ACK,
+        attribute_filters={"code": ...})` pattern; also confirmed against
+        `reader.py`'s own ACK-frame parsing, which populates that same
+        `code` attribute). This is real per-request correlation, unlike
+        the bare-type-only matching invariant #2 warns against for every
+        other event type -- so, like `discover_path`'s own PATH_RESPONSE
+        wait, this is deliberately NOT routed through `_command_lock`: it
+        can legitimately take several seconds, and serializing it would
+        stall every other outgoing command (CHANNEL sends, path
+        discovery) for that whole wait. (The `send_msg` call itself
+        still goes through `_run_command`/`_command_lock` via
+        `_send_direct_frame`.)
+
+        **Field-diagnosed fix (2026-09-15, real MeshChat traffic):**
+        this whole send-then-wait-for-ACK sequence is now serialized via
+        `_direct_exchange_lock`, a *separate* lock from `_command_lock`
+        held for the full duration, not just the local radio command.
+        Without it, two DIRECT sends spawned as independent background
+        tasks (`_send_direct_packet`/`_send_direct_supplement` are both
+        fire-and-forget by design -- see their own call sites in
+        `_send_outgoing_packet`/`_send_path_request`) could each acquire
+        `_command_lock` just long enough to queue their own frame, then
+        both sit waiting for their own remote ACK *concurrently* --
+        letting this node's radio transmit a second DIRECT frame while
+        the first one's ACK is still in flight. That's exactly the
+        half-duplex collision this design's own "DIRECT-fragmented send
+        sequencing: strictly one fragment in flight at a time" invariant
+        (reliability_engine_design.md's implementation-notes table) was
+        meant to prevent -- but that invariant was only ever enforced
+        *within* one `_send_direct_fragmented` call's own pass-0 loop,
+        never *across* concurrently-spawned ones. Real MeshChat usage
+        (several messages sent close together, each becoming its own
+        multi-fragment DIRECT send) surfaced this directly: six separate
+        pkt_ids all needing pass-1 re-drives in the same ~30s window,
+        repeated "no real delivery ACK" warnings, and cascading stale-
+        path resets on both sides -- the signature of concurrent DIRECT
+        exchanges colliding with each other, not of a single slow link.
+        Deliberately a single interface-wide lock, not one per peer:
+        there is exactly one physical radio, so two DIRECT exchanges to
+        *different* peers would collide on air exactly the same way.
+        CHANNEL sends are unaffected (no ACK wait, so nothing to
+        serialize beyond `_command_lock`'s own brief hold already
+        covers), and this doesn't reintroduce the "stall unrelated
+        commands" problem `_command_lock` was kept out of this wait for
+        in the first place -- it only ever blocks a *second concurrent
+        DIRECT send*, which needed to wait its turn on the shared radio
+        regardless.
+
+        Pure send-and-wait, no `record_direct_send_result` side effect --
+        that's the caller's (`_send_direct_with_attempts`'s) job, exactly
+        once per its own whole attempt budget, not once per individual
+        attempt here. Returns `(ack_received, waited_full_timeout)`; a
+        missing `expected_ack` (no ack correlation available at all) is
+        treated as local success with nothing to wait for, matching
+        Milestone 5's original behavior for that edge case.
+
+        **User-requested observability addition (2026-09-15, post-alpha-0.1.0
+        2-hop field test):** `peer_prefix`/`pkt_id`/`frag_idx`/`frag_total`
+        are capture/debug-only (never affect routing) -- they let this
+        one attempt's outcome be logged with enough context to reconstruct
+        exactly which attempt, of which fragment, of which message,
+        succeeded or failed, plus `_direct_exchange_lock`'s own live
+        contention (`_direct_exchange_queue_depth`, and how long this
+        attempt actually waited for its turn) -- see
+        `_capture_direct_attempt_result`'s own docstring."""
+        self._direct_exchange_queue_depth += 1
+        wait_start = time.monotonic()
+        try:
+            async with self._direct_exchange_lock(priority):
+                lock_wait_s = time.monotonic() - wait_start
+                queue_depth_at_acquire = self._direct_exchange_queue_depth
+                sent = await self._send_direct_frame(target, frame, attempt)
+
+                payload_dict = sent.payload if isinstance(sent.payload, dict) else {}
+                expected_ack = payload_dict.get("expected_ack")
+                if not expected_ack:
+                    ok, waited_full_timeout, ack_timeout_s = True, True, None
+                else:
+                    suggested_timeout_ms = payload_dict.get("suggested_timeout", 10000)
+                    timeout_s = max((float(suggested_timeout_ms) / 1000.0) * 1.2, self.direct_ack_min_timeout_s)
+                    # §4's routed-mode ceiling -- this interface's dispatcher
+                    # never issues a DIRECT send without already believing a
+                    # resolved path exists, so it's always in the "routed"
+                    # regime from its own point of view; see
+                    # _configure_peer_discovery's comment on why the doc's
+                    # separate flood-mode ceiling has no code path here.
+                    timeout_s = min(timeout_s, self.direct_ack_timeout_routed_max_s)
+
+                    ack_event = await self._mc_ready.wait_for_event(
+                        self._EventType.ACK,
+                        attribute_filters={"code": expected_ack.hex()},
+                        timeout=timeout_s,
+                    )
+                    ok, waited_full_timeout, ack_timeout_s = ack_event is not None, True, timeout_s
+
+                # User-requested fix (2026-09-15, generalized after a
+                # second real 2-hop field test, then split by outcome
+                # 2026-09-16 -- see direct_post_send_listen_success_min_s's
+                # own comment for the real zero-hop field data that
+                # motivated the split): every attempt, of every fragment,
+                # still listens before this method returns, and still
+                # *while holding* _direct_exchange_lock so it's a real
+                # quiet window on the shared radio, not just a delay this
+                # one caller happens to observe -- but which random range
+                # it draws from now depends on whether this attempt was
+                # actually ACKed. A missed ACK is a live "something might
+                # have collided" signal, independent of this node's own
+                # queue depth, so it still draws the full direct_post_
+                # send_listen_min_s/max_s (0-5s default) range. A real
+                # ACK is itself evidence the channel was clear for this
+                # exchange, so it draws the much smaller direct_post_
+                # send_listen_success_min_s/max_s (0-0.5s default) range
+                # instead -- still genuinely random every time (never
+                # skipped to a fixed value, so this can't settle into a
+                # lockstep pattern with anything else on the channel),
+                # still real spacing before the next contender for the
+                # lock (a retry of this fragment, the next fragment, or a
+                # different queued message) can go, just not the same
+                # "assume something's wrong" cost a clean ACK gives no
+                # reason to pay.
+                if ok:
+                    listen_min_s, listen_max_s = (
+                        self.direct_post_send_listen_success_min_s, self.direct_post_send_listen_success_max_s,
+                    )
+                else:
+                    listen_min_s, listen_max_s = (
+                        self.direct_post_send_listen_min_s, self.direct_post_send_listen_max_s,
+                    )
+                listen_delay_s = random.uniform(listen_min_s, listen_max_s)
+                if listen_delay_s > 0:
+                    await asyncio.sleep(listen_delay_s)
+
+                self._debug(
+                    f"DIRECT attempt={attempt} to {peer_prefix!r} "
+                    f"(pkt_id={pkt_id} frag_idx={frag_idx}/{frag_total}): ok={ok} "
+                    f"queue_depth={queue_depth_at_acquire} lock_wait={lock_wait_s:.2f}s "
+                    f"ack_timeout={ack_timeout_s} listen_delay={listen_delay_s:.2f}s."
+                )
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
+                    pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,
+                    hop_count=hop_count,
+                )
+                return ok, waited_full_timeout
+        finally:
+            self._direct_exchange_queue_depth -= 1
+
+    def _resolve_routing_peer(self, header: _RnsHeader) -> Optional[str]:
+        """docs/routing_decisions.md's "resolved path known" lookup,
+        peer-attribution half: maps an outgoing packet's own
+        destination-hash field to a bound peer via the opportunistic
+        RNS-token tables §7 populates (peer_discovery_design.md). A PROOF
+        packet needs the separate short-TTL correlation table -- its own
+        destination-hash field IS the truncated hash of the packet it
+        proves, never a stable per-peer identity (§7's "PROOF
+        exception")."""
+        if header.destination_hash is None:
+            return None
+        if header.packet_type == RNS.Packet.PROOF:
+            entry = self._proof_correlation.get(header.destination_hash)
+            if entry is None:
+                return None
+            peer_prefix, expiry = entry
+            if time.monotonic() >= expiry:
+                del self._proof_correlation[header.destination_hash]
+                return None
+            return peer_prefix
+        return self._rns_token_peer.get(header.destination_hash)
+
+    async def _delayed_retry_pass(self, data: bytes, pkt_id: int, attempt: int) -> None:
+        delay = random.uniform(self.retransmit_jitter_min_s, self.retransmit_jitter_max_s)
+        await asyncio.sleep(delay)
+        if self.detached or not self.online:
+            return
+        self._debug(
+            f"CHANNEL retry pass (attempt={attempt}) for pkt_id={pkt_id} "
+            f"firing after {delay:.1f}s jitter."
+        )
+        await self._send_channel_pass(data, pkt_id, attempt)
+
+    async def _send_channel_pass(self, data: bytes, pkt_id: int, attempt: int) -> None:
+        """One full CHANNEL send pass for `data` under `pkt_id`, at a
+        given `attempt` number -- re-fragments from scratch every time
+        (§1), even though the fast-path-vs-multi-fragment shape decision
+        itself doesn't depend on `attempt`; re-deriving it fresh per pass
+        costs nothing and keeps this the single place that decides it."""
+        fastpath_budget = self._channel_payload_budget()
+        if len(data) <= fastpath_budget:
+            await self._send_channel_fastpath_frame(data, pkt_id, attempt)
+            return
+
+        # Per wire_format_design.md's "constraint one," ANNOUNCE is the
+        # only RNS packet type that structurally needs this path today --
+        # everything else comfortably fits the fast-path budget above.
+        per_fragment_budget = self._channel_multifragment_payload_budget()
+        max_total_payload = per_fragment_budget * 255  # frag_total is a 1-byte field
+        if per_fragment_budget <= 0 or len(data) > max_total_payload:
+            self._outgoing_dropped_total += 1
+            RNS.log(
+                f"{self}: dropping outgoing packet ({len(data)} bytes, "
+                f"pkt_id={pkt_id} attempt={attempt}) -- exceeds even the "
+                f"fully-fragmented CHANNEL budget ({max_total_payload} "
+                f"bytes across 255 fragments at {per_fragment_budget} "
+                f"bytes each); no larger transport is available for "
+                f"CHANNEL traffic.",
+                RNS.LOG_WARNING,
+            )
+            return
+
+        await self._send_channel_multifragment_pass(data, pkt_id, attempt)
+
+    async def _send_channel_fastpath_frame(self, payload: bytes, pkt_id: int, attempt: int) -> None:
+        frame = self._encode_channel_fastpath(payload, pkt_id, attempt)
+        await self._wait_for_incoming_quiet()
+        await self._throttle_for_duty_cycle(frame)
+        try:
+            await self._run_command(
+                self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
+                "send_chan_msg",
+                self._EventType.OK,
+            )
+        except Exception as exc:
+            self._outgoing_dropped_total += 1
+            RNS.log(
+                f"{self}: CHANNEL send failed (pkt_id={pkt_id} "
+                f"attempt={attempt}, {len(payload)}-byte payload): {exc}",
+                RNS.LOG_WARNING,
+            )
+            return
+        self.txb += len(frame)
+        self._debug(
+            f"CHANNEL send OK: pkt_id={pkt_id} attempt={attempt} "
+            f"{len(payload)}-byte payload ({len(frame)} chars on wire)."
+        )
+
+    async def _send_channel_multifragment_pass(self, payload: bytes, pkt_id: int, attempt: int) -> None:
+        """One CHANNEL retry pass (docs/reliability_engine_design.md §1-2):
+        re-fragments `payload` fresh, sends every fragment (in a shuffled
+        order by default) with independently-drawn inter-fragment
+        spacing, all under the same `pkt_id` at the given `attempt`."""
+        chunks = self._fragment_payload(payload)
+        frag_total = len(chunks)
+
+        order = list(range(frag_total))
+        if self.fragment_order_shuffle:
+            random.shuffle(order)
+
+        # Milestone 2 has no live hop-count data source (module docstring)
+        # -- always resolves to the flat unknown-multi-hop tier for now.
+        spacing_min, spacing_max = self._fragment_spacing_range(hop_count=None)
+
+        self._debug(
+            f"CHANNEL multi-fragment send: pkt_id={pkt_id} attempt={attempt} "
+            f"frag_total={frag_total} order={order} "
+            f"spacing=[{spacing_min:.1f},{spacing_max:.1f})s"
+        )
+
+        for position, frag_idx in enumerate(order):
+            if self.detached or not self.online:
+                # Interface was detached, or the underlying MeshCore
+                # connection dropped (_on_mc_disconnected) mid-send --
+                # stop rather than burn through the remaining fragments
+                # each individually failing against a dead connection.
+                return
+            frame = self._encode_channel_multifragment(
+                chunks[frag_idx], pkt_id, frag_idx, frag_total, attempt
+            )
+            await self._wait_for_incoming_quiet()
+            await self._throttle_for_duty_cycle(frame)
+            try:
+                await self._run_command(
+                    self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
+                    "send_chan_msg",
+                    self._EventType.OK,
+                )
+                self.txb += len(frame)
+            except Exception as exc:
+                # CHANNEL is blind/unacknowledged (§0) -- a failure here
+                # means the local radio itself rejected/errored the
+                # command, not that the fragment wasn't heard over the
+                # air. Still attempt the rest of the set: one local
+                # command failure doesn't mean the others will also fail,
+                # and a partial fragment set is still useful (§1's
+                # union-of-passes reasoning applies within a pass too).
+                self._outgoing_dropped_total += 1
+                RNS.log(
+                    f"{self}: CHANNEL fragment send failed (pkt_id={pkt_id} "
+                    f"attempt={attempt} frag_idx={frag_idx}/{frag_total}): {exc}",
+                    RNS.LOG_WARNING,
+                )
+
+            if position < frag_total - 1:
+                await asyncio.sleep(random.uniform(spacing_min, spacing_max))
+
+    async def _send_direct(self, target, payload: bytes):
+        """A bare (fits-in-one-message) DIRECT send making exactly one
+        attempt. Note this method itself is NOT on the real send path as
+        of Milestone 6: `_send_outgoing_packet` drives DIRECT sends
+        through `_send_direct_with_attempts`, whose frame_builder callback
+        calls `_encode_direct_bare`/`_send_direct_frame_and_wait_for_ack`
+        directly rather than going through this wrapper (it needs the
+        ACK-correlation and outer-retry behavior those add, which this
+        method doesn't have). `_send_direct` has been kept, unwired, since
+        Milestone 1 as a minimal bare-encode-and-send primitive with its
+        own direct unit tests (see test_smart_meshcore_interface_send_
+        receive.py's "currently unwired DIRECT primitive" section);
+        `_send_direct_frame`, which it delegates to, IS shared by the
+        real send path. Returns the MSG_SENT event so a caller can read
+        its `expected_ack`/`suggested_timeout`/`type` fields, raises on
+        failure."""
+        frame = self._encode_direct_bare(payload)
+        return await self._send_direct_frame(target, frame)
+
+    async def _send_direct_frame(self, target, frame: str, attempt: int = 0):
+        """Sends one already-encoded DIRECT frame string (bare or
+        multi-fragment shape -- this method doesn't care which) via
+        `send_msg`, the one place either shape actually reaches the
+        radio. `attempt` is forwarded to the `meshcore` library's own
+        `send_msg(..., attempt=...)` parameter -- the firmware's own
+        per-attempt content-derived ACK/dedup-busting mechanism
+        (`wire_format_design.md`'s DIRECT section), meaningful on its own
+        for the bare shape (whose own encoding never varies by attempt,
+        per design) and redundant-but-harmless alongside this interface's
+        own header attempt byte for the multi-fragment shape. Called from
+        within `_send_direct_frame_and_wait_for_ack`'s own `_direct_
+        exchange_lock` hold, so `_throttle_for_duty_cycle`'s wait (if any)
+        correctly blocks that lock for the duration too -- nothing else
+        should be transmitting during it either, for the same reason
+        nothing else should be transmitting during the post-send listen
+        window that same caller already enforces."""
+        await self._wait_for_incoming_quiet()
+        await self._throttle_for_duty_cycle(frame)
+        result = await self._run_command(
+            self._mc_ready.commands.send_msg(target, frame, attempt=attempt),
+            "send_msg",
+            self._EventType.MSG_SENT,
+        )
+        self.txb += len(frame)
+        return result
+
+    # -------------------------------------------------------------------
+    # Path discovery (docs/path_discovery_spec.md) -- Milestone 4
+    # -------------------------------------------------------------------
+
+    def _resolve_contact(self, pubkey_prefix: str):
+        if self._mc is None:
+            return None
+        return self._mc.get_contact_by_key_prefix(pubkey_prefix)
+
+    async def _contact_refresh_loop(self):
+        """A live, periodic contact-table read -- never served from a
+        cached/inherited value (reliability_engine_design.md §2's
+        "data-source gap" fix, reinstating a real mechanism an earlier
+        draft of this design set dropped). Feeds path discovery's own
+        ensure_contacts() precondition; Milestone 5 is expected to also
+        feed this same freshness into the zero-hop/known-N-hop spacing
+        tiers, which have no live data source yet."""
+        try:
+            while not self.detached:
+                await asyncio.sleep(self.contact_refresh_interval_s)
+                if self.detached:
+                    break
+                try:
+                    await self._refresh_contacts_and_grant_telemetry()
+                except Exception as exc:
+                    RNS.log(f"{self}: periodic contact refresh failed: {exc}", RNS.LOG_WARNING)
+        except asyncio.CancelledError:
+            pass
+
+    async def _refresh_contacts_and_grant_telemetry(self) -> None:
+        """Milestone 5 tightens this to docs/peer_discovery_design.md
+        §5's actual recommendation: grant base telemetry only to peers
+        confirmed via this interface's own bind-frame protocol, not every
+        known MeshCore contact -- superseding Milestone 4's
+        `telemetry_grant_all_contacts`-default-on simplification, which
+        was explicitly flagged there as a placeholder for exactly this.
+        A contact not yet resolvable for an already-bound peer (§4's
+        "progressively filled in" model -- bind frames and native contact
+        adverts are independent floods with no ordering guarantee) is
+        simply skipped this pass; the next periodic refresh retries it.
+        `telemetry_grant_all_contacts` (default now off) is kept as an
+        explicit escape hatch back to the old open-to-every-contact
+        behavior, not removed -- a config value that stops being the
+        default doesn't stop being real config.
+
+        Code-review fix: `ensure_contacts()` is routed through
+        `self._command_lock` here even though it isn't wrapped in
+        `_run_command` (its return is a bool, not an Event with a `.type`
+        to check -- `_run_command`'s contract doesn't fit it). Left
+        unlocked, its internal `get_contacts()` waits on the library's
+        shared ERROR/NEXT_CONTACT/CONTACTS events with no per-request
+        correlation id (invariant #2) while it could run fully concurrently
+        with any `_run_command`-guarded call elsewhere -- e.g. a
+        concurrent `change_contact_flags` failing could fire an ERROR
+        event this call's dangling wait_for_event(ERROR) would catch
+        instead, misattributing an unrelated failure as a contacts-fetch
+        failure. This command is quick and only fires at all when contacts
+        haven't been fetched yet, so holding the lock across it doesn't
+        create the multi-second stall `discover_path`'s own docstring
+        warns `send_path_discovery_sync` would cause if it were
+        similarly wrapped."""
+        async with self._command_lock:
+            await self._mc_ready.ensure_contacts()
+        for peer in list(self._peers.values()):
+            contact = self._resolve_contact(peer.pubkey_prefix)
+            if contact is not None:
+                await self._grant_telemetry_permission_if_needed(contact)
+        if self.telemetry_grant_all_contacts:
+            for contact in list(self._mc_ready.contacts.values()):
+                await self._grant_telemetry_permission_if_needed(contact)
+
+    async def _grant_telemetry_permission_if_needed(self, contact) -> None:
+        """docs/path_discovery_spec.md's telemetry-permission section:
+        base telemetry (and so path discoverability) is gated per-contact
+        via bit 0x02 of that contact's own `flags` field, as stored in
+        THIS node's local contact table (confirmed directly against
+        examples/companion_radio/MyMesh.cpp's onContactRequest --
+        `cp = contact.flags >> 1`, checked against `TELEM_PERM_BASE`).
+        Granting is therefore a local action this node takes per peer, not
+        a message that reaches out to the peer. As of Milestone 5, called
+        only for peers confirmed via this interface's own bind-frame
+        protocol (peer_discovery_design.md §5) by default -- see
+        `_refresh_contacts_and_grant_telemetry` and `_register_peer`."""
+        current_flags = contact.get("flags", 0)
+        if current_flags & self.TELEM_PERM_BASE_FLAG_BIT:
+            return  # already granted
+        new_flags = current_flags | self.TELEM_PERM_BASE_FLAG_BIT
+        try:
+            await self._run_command(
+                self._mc_ready.commands.change_contact_flags(contact, new_flags),
+                "change_contact_flags",
+                self._EventType.OK,
+            )
+            self._debug(
+                f"granted base telemetry permission to contact "
+                f"{contact.get('adv_name', '?')!r} ({contact.get('public_key', '?')[:12]}...)."
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to grant telemetry permission to contact "
+                f"{contact.get('adv_name', '?')!r}: {exc}",
+                RNS.LOG_WARNING,
+            )
+
+    def _path_discovery_in_backoff(self, pubkey_prefix: str) -> bool:
+        until = self._path_discovery_backoff_until.get(pubkey_prefix)
+        return until is not None and time.monotonic() < until
+
+    def _record_path_discovery_success(self, pubkey_prefix: str) -> None:
+        self._path_discovery_failures.pop(pubkey_prefix, None)
+        self._path_discovery_backoff_until.pop(pubkey_prefix, None)
+
+    def _record_path_discovery_failure_round(self, pubkey_prefix: str) -> None:
+        failures = self._path_discovery_failures.get(pubkey_prefix, 0) + 1
+        self._path_discovery_failures[pubkey_prefix] = failures
+        cooldown = min(
+            self.path_discovery_base_cooldown_s * (self.path_discovery_backoff_factor ** (failures - 1)),
+            self.path_discovery_max_cooldown_s,
+        )
+        self._path_discovery_backoff_until[pubkey_prefix] = time.monotonic() + cooldown
+        RNS.log(
+            f"{self}: path discovery to {pubkey_prefix!r} failed "
+            f"({failures} consecutive round(s) of {self.path_discovery_quick_attempts} "
+            f"quick attempt(s) each) -- backing off {cooldown:.0f}s.",
+            RNS.LOG_WARNING,
+        )
+
+    async def discover_path(self, pubkey_prefix: str) -> Optional[_ResolvedPath]:
+        """docs/path_discovery_spec.md's discover_path() function-level
+        spec. Not yet called from anywhere in the automatic send path --
+        Milestone 5's routing decisions need to exist first to have a
+        DIRECT send that wants a path at all. Exists now, unit-tested
+        directly against fakes, as the primitive that logic will call.
+
+        Deliberately does NOT route send_path_discovery_sync() through
+        _run_command()/self._command_lock: the library call already
+        manages its own internal concurrency (a dedicated
+        `_mesh_request_lock`) across its send-then-decoupled-wait-for-
+        PATH_RESPONSE shape, which can legitimately take several seconds.
+        Serializing it behind this interface's own single command lock
+        too would stall every other outgoing command (CHANNEL sends,
+        retries) for that whole wait -- exactly what §3's "independent
+        queues, one slow operation shouldn't block everything else"
+        design principle argues against. Invariant #1 (check the actual
+        result, don't trust a bare non-None return) is still applied
+        manually below, just without that lock."""
+        if self._mc is None or not self.online:
+            return None
+
+        if self._path_discovery_in_backoff(pubkey_prefix):
+            # Precondition fix from the logical review
+            # (path_discovery_spec.md's own function-level spec): a
+            # caller retrying this peer while it's still in backoff must
+            # not fire a fresh quick-attempts burst and so contribute
+            # another failed round to the same schedule it's already
+            # respecting. No transmission at all in this case.
+            self._debug(f"discover_path({pubkey_prefix!r}): target is in backoff cooldown -- skipping.")
+            return None
+
+        contact = self._resolve_contact(pubkey_prefix)
+        if contact is None:
+            # Code-review fix: locked for the same reason
+            # `_refresh_contacts_and_grant_telemetry`'s own `ensure_contacts()`
+            # call is (see that method's docstring) -- unlocked, this could
+            # race any `_run_command`-guarded call elsewhere and steal its
+            # ERROR event via the library's own type-only correlation
+            # (invariant #2). Quick and only fires when contacts are
+            # unresolved, so this doesn't create the stall
+            # `send_path_discovery_sync` below is deliberately kept out of
+            # the lock to avoid.
+            try:
+                async with self._command_lock:
+                    await self._mc_ready.ensure_contacts()
+            except Exception as exc:
+                self._debug(f"discover_path({pubkey_prefix!r}): contact refresh failed: {exc}")
+            contact = self._resolve_contact(pubkey_prefix)
+        if contact is None:
+            RNS.log(
+                f"{self}: discover_path({pubkey_prefix!r}): peer is not a "
+                f"known contact -- cannot discover a path to it.",
+                RNS.LOG_WARNING,
+            )
+            return None
+
+        for attempt in range(1, self.path_discovery_quick_attempts + 1):
+            if self.detached or not self.online:
+                return None
+
+            try:
+                result = await self._mc_ready.commands.send_path_discovery_sync(contact)
+            except Exception as exc:
+                self._debug(f"discover_path({pubkey_prefix!r}) attempt {attempt}: {exc}")
+                result = None
+
+            if result is not None and result.type == self._EventType.PATH_RESPONSE:
+                payload = result.payload if isinstance(result.payload, dict) else {}
+                responder_prefix = str(payload.get("pubkey_pre", "")).lower()
+                full_pubkey = str(contact.get("public_key", "")).lower()
+                # The underlying wait is not peer-filtered (a response for
+                # a different in-flight discovery could otherwise be
+                # mistaken for this one's answer) -- verify it actually
+                # names the peer queried before accepting it.
+                if not responder_prefix or not full_pubkey.startswith(responder_prefix):
+                    self._debug(
+                        f"discover_path({pubkey_prefix!r}) attempt {attempt}: "
+                        f"PATH_RESPONSE pubkey_pre {responder_prefix!r} doesn't "
+                        f"match this contact -- ignoring, treating this attempt "
+                        f"as unanswered."
+                    )
+                else:
+                    resolved = _ResolvedPath(
+                        out_path_hex=str(payload.get("out_path", "")),
+                        out_path_len=int(payload.get("out_path_len", 0)),
+                        out_path_hash_len=int(payload.get("out_path_hash_len", 1)),
+                        resolved_at=time.monotonic(),
+                    )
+                    # This interface's own record is authoritative for its
+                    # own routing/staleness decisions regardless of
+                    # whether the device persist below succeeds.
+                    self._resolved_paths[pubkey_prefix] = resolved
+                    self._record_path_discovery_success(pubkey_prefix)
+                    RNS.log(
+                        f"{self}: path discovered to {pubkey_prefix!r} in "
+                        f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
+                        RNS.LOG_INFO,
+                    )
+                    await self._persist_resolved_path(contact, resolved)
+                    return resolved
+
+            self._debug(f"discover_path({pubkey_prefix!r}) attempt {attempt}: no response.")
+
+        self._record_path_discovery_failure_round(pubkey_prefix)
+        return None
+
+    async def _discover_path_coalesced(self, pubkey_prefix: str) -> Optional[_ResolvedPath]:
+        """Milestone 6's part of folding stale-path reset fully into
+        routing (docs/reliability_engine_design.md §8: "the next send
+        attempt for this peer... goes through discover_path() first...
+        and only falls through to genuinely flooding the message itself
+        if discovery itself fails") -- called from the DIRECT-primary
+        send path (`_send_direct_packet`) whenever no path is currently
+        resolved for a peer, whether that's a freshly stale-path-reset
+        peer or one that simply never had a path resolved yet.
+
+        Coalesces concurrent callers for the same peer into one shared
+        in-flight `discover_path()` attempt: several outgoing packets
+        queued for the same not-yet-resolved peer at once would otherwise
+        each independently kick off their own quick-attempts burst,
+        wasting airtime on redundant PATH_DISCOVERY floods for what's
+        really one underlying question. `discover_path()`'s own backoff
+        and authoritative-record logic (Milestone 4) is unchanged and
+        still applies underneath this -- this only de-duplicates
+        concurrent callers, it isn't a second cooldown mechanism."""
+        existing = self._pending_path_discoveries.get(pubkey_prefix)
+        if existing is not None:
+            return await existing
+
+        future = asyncio.get_running_loop().create_future()
+        self._pending_path_discoveries[pubkey_prefix] = future
+        try:
+            result = await self.discover_path(pubkey_prefix)
+        except Exception as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            self._pending_path_discoveries.pop(pubkey_prefix, None)
+
+    async def _persist_resolved_path(self, contact, resolved: _ResolvedPath) -> None:
+        """docs/path_discovery_spec.md's persistence fix: a successful
+        discovery is NOT written to the device's own persistent contact
+        record by the firmware itself (CMD_SEND_PATH_DISCOVERY_REQ's
+        handler returns before reaching the code path that would). Skip
+        this and this interface's own idea of "resolved" silently
+        diverges from what the official app / device flash state show."""
+        try:
+            await self._run_command(
+                self._mc_ready.commands.change_contact_path(
+                    contact, resolved.out_path_hex, path_hash_mode=resolved.out_path_hash_len - 1
+                ),
+                "change_contact_path",
+                self._EventType.OK,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: persisting discovered path to the device contact "
+                f"table failed: {exc} -- this interface's own record stays "
+                f"authoritative for routing regardless, but the official "
+                f"app / device flash state will disagree until this is "
+                f"retried.",
+                RNS.LOG_WARNING,
+            )
+
+    # -- Stale cached-path detection and reset (§8) ------------------------
+
+    def record_direct_send_result(
+        self,
+        pubkey_prefix: str,
+        succeeded: bool,
+        waited_full_timeout: bool,
+        rssi: Optional[float] = None,
+    ) -> None:
+        """docs/path_discovery_spec.md §8 / reliability_engine_design.md
+        §8: call this after every DIRECT send attempt made against an
+        already-cached path (not during discovery itself, and not for an
+        attempt with no cached path to begin with). Not yet wired into an
+        actual DIRECT send path -- Milestone 5+ adds the routing
+        decisions that would call this for real. Exists now, unit-tested
+        directly, as the primitive that logic will call.
+
+        Although this method itself is plain (synchronous, not a
+        coroutine), it can schedule a background reset task
+        (_spawn_background_task) when the failure threshold is crossed --
+        that only attaches correctly to this interface's own dedicated
+        event loop if this method is called from a coroutine already
+        running on it, exactly where its real Milestone 5+ caller (DIRECT-
+        send routing logic) will naturally already be. Calling it from any
+        other thread would schedule the reset task on the wrong loop.
+
+        Code-review note on the `rssi` parameter: no current call site
+        passes it (confirmed against every `record_direct_send_result`
+        call in this file), and this isn't just an integration gap -- the
+        installed `meshcore` library's real ACK event (the thing a DIRECT
+        send actually correlates on) carries only `code`/`trip_time`, no
+        signal-quality field at all. The nearest real signal, SNR (not
+        RSSI -- a different unit than `direct_path_reset_rssi_floor`'s
+        dBm-scale default), only appears on *inbound* CONTACT_MSG_RECV_V3
+        frames, and only under protocol version 3, meaning "the last SNR
+        this peer's DIRECT messages arrived with" would need its own
+        tracking and a considered dBm<->dB conversion before it could
+        feed this floor honestly. Left as configured/tested-but-unreached
+        rather than deleted or faked with a converted value that hasn't
+        been validated against real hardware."""
+        if succeeded:
+            self._direct_path_failures.pop(pubkey_prefix, None)
+            return
+        if not waited_full_timeout:
+            # An attempt cut short by this engine's own ceiling being too
+            # tight proves nothing about the path itself -- the old
+            # design's own field-diagnosed gate, kept unchanged.
+            return
+
+        failures = self._direct_path_failures.get(pubkey_prefix, 0) + 1
+        self._direct_path_failures[pubkey_prefix] = failures
+
+        effective_threshold = self.direct_path_reset_threshold
+        if rssi is not None and rssi > self.direct_path_reset_rssi_floor:
+            # Conditions look fine -- be more patient before concluding
+            # the path itself, rather than transient RF, is the problem.
+            effective_threshold = int(
+                self.direct_path_reset_threshold * self.direct_path_reset_patience_multiplier
+            )
+
+        if failures < effective_threshold:
+            return
+
+        # User-requested fix (2026-09-15, post-alpha-0.1.0 2-hop field
+        # test): see direct_path_reset_min_age_s's own comment. A path
+        # confirmed too recently to plausibly have gone stale is trusted
+        # regardless of accumulated failures -- the failure count above is
+        # deliberately NOT reset here, so this re-evaluates on every
+        # subsequent failure and fires the moment the path is old enough,
+        # rather than being silenced permanently by one early skip.
+        resolved = self._resolved_paths.get(pubkey_prefix)
+        if resolved is not None:
+            age_s = time.monotonic() - resolved.resolved_at
+            if age_s < self.direct_path_reset_min_age_s:
+                self._debug(
+                    f"record_direct_send_result({pubkey_prefix!r}): {failures} "
+                    f"failure(s) reached the reset threshold, but this path "
+                    f"was only confirmed {age_s:.1f}s ago (< "
+                    f"{self.direct_path_reset_min_age_s:.0f}s) -- trusting it "
+                    f"a while longer rather than spending a fresh discover_path() "
+                    f"burst on a path that hasn't plausibly gone stale yet."
+                )
+                return
+
+        self._spawn_background_task(self._reset_stale_path(pubkey_prefix))
+
+    async def _reset_stale_path(self, pubkey_prefix: str) -> None:
+        # Local state first (irreversible for this path either way, and
+        # the device round-trip below can independently fail) -- the next
+        # outgoing attempt for this peer should go through discover_path()
+        # again rather than retry a path already known to be dead.
+        self._direct_path_failures.pop(pubkey_prefix, None)
+        self._resolved_paths.pop(pubkey_prefix, None)
+
+        contact = self._resolve_contact(pubkey_prefix)
+        if contact is None:
+            return
+        try:
+            # reset_path() mutates the library's own local contact dict
+            # as a side effect before the device round-trip even resolves
+            # (confirmed directly against the installed library) -- the
+            # returned event, not a re-read of the contact, is what
+            # actually confirms the device-side command's own outcome.
+            await self._run_command(
+                self._mc_ready.commands.reset_path(contact),
+                "reset_path",
+                self._EventType.OK,
+            )
+            RNS.log(
+                f"{self}: reset stale cached path for {pubkey_prefix!r} "
+                f"after {self.direct_path_reset_threshold}+ consecutive "
+                f"full-timeout DIRECT send failures.",
+                RNS.LOG_WARNING,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to reset stale path for {pubkey_prefix!r}: {exc}",
+                RNS.LOG_WARNING,
+            )
+
+    # -------------------------------------------------------------------
+    # Peer discovery (docs/peer_discovery_design.md) -- Milestone 5
+    # -------------------------------------------------------------------
+
+    def _peer_cache_file_path(self) -> Optional[str]:
+        if self.peer_cache_path:
+            return self.peer_cache_path
+        base = getattr(RNS, "Reticulum", None)
+        base = getattr(base, "storagepath", None) if base is not None else None
+        if not base:
+            return None
+        return os.path.join(base, "smci_peers.json")
+
+    def _load_peer_cache(self) -> None:
+        """§4 entry point 2: "loading the persisted peer cache at
+        startup, once per cached entry" -- routed through the single
+        entry-point function (_register_peer) exactly like every other
+        way a peer can become known, per §4's single-entry-point rule.
+        Each cached entry's own persisted `last_seen` is preserved
+        (passed through explicitly), never refreshed to "now" -- a
+        restart isn't a fresh sighting, and silently extending every
+        cached peer's TTL on every restart would defeat §6's expiry."""
+        path = self._peer_cache_file_path()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            count = 0
+            for entry in data.get("peers", []):
+                prefix = str(entry.get("pubkey_prefix", "")).lower()
+                if not prefix:
+                    continue
+                self._register_peer(
+                    prefix,
+                    has_upstream_rns=entry.get("has_upstream_rns"),
+                    source="cache",
+                    last_seen=float(entry.get("last_seen", time.time())),
+                )
+                count += 1
+            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_INFO)
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to load peer cache ({path}): {exc} -- "
+                f"starting with no cached peers.",
+                RNS.LOG_WARNING,
+            )
+
+    def _save_peer_cache(self) -> None:
+        path = self._peer_cache_file_path()
+        if not path:
+            return
+        try:
+            data = {
+                "peers": [
+                    {
+                        "pubkey_prefix": peer.pubkey_prefix,
+                        "has_upstream_rns": peer.has_upstream_rns,
+                        "last_seen": peer.last_seen,
+                    }
+                    for peer in self._peers.values()
+                ]
+            }
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            RNS.log(f"{self}: failed to save peer cache ({path}): {exc}", RNS.LOG_WARNING)
+
+    def _register_peer(
+        self, pubkey_prefix: str, has_upstream_rns: Optional[bool] = None,
+        source: str = "", last_seen: Optional[float] = None,
+    ) -> None:
+        """§4's single entry-point function -- every place a peer can
+        become known calls this, and only this, so "a peer becomes known"
+        never has two divergent code paths to keep in sync (the old
+        design's `force_direct_path` bug, root-caused to exactly that).
+        `has_upstream_rns=None` means "no signal, don't touch this field"
+        -- only a call sourced from an actually-parsed bind frame may pass
+        a real `True`/`False` (§2's hard rule); cache-restore also passes
+        through whatever tri-state value was persisted, which is `None`
+        for a peer that was never actually confirmed by a bind frame
+        before this process last saved its cache.
+
+        Per §5, also (re-)grants telemetry permission -- idempotently,
+        unconditionally, every time this runs, including on cache
+        restore -- since a bind-frame-gated grant is the actual filter
+        that matters (peer_discovery_design.md §5's reasoning), not a
+        persisted "did I already grant this" flag. Best-effort only here:
+        if the MeshCore contact table hasn't caught up yet (§4's
+        "progressively filled in" model -- bind frames and native contact
+        adverts are independent floods with no ordering guarantee), the
+        periodic contact-refresh loop is the retry path, not this call.
+
+        Although this method itself is plain (synchronous, not a
+        coroutine), it can spawn a background telemetry-grant task
+        (_spawn_background_task) when a matching contact is already
+        resolvable -- exactly the same threading requirement
+        record_direct_send_result's own docstring documents (Milestone
+        4): that only attaches correctly to this interface's own
+        dedicated event loop if this method is called from a coroutine
+        already running on it, which every real production call site
+        (bind-frame receive, cache load during _async_setup) naturally
+        is. Calling it from any other thread schedules the task on the
+        wrong loop (or none at all)."""
+        pubkey_prefix = pubkey_prefix.lower()
+        now = last_seen if last_seen is not None else time.time()
+        peer = self._peers.get(pubkey_prefix)
+        changed = False
+        is_new = peer is None
+
+        if peer is None:
+            peer = _PeerRecord(pubkey_prefix=pubkey_prefix, has_upstream_rns=has_upstream_rns, last_seen=now)
+            self._peers[pubkey_prefix] = peer
+            changed = True
+            RNS.log(f"{self}: peer bound: {pubkey_prefix!r} (source={source}).", RNS.LOG_INFO)
+        else:
+            peer.last_seen = now
+            if has_upstream_rns is not None and peer.has_upstream_rns != has_upstream_rns:
+                peer.has_upstream_rns = has_upstream_rns
+                changed = True
+
+        if changed:
+            self._save_peer_cache()
+
+        if is_new:
+            # Milestone 6: proactively resolve a MeshCore path to a
+            # freshly-bound peer rather than waiting for the first
+            # outgoing send to discover one reactively -- closes half of
+            # peer_discovery_design.md §7's bootstrap gap ahead of time
+            # (the other half is the DIRECT-bootstrap-supplement in
+            # _send_outgoing_packet), so the very first bootstrap send
+            # doesn't also have to wait out a fresh discovery burst.
+            # Coalesced like every other discover_path() call, and purely
+            # best-effort -- a failure here is silently absorbed, since
+            # the reactive path in _send_direct_packet/_send_direct_
+            # supplement will simply try again when real traffic needs it.
+            self._spawn_background_task(self._discover_path_coalesced(pubkey_prefix))
+
+        contact = self._resolve_contact(pubkey_prefix)
+        if contact is not None:
+            self._spawn_background_task(self._grant_telemetry_permission_if_needed(contact))
+
+    def _touch_peer_seen(self, pubkey_prefix: str) -> None:
+        """A lightweight last-seen refresh for a peer ALREADY in the
+        registry (§6: "no traffic of any kind" resets the TTL, including
+        RNS traffic attributed to a peer via §7's token learning) --
+        deliberately NOT routed through _register_peer, which would
+        create a brand-new peer record from RNS traffic alone. Only a
+        bind frame (or a cache-restored entry) may ever create a peer;
+        this can only refresh one that already exists. Memory-only, no
+        immediate disk write -- the periodic TTL sweep persists
+        accumulated last_seen changes at its own cadence instead, so an
+        active peer doesn't trigger a disk write on every single packet."""
+        peer = self._peers.get(pubkey_prefix)
+        if peer is not None:
+            peer.last_seen = time.time()
+
+    async def _peer_discovery_bootstrap(self) -> None:
+        """§3/§4: exactly one bootstrap REQUEST, unconditionally, at
+        every process start, regardless of what the peer cache restored
+        -- the old design's own regression (cache-restore silencing this
+        node's own first-boot advertisement) made structurally impossible
+        here by never gating this call on any cached/loaded state at all.
+        After that, an optional slow repeat while still below
+        peer_discovery_target_peers -- a judgment call with no field data
+        behind the specific numbers, per the doc's own flag."""
+        await self._send_bind_frame(self.BIND_TYPE_REQUEST)
+        try:
+            while not self.detached:
+                await asyncio.sleep(self.peer_discovery_rerequest_interval_s)
+                if self.detached:
+                    break
+                if len(self._peers) >= self.peer_discovery_target_peers:
+                    continue
+                await self._send_bind_frame(self.BIND_TYPE_REQUEST)
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_bind_frame(self, frame_type: int) -> None:
+        attempt = next(self._bind_attempt_counter) & 0xFF
+        frame = self._encode_bind_frame(frame_type, attempt)
+        await self._wait_for_incoming_quiet()
+        await self._throttle_for_duty_cycle(frame)
+        try:
+            await self._run_command(
+                self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
+                "send_chan_msg(bind)",
+                self._EventType.OK,
+            )
+            self.txb += len(frame)
+            self._debug(
+                f"sent bind frame type={frame_type} attempt={attempt} "
+                f"cap={self._bind_capability():#04x}."
+            )
+        except Exception as exc:
+            RNS.log(f"{self}: bind-frame send failed: {exc}", RNS.LOG_WARNING)
+
+    async def _respond_to_bind_request(self, requester_prefix: str) -> None:
+        """§3's collision/storm-avoidance recommendation: per-responder
+        randomized jitter before transmitting (collision/half-duplex-deaf-
+        repeater spacing, not suppression -- every well-formed REQUEST
+        still gets answered eventually), plus a separate, much longer
+        global minimum re-response interval, which IS real suppression --
+        this node's own capability hasn't changed just because a second
+        REQUEST arrived shortly after the first RESPONSE went out."""
+        delay = random.uniform(self.bind_response_jitter_min_s, self.bind_response_jitter_max_s)
+        await asyncio.sleep(delay)
+        if self.detached or not self.online:
+            return
+
+        now = time.monotonic()
+        if (
+            self._last_bind_response_sent is not None
+            and now - self._last_bind_response_sent < self.bind_response_min_interval_s
+        ):
+            self._debug(
+                f"skipping bind RESPONSE to {requester_prefix!r} -- still "
+                f"within this node's own min re-response interval."
+            )
+            return
+
+        await self._send_bind_frame(self.BIND_TYPE_RESPONSE)
+        self._last_bind_response_sent = now
+
+    def _handle_incoming_bind_frame(self, marker_and_body: str) -> None:
+        if not self.peer_discovery_enabled:
+            return
+        try:
+            frame = self._decode_bind_frame(marker_and_body)
+        except ValueError as exc:
+            self._debug(f"discarding malformed bind frame: {exc}")
+            return
+
+        own_prefix = self._own_pubkey_prefix()
+        if own_prefix is not None and frame.pubkey_prefix == own_prefix:
+            return  # this node's own bind frame, echoed back somehow -- not a peer
+
+        has_upstream = bool(frame.cap & self.BIND_CAP_HAS_UPSTREAM_RNS)
+        self._register_peer(frame.pubkey_prefix, has_upstream_rns=has_upstream, source="bind_frame")
+
+        if frame.type == self.BIND_TYPE_REQUEST:
+            self._spawn_background_task(self._respond_to_bind_request(frame.pubkey_prefix))
+
+    async def _peer_ttl_sweep_loop(self) -> None:
+        """§6: a peer (and any RNS-token bindings linked to it, §7) is
+        dropped after no traffic of any kind for peer_ttl_s. Deliberately
+        does NOT touch the MeshCore device's own contact/route table
+        (independently owned by the firmware) or the telemetry grant
+        (revoking needs a stronger, explicit negative signal than mere
+        silence, per §6's own reasoning -- an unreachable peer isn't
+        currently issuing anything for the grant to guard against)."""
+        try:
+            while not self.detached:
+                await asyncio.sleep(self.peer_ttl_sweep_interval_s)
+                if self.detached:
+                    break
+                now = time.time()
+                expired = [
+                    prefix for prefix, peer in self._peers.items()
+                    if now - peer.last_seen > self.peer_ttl_s
+                ]
+                for prefix in expired:
+                    del self._peers[prefix]
+                    self._forget_peer_state(prefix)
+                    RNS.log(
+                        f"{self}: peer {prefix!r} expired (no traffic for "
+                        f"{self.peer_ttl_s:.0f}s).",
+                        RNS.LOG_INFO,
+                    )
+                if expired or self._peers:
+                    # Also persists any last_seen drift accumulated since
+                    # the previous sweep via _touch_peer_seen's
+                    # memory-only updates.
+                    self._save_peer_cache()
+        except asyncio.CancelledError:
+            pass
+
+    def _forget_peer_state(self, pubkey_prefix: str) -> None:
+        """Called when a peer is dropped on TTL expiry (`_peer_ttl_sweep_
+        loop`) -- clears every per-peer dict keyed by `pubkey_prefix`
+        anywhere in this interface, not just the RNS-token tables §7
+        itself documents. Code-review fix: the original version of this
+        method (named `_forget_rns_tokens_for_peer`, scoped to exactly
+        what that name says) left `_resolved_paths`,
+        `_path_discovery_failures`, `_path_discovery_backoff_until`,
+        `_direct_path_failures`, and `_pending_path_discoveries` all
+        untouched on peer expiry -- on a mesh with transient/mobile
+        peers, each one that binds, goes stale, and gets swept leaves a
+        permanent, never-cleaned entry in up to five other dicts,
+        unbounded growth over a long-running unattended field radio, and
+        `_stats_loop`'s own `resolved_paths`/`peers_in_discovery_backoff`
+        counts permanently overstating live state."""
+        stale = [dh for dh, prefix in self._rns_token_peer.items() if prefix == pubkey_prefix]
+        for dh in stale:
+            del self._rns_token_peer[dh]
+        stale_proof = [
+            h for h, (prefix, _expiry) in self._proof_correlation.items() if prefix == pubkey_prefix
+        ]
+        for h in stale_proof:
+            del self._proof_correlation[h]
+
+        self._resolved_paths.pop(pubkey_prefix, None)
+        self._path_discovery_failures.pop(pubkey_prefix, None)
+        self._path_discovery_backoff_until.pop(pubkey_prefix, None)
+        self._direct_path_failures.pop(pubkey_prefix, None)
+        # Deliberately NOT cancelled if still in flight -- _discover_path_
+        # coalesced's own try/finally already pops this same entry once
+        # discover_path() completes on its own; just dropping this
+        # interface's reference to it here is enough to stop treating an
+        # expired peer as having a resolved (or pending) path, without
+        # risking an InvalidStateError from cancelling a future that
+        # coroutine still intends to resolve normally.
+        self._pending_path_discoveries.pop(pubkey_prefix, None)
+
+    # -- Opportunistic RNS-token learning (§7) -----------------------------
+
+    def _canonical_peer_prefix(self, raw_prefix: str) -> Optional[str]:
+        """Resolves a MeshCore-native pubkey prefix (e.g. `pubkey_prefix`
+        off a CONTACT_MSG_RECV event) to this interface's own canonical
+        6-byte (12-hex-char) peer key, via a full contact lookup. Native
+        prefixes handed to this interface by different meshcore events
+        aren't guaranteed to share this project's own bind-frame-protocol
+        prefix length (§1 fixes that length only for THIS interface's own
+        control frames) -- so raw prefix strings of possibly-differing
+        lengths are never compared or used as dict keys directly against
+        `_peers`/`_rns_token_peer`/`_proof_correlation`; every lookup goes
+        through this canonicalization first."""
+        if not raw_prefix:
+            return None
+        contact = self._resolve_contact(raw_prefix)
+        if contact is None:
+            self._debug(
+                f"_canonical_peer_prefix({raw_prefix!r}): no resolvable contact "
+                f"-- token learning skipped for this receive. contacts_known="
+                f"{len(self._mc.contacts) if self._mc is not None else 'n/a'}."
+            )
+            return None
+        full_key = str(contact.get("public_key", "")).lower()
+        if len(full_key) < self.BIND_PUBKEY_PREFIX_BYTES * 2:
+            self._debug(
+                f"_canonical_peer_prefix({raw_prefix!r}): resolved contact's own "
+                f"public_key {full_key!r} is shorter than "
+                f"{self.BIND_PUBKEY_PREFIX_BYTES * 2} chars -- token learning skipped."
+            )
+            return None
+        return full_key[: self.BIND_PUBKEY_PREFIX_BYTES * 2]
+
+    def _observe_incoming_rns_packet(self, data: bytes, sender_peer_prefix: Optional[str]) -> None:
+        """§7: populated only from the DIRECT receive path -- a CHANNEL
+        "R" frame carries no sender pubkey at all
+        (wire_format_design.md), so reliable peer attribution is
+        structurally only available here, not for CHANNEL-received
+        traffic. Only learns from an already-bound peer (a token from an
+        unbound sender would have nothing in `_peers` for §6's TTL/expiry
+        bookkeeping to ever clean up)."""
+        if sender_peer_prefix is None:
+            self._debug("_observe_incoming_rns_packet: no canonical peer prefix -- nothing to learn from.")
+            return
+        if sender_peer_prefix not in self._peers:
+            self._debug(
+                f"_observe_incoming_rns_packet: {sender_peer_prefix!r} resolved to a "
+                f"contact but isn't a bound peer (_peers={list(self._peers.keys())}) "
+                f"-- token learning skipped."
+            )
+            return
+
+        header = self._parse_rns_header(data)
+        if header is None or header.destination_hash is None:
+            self._debug(
+                f"_observe_incoming_rns_packet: could not parse a destination_hash "
+                f"from this {len(data)}-byte payload from {sender_peer_prefix!r} "
+                f"(header={header!r}) -- token learning skipped."
+            )
+            return
+
+        self._touch_peer_seen(sender_peer_prefix)
+
+        if header.packet_type == RNS.Packet.PROOF:
+            # §7's "PROOF exception": a PROOF's own destination-hash field
+            # is the truncated hash of the packet it proves, never a
+            # stable per-peer identity -- never recorded in the normal
+            # token table no matter how much traffic is observed.
+            self._debug(
+                f"_observe_incoming_rns_packet: {sender_peer_prefix!r}'s packet is a "
+                f"PROOF -- destination_hash {header.destination_hash.hex()} is its "
+                f"own truncated hash, not learned as a normal token (§7 exception)."
+            )
+            return
+
+        self._rns_token_peer[header.destination_hash] = sender_peer_prefix
+        self._debug(
+            f"_observe_incoming_rns_packet: learned token "
+            f"{header.destination_hash.hex()} -> {sender_peer_prefix!r} "
+            f"(rns_tokens_learned now {len(self._rns_token_peer)})."
+        )
+        # A real token learned for this exact destination proves it IS
+        # reachable through this peer after all -- clear any backoff
+        # immediately rather than waiting for it to expire on its own.
+        self._clear_unknown_dest_backoff(header.destination_hash)
+
+        truncated_hash = self._compute_truncated_hash(data, header.header_type)
+        if truncated_hash is not None:
+            self._proof_correlation[truncated_hash] = (
+                sender_peer_prefix, time.monotonic() + self.proof_correlation_ttl_s
+            )
+
+    # -------------------------------------------------------------------
+    # Incoming (MeshCore event -> RNS core)
+    # -------------------------------------------------------------------
+
+    def _subscribe_data_events(self):
+        self._mc_ready.subscribe(self._EventType.CHANNEL_MSG_RECV, self._on_channel_msg_recv)
+        self._mc_ready.subscribe(self._EventType.CONTACT_MSG_RECV, self._on_contact_msg_recv)
+
+    async def _start_auto_message_fetching(self) -> None:
+        """A real, field-diagnosed correction: the `meshcore` library does
+        NOT push CHANNEL_MSG_RECV/CONTACT_MSG_RECV events on its own. The
+        firmware queues incoming channel/contact messages internally and
+        only notifies a connected client that something is waiting
+        (`EventType.MESSAGES_WAITING`) -- actually reading the queued
+        message's content off the device (`commands.get_msg()`, which is
+        what a subscribed CHANNEL_MSG_RECV/CONTACT_MSG_RECV callback
+        actually fires from, confirmed directly against the installed
+        library: `get_msg()`'s own `self.send(..., [EventType.
+        CONTACT_MSG_RECV, EventType.CHANNEL_MSG_RECV, ...])` uses the same
+        shared dispatcher/subscribe mechanism every other subscription
+        does, so it fans out to this interface's own long-lived
+        subscriptions exactly like any other event) is something the
+        client has to explicitly request. `start_auto_message_fetching()`
+        is the library's own helper for this: it subscribes to
+        MESSAGES_WAITING and drains with get_msg() every time one fires,
+        plus does one immediate get_msg() check for anything already
+        queued at connect time. Without calling this, `_subscribe_data_
+        events()` above subscribes to event types that would simply never
+        fire for real incoming traffic -- confirmed live: a two-node field
+        test sent traffic that physically arrived and sat queued on the
+        receiving device (readable directly via `commands.get_msg()`) while
+        the connected interface, subscribed but never draining, received
+        nothing. PATH_RESPONSE/ACK/OK/ERROR are unaffected -- those are
+        pushed directly by the device as part of the request/reply they
+        answer, not gated behind this queue-and-poll message mechanism."""
+        try:
+            await self._mc_ready.start_auto_message_fetching()
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to start auto message fetching: {exc} -- "
+                f"incoming CHANNEL/DIRECT messages will not be received "
+                f"until this is retried.",
+                RNS.LOG_ERROR,
+            )
+
+    async def _rearm_auto_message_fetching(self) -> None:
+        """Called from `_on_mc_connected` on every reconnect (not just
+        the initial connect `_async_setup` already handles) -- see that
+        call site's own comment for why this is needed. Stops first,
+        best-effort, so a still-registered `MESSAGES_WAITING` subscription
+        from before the reconnect doesn't accumulate a second one
+        alongside the fresh one `_start_auto_message_fetching` adds."""
+        if self._mc is None:
+            return
+        try:
+            await self._mc.stop_auto_message_fetching()
+        except Exception:
+            pass
+        await self._start_auto_message_fetching()
+
+    def _on_channel_msg_recv(self, event):
+        if self.detached:
+            return
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        raw_text = payload.get("text", "")
+
+        # The firmware unconditionally prepends "<node_name>: " to every
+        # CHANNEL text message it relays (meshcore_protocol_rules.md
+        # CHANNEL rule 2) -- split on the first ": " to recover the
+        # marker/header/payload that follows it. A node with no
+        # configured name collapses this to a bare ": " prefix, which
+        # this same split handles correctly (sender_name == "").
+        sender_name, sep, remainder = raw_text.partition(": ")
+        if not sep:
+            return  # not framed the way this firmware's CHANNEL send always frames it
+
+        if remainder.startswith(self.PEER_MARKER):
+            # Bind frames (docs/peer_discovery_design.md §1) are a
+            # separate control protocol riding the same CHANNEL, checked
+            # here before RNS-frame handling since the two markers are
+            # disjoint by construction ("P" vs "R"). The CHANNEL name
+            # prefix is NOT used as the sender's identity for this --
+            # unreliable/non-unique per §1; the bind frame carries its
+            # own pubkey_prefix field for that.
+            self._handle_incoming_bind_frame(remainder)
+            return
+
+        self._handle_incoming_frame(remainder, mode="channel", sender_token=sender_name)
+
+    def _on_contact_msg_recv(self, event):
+        if self.detached:
+            return
+        # User-requested fix (2026-09-16): recorded as early as possible --
+        # before the marker check, before this even resolves to a valid
+        # frame this interface can decode -- since the point is "the
+        # channel was just occupied by someone," which is true even for a
+        # DIRECT frame that turns out malformed or not ours. See
+        # incoming_quiet_window_s's own comment.
+        self._last_incoming_direct_at = time.monotonic()
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        text = payload.get("text", "")
+        sender_token = payload.get("pubkey_prefix", "")
+        self._handle_incoming_frame(text, mode="direct", sender_token=sender_token)
+
+    def _handle_incoming_frame(self, marker_and_body: str, mode: str, sender_token: str) -> None:
+        if not marker_and_body.startswith(self.MARKER):
+            return  # ordinary traffic sharing the channel/contact, not ours
+
+        try:
+            header, rns_payload = self._decode_frame(marker_and_body, mode=mode)
+        except ValueError as exc:
+            self._debug(f"discarding malformed {mode.upper()} frame from {sender_token!r}: {exc}")
+            return
+
+        if mode == "direct":
+            if header.coop:
+                # Code-review fix: the 0x40 cooperative-dispatch bit has
+                # "no defined meaning in the DIRECT header shapes" per
+                # wire_format_design.md's own text ("a DIRECT receiver
+                # should never inspect it") -- previously accepted
+                # silently, which combined with _reassembly_key's own
+                # sender_token-based keying meant a DIRECT sender setting
+                # this bit could land fragments in the same `("~coop",
+                # pkt_id, frag_total)` bucket a CHANNEL cooperative-
+                # dispatch fragment (or another DIRECT sender doing the
+                # same) uses, merging unrelated senders' fragments into
+                # one "complete" packet. Reject outright, matching every
+                # other structurally-invalid-per-this-design's-own-rules
+                # case this interface already treats as malformed.
+                self._incoming_dropped_total += 1
+                RNS.log(
+                    f"{self}: dropping DIRECT frame from {sender_token!r} -- "
+                    f"the cooperative-dispatch bit has no defined meaning on "
+                    f"DIRECT and is never set by this interface's own "
+                    f"encoder; treating as malformed.",
+                    RNS.LOG_WARNING,
+                )
+                return
+            if header.multi_fragment:
+                self._handle_direct_multifragment_frame(header, rns_payload, sender_token)
+                return
+            self._debug(f"DIRECT frame from {sender_token!r}: {len(rns_payload)}-byte payload.")
+            # Code-review fix: a bare DIRECT frame carries no pkt_id at all
+            # (it relies entirely on the firmware's own ACK cycle, per
+            # wire_format_design.md), so it can't reuse _reassembly_key's
+            # pkt_id-based scheme -- but since Milestone 6 added this
+            # interface's own _send_direct_with_attempts retry loop on top
+            # of that firmware ACK cycle, a lost ACK now causes a genuine
+            # resend (the firmware's own attempt-flag varies, but this
+            # interface's own bare-DIRECT frame content never does), which
+            # without a dedup check here would deliver the same logical
+            # packet to RNS core twice -- the one receive path that skipped
+            # the dedup discipline every other receive path already has.
+            dedup_key = ("~direct_bare", sender_token or "~anon", rns_payload)
+            if self._dedup_contains(dedup_key):
+                self._incoming_dropped_total += 1
+                self._debug(f"dropping duplicate bare DIRECT packet from {sender_token!r} (already delivered).")
+                return
+            self._dedup_add(dedup_key, rns_payload)
+            peer_prefix = self._canonical_peer_prefix(sender_token)
+            self._observe_incoming_rns_packet(rns_payload, peer_prefix)
+            self.process_incoming(rns_payload, transport="direct_bare", sender_peer_prefix=peer_prefix)
+            return
+
+        self._handle_channel_frame(header, rns_payload, sender_token)
+
+    def _handle_direct_multifragment_frame(self, header: _FrameHeader, payload: bytes, sender_token: str) -> None:
+        """docs/wire_format_design.md's DIRECT-needs-fragmenting receive
+        side (Milestone 6) -- reuses the exact same reassembly/dedup
+        machinery `_handle_channel_frame`/`_add_channel_fragment` already
+        built for CHANNEL. Both are keyed off `(mode, sender_token,
+        pkt_id, frag_total)` (`_reassembly_key`) -- `mode` is included
+        specifically so DIRECT's own `sender_token` (a peer's
+        `pubkey_prefix`) and CHANNEL's (a node's own plaintext,
+        attacker-controlled `adv_name`) can never collide in
+        `self._reassembly`/`self._dedup`, even though nothing stops a
+        CHANNEL sender from choosing an `adv_name` equal to some other
+        peer's real pubkey_prefix (a code-review-found gap this method's
+        own docstring used to wrongly claim was structurally impossible
+        without this). The one real difference from CHANNEL: once
+        reassembly completes, §7's
+        opportunistic token learning runs on the *complete* packet, using
+        the peer identity DIRECT alone can authenticate -- CHANNEL's own
+        multi-fragment path can't do this at all (no sender identity to
+        learn from), which is why `_add_channel_fragment` itself stays
+        deliberately silent on this and this caller adds it instead of
+        pushing DIRECT-specific behavior down into the shared helper."""
+        key = self._reassembly_key(header, sender_token, mode="direct")
+
+        if self._dedup_contains(key):
+            self._incoming_dropped_total += 1
+            self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
+            return
+
+        complete_data = self._add_channel_fragment(key, header, payload)
+        if complete_data is not None:
+            peer_prefix = self._canonical_peer_prefix(sender_token)
+            self._observe_incoming_rns_packet(complete_data, peer_prefix)
+            self.process_incoming(
+                complete_data, transport="direct_multifragment", sender_peer_prefix=peer_prefix,
+                frag_total=header.frag_total, pkt_id=header.pkt_id,
+            )
+
+    def _handle_channel_frame(self, header: _FrameHeader, payload: bytes, sender_token: str) -> None:
+        key = self._reassembly_key(header, sender_token, mode="channel")
+
+        if not header.multi_fragment:
+            # Single-fragment fast path: complete by construction, so the
+            # dedup cache holds the *whole packet* under this key -- a
+            # same-key hit is directly comparable against `payload`. Per
+            # §6's "verify content identity, don't just assume it"
+            # principle (already applied to reassembly's repeated-
+            # frag_idx case), extended here to the same residual risk
+            # §5.1 describes: two different anonymous ("~anon") senders
+            # -- or two genuinely different senders whose 16-bit pkt_id
+            # counters happen to collide -- picking the same key for two
+            # *different* packets within the dedup TTL window is a real,
+            # not just theoretical, scenario on a channel with more than
+            # one unnamed node. Treating a same-key-different-content
+            # arrival as "already delivered" would silently and
+            # permanently drop a legitimate packet.
+            cached_payload = self._dedup_get(key)
+            if cached_payload is not None:
+                if cached_payload == payload:
+                    self._incoming_dropped_total += 1
+                    self._debug(f"dropping duplicate CHANNEL packet {key} (already delivered).")
+                    return
+                RNS.log(
+                    f"{self}: dedup-cache collision for key {key} -- a new "
+                    f"arrival's content differs from what's cached under "
+                    f"the same key (§5.1's blank/anonymous-sender residual "
+                    f"risk); treating it as a distinct packet rather than "
+                    f"risk silently dropping a legitimate one.",
+                    RNS.LOG_WARNING,
+                )
+            self._dedup_add(key, payload)
+            self._debug(
+                f"CHANNEL frame from {sender_token or '~anon'}: pkt_id={header.pkt_id} "
+                f"attempt={header.attempt} {len(payload)}-byte payload."
+            )
+            self.process_incoming(
+                payload, transport="channel_bare", channel_sender_claimed=sender_token or None,
+                pkt_id=header.pkt_id,
+            )
+            return
+
+        # Multi-fragment: dedup is a pure key check here -- at this point
+        # we only ever have one fragment's own chunk, never the whole
+        # reassembled packet, so there's nothing meaningful to content-
+        # compare against. A key match means this packet already
+        # completed and was evicted from self._reassembly (§6's "late
+        # duplicate after completion" case); once that's happened there's
+        # no cached content left to verify a late fragment against, so a
+        # key match alone is what the existing design already treats as
+        # sufficient to drop it.
+        if self._dedup_contains(key):
+            self._incoming_dropped_total += 1
+            self._debug(f"dropping late/duplicate CHANNEL fragment for {key} (already delivered).")
+            return
+
+        complete_data = self._add_channel_fragment(key, header, payload)
+        if complete_data is not None:
+            self.process_incoming(
+                complete_data, transport="channel_multifragment",
+                channel_sender_claimed=sender_token or None,
+                frag_total=header.frag_total, pkt_id=header.pkt_id,
+            )
+
+    # -- Reassembly (docs/reliability_engine_design.md §5) ----------------
+
+    def _reassembly_key(self, header: _FrameHeader, sender_token: str, mode: str):
+        """§5.2's keying scheme. The `0x40`/coop branch keys on
+        `(pkt_id, frag_total)` alone, excluding sender identity entirely
+        -- required for cooperative broadcast's delegates (each
+        transmitting under their own firmware-assigned name) to ever land
+        in the same bucket, per wire_format_design.md's "cooperative-
+        broadcast reassembly bug" fix. Nothing sets this bit until
+        Milestone 7, but the branch is built now per the architecture
+        doc's own instruction, so M7 only has to add a sender, never
+        touch this receive path again (a DIRECT receiver rejects a
+        coop-flagged frame outright before ever reaching this method --
+        see `_handle_incoming_frame` -- so this branch is CHANNEL-only in
+        practice today, but `mode` is still included below rather than
+        relied on implicitly).
+
+        `mode` ("channel"/"direct") is included in every returned key --
+        a code-review-found gap, not just defensive style: DIRECT's own
+        `sender_token` (a peer's `pubkey_prefix`) and CHANNEL's (a node's
+        own plaintext, attacker-controlled `adv_name`) were previously
+        assumed to be unable to collide since they're "different kinds of
+        identifiers," but nothing actually enforced that -- a CHANNEL
+        sender can choose any `adv_name` string it likes, including one
+        that happens to equal another peer's real pubkey_prefix, which
+        would otherwise land its fragments in the same
+        `self._reassembly`/`self._dedup` bucket as that peer's genuine
+        DIRECT-fragmented send. Namespacing by transport makes that
+        structurally impossible instead of merely assumed-away, matching
+        this project's own established preference (e.g. the capability
+        hard-rule enforcement) for structural fixes over trusted
+        invariants."""
+        if header.coop:
+            return (mode, "~coop", header.pkt_id, header.frag_total)
+        return (mode, sender_token or "~anon", header.pkt_id, header.frag_total)
+
+    def _new_reassembly_bucket(self, key, frag_total: int, coop: bool) -> _ReassemblyBucket:
+        if len(self._reassembly) >= self.reassembly_max_keys:
+            self._evict_oldest_reassembly_bucket()
+        bucket = _ReassemblyBucket(frag_total=frag_total, coop=coop)
+        self._reassembly[key] = bucket
+        return bucket
+
+    def _evict_oldest_reassembly_bucket(self) -> None:
+        # §5.3: bounded capacity, oldest-by-last-progress -- a bucket
+        # that's kept receiving fragments across retry passes is clearly
+        # still alive regardless of when it happened to start, so
+        # eviction targets staleness, not age.
+        if not self._reassembly:
+            return
+        oldest_key = min(self._reassembly, key=lambda k: self._reassembly[k].last_progress)
+        self._incoming_dropped_total += 1
+        RNS.log(
+            f"{self}: reassembly map at capacity ({self.reassembly_max_keys} "
+            f"keys) -- evicting oldest-by-last-progress bucket {oldest_key}.",
+            RNS.LOG_WARNING,
+        )
+        del self._reassembly[oldest_key]
+
+    def _add_channel_fragment(self, key, header: _FrameHeader, payload: bytes) -> Optional[bytes]:
+        """Shared reassembly-fragment-accumulation logic for both CHANNEL
+        (`_handle_channel_frame`) and DIRECT
+        (`_handle_direct_multifragment_frame`) multi-fragment receipt --
+        the name predates DIRECT reassembly (Milestone 2) and is kept
+        rather than churned, since the logic itself was already
+        transport-agnostic (nothing below reads anything CHANNEL-
+        specific). Returns the complete reassembled payload the moment
+        the last fragment arrives, or `None` while still incomplete (or
+        on a same-index content collision, handled by evicting the whole
+        bucket) -- delivering to RNS core (`process_incoming`) and, for
+        DIRECT, opportunistic token learning are both the caller's job,
+        not this method's, since only the DIRECT caller needs the latter."""
+        bucket = self._reassembly.get(key)
+        if bucket is None:
+            bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+
+        if header.frag_idx in bucket.fragments:
+            # §6: a repeated frag_idx must be byte-identical by
+            # construction (every attempt of a given index carries the
+            # same payload bytes) -- verify rather than assume, since
+            # this is also the safety net for §5.1/§5.2's residual
+            # collision risk (two different transmissions sharing a key).
+            if bucket.fragments[header.frag_idx] != payload:
+                self._incoming_dropped_total += 1
+                RNS.log(
+                    f"{self}: reassembly collision detected for key {key} at "
+                    f"frag_idx {header.frag_idx} -- two different "
+                    f"transmissions produced different bytes for the same "
+                    f"slot; evicting rather than risk delivering a "
+                    f"corrupted amalgam.",
+                    RNS.LOG_WARNING,
+                )
+                self._reassembly.pop(key, None)
+            return None  # identical repeat: already counted, nothing more to do
+
+        bucket.fragments[header.frag_idx] = payload
+        bucket.last_progress = time.monotonic()
+
+        if len(bucket.fragments) < bucket.frag_total:
+            self._debug(
+                f"reassembly progress {key}: {len(bucket.fragments)}/{bucket.frag_total}"
+            )
+            return None
+
+        # Complete: per §6, delete from the reassembly map immediately
+        # and record it in the whole-packet dedup cache in the same step
+        # -- the two caches are sequential for a given key, never
+        # concurrent.
+        del self._reassembly[key]
+        complete_data = b"".join(bucket.fragments[i] for i in range(bucket.frag_total))
+        self._dedup_add(key, complete_data)
+        self._debug(f"reassembly complete {key}: {len(complete_data)} bytes")
+        return complete_data
+
+    async def _reassembly_cleanup_loop(self):
+        """§5.4's idle-since-last-progress TTL, swept periodically rather
+        than checked lazily -- a bucket that simply stops receiving
+        fragments needs to be reclaimed even if nothing ever queries it
+        again. Also sweeps expired whole-packet dedup entries (§7) and
+        expired PROOF-correlation entries (§7's other table, Milestone 6
+        fix below) in the same pass, since all three live only on this
+        event loop thread and share the same natural cadence."""
+        try:
+            while not self.detached:
+                await asyncio.sleep(self.REASSEMBLY_CLEANUP_INTERVAL_S)
+                if self.detached:
+                    break
+
+                now = time.monotonic()
+                stale_keys = [
+                    key
+                    for key, bucket in self._reassembly.items()
+                    if now - bucket.last_progress > (
+                        self.reassembly_idle_timeout_coop_s
+                        if bucket.coop
+                        else self.reassembly_idle_timeout_s
+                    )
+                ]
+                for key in stale_keys:
+                    del self._reassembly[key]
+                    self._incoming_dropped_total += 1
+                    RNS.log(
+                        f"{self}: reassembly bucket {key} evicted -- idle "
+                        f"timeout exceeded with no completion.",
+                        RNS.LOG_WARNING,
+                    )
+
+                self._dedup_sweep(now)
+                self._proof_correlation_sweep(now)
+        except asyncio.CancelledError:
+            pass
+
+    def _proof_correlation_sweep(self, now: float) -> None:
+        """Field-diagnosed gap: `_resolve_routing_peer`'s own PROOF-
+        correlation lookup already expires an entry lazily, on the exact
+        lookup that would use it (§7), but most delivered packets never
+        actually get proved -- an RNS Link doesn't send a PROOF back for
+        every single DATA packet -- so an entry whose PROOF never comes
+        would otherwise sit in `_proof_correlation` forever, unlike
+        `_dedup`/`_reassembly`, which both already get swept here
+        regardless of whether anything ever queries them again. Confirmed
+        live: `proof_correlations_pending` sat perfectly flat for minutes
+        during a real field test, exactly the signature of a table with
+        no time-based reclaim. This is that reclaim, mirroring
+        `_dedup_sweep`'s own shape."""
+        expired = [h for h, (_peer, expiry) in self._proof_correlation.items() if now >= expiry]
+        for h in expired:
+            del self._proof_correlation[h]
+
+    # -- Whole-packet dedup (docs/reliability_engine_design.md §7) --------
+
+    def _dedup_get(self, key) -> Optional[bytes]:
+        """Returns the cached whole-packet payload for `key` if present
+        and not yet expired (also lazily evicting an expired entry it
+        finds along the way), else None."""
+        entry = self._dedup.get(key)
+        if entry is None:
+            return None
+        expiry, cached_payload = entry
+        if time.monotonic() >= expiry:
+            del self._dedup[key]
+            return None
+        return cached_payload
+
+    def _dedup_contains(self, key) -> bool:
+        return self._dedup_get(key) is not None
+
+    def _dedup_add(self, key, payload: bytes) -> None:
+        self._dedup[key] = (time.monotonic() + self.whole_packet_dedup_ttl_s, payload)
+
+    def _dedup_sweep(self, now: float) -> None:
+        expired = [k for k, (expiry, _payload) in self._dedup.items() if now >= expiry]
+        for k in expired:
+            del self._dedup[k]
+
+    def process_incoming(
+        self, data: bytes, *, transport: str = "unknown",
+        sender_peer_prefix: Optional[str] = None, channel_sender_claimed: Optional[str] = None,
+        frag_total: Optional[int] = None, pkt_id: Optional[int] = None,
+    ) -> None:
+        """The single funnel every complete incoming RNS payload passes
+        through, regardless of shape (CHANNEL/DIRECT, bare/multi-
+        fragment) -- not an RNS.Interface base-class method (confirmed:
+        the base class has none by this name), so free to carry these
+        capture-only keyword parameters without risking a base-class
+        signature mismatch. All default to values meaning "not
+        applicable/not known" so this stays a normal call for anything
+        that doesn't care about packet capture."""
+        if not self.online or self.detached:
+            return
+        self.rxb += len(data)
+        if self._packet_capture_file is not None:
+            self._capture_incoming(
+                data, transport=transport, sender_peer_prefix=sender_peer_prefix,
+                channel_sender_claimed=channel_sender_claimed, frag_total=frag_total, pkt_id=pkt_id,
+            )
+        self.owner.inbound(data, self)
+
+    # -------------------------------------------------------------------
+    # Teardown
+    # -------------------------------------------------------------------
+
+    def detach(self):
+        # Base RNS.Interfaces.Interface.detach() is a no-op -- without this
+        # override, the dedicated event-loop thread and the underlying
+        # MeshCore connection have nothing to actually close down when RNS
+        # core detaches this interface
+        # (`docs/reliability_engine_design.md`'s base-class contract notes).
+        if self.detached:
+            return
+
+        self.detached = True
+        self.online = False
+
+        # Unblocks _outgoing_worker's blocking queue.Queue.get() (running
+        # on a thread-pool executor thread, not this event loop) -- that
+        # call has no cancellation mechanism of its own, so nothing else
+        # would ever wake it once no more packets get queued. Safe to do
+        # from this (synchronous, possibly-RNS-core) thread: queue.Queue
+        # is thread-safe by design.
+        try:
+            self._outqueue.put_nowait(self._OUTQUEUE_SHUTDOWN_SENTINEL)
+        except queue.Full:
+            pass
+
+        # Reads the raw backing field, not the `_loop` property above --
+        # this teardown safety net must tolerate setup never having
+        # completed (no event loop ever created), which the property's
+        # assert deliberately treats as a real invariant violation
+        # everywhere else.
+        loop = self._loop_impl
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self._async_teardown(), loop)
+            try:
+                future.result(timeout=self.SETUP_TIMEOUT_S)
+            except Exception as exc:
+                RNS.log(f"{self}: error during async teardown: {exc}", RNS.LOG_ERROR)
+            loop.call_soon_threadsafe(loop.stop)
+
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=self.SETUP_TIMEOUT_S)
+
+        # Only safe to close once run_forever() has actually returned (i.e.
+        # after the join above) -- closing a still-running loop is invalid.
+        if loop is not None and not loop.is_running():
+            loop.close()
+
+        self._close_packet_capture()
+
+        RNS.log(f"{self}: detached.", RNS.LOG_INFO)
+
+    async def _async_teardown(self):
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+        if self._reassembly_cleanup_task is not None:
+            self._reassembly_cleanup_task.cancel()
+        if self._contact_refresh_task is not None:
+            self._contact_refresh_task.cancel()
+        if self._peer_discovery_task is not None:
+            self._peer_discovery_task.cancel()
+        if self._peer_ttl_sweep_task is not None:
+            self._peer_ttl_sweep_task.cancel()
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._outgoing_worker_task is not None:
+            # The shutdown sentinel is already in the queue (detach()
+            # placed it before scheduling this coroutine) -- just wait
+            # for the worker to notice it and return on its own, with a
+            # bounded fallback rather than hanging teardown if it somehow
+            # doesn't.
+            try:
+                await asyncio.wait_for(self._outgoing_worker_task, timeout=5.0)
+            except Exception:
+                self._outgoing_worker_task.cancel()
+        if self._mc is not None:
+            try:
+                await self._mc.stop_auto_message_fetching()
+            except Exception as exc:
+                RNS.log(f"{self}: error stopping auto message fetching: {exc}", RNS.LOG_WARNING)
+            try:
+                await self._mc.disconnect()
+            except Exception as exc:
+                RNS.log(
+                    f"{self}: error disconnecting from MeshCore device: {exc}",
+                    RNS.LOG_WARNING,
+                )
+
+    # -------------------------------------------------------------------
+
+    def __str__(self):
+        return f"SmartMeshCoreInterface[{self.name}]"
+
+
+interface_class = SmartMeshCoreInterface
