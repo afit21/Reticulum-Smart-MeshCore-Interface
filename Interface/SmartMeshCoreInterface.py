@@ -2401,8 +2401,8 @@ class SmartMeshCoreInterface(Interface):
         # ranges for now -- "we can tune this later" still applies. See
         # _send_direct_frame_and_wait_for_ack's own docstring for exactly
         # where each fires.
-        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.0))
-        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 4.0))
+        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.5))
+        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 3.0))
         self.direct_post_send_listen_success_min_s = float(cfg.get("direct_post_send_listen_success_min", 0.0))
         self.direct_post_send_listen_success_max_s = float(cfg.get("direct_post_send_listen_success_max", 0.5))
 
