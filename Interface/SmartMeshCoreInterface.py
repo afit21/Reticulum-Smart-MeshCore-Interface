@@ -1587,7 +1587,7 @@ class SmartMeshCoreInterface(Interface):
     # all, rather than CHANNEL-plus-a-DIRECT-supplement. See
     # _in_small_mesh_mode() and _send_outgoing_packet()'s three routing
     # branches.
-    SMALL_MESH_DIRECT_ONLY_MAX_PEERS = 2
+    SMALL_MESH_DIRECT_ONLY_MAX_PEERS = 3
 
     # User-requested fix (not a config knob -- see _send_outgoing_packet's
     # own docstring for the full mechanism): delay an outgoing LRPROOF by
@@ -1598,7 +1598,7 @@ class SmartMeshCoreInterface(Interface):
     # uncontended handshake. Comfortably clear of 1.75s with margin for
     # clock/measurement jitter, and trivially small next to RNS's own
     # link-establishment timeout (6s*hops + 360s).
-    LINK_PROOF_RTT_INFLATION_DELAY_S = 2.5
+    LINK_PROOF_RTT_INFLATION_DELAY_S = 1.5
 
     # User-requested fix (not a config knob, mirroring the shape of
     # path_discovery's own existing backoff -- see _unknown_dest_in_
@@ -2102,12 +2102,12 @@ class SmartMeshCoreInterface(Interface):
         # has no live hop-count data source yet (Milestone 4/5's path
         # discovery/peer-topology work) -- every real send today resolves
         # to the flat unknown-multi-hop range below.
-        self.fragment_delay_min_s = float(cfg.get("fragment_delay_min", 8.0))
-        self.fragment_delay_max_s = float(cfg.get("fragment_delay_max", 15.0))
+        self.fragment_delay_min_s = float(cfg.get("fragment_delay_min", 5.0))
+        self.fragment_delay_max_s = float(cfg.get("fragment_delay_max", 10.0))
         self.fragment_delay_zero_hop_min_s = float(cfg.get("fragment_delay_zero_hop_min", 0.5))
         self.fragment_delay_zero_hop_max_s = float(cfg.get("fragment_delay_zero_hop_max", 1.5))
-        self.fragment_delay_per_hop_min_s = float(cfg.get("fragment_delay_per_hop_min", 8.0))
-        self.fragment_delay_per_hop_max_s = float(cfg.get("fragment_delay_per_hop_max", 15.0))
+        self.fragment_delay_per_hop_min_s = float(cfg.get("fragment_delay_per_hop_min", 5.0))
+        self.fragment_delay_per_hop_max_s = float(cfg.get("fragment_delay_per_hop_max", 10.0))
 
         # Each pass sends frag_idx in a freshly shuffled order rather than
         # always 0..N-1 -- targets the position-dependent half of the
@@ -2174,16 +2174,16 @@ class SmartMeshCoreInterface(Interface):
         # a quick-retry burst (each attempt already naturally spaced by
         # its own request/response wait, no additional artificial delay
         # layered on top), then per-target exponential backoff.
-        self.path_discovery_quick_attempts = int(cfg.get("path_discovery_quick_attempts", 3))
+        self.path_discovery_quick_attempts = int(cfg.get("path_discovery_quick_attempts", 2))
         self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 20.0))
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
-        self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 2.0))
+        self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 1.8))
 
         # Stale cached-DIRECT-path detection (§8) -- not yet wired into an
         # actual DIRECT send path (Milestone 5+ adds the routing decisions
         # that call record_direct_send_result() for real); the mechanism
         # and its config surface exist now, unit-tested directly.
-        self.direct_path_reset_threshold = int(cfg.get("direct_path_reset_threshold", 2))
+        self.direct_path_reset_threshold = int(cfg.get("direct_path_reset_threshold", 3))
         self.direct_path_reset_rssi_floor = float(cfg.get("direct_path_reset_rssi_floor", -105.0))
         self.direct_path_reset_patience_multiplier = float(
             cfg.get("direct_path_reset_patience_multiplier", 3.0)
