@@ -1,6 +1,9 @@
 """
 SmartMeshCoreInterface.py -- Smart Meshcore Interface for Reticulum
 
+
+TODO: Exppiration sweep for _path_response_last_sent_at. Currently no expiration, potential memory leak
+
 An `RNS.Interfaces.Interface` subclass that carries Reticulum (RNS) traffic
 over a MeshCore LoRa mesh. This is a from-scratch rebuild -- see CLAUDE.md
 and `docs/interface_architecture.md` (read that first; it links the rest of
@@ -1828,10 +1831,13 @@ class SmartMeshCoreInterface(Interface):
         # only a later success (via _clear_unknown_dest_backoff) ever
         # removed an entry.
         self._unknown_dest_last_attempt = {}
+        
         # PATH_RESPONSE_RATE_LIMIT_WINDOW_S's own state -- destination_hash
         # -> time.monotonic() of the last outgoing PATH_RESPONSE actually
         # sent for it. See _path_response_rate_limited.
         self._path_response_last_sent_at = {}
+        
+        
         self._contact_refresh_task = None
 
         # DIRECT-fragmented completion-check state (see
@@ -6197,7 +6203,7 @@ class SmartMeshCoreInterface(Interface):
             self._observe_incoming_rns_packet(rns_payload, peer_prefix)
             
             #Log heard my own frame
-            # TODO: Review if this actually happens and make adjustments accordingly
+            # TODO: Review if this actually happens and make adjustments accordingly. This may need to be a filter
             if peer_prefix == self._own_pubkey_prefix():
                 self._debug(f"heard my own bare DIRECT frame from {sender_token!r} -- ignoring.")
             
