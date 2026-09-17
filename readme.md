@@ -1,21 +1,35 @@
-# SmartMeshCoreInterface
+# Smart MeshCore Interface
 
-A [Reticulum](https://reticulum.network/) (RNS) interface that lets RNS nodes communicate over a [MeshCore](https://meshcore.co.uk/) LoRa mesh — implemented in [`Interface/SmartMeshCoreInterface.py`](Interface/SmartMeshCoreInterface.py), a single self-contained file.
+### Overview
 
-## Status: alpha 0.1.0
-In short, this current version allows you to send LXMF messages and browse nomadnet sites reliably over zero-hop MeshCore (nomadnet is quite slow). This interface has only been tested this interface over 1, 2 and 3 MeshCore repeater hops with two total RNS nodes communicating over this interface.
+An [Reticulum](https://reticulum.network/) (RNS) interface that lets RNS nodes communicate over a [MeshCore](https://meshcore.co.uk/) LoRa mesh without nuking your local MeshCore network!
 
-## Why this exists, and how it's different
+This project aims to let you access Nomadnet and send LXMF messages over a MeshCore network as a 'last mile' RNS hop without flooding MeshCore with traffic. In summary this is achieved by firewalling traffic entering the interface, prioritizing, artificially delaying some traffic, and making decisions on how to efficiently rout traffic over MeshCore.
 
-MeshCore's own CHANNEL broadcast is unauthenticated and unacknowledged — great for reach, unreliable for anything beyond a single small fragment. A prior implementation of this idea tried to tune multi-fragment CHANNEL delivery into reliability and hit a hard wall: field testing found ~80% delivery at one fragment, 0% at two or three, no matter how much the spacing was tuned. This interface takes a different approach:
+The project also aims to be as easy as possible to configure on your RNS nodes. In most situations, a minimal config is needed, just setup your MeshCore companion radio with the MeshCore app before using the interface.
 
-- **DIRECT is the primary transport, not a fallback.** Once two nodes have exchanged bind frames (this interface's own lightweight peer-discovery protocol) and RNS has opportunistically learned which MeshCore peer a given RNS destination belongs to, traffic between them goes DIRECT — MeshCore's real, ACK'd, cryptographically-identified point-to-point transport — instead of broadcasting on CHANNEL.
-- **CHANNEL is reserved for what actually needs it**: announces, path requests, and bootstrapping a brand-new destination before a DIRECT route is known — and even then, a small-mesh optimization (see below) skips CHANNEL entirely once there are only one or two bound peers, since there's no ambiguity left about who a packet is for.
-- **Self-throttling, not just self-limiting.** Real field use found gaps this design didn't anticipate on paper — DIRECT sends colliding with each other when issued concurrently, RNS's own Link-keepalive timing getting miscalibrated by an unrepresentatively fast handshake, a destination that will never answer getting retried forever — and each was found, fixed, and documented from actual packet-capture evidence, not guessed at.
+## Features (Version alpha0.1.0)
 
-This interface essentially aims to inspect RNS packets & automatically drop unnecessary traffic
+In short, this current version allows you to send LXMF messages and browse nomadnet sites over MeshCore. This interface has only been tested this interface over 1, 2 and 3 MeshCore repeater hops with two total RNS nodes communicating over this interface. See the [testing section](#testing) for more details.
 
-- **A packet capture tool built in.** Optional, off by default (`packet_capture_enabled`) — logs every in/out RNS packet as one JSON line (classification, routing decision, sender/target, timing) to a configurable directory, for exactly this kind of real-evidence debugging.
+**Battle Tested** - Tested and confident this is reliable.
+
+**Working** - Working, but testing has been limited.
+
+**Experimental** - Works most of the time or unreliable over multiple MeshCore hops or other conditions.
+
+**Unstable** - Works sometimes.
+
+**Basic** - only a bare bones implementation of this feature exists. It may not be tested at all.
+
+|    Feature    |    State    |        Description        |
+|----|----|----|
+| Automatic Link | Working | The interface will automatically peer with other nodes running this interface provided same MeshCore settings on companion. |
+| Z85 Encode | Battle Tested | Encode and decode RNS packets in Z85 for transport over MeshCore. This provides a size efficiency compared to base64 encoding. ~25% overhead compared to ~35% base 64 overhead. |
+| Meshcore Routing | Experimental | Route broadcast traffic over channels, and direct traffic over direct messages. The interface keeps a cache of which RNS addresses route to each MeshCore contact. If a low amount of peers are known, the interface sends broadcast traffic over direct message to avoid unnecessary floods. |
+| RNS Packet Aware Firewalling | Experimental | Inspects outgoing traffic and automatically drops unnecessary traffic. This is a sacrifice made to maintain respect for MeshCore users. |
+| Packet Aware Self-throttling | Working | Not just a speed limit. The interface tries to delay and prioritize packets. For example, packets related to a link handshake will be delayed so that less keep alive packets are required during the life of an RNS link.
+| Packet Capture Debug Tool | Battle tested | A built in packet capture tool used for debugging the interface |
 
 ## Requirements
 
