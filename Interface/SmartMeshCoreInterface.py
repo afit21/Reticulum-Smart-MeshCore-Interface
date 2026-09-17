@@ -2168,7 +2168,7 @@ class SmartMeshCoreInterface(Interface):
         # its own request/response wait, no additional artificial delay
         # layered on top), then per-target exponential backoff.
         self.path_discovery_quick_attempts = int(cfg.get("path_discovery_quick_attempts", 3))
-        self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 15.0))
+        self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 20.0))
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
         self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 2.0))
 
@@ -2201,7 +2201,7 @@ class SmartMeshCoreInterface(Interface):
         # this skip (see record_direct_send_result), so a path that's
         # genuinely gone bad is still torn down and rediscovered once it's
         # old enough for that to be plausible, just not before.
-        self.direct_path_reset_min_age_s = float(cfg.get("direct_path_reset_min_age", 30.0))
+        self.direct_path_reset_min_age_s = float(cfg.get("direct_path_reset_min_age", 60.0))
 
         # Live, periodic contact-table read -- reliability_engine_design.md
         # §2's "data-source gap" fix: never served from a cached/inherited
@@ -2402,7 +2402,7 @@ class SmartMeshCoreInterface(Interface):
         # _send_direct_frame_and_wait_for_ack's own docstring for exactly
         # where each fires.
         self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.0))
-        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 5.0))
+        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 4.0))
         self.direct_post_send_listen_success_min_s = float(cfg.get("direct_post_send_listen_success_min", 0.0))
         self.direct_post_send_listen_success_max_s = float(cfg.get("direct_post_send_listen_success_max", 0.5))
 
@@ -6398,9 +6398,11 @@ class SmartMeshCoreInterface(Interface):
 
         bucket.fragments[header.frag_idx] = payload
         bucket.last_progress = time.monotonic()
-        self._capture_fragment_received(
-            key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total, len(bucket.fragments),
-        )
+        
+        if header.pkt_id is not None:
+            self._capture_fragment_received(
+                key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total, len(bucket.fragments),
+            )
 
         if len(bucket.fragments) < bucket.frag_total:
             self._debug(
