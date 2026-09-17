@@ -951,6 +951,7 @@ _Z85_ALPHABET = (
 _Z85_DECODE = {c: i for i, c in enumerate(_Z85_ALPHABET)}
 
 
+
 def _z85_encode(data: bytes) -> str:
     pad = (-len(data)) % 4
     padded = data + b"\x00" * pad
@@ -6194,6 +6195,12 @@ class SmartMeshCoreInterface(Interface):
             self._dedup_add(dedup_key, rns_payload)
             peer_prefix = self._canonical_peer_prefix(sender_token)
             self._observe_incoming_rns_packet(rns_payload, peer_prefix)
+            
+            #Log heard my own frame
+            # TODO: Review if this actually happens and make adjustments accordingly
+            if peer_prefix == self._own_pubkey_prefix():
+                self._debug(f"heard my own bare DIRECT frame from {sender_token!r} -- ignoring.")
+            
             self.process_incoming(rns_payload, transport="direct_bare", sender_peer_prefix=peer_prefix)
             return
 
