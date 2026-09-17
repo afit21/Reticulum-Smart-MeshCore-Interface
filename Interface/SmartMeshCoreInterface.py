@@ -972,7 +972,7 @@ def _z85_encode(data: bytes) -> str:
 
 
 def _z85_decode(text: str) -> bytes:
-    if not isinstance(text,str) or text or text[0] not in "0123":
+    if not isinstance(text,str) or not text or text[0] not in "0123":
         raise ValueError("missing/invalid Z85 pad-count prefix")
     pad = int(text[0])
     body = text[1:]
