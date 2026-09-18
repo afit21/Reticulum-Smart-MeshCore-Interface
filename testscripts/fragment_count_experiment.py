@@ -4,9 +4,12 @@ fragment_count_experiment.py
 
 Standalone MeshCore CHANNEL-delivery experiment, independent of RNS/rnsd
 entirely (same style as path_discovery_diag.py) -- talks to a local MeshCore
-device directly and sends/receives the *exact* on-wire fragment framing
-Interface/MeshCore_Dynamic_Interface.py uses (imported directly from that
-file, so this can never drift out of sync with what actually ships).
+device directly and sends/receives the *exact* on-wire multi-fragment
+framing Interface/SmartMeshCoreInterface.py uses (its own encoder/decoder,
+imported directly from that file, so this can never drift out of sync with
+what actually ships). For the same experiment with no hardware, see
+fake_meshcore_repeater_sim.py, which models the flood-dedup behavior this
+script measures.
 
 Why this exists: field testing (fieldtests/reports/alpha-0.1-snapshot2.md,
 alpha-0.1-snapshot3.md) found multi-fragment CHANNEL packets over a
@@ -64,13 +67,13 @@ import time
 from meshcore import MeshCore, EventType
 
 INTERFACE_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "Interface", "MeshCore_Dynamic_Interface.py"
+    os.path.dirname(__file__), "..", "Interface", "SmartMeshCoreInterface.py"
 )
 
 
 def load_interface_module():
-    """Load MeshCore_Dynamic_Interface.py by path (no package/__init__.py
-    in this repo) so this script always tests the exact fragment framing
+    """Load SmartMeshCoreInterface.py by path (no package/__init__.py in
+    this repo) so this script always tests the exact fragment framing
     that ships, never a hand-copied approximation of it."""
     spec = importlib.util.spec_from_file_location("mci_under_test", INTERFACE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -78,7 +81,15 @@ def load_interface_module():
     return module
 
 
-MARKER_PREFIX = "FRAGEXP:"   # distinguishes our test traffic from real "RNS:" tunnel traffic
+def frame_codec(mci):
+    """An uninitialized interface instance: the "R"-marker encoders/decoder
+    only use class constants and the module's Z85 helpers, so no radio
+    connection (and no __init__) is needed to get byte-exact frames."""
+    cls = mci.SmartMeshCoreInterface
+    return cls.__new__(cls)
+
+
+MARKER_PREFIX = "FRAGEXP:"   # distinguishes our test payloads from real RNS tunnel traffic sharing the "R" marker
 ACK_PREFIX    = "FRAGEXPACK:"  # receiver -> sender per-trial completion report
 
 
@@ -91,10 +102,14 @@ def build_trial_payload(size: int) -> bytes:
 
 async def run_sender(args) -> None:
     mci = load_interface_module()
-    PacketHandler = mci._PacketHandler
-    z85_decode    = mci.z85_decode
+    codec = frame_codec(mci)
 
     mc = await MeshCore.create_serial(args.port, args.baud)
+    info = await mc.commands.send_appstart()
+    node_name = info.payload.get("name", "") if isinstance(info.payload, dict) else ""
+    # The firmware prepends "<name>: " to every CHANNEL text at the origin;
+    # that plus the encoded frame must fit FIRMWARE_TEXT_LIMIT.
+    name_prefix_cost = len(f"{node_name}: ")
     await mc.commands.set_channel(
         args.channel_idx, args.channel_name, bytes.fromhex(args.channel_secret)
     )
@@ -128,27 +143,38 @@ async def run_sender(args) -> None:
 
     try:
         fragment_counts = [int(x) for x in args.fragment_counts.split(",")]
-        pkt_id_counter = random.randint(0, 0xFFFF) * 0x10000  # avoid colliding with a prior run
+        pkt_id_counter = random.randint(0, 0xFFFF)  # the wire pkt_id is 16-bit; random start avoids a prior run's ids
+
+        def encode_fragments(data: bytes, pkt_id: int, per_frag: int, attempt: int) -> list:
+            chunks = [data[i:i + per_frag] for i in range(0, len(data), per_frag)]
+            frames = [
+                codec._encode_channel_multifragment(chunk, pkt_id, idx, len(chunks), attempt)
+                for idx, chunk in enumerate(chunks)
+            ]
+            for frame in frames:
+                if name_prefix_cost + len(frame) > codec.FIRMWARE_TEXT_LIMIT:
+                    raise SystemExit(
+                        f"--payload-size {per_frag} makes a {name_prefix_cost + len(frame)}-char CHANNEL text "
+                        f"(limit {codec.FIRMWARE_TEXT_LIMIT} incl. this node's '{node_name}: ' prefix) -- lower it"
+                    )
+            return frames
 
         for frag_count in fragment_counts:
             print(f"\n=== fragment_count={frag_count} ({args.trials} trial(s)) ===")
             for trial in range(args.trials):
-                pkt_id_counter += 1
-                pkt_id = pkt_id_counter & 0xFFFFFFFF
+                pkt_id_counter = (pkt_id_counter + 1) & 0xFFFF
+                pkt_id = pkt_id_counter
 
-                # payload_size chosen so PacketHandler produces exactly
+                # payload_size chosen so chunking produces exactly
                 # frag_count fragments: (frag_count-1) full fragments plus
                 # a smaller remainder, using a fixed per-fragment size.
                 per_frag = args.payload_size
                 total_len = per_frag * (frag_count - 1) + max(1, per_frag // 2)
-                data = build_trial_payload(total_len)
+                data = MARKER_PREFIX.encode() + build_trial_payload(total_len - len(MARKER_PREFIX))
 
-                handler = PacketHandler(
-                    MARKER_PREFIX.encode() + data, pkt_id, payload_size=per_frag, attempt=0
-                )
-                assert len(handler.fragments) == frag_count, (
-                    f"expected {frag_count} fragments, got {len(handler.fragments)} -- "
-                    f"adjust --payload-size"
+                fragments = encode_fragments(data, pkt_id, per_frag, attempt=0)
+                assert len(fragments) == frag_count, (
+                    f"expected {frag_count} fragments, got {len(fragments)} -- adjust --payload-size"
                 )
 
                 ack_events[pkt_id] = asyncio.Event()
@@ -158,7 +184,7 @@ async def run_sender(args) -> None:
                 if args.simulate_loss and frag_count > 1:
                     drop_idx = random.randrange(frag_count)
 
-                for idx, frag_str in enumerate(handler.fragments):
+                for idx, frag_str in enumerate(fragments):
                     if idx == drop_idx:
                         print(f"  [trial {trial}] simulating loss of fragment {idx}")
                         continue
@@ -168,17 +194,12 @@ async def run_sender(args) -> None:
                 if drop_idx is not None:
                     await asyncio.sleep(args.retry_delay)
                     retry_attempt = 1 if args.vary_retry else 0
-                    retry_handler = PacketHandler(
-                        MARKER_PREFIX.encode() + data, pkt_id,
-                        payload_size=per_frag, attempt=retry_attempt,
-                    )
+                    retry_fragments = encode_fragments(data, pkt_id, per_frag, attempt=retry_attempt)
                     print(
                         f"  [trial {trial}] resending fragment {drop_idx} "
                         f"(attempt={retry_attempt})"
                     )
-                    await mc.commands.send_chan_msg(
-                        args.channel_idx, retry_handler.fragments[drop_idx]
-                    )
+                    await mc.commands.send_chan_msg(args.channel_idx, retry_fragments[drop_idx])
 
                 try:
                     await asyncio.wait_for(ack_events[pkt_id].wait(), timeout=args.trial_timeout)
@@ -218,9 +239,7 @@ async def run_sender(args) -> None:
 
 async def run_receiver(args) -> None:
     mci = load_interface_module()
-    z85_decode  = mci.z85_decode
-    WIRE_PREFIX = mci._PacketHandler.MSG_PREFIX  # "RNS:" -- the actual on-wire prefix
-    import struct
+    codec = frame_codec(mci)
 
     mc = await MeshCore.create_serial(args.port, args.baud)
     await mc.commands.set_channel(
@@ -239,28 +258,26 @@ async def run_receiver(args) -> None:
         text = event.payload.get("text", "")
         # The SENDING node's own firmware unconditionally prepends
         # "<node_name>: " to every channel text message at compose time
-        # (confirmed against src/helpers/BaseChatMesh.cpp's
-        # sendGroupMessage -- see changelog.md), so the "RNS:" wire prefix
-        # is essentially never at index 0. Search for it instead of
-        # anchoring at the start, matching the real interface's own
-        # _on_channel_msg (text.find(self.MSG_PREFIX)).
-        rns_idx = text.find(WIRE_PREFIX)
-        if rns_idx == -1:
+        # (src/helpers/BaseChatMesh.cpp sendGroupMessage), so the "R"
+        # marker is never at index 0 -- split exactly the way the real
+        # interface's _on_channel_msg_recv does.
+        _sender_name, sep, remainder = text.partition(": ")
+        if not sep or not remainder.startswith(codec.MARKER):
             return
         try:
-            raw = z85_decode(text[rns_idx + len(WIRE_PREFIX):])
-            frag_idx, pkt_id, frag_total, attempt = struct.unpack(">BIBB", raw[:7])
-        except Exception as exc:
+            header, payload = codec._decode_frame(remainder, mode="channel")
+        except ValueError as exc:
             print(f"  dropped unparsable fragment: {exc}")
             return
+        if not header.multi_fragment:
+            return  # a single-fragment fast-path frame: real tunnel traffic, not a trial
+        frag_idx, pkt_id, frag_total, attempt = header.frag_idx, header.pkt_id, header.frag_total, header.attempt
 
-        payload = raw[7:]
         if frag_idx == 0 and not payload.startswith(MARKER_PREFIX.encode()):
-            # Real RNS tunnel traffic (or anything else on this channel)
-            # also uses the "RNS:" wire prefix -- only content this
-            # experiment itself sent carries MARKER_PREFIX right after the
-            # header, so anything else is very likely unrelated traffic
-            # sharing the channel, not one of our trials.
+            # Real RNS tunnel traffic shares the "R" marker and this exact
+            # frame shape -- only content this experiment itself sent
+            # carries MARKER_PREFIX right after the header, so anything
+            # else is unrelated traffic sharing the channel, not a trial.
             return
 
         path_len = event.payload.get("path_len")

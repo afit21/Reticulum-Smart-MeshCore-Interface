@@ -10,8 +10,11 @@ In short, this current version allows you to send LXMF messages and browse nomad
 MeshCore's own CHANNEL broadcast is unauthenticated and unacknowledged — great for reach, unreliable for anything beyond a single small fragment. A prior implementation of this idea tried to tune multi-fragment CHANNEL delivery into reliability and hit a hard wall: field testing found ~80% delivery at one fragment, 0% at two or three, no matter how much the spacing was tuned. This interface takes a different approach:
 
 - **DIRECT is the primary transport, not a fallback.** Once two nodes have exchanged bind frames (this interface's own lightweight peer-discovery protocol) and RNS has opportunistically learned which MeshCore peer a given RNS destination belongs to, traffic between them goes DIRECT — MeshCore's real, ACK'd, cryptographically-identified point-to-point transport — instead of broadcasting on CHANNEL.
-- **CHANNEL is reserved for what actually needs it**: announces, path requests, and bootstrapping a brand-new destination before a DIRECT route is known — and even then, a small-mesh optimization (see below) skips CHANNEL entirely once there are only one or two bound peers, since there's no ambiguity left about who a packet is for.
+- **CHANNEL is reserved for what actually needs it**: announces, path requests, and bootstrapping a brand-new destination before a DIRECT route is known — and even then, a small-mesh optimization (see below) skips CHANNEL entirely once there are only a few bound peers (three or fewer by default), since there's no ambiguity left about who a packet is for.
 - **Self-throttling, not just self-limiting.** Real field use found gaps this design didn't anticipate on paper — DIRECT sends colliding with each other when issued concurrently, RNS's own Link-keepalive timing getting miscalibrated by an unrepresentatively fast handshake, a destination that will never answer getting retried forever — and each was found, fixed, and documented from actual packet-capture evidence, not guessed at.
+
+- **Send once, then ask.** A DIRECT-fragmented send transmits each fragment once; if any ACK is missing it asks the receiver which fragments it actually holds (a small have-bitmap reply) and re-sends only the true gaps — instead of blindly retrying data that arrived but whose ACK was lost, the failure mode real field captures showed. Peers running an older version simply don't answer, and the sender falls back to re-driving everything. `direct_fragment_reconcile_enabled = no` restores the old per-fragment retry budget.
+- **Measured, not guessed, ACK timeouts.** Every DIRECT send's real ACK round-trip is measured per peer; once a few samples exist, the ACK-wait timeout is sized from that measurement (never larger than the firmware's own hop-count estimate, never below `direct_ack_rtt_min_timeout`, and discarded on the first miss or any path change so a slower link falls straight back to the conservative value). A missed ACK holds the shared radio for the whole timeout, so this is where wasted air-silence actually goes. Set `direct_ack_rtt_adaptive_enabled = no` to keep the firmware estimate only.
 
 This interface essentially aims to inspect RNS packets & automatically drop unnecessary traffic
 
@@ -85,6 +88,10 @@ All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet Me
 | 3 Hops          | Slow                     | Not working   |
 
 Please keep in mind that this project is in very early stages. This interface currently works better than all others I've been able to test.
+
+### Automated tests and simulation (no hardware)
+
+`python3 -m unittest discover -s tests` runs the automated suite: wire-format, RNS-header and reliability-engine unit tests (about a second), plus end-to-end scenarios that run two real interface instances through simulated repeater hops (`SMCI_SKIP_SLOW=1` skips those). The simulated mesh lives in `testscripts/simmesh/` and models DIRECT routing through repeaters, ACKs, path discovery, contacts, flood dedup, half-duplex, collisions and loss. `testscripts/fake_meshcore_repeater_sim.py` runs the interface over any topology you describe (`--link A-R --link R-B --repeater R`), `testscripts/rns_multiprocess_sim.py` does the same with a full real Reticulum instance per node, and `testscripts/calibrate_sim_from_captures.py` derives loss/latency settings for the simulator from real field captures. None of this replaces the field table above — simulated timing is not real radio timing — but it lets a change be checked against multi-hop DIRECT behavior before it goes anywhere near a real repeater.
 
 ## Credits
 

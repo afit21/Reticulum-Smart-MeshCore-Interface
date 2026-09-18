@@ -2,7 +2,7 @@
 """
 relay_delivery_test.py
 
-End-to-end RNS delivery test for MeshCore_Dynamic_Interface.py, meant to
+End-to-end RNS delivery test for SmartMeshCoreInterface.py, meant to
 answer the question the README's "Field Tests" table currently answers by
 hand: does traffic actually survive N repeater hops, and how reliably?
 
@@ -20,7 +20,7 @@ layout):
          rnsd --config ~/.reticulum_near
          rnsd --config ~/.reticulum_far
 
-     Each config's [[MeshCore Dynamic Interface]] block points at a
+     Each config's [[Smart MeshCore Interface]] block points at a
      *different* serial port/radio. Place (or attenuate) the two radios so
      they can't hear each other directly and must route through one or
      more repeaters -- MeshCore only ever counts as one RNS hop regardless
