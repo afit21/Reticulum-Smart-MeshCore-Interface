@@ -63,9 +63,13 @@ class SimMeshSelfTests(unittest.TestCase):
 
     def test_unchanged_flood_retransmit_is_absorbed_by_dedup(self):
         self._advert_all()
-        call_on(self.air.loop, self.A.cmd_send_chan_msg, 0, "same text")
+        # Explicit timestamp so both sends really are byte-identical: the
+        # sim's pkt_id is a content hash that includes the send timestamp, so
+        # relying on "same second" made this test fail whenever the two
+        # sends straddled a wall-clock second boundary (audit fix 2026-09-19).
+        call_on(self.air.loop, self.A.cmd_send_chan_msg, 0, "same text", 1700000000)
         self.assertTrue(wait_until(lambda: len(self.recB.of("MESSAGES_WAITING")) >= 1, 5.0))
-        call_on(self.air.loop, self.A.cmd_send_chan_msg, 0, "same text")  # same second, same content
+        call_on(self.air.loop, self.A.cmd_send_chan_msg, 0, "same text", 1700000000)  # identical bytes
         self.assertFalse(wait_until(lambda: len(self.recB.of("MESSAGES_WAITING")) >= 2, 1.5))
         self.assertGreaterEqual(self.R.counters["dedup_dropped"], 1)
         kind, payload = call_on(self.air.loop, self.B.cmd_get_msg)

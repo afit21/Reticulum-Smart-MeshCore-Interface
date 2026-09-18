@@ -29,9 +29,24 @@ def _bring_up(mesh, names, timeout=40.0):
         mesh.add_node(n)
     mesh.advert_all()
     try:
-        assert mesh.wait_contacts(timeout), "contacts never populated"
+        # Re-adverts if the first flood didn't reach everyone (audit fix
+        # 2026-09-19): mandatory for any mesh with two or more repeaters,
+        # where a single advert round is a coin flip.
+        assert mesh.advert_until_contacts(timeout=timeout), "contacts never populated"
         assert mesh.wait_bound(timeout), "bind-frame discovery never completed"
-        assert mesh.wait_resolved(timeout), "DIRECT paths never resolved"
+        if not mesh.wait_resolved(timeout):
+            # Audit fix (2026-09-19): post-bind discovery is deliberately
+            # bounded (POST_BIND_DISCOVERY_ROUNDS), and on a 2-repeater chain
+            # all of those rounds can fall inside the window where the far
+            # node's ADVERT has not arrived yet. The interface's documented
+            # recovery for that is "the next send resolves it", so nudge one
+            # small packet each way and wait again -- which is what a real
+            # deployment does, rather than the harness demanding that
+            # unsolicited discovery alone always win the race.
+            for name in names:
+                node = mesh.nodes[name]
+                node.send(build_rns_packet("data", dest_hash=node.dest_hash, payload=b"nudge"))
+            assert mesh.wait_resolved(timeout), "DIRECT paths never resolved"
     except AssertionError:
         # unittest skips tearDown when setUp fails: stop the mesh here or its
         # interfaces (and their executor threads) outlive the test run.

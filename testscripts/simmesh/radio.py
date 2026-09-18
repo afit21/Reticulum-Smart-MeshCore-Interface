@@ -224,12 +224,21 @@ class SimRadio:
         self._seen.append(pkt.pkt_id)
         self._tx(pkt)
 
-    def cmd_send_chan_msg(self, channel_idx: int, text: str) -> None:
+    def cmd_send_chan_msg(self, channel_idx: int, text: str, ts: Optional[int] = None) -> None:
         # The firmware prepends "<name>: " exactly once at the origin;
         # repeaters relay the text verbatim.
+        #
+        # `ts` is injectable purely so a test can send the SAME packet twice
+        # and actually get the same `pkt_id` (audit fix, 2026-09-19): the id
+        # is a content hash, and with `int(time.time())` inside the body two
+        # "identical" sends straddling a wall-clock second boundary hashed
+        # differently, so the flood-dedup test failed intermittently
+        # (observed 2 of 3 runs). The real firmware timestamps the same way;
+        # this only removes the race from the test's control flow.
         pkt = SimPacket(
             route=ROUTE_FLOOD, ptype=PTYPE_GRP_TXT, src=self.name, src_hash=self.hash_byte, dst=None, dst_hash=None,
-            body={"chan": channel_idx, "text": f"{self.name}: {text}", "ts": int(time.time())},
+            body={"chan": channel_idx, "text": f"{self.name}: {text}",
+                  "ts": int(time.time()) if ts is None else int(ts)},
         )
         self._seen.append(pkt.pkt_id)
         self._tx(pkt)
