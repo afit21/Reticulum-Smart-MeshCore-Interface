@@ -5740,11 +5740,20 @@ class SmartMeshCoreInterface(Interface):
         measured ACK RTT (step 2) says a QUERY+ANSWER round trip -- two
         DIRECT exchanges back to back, each with its own firmware ACK --
         plausibly takes more than that. Never shorter than the config
-        value."""
+        value; the RTT-derived part is capped at
+        `direct_ack_timeout_routed_max_s` (see below)."""
         st = self._ack_rtt.get(peer_prefix)
         timeout_s = self.direct_completion_check_timeout_s
         if st is not None:
-            timeout_s = max(timeout_s, 3.0 * (st["srtt"] + 4.0 * st["rttvar"]))
+            # Pre-field-test tweak (2026-09-18): capped at the same ceiling
+            # an ACK wait has. This wait now holds _direct_exchange_lock,
+            # and the estimator's initial spread (rttvar = rtt/2) makes
+            # 3*(srtt + 4*rttvar) about nine times the measured RTT --
+            # 20-30s at 1-2 hops for one unanswered query. The cap keeps
+            # the worst case equal to one already-accepted ACK timeout.
+            timeout_s = max(timeout_s, min(
+                3.0 * (st["srtt"] + 4.0 * st["rttvar"]), self.direct_ack_timeout_routed_max_s,
+            ))
         if self.rx_log_holds_enabled:
             # Code review (2026-09-18): the peer's ANSWER pays step 4's
             # pre-transmit hold (up to rx_log_hold_max_s) before it can
