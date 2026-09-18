@@ -3216,7 +3216,7 @@ class SmartMeshCoreInterface(Interface):
         # one check that the public repeater forwards raw packets. When
         # on: packets too large for one text frame go to a raw-capable
         # peer as unacknowledged raw bursts reconciled by the "Q" bitmap.
-        self.direct_raw_fragments_enabled = _cfg_bool(cfg.get("direct_raw_fragments_enabled", "no"))
+        self.direct_raw_fragments_enabled = _cfg_bool(cfg.get("direct_raw_fragments_enabled", "yes"))
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
