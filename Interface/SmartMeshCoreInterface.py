@@ -1349,6 +1349,81 @@ case that drives the reconcile QUERY) -- see the run notes in the
 review's own summary; real-hardware validation of the completion-frame
 locking change is still outstanding.
 
+**Field-diagnosed batch (2026-09-18, evening -- the first real multi-hop
+capture: `fieldtests/raw/2026-09-18-drive-home/`, laptop side only, a
+3-hop path (`?->d6->19->desktop`) that degraded to a dead first hop and
+then collapsed to zero-hop as the car arrived home).** Diagnosed by a
+second Claude session on the laptop and re-verified here against the
+same JSONL before anything was changed. Four fixes:
+
+1. *Reconcile QUERY timeout fell to the 5s floor at 3 hops, where the
+   QUERY's own ACK alone takes ~4.5s* -- both reconcile queries in the
+   capture timed out at exactly 5.0s with `rtt_samples=0`, because the
+   miss that triggers a reconcile is (by construction) a miss under the
+   measured timeout, and step 2's Karn invalidation had just discarded
+   the RTT stats `_completion_query_timeout_s` needed. Karn is right not
+   to *trust* that estimate for the next ACK wait; it is still the best
+   information for sizing a two-frame exchange. `_invalidate_ack_rtt`
+   now keeps the discarded stats in `_ack_rtt_snapshot` (for the
+   missed-ACK case only -- a path change still drops everything), and
+   with no snapshot at all the query waits the peer's last firmware
+   hop-aware ACK bound (`_last_firmware_ack_timeout_s`) x2, capped as
+   before at `direct_ack_timeout_routed_max_s`.
+2. *Early abort on a dead first hop (`direct_hop1_abort_enabled`,
+   default yes).* The outage cost was the timeout, not collisions: nine
+   consecutive misses each burned the full 28s firmware timeout while
+   the RX log heard *nothing at all* -- no repeater forward of our own
+   frame, when every one of the 24 successful multi-hop attempts before
+   the outage had one (`rx_echo_seen_s` 0.84-3.58s, median 1.73s). The
+   stale-path reset therefore needed 4 minutes to fire and the queue
+   backed up to 18 deep with 225s lock waits. Now
+   `_send_direct_frame_and_wait_for_ack` learns each peer's echo timing
+   (`_echo_stats`, last 16 samples, cleared on any path change) and,
+   once `direct_hop1_abort_min_samples` (3) exist, waits only
+   `max(direct_hop1_abort_min_s, direct_hop1_abort_echo_multiplier x
+   the peer's slowest observed echo)` (5s / 2.0 by default) for EITHER
+   the ACK or the echo; if neither has arrived it gives up on that
+   attempt as `ack_timeout_source="hop1_abort"` -- a recorded failure,
+   since silence where a forward was due is positive evidence, so the
+   reset fires in ~30s instead of ~4 minutes. The guard the capture
+   demanded: 18 successful attempts in the last minute had NO echo,
+   because the laptop was already zero-hop (ACK in 1.3-2.2s) while the
+   interface still carried `hop_count=3`. An ACK always wins the race
+   against a >=5s deadline, so those keep succeeding. Self-disabling on
+   a radio/library with no RX-log feed (no echo samples -> never arms),
+   never applied at hop_count 0/None, never longer than the ACK timeout
+   it shortens, and it does not Karn-invalidate the RTT estimate (the
+   estimate wasn't what governed the wait).
+3. *Outgoing path requests are coalesced per requested destination*
+   (`PATH_REQUEST_RATE_LIMIT_WINDOW_S`, 20s, the mirror of the
+   2026-09-15 PATH_RESPONSE rule): RNS emitted 14 identical requests for
+   one destination at 4-8s gaps -- explicit client retries, under
+   Transport's own 20s automatic floor -- and each became a 3-hop DIRECT
+   exchange, driving queue depth to 7 on its own. Every path request
+   shares one PLAIN pseudo-destination hash, so the key is the
+   *requested* hash, the first 16 bytes of the packet data
+   (`_path_request_target`, layout confirmed against
+   `RNS.Transport.request_path`).
+4. *Queued packets expire (`outgoing_max_age`, 120s; ANNOUNCE exempt).*
+   17 LXMF pings queued during the outage drained as a stale burst in
+   85s once the path came back. The age is checked at dequeue
+   (`_outgoing_worker`), before every DIRECT attempt's lock acquisition
+   and again right after it (`expires_at`, threaded down the DIRECT
+   chain exactly like `hop_count`), and before each CHANNEL retry pass
+   -- an expired packet is dropped with `ack_timeout_source="expired"` /
+   routing decision `expired_in_queue` in the capture, counted in
+   `outgoing_dropped_total`, and never recorded as a path failure. 120s
+   matches `reassembly_idle_timeout`: past it the receiver has already
+   given up on any fragmented packet anyway.
+
+Not done from the same analysis, deliberately: dropping LINK-context
+packets after a LINKCLOSE -- the capture shows zero later packets to the
+closed link's hash, so there was no evidence to build against. The
+multi-hop numbers the RX-log hold model was waiting on now exist (echo
+1.4-3.0s, 3-hop ACK 3.5-7.0s mean 3.5s, RSSI -100 via repeater vs -52
+direct); holds stayed off and the recorded predictions were small, which
+fits link loss rather than contention, so the default is unchanged.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -1966,7 +2041,7 @@ class SmartMeshCoreInterface(Interface):
     # raises TypeError. priority=-1 sorts before both real tiers (0, 1),
     # so it's also dequeued at the first opportunity on shutdown; seq=-1
     # never collides since _outqueue_seq only ever counts up from 0.
-    _OUTQUEUE_SHUTDOWN_SENTINEL = (-1, -1, None, None)
+    _OUTQUEUE_SHUTDOWN_SENTINEL = (-1, -1, None, None, 0.0)
 
     # --- Path discovery / telemetry permission (docs/path_discovery_spec.md) --
     # Firmware constants, not user config -- confirmed directly against
@@ -2144,6 +2219,15 @@ class SmartMeshCoreInterface(Interface):
     # client retry loop still gets answered promptly.
     PATH_RESPONSE_RATE_LIMIT_WINDOW_S = 20.0
 
+    # Field-diagnosed (2026-09-18 drive-home capture, see module
+    # docstring): the request-side mirror of the rule above. 14 identical
+    # path requests for one destination in 4 minutes, 4-8s apart, each a
+    # full 3-hop DIRECT exchange. Keyed on the REQUESTED destination
+    # (inside the payload -- every path request shares one PLAIN
+    # pseudo-destination hash). Same 20s as RNS.Transport's own automatic
+    # PATH_REQUEST_MI floor, so only explicit client retries are affected.
+    PATH_REQUEST_RATE_LIMIT_WINDOW_S = 20.0
+
     # -------------------------------------------------------------------
     # Construction
     # -------------------------------------------------------------------
@@ -2262,6 +2346,17 @@ class SmartMeshCoreInterface(Interface):
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on
         # this interface's own event loop.
         self._ack_rtt = {}
+        # Field fix (2026-09-18 evening, see module docstring): the stats
+        # Karn just discarded, kept only so _completion_query_timeout_s can
+        # size a reconcile QUERY on the link it was just measured on; and
+        # the firmware's last hop-aware ACK bound per peer as the fallback
+        # when even that is gone. Both dropped on any path change.
+        self._ack_rtt_snapshot = {}
+        self._last_firmware_ack_timeout_s = {}
+        # Per-peer repeater-echo timings (seconds after our own transmit
+        # that the first hop was heard forwarding our frame), the data
+        # behind the early hop-1 abort -- see _hop1_abort_deadline_s.
+        self._echo_stats = {}
         # Step 2: the currently open per-attempt RX-log correlation window
         # (None when no DIRECT attempt is in flight). Opened/closed by
         # _send_direct_frame_and_wait_for_ack under _direct_exchange_lock
@@ -2379,6 +2474,9 @@ class SmartMeshCoreInterface(Interface):
         # -> time.monotonic() of the last outgoing PATH_RESPONSE actually
         # sent for it. See _path_response_rate_limited.
         self._path_response_last_sent_at = {}
+        # PATH_REQUEST_RATE_LIMIT_WINDOW_S's state -- requested destination
+        # hash -> time.monotonic() of the last path request sent for it.
+        self._path_request_last_sent_at = {}
         # Code review (2026-09-18): link_id -> (destination_hash, expiry)
         # for every LINKREQUEST this node sent, so the LRPROOF that answers
         # it (whose destination field is that link_id, never the
@@ -2791,6 +2889,31 @@ class SmartMeshCoreInterface(Interface):
         # only delay it.
         self.direct_fragment_reconcile_enabled = _cfg_bool(cfg.get("direct_fragment_reconcile_enabled", "yes"))
         self.direct_fragment_pass0_attempts = int(cfg.get("direct_fragment_pass0_attempts", 1))
+
+        # Field-diagnosed (2026-09-18 drive-home capture, see module
+        # docstring): give up on a multi-hop DIRECT attempt early when the
+        # first-hop repeater was never heard forwarding our frame. Armed
+        # per peer only after `direct_hop1_abort_min_samples` echoes have
+        # been measured for the current path; the deadline is
+        # `max(direct_hop1_abort_min, multiplier x slowest echo seen)`,
+        # never longer than the ACK timeout it shortens. The 5s floor is
+        # what keeps a stale hop_count harmless: a zero-hop ACK (1.3-2.2s
+        # measured) always arrives first. An abort counts as a real
+        # failure toward direct_path_reset_threshold -- silence where a
+        # forward was due is evidence, unlike a plain timeout.
+        self.direct_hop1_abort_enabled = _cfg_bool(cfg.get("direct_hop1_abort_enabled", "yes"))
+        self.direct_hop1_abort_min_samples = int(cfg.get("direct_hop1_abort_min_samples", 3))
+        self.direct_hop1_abort_echo_multiplier = float(cfg.get("direct_hop1_abort_echo_multiplier", 2.0))
+        self.direct_hop1_abort_min_s = float(cfg.get("direct_hop1_abort_min", 5.0))
+
+        # Field-diagnosed (same capture): a packet that has sat in this
+        # interface's queue (or behind _direct_exchange_lock) longer than
+        # this is dropped instead of sent -- 17 LXMF pings queued through
+        # a 4-minute outage drained as a stale burst the moment the path
+        # came back. ANNOUNCE is exempt (idempotent, and RNS won't re-send
+        # one soon). 0 disables. Default matches reassembly_idle_timeout:
+        # past it the receiver has given up on any fragmented packet too.
+        self.outgoing_max_age_s = float(cfg.get("outgoing_max_age", 120.0))
 
     def _configure_path_discovery(self, cfg):
         # docs/path_discovery_spec.md's "Retry and backoff structure" --
@@ -3446,6 +3569,7 @@ class SmartMeshCoreInterface(Interface):
         send_cmd_latency_s: Optional[float] = None, rx_window: Optional[dict] = None,
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
+        hop1_abort_deadline_s: Optional[float] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -3553,6 +3677,11 @@ class SmartMeshCoreInterface(Interface):
             # through the same ACK-waited path -- so an analysis can keep
             # its per-attempt reliability stats to real payload frames.
             "kind": kind,
+            # Field fix (2026-09-18 evening): the armed early-abort
+            # deadline for this attempt (None = not armed); when it fired,
+            # ack_timeout_source is "hop1_abort" and ack_timeout_s equals
+            # this. "expired" means the packet aged out before transmit.
+            "hop1_abort_deadline_s": round(hop1_abort_deadline_s, 3) if hop1_abort_deadline_s is not None else None,
         })
 
     def _capture_channel_fragment_sent(
@@ -4750,7 +4879,7 @@ class SmartMeshCoreInterface(Interface):
         priority = self._priority_tier(header)
         seq = next(self._outqueue_seq)
         try:
-            self._outqueue.put_nowait((priority, seq, raw, header))
+            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic()))
         except queue.Full:
             self._outgoing_dropped_total += 1
             RNS.log(
@@ -4773,12 +4902,29 @@ class SmartMeshCoreInterface(Interface):
         executor thread)."""
         loop = asyncio.get_running_loop()
         while True:
-            priority, seq, data, header = await loop.run_in_executor(None, self._outqueue.get)
+            priority, seq, data, header, enqueued_at = await loop.run_in_executor(None, self._outqueue.get)
             if data is None:
                 self._outqueue.task_done()
                 return
             try:
-                await self._send_outgoing_packet(data, header)
+                # Field fix (2026-09-18 evening): outgoing_max_age -- see
+                # that config's own comment. ANNOUNCE never expires.
+                expires_at = None
+                if self.outgoing_max_age_s > 0 and not (
+                    header is not None and header.packet_type == RNS.Packet.ANNOUNCE
+                ):
+                    expires_at = enqueued_at + self.outgoing_max_age_s
+                if self._expired(expires_at):
+                    self._outgoing_dropped_total += 1
+                    self._capture_outgoing(header, data, "expired_in_queue")
+                    RNS.log(
+                        f"{self}: dropping outgoing packet ({len(data)} bytes) -- sat "
+                        f"{time.monotonic() - enqueued_at:.0f}s in the outgoing queue, past "
+                        f"outgoing_max_age={self.outgoing_max_age_s:.0f}s.",
+                        RNS.LOG_WARNING,
+                    )
+                else:
+                    await self._send_outgoing_packet(data, header, expires_at=expires_at)
             except Exception as exc:
                 RNS.log(
                     f"{self}: unexpected error sending an outgoing packet: {exc}",
@@ -4786,6 +4932,12 @@ class SmartMeshCoreInterface(Interface):
                 )
             finally:
                 self._outqueue.task_done()
+
+    def _expired(self, expires_at: Optional[float]) -> bool:
+        """outgoing_max_age check -- `expires_at` is a time.monotonic()
+        deadline threaded down from `_outgoing_worker`, or None when the
+        packet never expires (ANNOUNCE, or the feature is disabled)."""
+        return expires_at is not None and time.monotonic() >= expires_at
 
     def _in_small_mesh_mode(self) -> bool:
         """True when between 1 and SMALL_MESH_DIRECT_ONLY_MAX_PEERS peers
@@ -4813,7 +4965,9 @@ class SmartMeshCoreInterface(Interface):
         peers = sorted(self._peers.values(), key=lambda p: p.last_seen, reverse=True)
         return [p.pubkey_prefix for p in peers]
 
-    async def _send_direct_to_all_peers(self, data: bytes, priority: int = PRIORITY_NORMAL) -> None:
+    async def _send_direct_to_all_peers(
+        self, data: bytes, priority: int = PRIORITY_NORMAL, expires_at: Optional[float] = None,
+    ) -> None:
         """Small-mesh replacement for a CHANNEL broadcast: one DIRECT
         copy to every bound peer instead, each spawned independently
         (never gated on another's outcome, same reasoning as every other
@@ -4823,7 +4977,9 @@ class SmartMeshCoreInterface(Interface):
         bare-vs-fragmented dispatch correctly regardless of caller."""
         for peer_prefix in self._all_bound_peer_prefixes():
             self._spawn_background_task(
-                self._send_direct_supplement(data, peer_prefix, trigger_discovery=True, priority=priority)
+                self._send_direct_supplement(
+                    data, peer_prefix, trigger_discovery=True, priority=priority, expires_at=expires_at,
+                )
             )
 
     def _unknown_dest_in_backoff(self, destination_hash: Optional[bytes]) -> bool:
@@ -4895,6 +5051,33 @@ class SmartMeshCoreInterface(Interface):
             self._unknown_dest_backoff_until.pop(h, None)
             self._unknown_dest_last_attempt.pop(h, None)
 
+    def _path_request_target(self, data: bytes, header: _RnsHeader) -> Optional[bytes]:
+        """The destination a path request is asking about: the first
+        TRUNCATED_HASHLENGTH bytes of the packet data (`RNS.Transport.
+        request_path`: `destination_hash + [transport identity hash] +
+        tag`, sent PLAIN so it sits in the clear). The packet's own
+        destination-hash field is the shared path-request pseudo-
+        destination, identical for every request, so it is useless as a
+        rate-limit key."""
+        dst_len = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+        data_offset = ((2 + dst_len) if header.header_type == 1 else 2) + dst_len + 1
+        if len(data) < data_offset + dst_len:
+            return None
+        return data[data_offset:data_offset + dst_len]
+
+    def _path_request_rate_limited(self, requested_hash: Optional[bytes]) -> bool:
+        """PATH_REQUEST_RATE_LIMIT_WINDOW_S -- same shape and fail-open
+        convention as `_path_response_rate_limited`, including recording
+        the send time as a side effect on the not-limited path."""
+        if requested_hash is None:
+            return False
+        now = time.monotonic()
+        last_sent = self._path_request_last_sent_at.get(requested_hash)
+        if last_sent is not None and now - last_sent < self.PATH_REQUEST_RATE_LIMIT_WINDOW_S:
+            return True
+        self._path_request_last_sent_at[requested_hash] = now
+        return False
+
     def _path_response_rate_limit_sweep(self, now: float) -> None:
         """Code review (2026-09-18): `_path_response_last_sent_at` had no
         reclaim at all (a TODO at the top of this file said as much) --
@@ -4907,6 +5090,12 @@ class SmartMeshCoreInterface(Interface):
         ]
         for h in stale:
             del self._path_response_last_sent_at[h]
+        stale = [
+            h for h, last in self._path_request_last_sent_at.items()
+            if now - last >= self.PATH_REQUEST_RATE_LIMIT_WINDOW_S
+        ]
+        for h in stale:
+            del self._path_request_last_sent_at[h]
 
     def _pending_link_request_sweep(self, now: float) -> None:
         """Code review (2026-09-18): a LINKREQUEST whose LRPROOF never
@@ -4937,7 +5126,9 @@ class SmartMeshCoreInterface(Interface):
         self._path_response_last_sent_at[destination_hash] = now
         return False
 
-    async def _send_outgoing_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+    async def _send_outgoing_packet(
+        self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
+    ) -> None:
         """Entry point the outgoing worker calls for every packet -- logs
         the classification debug line, then either delays an LRPROOF
         (see below) or dispatches immediately via
@@ -5002,7 +5193,7 @@ class SmartMeshCoreInterface(Interface):
                 f"real latency rather than an optimistic handshake sample."
             )
             self._capture_outgoing(header, data, "lrproof_delayed")
-            self._spawn_background_task(self._send_delayed_link_proof(data, header))
+            self._spawn_background_task(self._send_delayed_link_proof(data, header, expires_at))
             return
 
         # User-requested fix (2026-09-15, real 2-hop repeater field
@@ -5022,6 +5213,25 @@ class SmartMeshCoreInterface(Interface):
                 )
                 return
 
+        # Field fix (2026-09-18 evening): coalesce repeated path requests
+        # for the same requested destination -- see
+        # PATH_REQUEST_RATE_LIMIT_WINDOW_S's own comment.
+        if (
+            header is not None
+            and header.packet_type == RNS.Packet.DATA
+            and header.destination_type == RNS.Destination.PLAIN
+        ):
+            requested = self._path_request_target(data, header)
+            if self._path_request_rate_limited(requested):
+                self._outgoing_dropped_total += 1
+                self._capture_outgoing(header, data, "path_request_rate_limited")
+                self._debug(
+                    f"routing decision: path request for "
+                    f"{requested.hex() if requested else None} -- dropped, one was already "
+                    f"sent within {self.PATH_REQUEST_RATE_LIMIT_WINDOW_S:.0f}s."
+                )
+                return
+
         # Code review (2026-09-18): remember which destination this
         # LINKREQUEST is for, keyed by the link_id its LRPROOF will carry --
         # see _observe_incoming_rns_packet's PROOF branch for the other
@@ -5038,15 +5248,19 @@ class SmartMeshCoreInterface(Interface):
                     header.destination_hash, time.monotonic() + self.proof_correlation_ttl_s,
                 )
 
-        await self._dispatch_outgoing_packet(data, header)
+        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at)
 
-    async def _send_delayed_link_proof(self, data: bytes, header: _RnsHeader) -> None:
+    async def _send_delayed_link_proof(
+        self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
+    ) -> None:
         await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
         if self.detached or not self.online:
             return
-        await self._dispatch_outgoing_packet(data, header)
+        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at)
 
-    async def _dispatch_outgoing_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+    async def _dispatch_outgoing_packet(
+        self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
+    ) -> None:
         """docs/routing_decisions.md's routing dispatcher -- the three
         outgoing situations, in the doc's own order:
 
@@ -5077,7 +5291,7 @@ class SmartMeshCoreInterface(Interface):
            persistence-failure note).
         """
         if header is not None and header.packet_type == RNS.Packet.DATA and header.destination_type == RNS.Destination.PLAIN:
-            await self._send_path_request(data, header)
+            await self._send_path_request(data, header, expires_at=expires_at)
             return
 
         if header is not None and header.packet_type != RNS.Packet.ANNOUNCE:
@@ -5098,7 +5312,9 @@ class SmartMeshCoreInterface(Interface):
                 # rather than awaited, exactly like path discovery and the
                 # CHANNEL extra-retry passes above: one slow operation must
                 # not stall the worker from draining the next queued packet.
-                self._spawn_background_task(self._send_direct_packet(data, header, peer_prefix))
+                self._spawn_background_task(
+                    self._send_direct_packet(data, header, peer_prefix, expires_at=expires_at)
+                )
                 return
 
             # Milestone 6 fix for a real field-diagnosed gap
@@ -5153,14 +5369,16 @@ class SmartMeshCoreInterface(Interface):
                     candidate_peers=self._all_bound_peer_prefixes(),
                 )
                 self._record_unknown_dest_attempt(header.destination_hash)
-                await self._send_direct_to_all_peers(data, priority=self._priority_tier(header))
+                await self._send_direct_to_all_peers(
+                    data, priority=self._priority_tier(header), expires_at=expires_at,
+                )
                 return
             bootstrap_targets = [] if backed_off else self._select_bootstrap_supplement_targets()
             for bootstrap_peer_prefix in bootstrap_targets:
                 self._spawn_background_task(
                     self._send_direct_supplement(
                         data, bootstrap_peer_prefix, trigger_discovery=True,
-                        priority=self._priority_tier(header),
+                        priority=self._priority_tier(header), expires_at=expires_at,
                     )
                 )
             if bootstrap_targets:
@@ -5188,14 +5406,16 @@ class SmartMeshCoreInterface(Interface):
                     header, data, "small_mesh_direct_all_announce",
                     candidate_peers=self._all_bound_peer_prefixes(),
                 )
-                await self._send_direct_to_all_peers(data, priority=self._priority_tier(header))
+                await self._send_direct_to_all_peers(
+                    data, priority=self._priority_tier(header), expires_at=expires_at,
+                )
                 return
             self._debug("routing decision: ANNOUNCE -> CHANNEL broadcast only (never DIRECT, by design).")
             self._capture_outgoing(header, data, "broadcast_announce_only")
         else:
             self._capture_outgoing(header, data, "broadcast_fallback")
 
-        await self._send_broadcast_packet(data, header)
+        await self._send_broadcast_packet(data, header, expires_at=expires_at)
 
     def _select_bootstrap_supplement_targets(self) -> list:
         """Milestone 6's DIRECT-bootstrap-supplement target selection:
@@ -5228,7 +5448,9 @@ class SmartMeshCoreInterface(Interface):
         )
         return [p.pubkey_prefix for p in peers[: self.bootstrap_direct_supplement_cap]]
 
-    async def _send_broadcast_packet(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+    async def _send_broadcast_packet(
+        self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
+    ) -> None:
         """The CHANNEL broadcast send, exactly as Milestones 1-3 built it
         -- extracted unchanged out of Milestone 3's own
         `_send_outgoing_packet` body so Milestone 5's dispatcher above can
@@ -5248,9 +5470,11 @@ class SmartMeshCoreInterface(Interface):
         # wait for pkt_id's own retry never blocks the worker from moving
         # on to the next queued packet.
         for attempt in range(1, retry_extra + 1):
-            self._spawn_background_task(self._delayed_retry_pass(data, pkt_id, attempt))
+            self._spawn_background_task(self._delayed_retry_pass(data, pkt_id, attempt, expires_at))
 
-    async def _send_path_request(self, data: bytes, header: _RnsHeader) -> None:
+    async def _send_path_request(
+        self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
+    ) -> None:
         """docs/routing_decisions.md's path-request case: always
         broadcast, plus a DIRECT copy to a capped number of known
         router-capability peers that already have a resolved path --
@@ -5290,17 +5514,21 @@ class SmartMeshCoreInterface(Interface):
                 header, data, "small_mesh_direct_all_path_request",
                 candidate_peers=self._all_bound_peer_prefixes(),
             )
-            await self._send_direct_to_all_peers(data, priority=self._priority_tier(header))
+            await self._send_direct_to_all_peers(
+                data, priority=self._priority_tier(header), expires_at=expires_at,
+            )
             return
         self._debug("routing decision: path request -> CHANNEL broadcast + router-peer DIRECT supplement.")
         supplement_targets = self._select_direct_supplement_targets()
         self._capture_outgoing(
             header, data, "broadcast_path_request_supplement", candidate_peers=supplement_targets,
         )
-        self._spawn_background_task(self._send_broadcast_packet(data, header))
+        self._spawn_background_task(self._send_broadcast_packet(data, header, expires_at=expires_at))
         for peer_prefix in supplement_targets:
             self._spawn_background_task(
-                self._send_direct_supplement(data, peer_prefix, priority=self._priority_tier(header))
+                self._send_direct_supplement(
+                    data, peer_prefix, priority=self._priority_tier(header), expires_at=expires_at,
+                )
             )
 
     def _select_direct_supplement_targets(self) -> list:
@@ -5338,7 +5566,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_direct_supplement(
         self, data: bytes, peer_prefix: str, trigger_discovery: bool = False,
-        priority: int = PRIORITY_NORMAL,
+        priority: int = PRIORITY_NORMAL, expires_at: Optional[float] = None,
     ) -> None:
         """A DIRECT copy of `data` to one bound peer, fired alongside a
         mandatory broadcast this method never gates or is gated by (see
@@ -5370,6 +5598,10 @@ class SmartMeshCoreInterface(Interface):
         await asyncio.sleep(random.uniform(spacing_min, spacing_max))
         if self.detached or not self.online:
             return
+        if self._expired(expires_at):
+            self._outgoing_dropped_total += 1
+            self._debug(f"DIRECT supplement to {peer_prefix!r} skipped -- packet expired (outgoing_max_age).")
+            return
 
         contact = self._resolve_contact(peer_prefix)
         target = contact.get("public_key") if contact is not None else None
@@ -5395,6 +5627,7 @@ class SmartMeshCoreInterface(Interface):
         # uses rather than assuming bare unconditionally.
         ok = await self._send_direct_payload(
             target, peer_prefix, data, priority=priority, hop_count=resolved.out_path_len,
+            expires_at=expires_at,
         )
         if ok is None:
             # Code-review fix: _send_direct_packet's own handling of this
@@ -5415,7 +5648,10 @@ class SmartMeshCoreInterface(Interface):
                 RNS.LOG_WARNING,
             )
 
-    async def _send_direct_packet(self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str) -> None:
+    async def _send_direct_packet(
+        self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str,
+        expires_at: Optional[float] = None,
+    ) -> None:
         """Case 3 of docs/routing_decisions.md's summary table: DIRECT is
         the primary transport here, not a supplement -- no CHANNEL
         fallback on an ACK failure, only on the local resolution steps
@@ -5445,6 +5681,7 @@ class SmartMeshCoreInterface(Interface):
 
         ok = await self._send_direct_payload(
             target, peer_prefix, data, priority=self._priority_tier(header), hop_count=resolved.out_path_len,
+            expires_at=expires_at,
         )
         if ok is None:
             # Too big even for the fully-fragmented DIRECT budget --
@@ -5465,6 +5702,9 @@ class SmartMeshCoreInterface(Interface):
         self._capture_direct_send_result(
             peer_prefix, header.destination_hash if header is not None else None, ok, resolved, len(data),
         )
+        if not ok and self._expired(expires_at):
+            # Already logged and counted where the expiry was detected.
+            return
         if not ok:
             RNS.log(
                 f"{self}: DIRECT send to {peer_prefix!r} did not receive a "
@@ -5478,7 +5718,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_direct_payload(
         self, target: str, peer_prefix: str, data: bytes, priority: int = PRIORITY_NORMAL,
-        hop_count: Optional[int] = None,
+        hop_count: Optional[int] = None, expires_at: Optional[float] = None,
     ) -> Optional[bool]:
         """Sends `data` DIRECT to `target`, choosing the bare or DIRECT-
         needs-fragmenting shape automatically based on size -- shared by
@@ -5494,7 +5734,7 @@ class SmartMeshCoreInterface(Interface):
         if len(data) <= fastpath_budget:
             return await self._send_direct_with_attempts(
                 target, lambda attempt, d=data: self._encode_direct_bare(d), peer_prefix,
-                priority=priority, hop_count=hop_count,
+                priority=priority, hop_count=hop_count, expires_at=expires_at,
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -5509,11 +5749,13 @@ class SmartMeshCoreInterface(Interface):
         pkt_id = self._next_pkt_id()
         return await self._send_direct_fragmented(
             target, peer_prefix, data, pkt_id, priority=priority, hop_count=hop_count,
+            expires_at=expires_at,
         )
 
     async def _send_direct_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
         priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+        expires_at: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's two-pass DIRECT-
         fragmentation structure, fixed by a logical review specifically
@@ -5577,6 +5819,7 @@ class SmartMeshCoreInterface(Interface):
                 pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                 hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
                 attempts_override=attempts_override, record_result=record_result,
+                expires_at=expires_at,
             )
 
         # Step 3 (2026-09-18, see direct_fragment_reconcile_enabled's own
@@ -5611,6 +5854,11 @@ class SmartMeshCoreInterface(Interface):
                 return False
 
         missing = [i for i in range(frag_total) if not acked[i]]
+        if missing and self._expired(expires_at):
+            # Field fix (2026-09-18 evening): no reconcile QUERY and no
+            # re-drive for a packet the receiver has already given up on.
+            self._debug(f"DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r}: packet expired -- giving up.")
+            return False
         if reconcile and any(acked):
             # Pass-0 attempts are unrecorded (see send_one's record_result);
             # a real ACK is still real evidence the path works, recorded
@@ -5742,8 +5990,17 @@ class SmartMeshCoreInterface(Interface):
         plausibly takes more than that. Never shorter than the config
         value; the RTT-derived part is capped at
         `direct_ack_timeout_routed_max_s` (see below)."""
-        st = self._ack_rtt.get(peer_prefix)
+        st = self._ack_rtt.get(peer_prefix) or self._ack_rtt_snapshot.get(peer_prefix)
         timeout_s = self.direct_completion_check_timeout_s
+        if st is None:
+            # Field fix (2026-09-18 evening): no RTT information at all --
+            # the firmware's hop-aware ACK bound for this peer, doubled for
+            # the two exchanges a QUERY+ANSWER round trip is, is still far
+            # better than a flat 5s at 3 hops (where one ACK alone took
+            # ~4.5s in the drive-home capture).
+            fw = self._last_firmware_ack_timeout_s.get(peer_prefix)
+            if fw is not None:
+                timeout_s = max(timeout_s, min(2.0 * fw, self.direct_ack_timeout_routed_max_s))
         if st is not None:
             # Pre-field-test tweak (2026-09-18): capped at the same ceiling
             # an ACK wait has. This wait now holds _direct_exchange_lock,
@@ -5837,6 +6094,7 @@ class SmartMeshCoreInterface(Interface):
         priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None, time_critical: bool = False,
         pass_number: Optional[int] = None,
         attempts_override: Optional[int] = None, record_result: bool = True,
+        expires_at: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -5903,13 +6161,26 @@ class SmartMeshCoreInterface(Interface):
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            if self._expired(expires_at):
+                # Field fix (2026-09-18 evening): outgoing_max_age. Not a
+                # path failure (nothing was learned about the path), so no
+                # record_direct_send_result call; counted as a drop once.
+                self._outgoing_dropped_total += 1
+                RNS.log(
+                    f"{self}: dropping DIRECT send to {peer_prefix!r}"
+                    f"{f' (pkt_id={pkt_id} frag_idx={frag_idx}/{frag_total})' if pkt_id is not None else ''}"
+                    f" -- packet expired (outgoing_max_age={self.outgoing_max_age_s:.0f}s) before "
+                    f"attempt {attempt} could transmit.",
+                    RNS.LOG_WARNING,
+                )
+                return False
             frame = frame_builder(attempt)
             try:
                 ok, waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                     target, frame, attempt, peer_prefix=peer_prefix,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
-                    pass_number=pass_number,
+                    pass_number=pass_number, expires_at=expires_at,
                 )
             except Exception as exc:
                 RNS.log(
@@ -5954,13 +6225,32 @@ class SmartMeshCoreInterface(Interface):
         st["samples"] += 1
         st["last_rtt"] = rtt_s
 
-    def _invalidate_ack_rtt(self, peer_prefix: Optional[str], reason: str) -> None:
+    def _invalidate_ack_rtt(self, peer_prefix: Optional[str], reason: str, keep_for_query: bool = False) -> None:
         """Karn-style: drop everything measured for this peer. Called on a
         missed ACK that was governed by the measured timeout (the estimate
         may simply have been too tight -- go back to the firmware's guess
         until fresh samples say otherwise) and on any path change (a new
-        path is a new link with its own RTT)."""
-        if peer_prefix is not None and self._ack_rtt.pop(peer_prefix, None) is not None:
+        path is a new link with its own RTT).
+
+        Field fix (2026-09-18 evening): `keep_for_query=True` (the
+        missed-ACK case) parks the discarded stats in `_ack_rtt_snapshot`
+        so `_completion_query_timeout_s` can still size the reconcile
+        QUERY that this very miss is about to trigger -- the drive-home
+        capture's two reconciles both fell to the 5s floor at 3 hops for
+        want of exactly these numbers. A path change (`keep_for_query`
+        False) drops the snapshot, the echo timings and the last firmware
+        bound too: none of them describe the new path."""
+        if peer_prefix is None:
+            return
+        st = self._ack_rtt.pop(peer_prefix, None)
+        if keep_for_query:
+            if st is not None:
+                self._ack_rtt_snapshot[peer_prefix] = st
+        else:
+            self._ack_rtt_snapshot.pop(peer_prefix, None)
+            self._echo_stats.pop(peer_prefix, None)
+            self._last_firmware_ack_timeout_s.pop(peer_prefix, None)
+        if st is not None:
             self._debug(f"ACK RTT estimate for {peer_prefix!r} discarded ({reason}); firmware timeout applies until re-measured.")
 
     def _adaptive_ack_timeout(self, peer_prefix: Optional[str], firmware_timeout_s: float) -> "tuple[float, str]":
@@ -5983,6 +6273,39 @@ class SmartMeshCoreInterface(Interface):
         if measured >= firmware_timeout_s:
             return firmware_timeout_s, "firmware"
         return measured, "measured"
+
+    def _record_echo(self, peer_prefix: Optional[str], hop_count: Optional[int], echo_s: float) -> None:
+        """One measured repeater-echo time (our own frame heard forwarded
+        by the first hop, seconds after MSG_SENT) for a multi-hop peer.
+        Last 16 samples; cleared with the RTT stats on any path change."""
+        if peer_prefix is None or hop_count is None or hop_count < 1 or echo_s <= 0:
+            return
+        samples = self._echo_stats.setdefault(peer_prefix, [])
+        samples.append(echo_s)
+        del samples[:-16]
+
+    def _hop1_abort_deadline_s(
+        self, peer_prefix: Optional[str], hop_count: Optional[int], timeout_s: float,
+    ) -> Optional[float]:
+        """Field fix (2026-09-18 evening, see direct_hop1_abort_enabled's
+        own comment): how long to wait for either the ACK or the first
+        hop's echo before calling the attempt dead, or None when the abort
+        is not armed for this peer (disabled, zero/unknown hop count, too
+        few echo samples, or a deadline that wouldn't be shorter than the
+        ACK timeout anyway)."""
+        if (
+            not self.direct_hop1_abort_enabled
+            or peer_prefix is None
+            or hop_count is None or hop_count < 1
+        ):
+            return None
+        samples = self._echo_stats.get(peer_prefix)
+        if not samples or len(samples) < self.direct_hop1_abort_min_samples:
+            return None
+        deadline_s = max(self.direct_hop1_abort_min_s, self.direct_hop1_abort_echo_multiplier * max(samples))
+        if deadline_s >= timeout_s:
+            return None
+        return deadline_s
 
     def _rtt_capture_fields(self, peer_prefix: Optional[str]) -> dict:
         st = self._ack_rtt.get(peer_prefix) if peer_prefix is not None else None
@@ -6080,6 +6403,7 @@ class SmartMeshCoreInterface(Interface):
         time_critical: bool = False,  # forwarded to _send_direct_frame -> _pre_transmit_gate, see module docstring 2026-09-18
         pass_number: Optional[int] = None,  # capture-only, see _capture_direct_attempt_result's docstring
         kind: Optional[str] = None,  # capture-only: None for an "R" frame, "completion_answer" for a "Q" ANSWER (2026-09-18 review)
+        expires_at: Optional[float] = None,  # outgoing_max_age deadline (2026-09-18 evening), see _expired
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -6159,6 +6483,18 @@ class SmartMeshCoreInterface(Interface):
             async with self._direct_exchange_lock(priority):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
+                if self._expired(expires_at):
+                    # Field fix (2026-09-18 evening): the lock wait itself
+                    # (225s in the drive-home capture) is where a queued
+                    # packet most often ages out. Recorded, not transmitted;
+                    # the caller's own pre-attempt check logs the drop.
+                    self._capture_direct_attempt_result(
+                        peer_prefix, attempt, False, queue_depth_at_acquire, lock_wait_s, None,
+                        pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                        time_critical=time_critical, pass_number=pass_number,
+                        ack_timeout_source="expired", kind=kind,
+                    )
+                    return False, False
                 # Code-review fix: a local exception raised anywhere in this
                 # block (e.g. _send_direct_frame surfacing a firmware ERROR
                 # via _run_command) used to propagate straight out of this
@@ -6182,6 +6518,7 @@ class SmartMeshCoreInterface(Interface):
                 ack_timeout_source = "none"
                 ack_latency_s = None
                 send_cmd_latency_s = None
+                hop1_abort_deadline_s = None
                 rx_window = self._open_rx_log_window(target)
                 try:
                     sent = await self._send_direct_frame(
@@ -6207,14 +6544,37 @@ class SmartMeshCoreInterface(Interface):
                         # _configure_peer_discovery's comment on why the doc's
                         # separate flood-mode ceiling has no code path here.
                         timeout_s = min(timeout_s, self.direct_ack_timeout_routed_max_s)
+                        if peer_prefix is not None:
+                            self._last_firmware_ack_timeout_s[peer_prefix] = timeout_s
                         timeout_s, ack_timeout_source = self._adaptive_ack_timeout(peer_prefix, timeout_s)
 
+                        # Field fix (2026-09-18 evening): early abort on a
+                        # dead first hop -- see _hop1_abort_deadline_s. Wait
+                        # for the ACK only until the deadline; if by then
+                        # neither the ACK nor the first hop's echo of our
+                        # frame has been heard, the frame never left this
+                        # radio's neighbourhood and the rest of the timeout
+                        # buys nothing. If the echo WAS heard, the frame is
+                        # in the mesh: keep waiting the remainder as before.
+                        hop1_abort_deadline_s = self._hop1_abort_deadline_s(peer_prefix, hop_count, timeout_s)
+                        ack_filters = {"code": expected_ack.hex()}
+                        first_wait_s = hop1_abort_deadline_s if hop1_abort_deadline_s is not None else timeout_s
                         ack_event = await self._mc_ready.wait_for_event(
-                            self._EventType.ACK,
-                            attribute_filters={"code": expected_ack.hex()},
-                            timeout=timeout_s,
+                            self._EventType.ACK, attribute_filters=ack_filters, timeout=first_wait_s,
                         )
-                        ok, waited_full_timeout, ack_timeout_s = ack_event is not None, True, timeout_s
+                        aborted = False
+                        if ack_event is None and hop1_abort_deadline_s is not None:
+                            if rx_window["echo_seen_s"] is None:
+                                aborted = True
+                            else:
+                                ack_event = await self._mc_ready.wait_for_event(
+                                    self._EventType.ACK, attribute_filters=ack_filters,
+                                    timeout=max(0.01, timeout_s - first_wait_s),
+                                )
+                        ok, waited_full_timeout = ack_event is not None, True
+                        ack_timeout_s = hop1_abort_deadline_s if aborted else timeout_s
+                        if aborted:
+                            ack_timeout_source = "hop1_abort"
                         if ok:
                             ack_latency_s = time.monotonic() - ack_wait_start
                             self._record_ack_rtt(peer_prefix, ack_latency_s)
@@ -6223,7 +6583,9 @@ class SmartMeshCoreInterface(Interface):
                             # it missed -- maybe the link slowed, maybe the
                             # estimate was tight. Either way, back to the
                             # firmware's guess until fresh samples exist.
-                            self._invalidate_ack_rtt(peer_prefix, "missed ACK under measured timeout")
+                            self._invalidate_ack_rtt(
+                                peer_prefix, "missed ACK under measured timeout", keep_for_query=True,
+                            )
                             # Code review (2026-09-18): a miss under a timeout
                             # this interface tightened on its own is exactly
                             # §8's "cut short by this engine's own ceiling"
@@ -6268,6 +6630,8 @@ class SmartMeshCoreInterface(Interface):
                 # Step 4 (2026-09-18): the diagnosis is always computed and
                 # captured; it only *chooses* the hold when rx_log_holds_
                 # enabled. Otherwise the flat ranges above still apply.
+                if rx_window["echo_seen_s"] is not None:
+                    self._record_echo(peer_prefix, hop_count, rx_window["echo_seen_s"])
                 miss_diagnosis = None if ok else self._diagnose_missed_ack(rx_window, hop_count)
                 medium_busy_remaining_s = self._medium_busy_remaining_s()
                 if ok:
@@ -6289,7 +6653,7 @@ class SmartMeshCoreInterface(Interface):
                     f"DIRECT attempt={attempt} to {peer_prefix!r} "
                     f"(pkt_id={pkt_id} frag_idx={frag_idx}/{frag_total}): ok={ok} "
                     f"queue_depth={queue_depth_at_acquire} lock_wait={lock_wait_s:.2f}s "
-                    f"ack_timeout={ack_timeout_s} ({ack_timeout_source}) "
+                    f"ack_timeout={ack_timeout_s} ({ack_timeout_source}) hop1_abort_deadline={hop1_abort_deadline_s} "
                     f"ack_latency={ack_latency_s if ack_latency_s is None else round(ack_latency_s, 3)}s "
                     f"listen_delay={listen_delay_s:.2f}s "
                     f"rx_window: echo={rx_window['echo_seen_s']} ack_on_air={rx_window['ack_seen_on_air_s']} "
@@ -6308,7 +6672,7 @@ class SmartMeshCoreInterface(Interface):
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
-                    kind=kind,
+                    kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
                 )
                 if send_exc is not None:
                     # Listened out the quiet window above first, same as any
@@ -6358,10 +6722,15 @@ class SmartMeshCoreInterface(Interface):
             return peer_prefix
         return self._rns_token_peer.get(header.destination_hash)
 
-    async def _delayed_retry_pass(self, data: bytes, pkt_id: int, attempt: int) -> None:
+    async def _delayed_retry_pass(
+        self, data: bytes, pkt_id: int, attempt: int, expires_at: Optional[float] = None,
+    ) -> None:
         delay = random.uniform(self.retransmit_jitter_min_s, self.retransmit_jitter_max_s)
         await asyncio.sleep(delay)
         if self.detached or not self.online:
+            return
+        if self._expired(expires_at):
+            self._debug(f"CHANNEL retry pass (attempt={attempt}) for pkt_id={pkt_id} skipped -- packet expired.")
             return
         self._debug(
             f"CHANNEL retry pass (attempt={attempt}) for pkt_id={pkt_id} "
@@ -7453,6 +7822,10 @@ class SmartMeshCoreInterface(Interface):
             del self._proof_correlation[h]
 
         self._resolved_paths.pop(pubkey_prefix, None)
+        self._ack_rtt.pop(pubkey_prefix, None)
+        self._ack_rtt_snapshot.pop(pubkey_prefix, None)
+        self._echo_stats.pop(pubkey_prefix, None)
+        self._last_firmware_ack_timeout_s.pop(pubkey_prefix, None)
         self._path_discovery_failures.pop(pubkey_prefix, None)
         self._path_discovery_backoff_until.pop(pubkey_prefix, None)
         self._direct_path_failures.pop(pubkey_prefix, None)
