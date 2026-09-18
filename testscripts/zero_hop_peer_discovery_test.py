@@ -100,6 +100,10 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=90.0, help="Total seconds to run before reporting and exiting")
     parser.add_argument("--bind-timeout", type=float, default=60.0, help="Seconds to wait for bind-frame peer discovery")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--packet-capture-dir", default=None,
+                        help="Enable the interface's own JSONL packet capture (packet_capture_enabled) into this "
+                             "directory -- includes the observe-only 'rx_log' records (2026-09-18) for every packet "
+                             "the radio overhears, so this test doubles as a check of that tap on real hardware.")
     args = parser.parse_args()
 
     module = _load_interface_module()
@@ -125,6 +129,8 @@ def main() -> None:
         # tighter, still-plausible window.
         bind_response_jitter_min=1.0,
         bind_response_jitter_max=4.0,
+        **({"packet_capture_enabled": "yes", "packet_capture_dir": args.packet_capture_dir}
+           if args.packet_capture_dir else {}),
     )
 
     log(f"[{args.role}] connecting to {args.port}...")

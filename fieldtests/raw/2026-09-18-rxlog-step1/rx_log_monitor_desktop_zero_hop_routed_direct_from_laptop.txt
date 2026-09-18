@@ -1,0 +1,10 @@
+Connecting to /dev/ttyUSB0 @ 115200...
+INFO:meshcore:Serial Connection started
+Connected. Listening to the raw-RX log feed for 40s. This script transmits nothing.
+
+    t+s   Δprev    snr   rssi  type      route     plen  path           src>dst ack      len  pkt_hash   note
+-------------------------------------------------------------------------------------------------------------
+   7.10       -   12.0    -54  TEXT_MSG  DIRECT       0                 34>7b             38  3692272862 
+
+Done: 1 packet(s) heard in 40s, 0 flagged as repeater echoes.
+By payload type: TEXT_MSG=1

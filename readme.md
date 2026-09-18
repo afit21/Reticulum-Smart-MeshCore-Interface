@@ -15,7 +15,7 @@ MeshCore's own CHANNEL broadcast is unauthenticated and unacknowledged — great
 
 This interface essentially aims to inspect RNS packets & automatically drop unnecessary traffic
 
-- **A packet capture tool built in.** Optional, off by default (`packet_capture_enabled`) — logs every in/out RNS packet as one JSON line (classification, routing decision, sender/target, timing) to a configurable directory, for exactly this kind of real-evidence debugging.
+- **A packet capture tool built in.** Optional, off by default (`packet_capture_enabled`) — logs every in/out RNS packet as one JSON line (classification, routing decision, sender/target, timing) to a configurable directory, for exactly this kind of real-evidence debugging. When capture is on, the interface also records every packet the radio overhears on air (the companion firmware's raw-RX log feed, `rx_log_observe_enabled`, default on) — addressed to this node or not — with SNR, MeshCore packet type, path, and timing relative to this node's own last transmit.
 
 ## Requirements
 
