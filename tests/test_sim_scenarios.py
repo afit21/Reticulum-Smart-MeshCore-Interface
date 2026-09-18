@@ -28,9 +28,15 @@ def _bring_up(mesh, names, timeout=40.0):
     for n in names:
         mesh.add_node(n)
     mesh.advert_all()
-    assert mesh.wait_contacts(timeout), "contacts never populated"
-    assert mesh.wait_bound(timeout), "bind-frame discovery never completed"
-    assert mesh.wait_resolved(timeout), "DIRECT paths never resolved"
+    try:
+        assert mesh.wait_contacts(timeout), "contacts never populated"
+        assert mesh.wait_bound(timeout), "bind-frame discovery never completed"
+        assert mesh.wait_resolved(timeout), "DIRECT paths never resolved"
+    except AssertionError:
+        # unittest skips tearDown when setUp fails: stop the mesh here or its
+        # interfaces (and their executor threads) outlive the test run.
+        mesh.stop()
+        raise
 
 
 def _prime(sender, receiver, timeout=30.0):
@@ -59,10 +65,16 @@ class ZeroHopScenarios(unittest.TestCase):
         _prime(self.a, self.b)
         self.a.send(build_rns_packet("data", dest_hash=self.b.dest_hash, payload=b"probe-1"))
         self.assertTrue(wait_until(lambda: _probe_count(self.b) == 1, 20.0))
+        # The sender records its attempt only after the ACK and the post-send
+        # listen window -- a few hundred ms after the receiver already has
+        # the packet -- so wait for the record rather than racing it.
+        self.assertTrue(wait_until(lambda: summarize_capture(self.a.capture_records())["direct_attempts_ok"] >= 1, 15.0))
         summary = summarize_capture(self.a.capture_records())
         self.assertGreaterEqual(summary["routing_decisions"].get("direct_primary", 0), 1)
         self.assertGreaterEqual(summary["direct_attempts_ok"], 1)
-        self.assertEqual(summarize_capture(self.b.capture_records())["incoming_transports"].get("direct_bare", 0), 2)
+        # B receives exactly one bare DIRECT frame: the probe (the priming
+        # packet went the other way, B -> A).
+        self.assertEqual(summarize_capture(self.b.capture_records())["incoming_transports"].get("direct_bare", 0), 1)
         self.assertEqual(self.a.resolved_paths[self.b.prefix].out_path_len, 0)
 
     def test_announce_and_path_request_go_direct_in_small_mesh(self):
@@ -127,6 +139,8 @@ class RepeaterScenarios(unittest.TestCase):
         for i in range(3):
             a.send(build_rns_packet("data", dest_hash=b.dest_hash, payload=f"probe-{i}".encode()))
         self.assertTrue(wait_until(lambda: _probe_count(b) == 3, 40.0))
+        self.assertTrue(wait_until(
+            lambda: summarize_capture(a.capture_records())["direct_attempts_by_hop"].get(1, [0, 0])[0] >= 3, 15.0))
         summary = summarize_capture(a.capture_records())
         self.assertGreaterEqual(summary["direct_attempts_by_hop"].get(1, [0, 0])[0], 3)
         self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 6)

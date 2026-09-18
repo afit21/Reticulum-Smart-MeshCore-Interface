@@ -46,6 +46,7 @@ class EventType(enum.Enum):
     MESSAGES_WAITING = "messages_waiting"
     PATH_RESPONSE = "path_response"
     RX_LOG_DATA = "rx_log_data"
+    RAW_DATA = "raw_data"
     CONNECTED = "connected"
     DISCONNECTED = "disconnected"
     DEVICE_INFO = "device_info"
@@ -156,6 +157,16 @@ class SimCommands:
         if result is None:
             return SimEvent(EventType.ERROR, {"reason": "destination is not a known contact"})
         return SimEvent(EventType.MSG_SENT, result, {"type": result["type"], "expected_ack": result["expected_ack"].hex()})
+
+    async def send_raw_data(self, payload: bytes, path: bytes = b"") -> SimEvent:
+        """meshcore 2.3.9.1 commands/messaging.py send_raw_data: payload
+        bytes (>= 4) and optional path bytes; resolves OK or ERROR."""
+        if not isinstance(payload, (bytes, bytearray)):
+            raise TypeError("payload must be bytes-like")
+        if len(payload) < 4:
+            raise ValueError("payload must be at least 4 bytes")
+        ok = self._radio.cmd_send_raw_data(bytes(path), bytes(payload))
+        return SimEvent(EventType.OK, {}) if ok else SimEvent(EventType.ERROR, {"reason": "raw payload too large"})
 
     async def _send_path_discovery_raw(self, dst) -> SimEvent:
         dst_hex = dst["public_key"] if isinstance(dst, dict) else str(dst)
