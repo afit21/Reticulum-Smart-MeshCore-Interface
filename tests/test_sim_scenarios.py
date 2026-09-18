@@ -86,7 +86,9 @@ class ZeroHopScenarios(unittest.TestCase):
         self.assertGreaterEqual(decisions.get("small_mesh_direct_all_announce", 0), 1)
         self.assertGreaterEqual(decisions.get("small_mesh_direct_all_path_request", 0), 1)
         transports = summarize_capture(self.b.capture_records())["incoming_transports"]
-        self.assertGreaterEqual(transports.get("direct_multifragment", 0), 1)  # the announce was fragmented
+        # the announce was fragmented -- as text, or as raw fragments now that
+        # direct_raw_fragments_enabled defaults on and both nodes advertise it
+        self.assertGreaterEqual(transports.get("direct_multifragment", 0) + transports.get("direct_raw_multifragment", 0), 1)
         self.assertEqual(self.mesh.air.stats.by_type.get("GRP_TXT", 0) and 0, 0)  # placeholder: CHANNEL only carried bind frames
 
     def test_bare_direct_retry_never_delivers_twice(self):

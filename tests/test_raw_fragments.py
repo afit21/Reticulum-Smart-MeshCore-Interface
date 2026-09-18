@@ -87,6 +87,80 @@ class RawCodecAndGate(SingleNodeCase):
             iface.direct_raw_fragments_enabled = False
 
 
+class CompletionQueryTimeout(SingleNodeCase):
+    """First raw field test (2026-09-18 night): the reconcile wait is sized
+    from the measured QUERY -> ANSWER round trip, with a hop-scaled prior."""
+
+    def test_hop_scaled_prior_then_measured_rtt(self):
+        iface = self.iface
+        peer = "abcdef012345"
+        iface._query_rtt.pop(peer, None); iface._ack_rtt.pop(peer, None); iface._ack_rtt_snapshot.pop(peer, None)
+        iface._last_firmware_ack_timeout_s.pop(peer, None)
+        base = iface.direct_completion_check_timeout_s
+        self.assertEqual(iface._completion_query_timeout_s(peer, hop_count=0), base)
+        self.assertEqual(iface._completion_query_timeout_s(peer, hop_count=1), 2 * base)
+        self.assertEqual(iface._completion_query_timeout_s(peer, hop_count=3), 4 * base)
+        iface._record_query_rtt(peer, 3.0)                      # srtt 3, rttvar 1.5 -> 2*(3+6) = 18, capped at the routed max
+        self.assertAlmostEqual(iface._completion_query_timeout_s(peer, hop_count=0),
+                               max(base, min(18.0, iface.direct_ack_timeout_routed_max_s)))
+        for _ in range(20):
+            iface._record_query_rtt(peer, 3.0)                  # converges: rttvar -> 0, 2*srtt = 6
+        self.assertLess(iface._completion_query_timeout_s(peer, hop_count=0), 8.0)
+        self.assertGreaterEqual(iface._completion_query_timeout_s(peer, hop_count=0), base)
+        iface._invalidate_ack_rtt(peer, "path change")          # path change drops the query stats too
+        self.assertNotIn(peer, iface._query_rtt)
+
+
+class PerPathFallbackVerdict(SingleNodeCase):
+    """User's design (2026-09-18 night): raw first; if Z85 text works
+    where raw did not, the PATH is noted, and a new path is raw-first
+    again."""
+
+    def _resolved(self, path_hex):
+        M = self.module
+        return M._ResolvedPath(out_path_hex=path_hex, out_path_len=len(path_hex) // 2, out_path_hash_len=1,
+                               resolved_at=time.monotonic())
+
+    def test_text_success_notes_the_path_not_the_peer(self):
+        iface, M = self.iface, self.module
+        peer = "abcdef012345"
+        N = M.SmartMeshCoreInterface.PRIORITY_NORMAL
+        try:
+            iface.direct_raw_fragments_enabled = True
+            self.on_loop(iface._register_peer, peer, None, "test", None, True)
+            iface._resolved_paths[peer] = self._resolved("19d6")
+            self.assertTrue(iface._raw_fragments_eligible(peer, N))
+            # raw fell back on this path, then the text send succeeded
+            iface._raw_disabled_until[peer] = time.monotonic() + 600
+            iface._note_raw_fallback_outcome(peer, "19d6", text_ok=True)
+            self.assertIn("19d6", iface._raw_unsupported_paths)
+            self.assertNotIn(peer, iface._raw_disabled_until, "path verdict lifts the per-peer pause")
+            self.assertFalse(iface._raw_fragments_eligible(peer, N), "known-bad chain is never probed again")
+            # a new path through different repeaters is raw-first again
+            iface._resolved_paths[peer] = self._resolved("4fbe")
+            self.assertTrue(iface._raw_fragments_eligible(peer, N))
+            # the note expires
+            iface._raw_unsupported_paths["19d6"]["since"] -= iface.direct_raw_path_unsupported_ttl_s + 1
+            iface._resolved_paths[peer] = self._resolved("19d6")
+            self.assertTrue(iface._raw_fragments_eligible(peer, N))
+            self.assertNotIn("19d6", iface._raw_unsupported_paths)
+        finally:
+            iface.direct_raw_fragments_enabled = False
+            iface._peers.pop(peer, None); iface._resolved_paths.pop(peer, None)
+            iface._raw_unsupported_paths.clear(); iface._raw_disabled_until.clear()
+
+    def test_text_failure_concludes_nothing_about_raw(self):
+        iface = self.iface
+        peer = "abcdef012345"
+        iface._raw_disabled_until[peer] = time.monotonic() + 600
+        iface._note_raw_fallback_outcome(peer, "19d6", text_ok=False)
+        self.assertNotIn("19d6", iface._raw_unsupported_paths)
+        self.assertIn(peer, iface._raw_disabled_until, "the short pause still applies to a sick path")
+        iface._note_raw_fallback_outcome(peer, "", text_ok=True)   # zero hop: no chain to note
+        self.assertEqual(iface._raw_unsupported_paths, {})
+        iface._raw_disabled_until.clear()
+
+
 def _raw_mesh(test, links, repeaters=(), seed=1):
     quiet_rns()
     mesh = SimMesh(links, repeaters=repeaters, seed=seed, capture_dir=tempfile.mkdtemp(prefix="smci-raw-cap-"))
@@ -147,6 +221,25 @@ class RawFragmentScenarios(unittest.TestCase):
         self.assertTrue(wait_until(lambda: big in b.owner.received, 60.0), "raw transfer through a repeater never delivered")
         self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 4)
         self.assertGreaterEqual(len(_events(a, "raw_fragment_sent")), 4)
+
+        # The chain stops carrying raw packets: Z85 text gets through, so the
+        # PATH is noted and raw is not probed again on it.
+        self.mesh.air.type_loss["RAW_CUSTOM"] = 1.0
+        big2 = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"raw-hop-2-" + os.urandom(440))
+        a.send(big2)
+        self.assertTrue(wait_until(lambda: big2 in b.owner.received, 240.0), "text fallback through the repeater never delivered")
+        path_hex = a.resolved_paths[b.prefix].out_path_hex
+        # The verdict is written when the sender's text send completes, a few
+        # seconds after the receiver already has the packet.
+        self.assertTrue(wait_until(lambda: path_hex in a.iface._raw_unsupported_paths, 20.0),
+                        "the repeater chain should be noted as not carrying raw")
+        self.assertNotIn(b.prefix, a.iface._raw_disabled_until, "the per-peer pause is lifted once the path is noted")
+        raw_before = len(_events(a, "raw_fragment_sent"))
+        self.mesh.air.type_loss.pop("RAW_CUSTOM", None)
+        big3 = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"raw-hop-3-" + os.urandom(440))
+        a.send(big3)
+        self.assertTrue(wait_until(lambda: big3 in b.owner.received, 90.0))
+        self.assertEqual(len(_events(a, "raw_fragment_sent")), raw_before, "a noted chain must not be probed with raw again")
 
 
 if __name__ == "__main__":

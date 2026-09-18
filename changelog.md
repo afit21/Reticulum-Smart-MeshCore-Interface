@@ -34,7 +34,7 @@ sends only the gaps, and always reconciles (`direct_fragment_resume_
 enabled`, never for handshake priority). Tests: `tests/test_alpha011_
 fixes.py`.
 
-### Added: raw binary DIRECT fragments (off by default)
+### Added: raw binary DIRECT fragments (on by default after the first field test)
 
 `direct_raw_fragments_enabled`. A packet too large for one text frame
 goes to a peer that advertised `BIND_CAP_RAW_FRAGMENTS` as MeshCore raw
@@ -52,9 +52,45 @@ disabled for that peer for `direct_raw_fallback_cooldown` and the packet
 is re-sent as text. Raw frames carry an unauthenticated src prefix, so
 nothing is learned from them. The simulator gained the RAW_CUSTOM packet
 type with the firmware's seen-dedup; tests in `tests/test_raw_fragments.
-py`; `zero_hop_peer_discovery_test.py --raw-fragments`. Not yet run on
-hardware; needs both radios on this build and one pass through a public
-repeater.
+py`; `zero_hop_peer_discovery_test.py --raw-fragments`. Switched on by
+default after the field test below; a peer that has not advertised the
+capability still receives text fragments.
+
+### Changed: raw-first with a per-path Z85 fallback verdict (user's design)
+
+The fallback note is now kept per path (the repeater chain) rather than
+per peer: after `direct_raw_fallback_strikes` answered reconciles show a
+burst delivered nothing, raw is paused for the peer and the packet goes
+as Z85 text on the same path; if that succeeds the path is noted as not
+carrying raw packets for `direct_raw_path_unsupported_ttl` (a day) and
+the peer's pause is lifted, if it fails nothing is concluded about raw.
+A new path is always tried raw-first again. `[STATS]` lists the noted
+paths. A raw send that runs out of rounds with its reconciles answered
+(the path is alive, the loss was just too high) is re-sent as Z85 text
+rather than dropped (and raw is paused for that peer for the cooldown, without a
+verdict on the chain); only an unanswered send counts as a path failure. A path is
+only ever noted as not carrying raw when raw delivered nothing at all on it.
+
+### Added: capture records name the send method
+
+`direct_send_result` carries `method` (`z85_bare`, `z85_text` or `raw`)
+and `fallback_from_raw`; `fragment_received` carries `raw`. The
+receiver-side `transport` field (`direct_raw_multifragment` vs
+`direct_multifragment`) already distinguished them.
+
+### Fixed: first raw field test (2026-09-18 night) -- reconcile timing under load
+
+The field run (`fieldtests/raw/binaryfieldtest/`, both sides captured)
+confirmed the public repeater forwards raw packets: 35/35 raw packets at
+zero hop and 483-byte parts through one repeater in two rounds each. It
+also showed the reconcile QUERY running at the flat 5s floor after a
+path change (raw bursts give the ACK-RTT estimator nothing to learn
+from) and, worse, completion ANSWERs waiting up to 50s for the radio
+lock because the node's own queries held it while idle. Now the
+QUERY -> ANSWER round trip is measured per peer (`_query_rtt`) with a
+hop-scaled prior before any sample exists, and the QUERY is sent as an
+ordinary ACKed exchange with the ANSWER awaited radio-free. Overheard raw
+packets are named `RAW_CUSTOM` in the RX log.
 
 ### Fixed: two pre-existing robustness issues surfaced by the test suite
 

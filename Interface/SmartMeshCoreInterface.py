@@ -1565,8 +1565,9 @@ failures around the laptop's radio restarts with no degradation visible
 beforehand (command latency flat at 0.02-0.03s).
 
 **Raw binary DIRECT fragments (2026-09-18 night, user-approved "go for
-it" on the airtime review; `direct_raw_fragments_enabled`, DEFAULT OFF
-until validated on hardware).** The largest remaining airtime cost was
+it" on the airtime review; `direct_raw_fragments_enabled`, off until the
+first field test the same night confirmed it and the user switched the
+default to ON).** The largest remaining airtime cost was
 per-fragment overhead: a DIRECT text fragment carries 114 bytes of RNS
 payload in 166 bytes on air (Z85's 25%, our 6-byte header, the firmware's
 text framing and 16-byte cipher padding) and costs a firmware ACK frame
@@ -1617,8 +1618,8 @@ adding a second one):
   FRAGMENTS` (0x02) when the flag is on; `_PeerRecord.raw_fragments`
   (tri-state, persisted in the peer cache like `has_upstream_rns`) must
   be True for a peer to receive raw fragments, so an old build never
-  gets frames it cannot hear. Off by default until both radios have run
-  it; flip it on both sides for the test.
+  gets frames it cannot hear. On by default since the first field test;
+  a peer that has not advertised the bit still gets text fragments.
 - *Self-disabling fallback.* If a reconcile ANSWER arrives (the text
   path works) but shows the burst delivered nothing, twice, raw is
   disabled for that peer for `direct_raw_fallback_cooldown` (600s) and
@@ -1640,7 +1641,72 @@ adding a second one):
 
 Verified in the simulator (`testscripts/simmesh` gained `send_raw_data`,
 `RAW_DATA` and the RAW_CUSTOM packet type with the firmware's
-seen-dedup): see `tests/test_raw_fragments.py`. Real hardware: not yet.
+seen-dedup): see `tests/test_raw_fragments.py`.
+
+**First field test (2026-09-18, 21:57-23:01, `fieldtests/raw/
+binaryfieldtest/`, both sides captured): the repeater assumption holds
+and raw is the bulk transport from here.** Zero hop: 35/35 raw packets
+delivered, 5 extra fragments in total, every reconcile answered. Hop 1
+through the public repeater: 25 raw fragments sent, PATH_RESPONSE,
+RESOURCE_ADV and 483-byte RESOURCE parts reassembled by the far side as
+`direct_raw_multifragment`; two 483-byte parts arrived in exactly two
+rounds each (burst delivered 3/4 and 2/4, the reconcile named the gaps,
+one re-burst finished them). No fallback fired. Two things the capture
+exposed, fixed the same night:
+
+1. *The reconcile query had no RTT information when it mattered.* Raw
+   bursts produce no ACKs, so the step-2 estimator never learns a raw-
+   only peer's timing, and a path change clears it anyway; the first
+   hop-1 raw packet after rediscovery ran its queries at the 5s floor,
+   timed out twice and re-burst a fragment the peer already held, while
+   later queries (fed by unrelated text sends) swung to 26-32s.
+   `_query_rtt` now measures the QUERY -> ANSWER round trip itself per
+   peer (`_record_query_rtt`, Jacobson/Karels like the ACK estimator, and
+   the QUERY's own firmware ACK still feeds `_ack_rtt`), and before any
+   sample exists the prior is hop-scaled: `direct_completion_check_
+   timeout` x (hops + 1). Cleared with the ACK stats on a path change.
+2. *Holding the radio lock through the ANSWER wait blocked the other
+   node's answers.* At 22:08:56 the desktop's four completion ANSWERs to
+   the laptop's queries waited 31-50s for `_direct_exchange_lock` because
+   the desktop's own queries held it while idle; the laptop's queries
+   timed out, it re-burst, and one send failed. Under bidirectional
+   traffic the hold (a 2026-09-18 review decision, made on the half-
+   duplex argument) is a head-of-line blocker with a measured cost, so
+   the QUERY now goes through `_send_direct_frame_and_wait_for_ack`
+   (`kind="completion_query"`: lock held through its own transmit and
+   firmware ACK, exactly like every other frame) and the ANSWER is
+   awaited with the radio free. A late ANSWER still resolves the next
+   query for the same pkt_id, as before.
+
+Also: overheard raw packets are named `RAW_CUSTOM` in the RX log and
+[STATS] (the library's name table stops at CONTROL and reported them as
+`UNK`).
+
+**Raw-first with a per-PATH Z85 fallback (2026-09-18 night, user's
+design).** "Default to binary, keep Z85 as the fallback if a repeater in
+the chain doesn't support it; when a new path is detected try binary
+again; if Z85 works but binary doesn't, note that a repeater in that
+path's chain doesn't carry binary." The earlier fallback note was per
+peer with a 10-minute cooldown, so it forgot and re-probed raw on the
+same chain, and it never checked whether Z85 actually worked. Now:
+
+- The strike rule is unchanged (`direct_raw_fallback_strikes`, default 2:
+  answered reconciles showing a burst delivered nothing), but it only
+  *pauses* raw for the peer (`direct_raw_fallback_cooldown`) and records
+  `_raw_fallback_pending[peer] = path`.
+- The packet is then sent as Z85 text on the same path. If THAT
+  succeeds, the path -- the repeater chain, `out_path_hex`, not the peer
+  -- goes into `_raw_unsupported_paths` for `direct_raw_path_
+  unsupported_ttl` (a day) and the peer's pause is lifted: raw is off
+  for that chain only, and the verdict is logged as "a repeater in the
+  chain does not carry raw packets". If the text send fails too, nothing
+  is noted about raw: the path itself is sick, and the short pause is
+  all that applies.
+- A path change (`_reset_stale_path`, a fresh discovery) clears the
+  peer's pause, and `_raw_fragments_eligible` consults the new path's
+  own entry -- so a new chain is always tried raw-first, and a chain
+  already known to drop raw is never probed again while its note lives.
+  Zero-hop paths (no repeater) are never noted.
 
 Two robustness fixes found while getting that suite to run reliably
 (both pre-existing, confirmed by running the committed alpha-0.1.1 tree
@@ -2628,6 +2694,10 @@ class SmartMeshCoreInterface(Interface):
         # the firmware's last hop-aware ACK bound per peer as the fallback
         # when even that is gone. Both dropped on any path change.
         self._ack_rtt_snapshot = {}
+        # First raw field test (2026-09-18 night): QUERY -> ANSWER round
+        # trip per peer, measured directly -- raw bursts produce no ACK
+        # samples, so this is what sizes the reconcile wait.
+        self._query_rtt = {}
         self._last_firmware_ack_timeout_s = {}
         # Per-peer repeater-echo timings (seconds after our own transmit
         # that the first hop was heard forwarding our frame), the data
@@ -2788,6 +2858,12 @@ class SmartMeshCoreInterface(Interface):
         # until which raw is disabled for that peer (fallback to text), and
         # receive-side counters for the [STATS] line.
         self._raw_disabled_until = {}
+        # Per-PATH verdicts (user's design, 2026-09-18 night): out_path_hex
+        # -> {"since", "peer"} for a repeater chain that provably drops
+        # raw packets (Z85 text got through where raw did not), and the
+        # peer -> path of a fallback whose text outcome is still pending.
+        self._raw_unsupported_paths = {}
+        self._raw_fallback_pending = {}
         self._raw_fragments_received = 0
         self._raw_frames_ignored = 0
 
@@ -3211,11 +3287,13 @@ class SmartMeshCoreInterface(Interface):
         self.direct_fragment_resume_enabled = _cfg_bool(cfg.get("direct_fragment_resume_enabled", "yes"))
 
         # Raw binary DIRECT fragments (2026-09-18 night, see module
-        # docstring). DEFAULT OFF until validated on real radios: it needs
-        # both peers on this build (capability-gated by bind frame) and
-        # one check that the public repeater forwards raw packets. When
-        # on: packets too large for one text frame go to a raw-capable
-        # peer as unacknowledged raw bursts reconciled by the "Q" bitmap.
+        # docstring). Default ON since the first field test the same night
+        # (user decision): both radios ran it zero-hop and through the
+        # public repeater with every transfer completing. Still capability-
+        # gated by bind frame, so a peer on an older build never receives
+        # raw frames. When on: packets too large for one text frame go to a
+        # raw-capable peer as unacknowledged raw bursts reconciled by the
+        # "Q" bitmap.
         self.direct_raw_fragments_enabled = _cfg_bool(cfg.get("direct_raw_fragments_enabled", "yes"))
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
@@ -3229,10 +3307,16 @@ class SmartMeshCoreInterface(Interface):
         # Burst-then-ask rounds per packet, and QUERY tries per round.
         self.direct_raw_reconcile_rounds = int(cfg.get("direct_raw_reconcile_rounds", 3))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
-        # Two answered reconciles in a row showing a burst delivered
-        # nothing -> raw is disabled for that peer for this long and the
-        # packet goes as text fragments instead.
+        # `direct_raw_fallback_strikes` answered reconciles in a row showing
+        # a burst delivered nothing -> raw is paused for that peer for
+        # `direct_raw_fallback_cooldown` and the packet goes as Z85 text on
+        # the same path. If the text send succeeds, the PATH (the repeater
+        # chain) is noted as not carrying raw packets for `direct_raw_path_
+        # unsupported_ttl` and the peer's pause is lifted; a new path is
+        # always tried raw-first again (user's design, 2026-09-18 night).
+        self.direct_raw_fallback_strikes = int(cfg.get("direct_raw_fallback_strikes", 2))
         self.direct_raw_fallback_cooldown_s = float(cfg.get("direct_raw_fallback_cooldown", 600.0))
+        self.direct_raw_path_unsupported_ttl_s = float(cfg.get("direct_raw_path_unsupported_ttl", 86400.0))
 
         # Field-diagnosed (2026-09-18 drive-home capture, see module
         # docstring): give up on a multi-hop DIRECT attempt early when the
@@ -3880,7 +3964,10 @@ class SmartMeshCoreInterface(Interface):
             "payload_hash": self._payload_correlation_hash(data),
         })
 
-    def _capture_fragment_received(self, mode: str, sender_token: str, pkt_id: int, frag_idx: int, frag_total: int, progress: int) -> None:
+    def _capture_fragment_received(
+        self, mode: str, sender_token: str, pkt_id: int, frag_idx: int, frag_total: int, progress: int,
+        raw: bool = False,
+    ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per individual
         fragment actually added to a reassembly bucket, not just the
         single record `_capture_incoming` emits once the whole message
@@ -3905,6 +3992,9 @@ class SmartMeshCoreInterface(Interface):
             "frag_idx": frag_idx,
             "frag_total": frag_total,
             "progress": progress,
+            # User-requested (2026-09-19): raw binary fragment (True) or a
+            # Z85 text one (False); both share the same reassembly bucket.
+            "raw": raw,
         })
 
     def _capture_direct_attempt_result(
@@ -4077,6 +4167,7 @@ class SmartMeshCoreInterface(Interface):
     def _capture_direct_send_result(
         self, peer_prefix: str, destination_hash: Optional[bytes], ok: bool,
         resolved: "_ResolvedPath", size_bytes: int,
+        method: Optional[str] = None, fallback_from_raw: bool = False,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per whole DIRECT message (every
@@ -4098,6 +4189,12 @@ class SmartMeshCoreInterface(Interface):
             "out_path_len": resolved.out_path_len,
             "out_path_hex": resolved.out_path_hex,
             "size_bytes": size_bytes,
+            # User-requested (2026-09-19): how the packet was carried --
+            # "z85_bare" (one text frame), "z85_text" (Z85 text fragments),
+            # "raw" (raw binary fragments) -- and whether the text send was
+            # the fallback after a raw attempt on this same packet.
+            "method": method,
+            "fallback_from_raw": fallback_from_raw,
         })
 
     def _capture_completion_check_result(
@@ -4282,7 +4379,8 @@ class SmartMeshCoreInterface(Interface):
         if delay > 0:
             self._debug(
                 f"duty-cycle throttle: waited {delay:.2f}s before this "
-                f"{len(frame)}-char frame (estimated {estimated_s:.2f}s airtime, "
+                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} frame "
+                f"(estimated {estimated_s:.2f}s airtime, "
                 f"{'LoRa model' if self._radio_params is not None else f'duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps'})."
             )
         return delay
@@ -4751,6 +4849,7 @@ class SmartMeshCoreInterface(Interface):
                     f"rx_log_events_total={self._rx_log_events_total} "
                     f"rx_log_by_type={dict(self._rx_log_by_payload_type)} "
                     f"raw_fragments_rx={self._raw_fragments_received} raw_frames_ignored={self._raw_frames_ignored} "
+                    f"raw_unsupported_paths={list(self._raw_unsupported_paths)} "
                     f"ack_rtt={{{', '.join(f'{p!r}: srtt={st['srtt']:.2f}s rttvar={st['rttvar']:.2f}s n={st['samples']}' for p, st in self._ack_rtt.items())}}}",
                     RNS.LOG_INFO,
                 )
@@ -5072,8 +5171,49 @@ class SmartMeshCoreInterface(Interface):
             return False
         if self._own_pubkey_prefix() is None:
             return False
+        path_hex = self._resolved_paths[peer_prefix].out_path_hex or ""
+        if path_hex and self._raw_path_unsupported(path_hex):
+            return False
         until = self._raw_disabled_until.get(peer_prefix)
         return not (until is not None and time.monotonic() < until)
+
+    def _raw_path_unsupported(self, path_hex: str) -> bool:
+        note = self._raw_unsupported_paths.get(path_hex)
+        if note is None:
+            return False
+        if time.monotonic() - note["since"] >= self.direct_raw_path_unsupported_ttl_s:
+            del self._raw_unsupported_paths[path_hex]
+            return False
+        return True
+
+    def _note_raw_fallback_outcome(self, peer_prefix: str, path_hex: str, text_ok: bool) -> None:
+        """Called after the Z85 text send that followed a raw fallback on
+        `path_hex`. Text succeeded -> the chain drops raw packets: note the
+        path and lift the peer's pause. Text failed too -> the path is
+        sick; nothing is concluded about raw."""
+        if not text_ok:
+            self._debug(
+                f"raw fallback to {peer_prefix!r} on path {path_hex or '<zero-hop>'}: the Z85 text send failed as "
+                f"well -- a path problem, not a raw one; raw stays paused for the cooldown only."
+            )
+            return
+        if not path_hex:
+            # Zero hop: no repeater to blame -- the peer's own radio did not
+            # deliver raw frames. The per-peer pause already covers it.
+            RNS.log(
+                f"{self}: Z85 text to {peer_prefix!r} succeeded at zero hop where raw fragments did not -- "
+                f"raw paused for this peer for {self.direct_raw_fallback_cooldown_s:.0f}s.",
+                RNS.LOG_WARNING,
+            )
+            return
+        self._raw_unsupported_paths[path_hex] = {"since": time.monotonic(), "peer": peer_prefix}
+        self._raw_disabled_until.pop(peer_prefix, None)
+        RNS.log(
+            f"{self}: Z85 text to {peer_prefix!r} over path {path_hex} succeeded where raw fragments did not -- "
+            f"a repeater in that chain does not carry raw packets; noted for "
+            f"{self.direct_raw_path_unsupported_ttl_s / 3600:.0f}h (raw resumes on a different path).",
+            RNS.LOG_WARNING,
+        )
 
     def _next_pkt_id(self) -> int:
         # Only ever called from this interface's own dedicated event loop
@@ -6217,9 +6357,10 @@ class SmartMeshCoreInterface(Interface):
             await self._send_broadcast_packet(data, header)
             return
 
+        send_info: dict = {}
         ok = await self._send_direct_payload(
             target, peer_prefix, data, priority=self._priority_tier(header), hop_count=resolved.out_path_len,
-            expires_at=expires_at,
+            expires_at=expires_at, send_info=send_info,
         )
         if ok is None:
             # Too big even for the fully-fragmented DIRECT budget --
@@ -6239,6 +6380,7 @@ class SmartMeshCoreInterface(Interface):
 
         self._capture_direct_send_result(
             peer_prefix, header.destination_hash if header is not None else None, ok, resolved, len(data),
+            method=send_info.get("method"), fallback_from_raw=bool(send_info.get("fallback_from_raw")),
         )
         if not ok and self._expired(expires_at):
             # Already logged and counted where the expiry was detected.
@@ -6257,6 +6399,7 @@ class SmartMeshCoreInterface(Interface):
     async def _send_direct_payload(
         self, target: str, peer_prefix: str, data: bytes, priority: int = PRIORITY_NORMAL,
         hop_count: Optional[int] = None, expires_at: Optional[float] = None,
+        send_info: Optional[dict] = None,
     ) -> Optional[bool]:
         """Sends `data` DIRECT to `target`, choosing the bare or DIRECT-
         needs-fragmenting shape automatically based on size -- shared by
@@ -6268,8 +6411,14 @@ class SmartMeshCoreInterface(Interface):
         the fully-fragmented DIRECT budget (nothing was attempted),
         otherwise whether every fragment (or the single bare message)
         was actually ACKed."""
+        # `send_info` (2026-09-19, capture only): filled with "method" and
+        # "fallback_from_raw" so direct_send_result can say how the packet
+        # was carried.
+        if send_info is None:
+            send_info = {}
         fastpath_budget = self._direct_payload_budget()
         if len(data) <= fastpath_budget:
+            send_info["method"] = "z85_bare"
             return await self._send_direct_with_attempts(
                 target, lambda attempt, d=data: self._encode_direct_bare(d), peer_prefix,
                 priority=priority, hop_count=hop_count, expires_at=expires_at,
@@ -6308,14 +6457,21 @@ class SmartMeshCoreInterface(Interface):
                 expires_at=expires_at, resume=resume, resume_key=resume_key,
             )
             if raw_result is not None:
+                send_info["method"] = "raw"
                 return raw_result
             # None: raw declined or fell back mid-way -- fresh pkt_id, text path.
+            send_info["fallback_from_raw"] = True
             pkt_id = self._next_pkt_id()
             resume = None
-        return await self._send_direct_fragmented(
+        send_info["method"] = "z85_text"
+        text_ok = await self._send_direct_fragmented(
             target, peer_prefix, data, pkt_id, priority=priority, hop_count=hop_count,
             expires_at=expires_at, resume=resume, resume_key=resume_key,
         )
+        pending_path = self._raw_fallback_pending.pop(peer_prefix, None)
+        if pending_path is not None:
+            self._note_raw_fallback_outcome(peer_prefix, pending_path, bool(text_ok))
+        return text_ok
 
     async def _send_raw_fragment(
         self, path: bytes, frame: bytes, priority: int, telemetry: Optional[dict] = None,
@@ -6430,7 +6586,7 @@ class SmartMeshCoreInterface(Interface):
             answer = None
             for q in range(max(1, self.direct_raw_query_attempts)):
                 answer = await self._query_remote_fragments(
-                    target, peer_prefix, pkt_id, frag_total, stage=f"raw{rnd}", priority=priority,
+                    target, peer_prefix, pkt_id, frag_total, stage=f"raw{rnd}", priority=priority, hop_count=hop_count,
                 )
                 if answer is not None or self.detached or not self.online:
                     break
@@ -6455,15 +6611,26 @@ class SmartMeshCoreInterface(Interface):
                 return True
             if sum(acked) <= held_before and missing:
                 empty_answered_bursts += 1
-                if empty_answered_bursts >= 2:
+                if empty_answered_bursts >= max(1, self.direct_raw_fallback_strikes):
                     # The text path works (the ANSWER came back) but raw
-                    # frames are not arriving: a repeater or firmware that
-                    # does not carry them. Fall back for this peer.
+                    # frames are not arriving. Pause raw for this peer and
+                    # fall back to Z85 on the same path; the caller records
+                    # the verdict per PATH once the text send's outcome is
+                    # known (_note_raw_fallback_outcome).
                     self._raw_disabled_until[peer_prefix] = time.monotonic() + self.direct_raw_fallback_cooldown_s
+                    # A verdict on the chain is only possible if raw delivered
+                    # NOTHING on it (review, 2026-09-19): a chain that carried
+                    # fragments 0 and 1 and then stalled is lossy, not
+                    # raw-incapable, and must not be noted.
+                    nothing_ever_held = not any(acked)
+                    if nothing_ever_held:
+                        self._raw_fallback_pending[peer_prefix] = path.hex()
                     RNS.log(
-                        f"{self}: raw fragments to {peer_prefix!r} are not arriving (two answered reconciles, "
-                        f"nothing new held) -- disabling raw for this peer for "
-                        f"{self.direct_raw_fallback_cooldown_s:.0f}s and re-sending as text fragments.",
+                        f"{self}: raw fragments to {peer_prefix!r} are not arriving over path "
+                        f"{path.hex() or '<zero-hop>'} ({empty_answered_bursts} answered reconciles, nothing new "
+                        f"held; receiver holds {sum(acked)}/{frag_total}) -- re-sending as Z85 text"
+                        + ("; if that succeeds the path is noted as not carrying raw." if nothing_ever_held
+                           else " (raw did deliver part of it, so no verdict on the chain)."),
                         RNS.LOG_WARNING,
                     )
                     return None
@@ -6471,18 +6638,40 @@ class SmartMeshCoreInterface(Interface):
                 empty_answered_bursts = 0
 
         remember()
-        # Unanswered throughout: nothing is known about the path -> a real
-        # failure. Answered but incomplete: the path works, the data did not
-        # all get there -- not a path failure.
-        self.record_direct_send_result(
-            peer_prefix, succeeded=False, waited_full_timeout=(query_unanswered_rounds == rounds),
-        )
+        if query_unanswered_rounds == rounds:
+            # Unanswered throughout: nothing is known about the path -> a
+            # real failure, recorded like any other.
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+            RNS.log(
+                f"{self}: RAW fragmented send pkt_id={pkt_id} to {peer_prefix!r} gave up after {rounds} round(s) "
+                f"with no reconcile ever answered: receiver holds {sum(acked)}/{frag_total}.",
+                RNS.LOG_WARNING,
+            )
+            return False
+        # Answered but still incomplete after every round: the path is alive
+        # and raw made progress, it just did not finish under this loss.
+        # Not a path failure and not a verdict on the chain -- hand the packet
+        # to the Z85 text path (per-fragment ACKs, finishing budget) rather
+        # than drop it, and pause raw for this peer for the cooldown so the
+        # next packets under the same loss go straight to text instead of
+        # each spending three raw rounds first (review, 2026-09-19). The
+        # receiver's raw bucket is remembered for resume.
+        self._raw_disabled_until[peer_prefix] = time.monotonic() + self.direct_raw_fallback_cooldown_s
+        # Review (2026-09-19): the chain verdict is about the whole send, not
+        # the strike sequence -- if raw delivered nothing in any round while
+        # the text-path reconcile was answered at least once, this is the
+        # same "Z85 works, binary doesn't" evidence the strike rule looks
+        # for, and an unanswered round in between must not hide it.
+        if not any(acked):
+            self._raw_fallback_pending[peer_prefix] = path.hex()
         RNS.log(
-            f"{self}: RAW fragmented send pkt_id={pkt_id} to {peer_prefix!r} gave up after {rounds} round(s): "
-            f"receiver holds {sum(acked)}/{frag_total}.",
+            f"{self}: RAW fragmented send pkt_id={pkt_id} to {peer_prefix!r} incomplete after {rounds} round(s) "
+            f"(receiver holds {sum(acked)}/{frag_total}) -- re-sending as Z85 text"
+            + ("; nothing arrived raw, so a successful text send notes the path." if not any(acked) else ".")
+            ,
             RNS.LOG_WARNING,
         )
-        return False
+        return None
 
     async def _send_direct_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
@@ -6633,7 +6822,7 @@ class SmartMeshCoreInterface(Interface):
         # receiver's bucket, and the answer below is the ground truth.
         if reconcile and (missing or resumed):
             answer = await self._query_remote_fragments(
-                target, peer_prefix, pkt_id, frag_total, stage="reconcile", priority=priority,
+                target, peer_prefix, pkt_id, frag_total, stage="reconcile", priority=priority, hop_count=hop_count,
             )
             if self.detached or not self.online:
                 remember_for_resume()
@@ -6695,7 +6884,7 @@ class SmartMeshCoreInterface(Interface):
 
         if self.direct_completion_check_enabled:
             confirmed = await self._check_remote_completion(
-                target, peer_prefix, pkt_id, frag_total, priority=priority,
+                target, peer_prefix, pkt_id, frag_total, priority=priority, hop_count=hop_count,
             )
             if confirmed:
                 RNS.log(
@@ -6721,7 +6910,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _check_remote_completion(
         self, target: str, peer_prefix: str, pkt_id: int, frag_total: int,
-        priority: int = PRIORITY_NORMAL,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
     ) -> bool:
         """Field-data-driven fix (2026-09-16): real capture from a 5-node
         field test found a concrete case (`pkt_id=3`, router -> a client)
@@ -6761,19 +6950,46 @@ class SmartMeshCoreInterface(Interface):
         `_query_remote_fragments`, which is also called *between* the
         passes as the reconcile step -- see `_send_direct_fragmented`."""
         answer = await self._query_remote_fragments(
-            target, peer_prefix, pkt_id, frag_total, stage="final", priority=priority,
+            target, peer_prefix, pkt_id, frag_total, stage="final", priority=priority, hop_count=hop_count,
         )
         return answer is not None and answer.complete
 
-    def _completion_query_timeout_s(self, peer_prefix: str) -> float:
-        """`direct_completion_check_timeout_s`, or longer when this peer's
-        measured ACK RTT (step 2) says a QUERY+ANSWER round trip -- two
-        DIRECT exchanges back to back, each with its own firmware ACK --
-        plausibly takes more than that. Never shorter than the config
-        value; the RTT-derived part is capped at
-        `direct_ack_timeout_routed_max_s` (see below)."""
+    def _record_query_rtt(self, peer_prefix: Optional[str], rtt_s: float) -> None:
+        """One measured QUERY -> ANSWER round trip (first raw field test,
+        2026-09-18 night). Same estimator shape as `_record_ack_rtt`."""
+        if peer_prefix is None or rtt_s <= 0:
+            return
+        st = self._query_rtt.get(peer_prefix)
+        if st is None:
+            self._query_rtt[peer_prefix] = {"srtt": rtt_s, "rttvar": rtt_s / 2.0, "samples": 1}
+            return
+        err = rtt_s - st["srtt"]
+        st["rttvar"] = 0.75 * st["rttvar"] + 0.25 * abs(err)
+        st["srtt"] = st["srtt"] + 0.125 * err
+        st["samples"] += 1
+
+    def _completion_query_timeout_s(self, peer_prefix: str, hop_count: Optional[int] = None) -> float:
+        """How long to wait for a completion ANSWER. In order of
+        preference: the measured QUERY -> ANSWER round trip for this peer
+        (`_query_rtt`, 2 x (srtt + 4*rttvar)); else the step-2 ACK RTT
+        bound; else the firmware's hop-aware ACK bound doubled; and in all
+        cases never below a hop-scaled prior, `direct_completion_check_
+        timeout_s` x (hops + 1) -- the first raw field test ran a hop-1
+        query at the flat 5s floor and timed out on a reply that needed
+        ~6s. Capped at `direct_ack_timeout_routed_max_s`, plus the step-4
+        hold cap when holds are on."""
+        if hop_count is None:
+            resolved = self._resolved_paths.get(peer_prefix)
+            hop_count = resolved.out_path_len if resolved is not None else 0
+        timeout_s = self.direct_completion_check_timeout_s * (1 + max(0, hop_count))
+        qs = self._query_rtt.get(peer_prefix)
+        if qs is not None:
+            measured = 2.0 * (qs["srtt"] + 4.0 * qs["rttvar"])
+            timeout_s = max(timeout_s, min(measured, self.direct_ack_timeout_routed_max_s))
+            if self.rx_log_holds_enabled:
+                timeout_s += self.rx_log_hold_max_s
+            return timeout_s
         st = self._ack_rtt.get(peer_prefix) or self._ack_rtt_snapshot.get(peer_prefix)
-        timeout_s = self.direct_completion_check_timeout_s
         if st is None:
             # Field fix (2026-09-18 evening): no RTT information at all --
             # the firmware's hop-aware ACK bound for this peer, doubled for
@@ -6803,7 +7019,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _query_remote_fragments(
         self, target: str, peer_prefix: str, pkt_id: int, frag_total: int, stage: str,
-        priority: int = PRIORITY_NORMAL,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
     ) -> Optional[_CompletionFrame]:
         """Step 3 (2026-09-18, see module docstring): one `"Q"` QUERY to the
         receiver, answered with its have-bitmap (v2) or a bare complete
@@ -6832,34 +7048,46 @@ class SmartMeshCoreInterface(Interface):
         self._completion_query_waiters[key] = fut
         outcome = "send_failed"
         answer: Optional[_CompletionFrame] = None
-        timeout_s = self._completion_query_timeout_s(peer_prefix)
+        timeout_s = self._completion_query_timeout_s(peer_prefix, hop_count)
         try:
             frame = self._encode_completion_frame(self.COMPLETION_TYPE_QUERY, pkt_id, frag_total)
-            async with self._direct_exchange_lock(priority):
-                try:
-                    await self._send_direct_frame(target, frame, time_critical=True)
-                except Exception as exc:
-                    self._debug(
-                        f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
-                        f"send failed locally: {exc} -- treating as no answer."
-                    )
-                    return None
-                try:
-                    got: _CompletionFrame = await asyncio.wait_for(fut, timeout=timeout_s)
-                    answer = got
-                    outcome = "answered"
-                    self._debug(
-                        f"completion ANSWER ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
-                        f"complete={got.complete} held={sorted(got.held) if got.held is not None else None}."
-                    )
-                    return got
-                except asyncio.TimeoutError:
-                    outcome = "timeout"
-                    self._debug(
-                        f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
-                        f"no answer within {timeout_s:.1f}s -- no information, proceeding as if unanswered."
-                    )
-                    return None
+            # First raw field test (2026-09-18 night): the QUERY is one
+            # ordinary ACKed exchange -- lock held through its transmit and
+            # firmware ACK -- and the ANSWER is then awaited with the radio
+            # free. Holding the lock through the answer wait (the earlier
+            # review's shape) blocked this node's own ANSWERs to the peer's
+            # queries for up to 50s under bidirectional traffic.
+            sent_at = time.monotonic()
+            try:
+                await self._send_direct_frame_and_wait_for_ack(
+                    target, frame, 0, peer_prefix=peer_prefix, priority=priority,
+                    time_critical=True, kind="completion_query", hop_count=hop_count,
+                )
+            except Exception as exc:
+                self._debug(
+                    f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
+                    f"send failed locally: {exc} -- treating as no answer."
+                )
+                return None
+            remaining = max(0.5, timeout_s - (time.monotonic() - sent_at))
+            try:
+                got: _CompletionFrame = await asyncio.wait_for(fut, timeout=remaining)
+                answer = got
+                outcome = "answered"
+                self._record_query_rtt(peer_prefix, time.monotonic() - sent_at)
+                self._debug(
+                    f"completion ANSWER ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
+                    f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
+                    f"after {time.monotonic() - sent_at:.1f}s."
+                )
+                return got
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+                self._debug(
+                    f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
+                    f"no answer within {timeout_s:.1f}s -- no information, proceeding as if unanswered."
+                )
+                return None
         finally:
             self._completion_query_waiters.pop(key, None)
             self._capture_completion_check_result(
@@ -7034,6 +7262,10 @@ class SmartMeshCoreInterface(Interface):
             self._ack_rtt_snapshot.pop(peer_prefix, None)
             self._echo_stats.pop(peer_prefix, None)
             self._last_firmware_ack_timeout_s.pop(peer_prefix, None)
+            self._query_rtt.pop(peer_prefix, None)
+            # A new path is a new repeater chain: try raw first again.
+            self._raw_disabled_until.pop(peer_prefix, None)
+            self._raw_fallback_pending.pop(peer_prefix, None)
         if st is not None:
             self._debug(f"ACK RTT estimate for {peer_prefix!r} discarded ({reason}); firmware timeout applies until re-measured.")
 
@@ -8660,6 +8892,8 @@ class SmartMeshCoreInterface(Interface):
         for k in [k for k in self._resumable_sends if k[0] == pubkey_prefix]:
             del self._resumable_sends[k]
         self._raw_disabled_until.pop(pubkey_prefix, None)
+        self._raw_fallback_pending.pop(pubkey_prefix, None)
+        self._query_rtt.pop(pubkey_prefix, None)
         self._path_discovery_failures.pop(pubkey_prefix, None)
         self._path_discovery_backoff_until.pop(pubkey_prefix, None)
         self._direct_path_failures.pop(pubkey_prefix, None)
@@ -9027,7 +9261,7 @@ class SmartMeshCoreInterface(Interface):
             self._last_rx_log_at = now
             self._rx_log_feed_seen = True
             self._rx_log_events_total += 1
-            payload_typename = str(payload.get("payload_typename", "UNK"))
+            payload_typename = self._rx_log_typename(payload)
             self._rx_log_by_payload_type[payload_typename] += 1
 
             fields = self._rx_log_capture_fields(payload, since_last_rx, since_own_tx)
@@ -9058,6 +9292,16 @@ class SmartMeshCoreInterface(Interface):
     # the ones whose cleartext payload starts with [dest_hash][src_hash].
     _RX_LOG_ADDRESSED_PAYLOAD_TYPES = frozenset({0, 1, 2, 8})  # REQ, RESPONSE, TEXT_MSG, PATH
     _RX_LOG_PAYLOAD_TYPE_ACK = 3
+
+    _RX_LOG_PAYLOAD_TYPE_RAW_CUSTOM = 15
+
+    def _rx_log_typename(self, payload: dict) -> str:
+        """The library's name table stops at CONTROL (11), so a raw packet
+        (PAYLOAD_TYPE_RAW_CUSTOM, 0x0F) is reported as "UNK"; name it."""
+        name = payload.get("payload_typename")
+        if payload.get("payload_type") == self._RX_LOG_PAYLOAD_TYPE_RAW_CUSTOM and (not name or name == "UNK"):
+            return "RAW_CUSTOM"
+        return str(name if name is not None else "UNK")
 
     def _rx_log_capture_fields(self, payload: dict, since_last_rx: Optional[float], since_own_tx: Optional[float]) -> dict:
         """The `rx_log` capture record. Everything the firmware/library
@@ -9092,7 +9336,7 @@ class SmartMeshCoreInterface(Interface):
             "route_type": payload.get("route_type"),
             "route_typename": payload.get("route_typename"),
             "payload_type": payload_type,
-            "payload_typename": payload.get("payload_typename"),
+            "payload_typename": self._rx_log_typename(payload),
             "payload_ver": payload.get("payload_ver"),
             "path_len": payload.get("path_len"),
             "path": payload.get("path"),
@@ -9338,7 +9582,7 @@ class SmartMeshCoreInterface(Interface):
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
             return
 
-        complete_data = self._add_channel_fragment(key, header, payload)
+        complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
         if complete_data is None:
             self._last_incoming_direct_at = time.monotonic()
         else:
@@ -9477,7 +9721,7 @@ class SmartMeshCoreInterface(Interface):
         )
         del self._reassembly[oldest_key]
 
-    def _add_channel_fragment(self, key, header: _FrameHeader, payload: bytes) -> Optional[bytes]:
+    def _add_channel_fragment(self, key, header: _FrameHeader, payload: bytes, raw: bool = False) -> Optional[bytes]:
         """Shared reassembly-fragment-accumulation logic for both CHANNEL
         (`_handle_channel_frame`) and DIRECT
         (`_handle_direct_multifragment_frame`) multi-fragment receipt --
@@ -9518,7 +9762,7 @@ class SmartMeshCoreInterface(Interface):
         
         if header.pkt_id is not None:
             self._capture_fragment_received(
-                key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total, len(bucket.fragments),
+                key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total, len(bucket.fragments), raw=raw,
             )
 
         if len(bucket.fragments) < bucket.frag_total:
@@ -9579,6 +9823,9 @@ class SmartMeshCoreInterface(Interface):
                 self._pending_link_request_sweep(now)
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
+                for path_hex in [p for p, n in self._raw_unsupported_paths.items()
+                                 if now - n["since"] >= self.direct_raw_path_unsupported_ttl_s]:
+                    del self._raw_unsupported_paths[path_hex]
         except asyncio.CancelledError:
             pass
 
