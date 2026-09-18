@@ -355,7 +355,9 @@ def main() -> None:
     run.add_argument("--iface-option", action="append", default=[], metavar="KEY=VALUE", help="Extra interface config for every node")
     run.add_argument("--capture-dir", default=None)
     run.add_argument("--announce-interval", type=float, default=15.0)
-    run.add_argument("--advert-interval", type=float, default=60.0)
+    run.add_argument("--advert-interval", type=float, default=20.0,
+                     help="Seconds between each radio's re-adverts; a node that boots after its neighbor's "
+                          "advert only learns it from the next one, so this bounds setup time")
     run.add_argument("--settle", type=float, default=8.0, help="Seconds after the responder is ready before starting the sender")
     run.add_argument("--path-timeout", type=float, default=120.0)
     run.add_argument("--probe-timeout", type=float, default=60.0)
@@ -378,7 +380,7 @@ def main() -> None:
     node.add_argument("--transport-node", action="store_true")
     node.add_argument("--iface-option", action="append", default=[])
     node.add_argument("--announce-interval", type=float, default=15.0)
-    node.add_argument("--advert-interval", type=float, default=60.0)
+    node.add_argument("--advert-interval", type=float, default=20.0)
     node.add_argument("--path-timeout", type=float, default=120.0)
     node.add_argument("--path-request-interval", type=float, default=20.0)
     node.add_argument("--probe-timeout", type=float, default=60.0)
