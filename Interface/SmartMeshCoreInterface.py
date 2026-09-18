@@ -1424,6 +1424,86 @@ multi-hop numbers the RX-log hold model was waiting on now exist (echo
 direct); holds stayed off and the recorded predictions were small, which
 fits link loss rather than contention, so the default is unchanged.
 
+**Field-diagnosed batch (2026-09-18, late evening -- a zero-hop NomadNet
+page load, both sides captured: `fieldtests/raw/2026-09-18-zero-hop-
+nomadnet-page/`).** Link setup took 14s; the page's 12 Resource parts
+(483B each, 5 DIRECT fragments apiece, 60 fragments) then took 7.6
+minutes, during which the server transmitted 110 fragments -- every one
+ACKed, mean ACK 1.24s, so the radio was not the problem. Three causes,
+verified against the capture and fixed in the same order; the third was
+self-inflicted by that morning's `outgoing_max_age`:
+
+1. *The duty-cycle estimate was quantizing away a third of the policy's
+   own allowance.* `_throttle_for_duty_cycle` estimated a full 151-char
+   fragment at 1.007s (`151*8/1200`), so three in one 10s window came
+   to 3.02s -- a hair over the 3.0s cap -- and the limiter admitted two
+   per window (median 4.3s between ACKed sends; 304s of the 509s
+   transfer spent waiting on it). The other radio's RX log shows what a
+   fragment really is on air: 166 bytes, exactly the firmware's framing
+   (`Mesh::createDatagram`: dest+src hash, 2-byte MAC, and
+   `encryptThenMAC` padding timestamp+flags+text+NUL to a 16-byte
+   cipher block, plus the 2-byte packet header), and at this rig's
+   SF7/BW62.5/CR8 that is 0.877s by the step-4 time-on-air model. Three
+   of those are 2.63s. `_estimate_tx_airtime_s` now feeds the limiter
+   that model-derived figure whenever SELF_INFO has provided the radio
+   parameters, falling back to `duty_cycle_estimate_bitrate` otherwise.
+   The 30%-of-10s policy itself is untouched; at these settings it now
+   admits the three fragments per window it always allowed for. (The
+   `_DutyCycleLimiter` docstring's "no access to SF/BW/CR" was true when
+   written and stopped being true at step 4.)
+2. *`outgoing_max_age` dropped fragments mid-packet.* All nine expiries
+   in the capture were fragments 2-4 of 5, in pass 0, of parts whose
+   earlier fragments had already been transmitted -- each one threw away
+   the air already spent, left the receiver's bucket to time out, and
+   made RNS re-request the whole part as a fresh packet. The 120s age is
+   simply shorter than a throttled 13-packet queue's drain time. Expiry
+   is now decided once, before a packet's FIRST transmission (bare
+   attempt 0, or fragment 0 of pass 0), and never afterwards; and
+   packets carrying Resource data parts (`context == RESOURCE`) are
+   exempt altogether -- RNS's Resource layer owns their retransmission
+   (the receiver re-requests what it lacks), so this interface
+   second-guessing it can only add round trips.
+3. *RNS re-requested parts that were still queued here, so half the
+   transfer was redundant:* 26 RESOURCE packets queued for 12 distinct
+   payloads (the receiver re-requests every ~27s while the earlier copy
+   is still waiting on the limiter). `process_outgoing` now drops a
+   packet whose bytes are already queued or in flight
+   (`_outgoing_inflight`, keyed by the packet's truncated hash, released
+   only when every send task the packet spawned has finished -- never on
+   a timer, so a copy that genuinely failed can be re-sent the moment
+   the failure is known). Identical RNS bytes have identical effect and
+   the receiver would dedup them anyway; the capture's own `payload_hash`
+   is what showed the duplication. Recorded as `duplicate_in_flight`.
+
+Policy change, user decision (2026-09-18, same evening): `duty_cycle_
+window` default raised from 10s to 60s at the same 30% fraction. At
+SF7/BW62.5 the 10s window capped a 60-fragment page at roughly 3 minutes
+even with zero waste, because a burst could only ever reach the ~26% a
+10s window quantizes to; over 60s a burst can use the full 18s of
+allowance (about twenty 0.877s fragments back to back) before the
+limiter pauses it, and the "majority of the time listening" intent
+still holds over every rolling minute. The user's original 2026-09-16
+instruction ("a max of 30% of total airtime in a 10 second period") is
+superseded by this one; the fraction is unchanged.
+
+**User-requested (2026-09-18, same evening): link-maintenance traffic
+bypasses the duty-cycle wait** (`duty_cycle_exempt_handshake`, default
+yes). The concern: a burst of page data can consume the whole 18s/60s
+allowance, and a KEEPALIVE/LRRTT/LRPROOF queued behind it would then wait
+for budget while RNS's own link timers run -- losing the Link, which
+costs a full re-establishment, to protect a few hundred milliseconds of
+air. The class is exactly `_priority_tier`'s PRIORITY_HANDSHAKE
+(LINKREQUEST, PROOF, and the KEEPALIVE..LRPROOF / RESOURCE_PRF/ICL/RCL
+contexts) -- the same packets that already jump `_direct_exchange_lock`'s
+queue, so the two priority mechanisms now agree. Its airtime is still
+RECORDED against the window (`_throttle_for_duty_cycle`'s `exempt` path
+records without waiting), so ordinary data pays for it and the 30%
+ceiling stays honest over any minute; only the wait is skipped. Applies
+on both the DIRECT path (`_send_direct_frame_and_wait_for_ack` derives it
+from `priority`) and the CHANNEL path (`_send_broadcast_packet` from the
+header); bind and completion frames are unaffected. Captured per attempt
+as `duty_cycle_exempt`.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -1802,7 +1882,9 @@ class _DutyCycleLimiter:
     the field-test synthesis above): "all interfaces should spend the
     majority of their time listening" -- a global cap on how much of any
     trailing `window_s` this interface spends transmitting, `max_fraction`
-    (default 0.30, i.e. at most 30% of every rolling 10s), enforced across
+    (default 0.30, i.e. at most 30% of every rolling window -- 10s as
+    first requested, 60s since 2026-09-18 by the same user's decision,
+    see the module docstring's page-load entry), enforced across
     *every* actual radio-keying command this interface issues (CHANNEL
     fastpath/multi-fragment sends, DIRECT sends, bind frames alike -- see
     each of their own call sites for where `wait_for_budget`/`record` are
@@ -1825,10 +1907,13 @@ class _DutyCycleLimiter:
     that config value's own comment for the two-step tuning history --
     300 was tried first and still fired on ordinary Link+Resource
     traffic in the same real hardware test) -- a more realistic raw LoRa
-    PHY figure, the right basis for *this* estimate specifically. Neither
-    is a real PHY-layer measurement (this interface has no access to
-    actual LoRa spreading-factor/bandwidth/coding-rate timing, only what
-    the `meshcore` library exposes), and deliberately NOT the wall-clock
+    PHY figure, the right basis for *this* estimate specifically. Since
+    2026-09-18 (evening) the estimate is the real LoRa time-on-air from
+    `_estimate_tx_airtime_s` whenever SELF_INFO has provided the radio's
+    SF/BW/CR (see that method: the bitrate figure quantized a 151-char
+    fragment to 1.007s where the air really carries 0.877s at SF7/BW62.5/
+    CR8, costing a third of the policy's own allowance); the bitrate
+    figure remains the fallback. Either way it is deliberately NOT the wall-clock
     duration of the `send_msg`/`send_chan_msg` command call itself --
     that duration is dominated by local serial/BLE/TCP round-trip
     overhead to the companion radio, not real over-the-air time, and
@@ -2041,7 +2126,7 @@ class SmartMeshCoreInterface(Interface):
     # raises TypeError. priority=-1 sorts before both real tiers (0, 1),
     # so it's also dequeued at the first opportunity on shutdown; seq=-1
     # never collides since _outqueue_seq only ever counts up from 0.
-    _OUTQUEUE_SHUTDOWN_SENTINEL = (-1, -1, None, None, 0.0)
+    _OUTQUEUE_SHUTDOWN_SENTINEL = (-1, -1, None, None, 0.0, None)
 
     # --- Path discovery / telemetry permission (docs/path_discovery_spec.md) --
     # Firmware constants, not user config -- confirmed directly against
@@ -2406,6 +2491,14 @@ class SmartMeshCoreInterface(Interface):
         # same-priority items never need Python to compare their `data`/
         # `header` fields to break a tie.
         self._pkt_id_counter = 0
+        # Field fix (2026-09-18 evening, page-load capture): truncated hash
+        # of every RNS packet currently queued or being sent -> enqueue
+        # time. process_outgoing (RNS's thread) drops a packet whose bytes
+        # are already here; _outgoing_worker releases the entry once every
+        # send task the packet spawned has finished. Guarded by a
+        # threading.Lock since both threads touch it.
+        self._outgoing_inflight = {}
+        self._outgoing_inflight_lock = threading.Lock()
         self._outqueue = queue.PriorityQueue(maxsize=self.OUTQUEUE_MAXSIZE)
         self._outqueue_seq = itertools.count()
         self._outgoing_worker_task = None
@@ -2657,11 +2750,22 @@ class SmartMeshCoreInterface(Interface):
         # `_send_direct_frame`/`_send_bind_frame`'s own call sites for
         # where it's actually enforced. Defaults match the user's own
         # stated numbers exactly (30% of a rolling 10s window) --
+        # window raised to 60s on 2026-09-18 at the user's decision after
+        # the zero-hop page-load capture (see module docstring): the same
+        # 30%, but a burst can now actually use it instead of the ~26% a
+        # 10s window quantizes to --
         # deliberately not derived from any field measurement, a
         # precautionary ceiling rather than a data-driven one.
         self.duty_cycle_enabled = _cfg_bool(cfg.get("duty_cycle_enabled", "yes"))
-        self.duty_cycle_window_s = float(cfg.get("duty_cycle_window", 10.0))
+        self.duty_cycle_window_s = float(cfg.get("duty_cycle_window", 60.0))
         self.duty_cycle_max_fraction = float(cfg.get("duty_cycle_max_fraction", 0.30))
+        # User-requested (2026-09-18 evening, see module docstring): link-
+        # maintenance traffic (PRIORITY_HANDSHAKE -- LINKREQUEST, PROOF,
+        # KEEPALIVE..LRPROOF, RESOURCE_PRF/ICL/RCL) never waits for budget;
+        # its airtime is still charged to the window so data pays for it.
+        # A Link lost to a throttled keepalive costs far more air to
+        # re-establish than the keepalive itself.
+        self.duty_cycle_exempt_handshake = _cfg_bool(cfg.get("duty_cycle_exempt_handshake", "yes"))
 
         # Field-diagnosed fix (2026-09-16, real zero-hop hardware test, the
         # very next thing tried after the duty-cycle cap above shipped):
@@ -2911,8 +3015,13 @@ class SmartMeshCoreInterface(Interface):
         # this is dropped instead of sent -- 17 LXMF pings queued through
         # a 4-minute outage drained as a stale burst the moment the path
         # came back. ANNOUNCE is exempt (idempotent, and RNS won't re-send
-        # one soon). 0 disables. Default matches reassembly_idle_timeout:
-        # past it the receiver has given up on any fragmented packet too.
+        # one soon). 0 disables. Default matches reassembly_idle_timeout.
+        # Refined the same evening (page-load capture, see module
+        # docstring): the decision is made ONCE, before a packet's first
+        # transmission -- never between fragments or attempts, where a drop
+        # only wastes the air already spent -- and Resource data parts
+        # (context RESOURCE) are exempt: RNS's Resource layer owns their
+        # retransmission and re-requests what it lacks.
         self.outgoing_max_age_s = float(cfg.get("outgoing_max_age", 120.0))
 
     def _configure_path_discovery(self, cfg):
@@ -3569,7 +3678,7 @@ class SmartMeshCoreInterface(Interface):
         send_cmd_latency_s: Optional[float] = None, rx_window: Optional[dict] = None,
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
-        hop1_abort_deadline_s: Optional[float] = None,
+        hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -3682,6 +3791,9 @@ class SmartMeshCoreInterface(Interface):
             # ack_timeout_source is "hop1_abort" and ack_timeout_s equals
             # this. "expired" means the packet aged out before transmit.
             "hop1_abort_deadline_s": round(hop1_abort_deadline_s, 3) if hop1_abort_deadline_s is not None else None,
+            # User-requested (2026-09-18 evening): handshake-class frames
+            # skip the duty-cycle wait (airtime still charged).
+            "duty_cycle_exempt": duty_cycle_exempt,
         })
 
     def _capture_channel_fragment_sent(
@@ -3892,7 +4004,12 @@ class SmartMeshCoreInterface(Interface):
             )
         return result
 
-    async def _throttle_for_duty_cycle(self, frame: str) -> float:
+    def _duty_cycle_exempt(self, priority: int) -> bool:
+        """Whether a frame of this priority tier skips the duty-cycle wait
+        (see duty_cycle_exempt_handshake). Its airtime is still recorded."""
+        return self.duty_cycle_exempt_handshake and priority == self.PRIORITY_HANDSHAKE
+
+    async def _throttle_for_duty_cycle(self, frame: str, exempt: bool = False) -> float:
         """User-requested fix (2026-09-16): called at every actual radio-
         keying call site (`_send_channel_fastpath_frame`, one iteration
         of `_send_channel_multifragment_pass`'s per-fragment loop,
@@ -3911,14 +4028,22 @@ class SmartMeshCoreInterface(Interface):
         `duty_cycle_enabled` is off."""
         if not self.duty_cycle_enabled or self.duty_cycle_estimate_bitrate <= 0:
             return 0.0
-        estimated_s = (len(frame) * 8) / self.duty_cycle_estimate_bitrate
+        estimated_s = self._estimate_tx_airtime_s(frame)
+        if exempt:
+            # Link-maintenance traffic: charged, never delayed.
+            self._duty_cycle.record(estimated_s)
+            self._debug(
+                f"duty-cycle: handshake-class {len(frame)}-char frame sent without waiting "
+                f"for budget ({estimated_s:.2f}s airtime still charged to the window)."
+            )
+            return 0.0
         delay = await self._duty_cycle.wait_for_budget(estimated_s)
         self._duty_cycle.record(estimated_s)
         if delay > 0:
             self._debug(
                 f"duty-cycle throttle: waited {delay:.2f}s before this "
-                f"{len(frame)}-char frame (estimated {estimated_s:.2f}s "
-                f"airtime at duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps)."
+                f"{len(frame)}-char frame (estimated {estimated_s:.2f}s airtime, "
+                f"{'LoRa model' if self._radio_params is not None else f'duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps'})."
             )
         return delay
 
@@ -3990,7 +4115,9 @@ class SmartMeshCoreInterface(Interface):
             )
         return total_waited
 
-    async def _pre_transmit_gate(self, frame: str, skip_quiet_defer: bool = False) -> "tuple[float, float, float]":
+    async def _pre_transmit_gate(
+        self, frame: str, skip_quiet_defer: bool = False, duty_cycle_exempt: bool = False,
+    ) -> "tuple[float, float, float]":
         """Code-review fix: `await self._wait_for_incoming_quiet()` then
         `await self._throttle_for_duty_cycle(frame)`, in that order, used
         to be copy-pasted verbatim at every one of this interface's radio-
@@ -4039,7 +4166,7 @@ class SmartMeshCoreInterface(Interface):
         quiet_defer_wait_s = 0.0
         if not skip_quiet_defer:
             quiet_defer_wait_s = await self._wait_for_incoming_quiet()
-        duty_cycle_wait_s = await self._throttle_for_duty_cycle(frame)
+        duty_cycle_wait_s = await self._throttle_for_duty_cycle(frame, exempt=duty_cycle_exempt)
         # Step 4 (2026-09-18): last, so it reflects whatever was overheard
         # during the two waits above. A no-op unless rx_log_holds_enabled.
         medium_hold_wait_s = await self._wait_for_medium_clear()
@@ -4877,10 +5004,30 @@ class SmartMeshCoreInterface(Interface):
         raw = bytes(data)
         header = self._parse_rns_header(raw)
         priority = self._priority_tier(header)
+        # Field fix (2026-09-18 evening): identical bytes already queued or
+        # in flight -> drop. RNS's Resource layer re-requests parts every
+        # ~27s while the earlier copy is still waiting on the duty-cycle
+        # limiter; the page-load capture queued 26 RESOURCE packets for 12
+        # distinct payloads. The receiver would dedup them anyway.
+        inflight_key = RNS.Identity.truncated_hash(raw)
+        with self._outgoing_inflight_lock:
+            duplicate = inflight_key in self._outgoing_inflight
+            if not duplicate:
+                self._outgoing_inflight[inflight_key] = time.monotonic()
+        if duplicate:
+            self._outgoing_dropped_total += 1
+            self._capture_outgoing(header, raw, "duplicate_in_flight")
+            self._debug(
+                f"dropping outgoing packet ({len(raw)} bytes, "
+                f"{self._payload_correlation_hash(raw)}) -- identical bytes are already "
+                f"queued or in flight."
+            )
+            return
         seq = next(self._outqueue_seq)
         try:
-            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic()))
+            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic(), inflight_key))
         except queue.Full:
+            self._release_inflight(inflight_key)
             self._outgoing_dropped_total += 1
             RNS.log(
                 f"{self}: dropping outgoing packet ({len(data)} bytes) -- "
@@ -4902,16 +5049,21 @@ class SmartMeshCoreInterface(Interface):
         executor thread)."""
         loop = asyncio.get_running_loop()
         while True:
-            priority, seq, data, header, enqueued_at = await loop.run_in_executor(None, self._outqueue.get)
+            priority, seq, data, header, enqueued_at, inflight_key = await loop.run_in_executor(None, self._outqueue.get)
             if data is None:
                 self._outqueue.task_done()
                 return
+            spawned: list = []
             try:
                 # Field fix (2026-09-18 evening): outgoing_max_age -- see
-                # that config's own comment. ANNOUNCE never expires.
+                # that config's own comment. ANNOUNCE never expires, nor do
+                # Resource data parts (RNS's Resource layer owns those).
                 expires_at = None
                 if self.outgoing_max_age_s > 0 and not (
-                    header is not None and header.packet_type == RNS.Packet.ANNOUNCE
+                    header is not None and (
+                        header.packet_type == RNS.Packet.ANNOUNCE
+                        or header.context == RNS.Packet.RESOURCE
+                    )
                 ):
                     expires_at = enqueued_at + self.outgoing_max_age_s
                 if self._expired(expires_at):
@@ -4924,7 +5076,7 @@ class SmartMeshCoreInterface(Interface):
                         RNS.LOG_WARNING,
                     )
                 else:
-                    await self._send_outgoing_packet(data, header, expires_at=expires_at)
+                    await self._send_outgoing_packet(data, header, expires_at=expires_at, spawned=spawned)
             except Exception as exc:
                 RNS.log(
                     f"{self}: unexpected error sending an outgoing packet: {exc}",
@@ -4932,6 +5084,40 @@ class SmartMeshCoreInterface(Interface):
                 )
             finally:
                 self._outqueue.task_done()
+                self._release_inflight_when_done(inflight_key, spawned)
+
+    def _release_inflight(self, inflight_key) -> None:
+        if inflight_key is None:
+            return
+        with self._outgoing_inflight_lock:
+            self._outgoing_inflight.pop(inflight_key, None)
+
+    def _release_inflight_when_done(self, inflight_key, spawned: list) -> None:
+        """Releases a packet's `_outgoing_inflight` entry once every send
+        task `_dispatch_outgoing_packet` spawned for it has finished --
+        success or failure -- so a genuinely failed copy can be re-sent
+        by RNS immediately, while a copy still working through the queue
+        or the radio lock keeps its duplicates out."""
+        live = [t for t in spawned if t is not None and not t.done()]
+        if not live:
+            self._release_inflight(inflight_key)
+            return
+
+        async def _wait_then_release():
+            await asyncio.gather(*live, return_exceptions=True)
+            self._release_inflight(inflight_key)
+
+        self._spawn_background_task(_wait_then_release())
+
+    def _outgoing_inflight_sweep(self, now: float) -> None:
+        """Safety net only: an entry should always be released by
+        `_release_inflight_when_done`; anything older than ten minutes is
+        a leak (a send path that raised before spawning, say) and is
+        cleared so it can never block a destination for good."""
+        with self._outgoing_inflight_lock:
+            stale = [k for k, t in self._outgoing_inflight.items() if now - t > 600.0]
+            for k in stale:
+                del self._outgoing_inflight[k]
 
     def _expired(self, expires_at: Optional[float]) -> bool:
         """outgoing_max_age check -- `expires_at` is a time.monotonic()
@@ -4967,6 +5153,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_direct_to_all_peers(
         self, data: bytes, priority: int = PRIORITY_NORMAL, expires_at: Optional[float] = None,
+        spawned: Optional[list] = None,
     ) -> None:
         """Small-mesh replacement for a CHANNEL broadcast: one DIRECT
         copy to every bound peer instead, each spawned independently
@@ -4976,11 +5163,13 @@ class SmartMeshCoreInterface(Interface):
         already handles path-resolution-with-discovery, spacing, and
         bare-vs-fragmented dispatch correctly regardless of caller."""
         for peer_prefix in self._all_bound_peer_prefixes():
-            self._spawn_background_task(
+            task = self._spawn_background_task(
                 self._send_direct_supplement(
                     data, peer_prefix, trigger_discovery=True, priority=priority, expires_at=expires_at,
                 )
             )
+            if spawned is not None:
+                spawned.append(task)
 
     def _unknown_dest_in_backoff(self, destination_hash: Optional[bytes]) -> bool:
         if destination_hash is None:
@@ -5128,6 +5317,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_outgoing_packet(
         self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
+        spawned: Optional[list] = None,
     ) -> None:
         """Entry point the outgoing worker calls for every packet -- logs
         the classification debug line, then either delays an LRPROOF
@@ -5193,7 +5383,9 @@ class SmartMeshCoreInterface(Interface):
                 f"real latency rather than an optimistic handshake sample."
             )
             self._capture_outgoing(header, data, "lrproof_delayed")
-            self._spawn_background_task(self._send_delayed_link_proof(data, header, expires_at))
+            task = self._spawn_background_task(self._send_delayed_link_proof(data, header, expires_at))
+            if spawned is not None:
+                spawned.append(task)
             return
 
         # User-requested fix (2026-09-15, real 2-hop repeater field
@@ -5248,7 +5440,7 @@ class SmartMeshCoreInterface(Interface):
                     header.destination_hash, time.monotonic() + self.proof_correlation_ttl_s,
                 )
 
-        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at)
+        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=spawned)
 
     async def _send_delayed_link_proof(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
@@ -5256,10 +5448,18 @@ class SmartMeshCoreInterface(Interface):
         await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
         if self.detached or not self.online:
             return
-        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at)
+        inner: list = []
+        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+        # Finish everything the dispatch spawned before this task ends, so
+        # the packet's in-flight entry (released when THIS task finishes)
+        # really covers the whole send.
+        live = [t for t in inner if t is not None]
+        if live:
+            await asyncio.gather(*live, return_exceptions=True)
 
     async def _dispatch_outgoing_packet(
         self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
+        spawned: Optional[list] = None,
     ) -> None:
         """docs/routing_decisions.md's routing dispatcher -- the three
         outgoing situations, in the doc's own order:
@@ -5291,7 +5491,7 @@ class SmartMeshCoreInterface(Interface):
            persistence-failure note).
         """
         if header is not None and header.packet_type == RNS.Packet.DATA and header.destination_type == RNS.Destination.PLAIN:
-            await self._send_path_request(data, header, expires_at=expires_at)
+            await self._send_path_request(data, header, expires_at=expires_at, spawned=spawned)
             return
 
         if header is not None and header.packet_type != RNS.Packet.ANNOUNCE:
@@ -5312,9 +5512,11 @@ class SmartMeshCoreInterface(Interface):
                 # rather than awaited, exactly like path discovery and the
                 # CHANNEL extra-retry passes above: one slow operation must
                 # not stall the worker from draining the next queued packet.
-                self._spawn_background_task(
+                task = self._spawn_background_task(
                     self._send_direct_packet(data, header, peer_prefix, expires_at=expires_at)
                 )
+                if spawned is not None:
+                    spawned.append(task)
                 return
 
             # Milestone 6 fix for a real field-diagnosed gap
@@ -5370,17 +5572,19 @@ class SmartMeshCoreInterface(Interface):
                 )
                 self._record_unknown_dest_attempt(header.destination_hash)
                 await self._send_direct_to_all_peers(
-                    data, priority=self._priority_tier(header), expires_at=expires_at,
+                    data, priority=self._priority_tier(header), expires_at=expires_at, spawned=spawned,
                 )
                 return
             bootstrap_targets = [] if backed_off else self._select_bootstrap_supplement_targets()
             for bootstrap_peer_prefix in bootstrap_targets:
-                self._spawn_background_task(
+                task = self._spawn_background_task(
                     self._send_direct_supplement(
                         data, bootstrap_peer_prefix, trigger_discovery=True,
                         priority=self._priority_tier(header), expires_at=expires_at,
                     )
                 )
+                if spawned is not None:
+                    spawned.append(task)
             if bootstrap_targets:
                 self._record_unknown_dest_attempt(header.destination_hash)
             self._debug(
@@ -5407,7 +5611,7 @@ class SmartMeshCoreInterface(Interface):
                     candidate_peers=self._all_bound_peer_prefixes(),
                 )
                 await self._send_direct_to_all_peers(
-                    data, priority=self._priority_tier(header), expires_at=expires_at,
+                    data, priority=self._priority_tier(header), expires_at=expires_at, spawned=spawned,
                 )
                 return
             self._debug("routing decision: ANNOUNCE -> CHANNEL broadcast only (never DIRECT, by design).")
@@ -5461,8 +5665,9 @@ class SmartMeshCoreInterface(Interface):
         see _send_path_request)."""
         retry_extra = self._retry_extra_for(header)
         pkt_id = self._next_pkt_id()
+        duty_cycle_exempt = self._duty_cycle_exempt(self._priority_tier(header))
 
-        await self._send_channel_pass(data, pkt_id, attempt=0)
+        await self._send_channel_pass(data, pkt_id, attempt=0, duty_cycle_exempt=duty_cycle_exempt)
 
         # §1-§2: each extra pass is scheduled unconditionally at send
         # time (CHANNEL has no ACK to react to) as an independent
@@ -5470,10 +5675,13 @@ class SmartMeshCoreInterface(Interface):
         # wait for pkt_id's own retry never blocks the worker from moving
         # on to the next queued packet.
         for attempt in range(1, retry_extra + 1):
-            self._spawn_background_task(self._delayed_retry_pass(data, pkt_id, attempt, expires_at))
+            self._spawn_background_task(
+                self._delayed_retry_pass(data, pkt_id, attempt, expires_at, duty_cycle_exempt)
+            )
 
     async def _send_path_request(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
+        spawned: Optional[list] = None,
     ) -> None:
         """docs/routing_decisions.md's path-request case: always
         broadcast, plus a DIRECT copy to a capped number of known
@@ -5515,7 +5723,7 @@ class SmartMeshCoreInterface(Interface):
                 candidate_peers=self._all_bound_peer_prefixes(),
             )
             await self._send_direct_to_all_peers(
-                data, priority=self._priority_tier(header), expires_at=expires_at,
+                data, priority=self._priority_tier(header), expires_at=expires_at, spawned=spawned,
             )
             return
         self._debug("routing decision: path request -> CHANNEL broadcast + router-peer DIRECT supplement.")
@@ -5523,13 +5731,15 @@ class SmartMeshCoreInterface(Interface):
         self._capture_outgoing(
             header, data, "broadcast_path_request_supplement", candidate_peers=supplement_targets,
         )
-        self._spawn_background_task(self._send_broadcast_packet(data, header, expires_at=expires_at))
+        tasks = [self._spawn_background_task(self._send_broadcast_packet(data, header, expires_at=expires_at))]
         for peer_prefix in supplement_targets:
-            self._spawn_background_task(
+            tasks.append(self._spawn_background_task(
                 self._send_direct_supplement(
                     data, peer_prefix, priority=self._priority_tier(header), expires_at=expires_at,
                 )
-            )
+            ))
+        if spawned is not None:
+            spawned.extend(tasks)
 
     def _select_direct_supplement_targets(self) -> list:
         """docs/routing_decisions.md's path-request DIRECT-supplement
@@ -5819,7 +6029,10 @@ class SmartMeshCoreInterface(Interface):
                 pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                 hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
                 attempts_override=attempts_override, record_result=record_result,
-                expires_at=expires_at,
+                # Page-load fix (2026-09-18 evening): expiry is decided only
+                # before the packet's very first transmission. Every later
+                # fragment/pass is already committed air.
+                expires_at=(expires_at if (frag_idx == 0 and pass_number == 0) else None),
             )
 
         # Step 3 (2026-09-18, see direct_fragment_reconcile_enabled's own
@@ -5854,11 +6067,6 @@ class SmartMeshCoreInterface(Interface):
                 return False
 
         missing = [i for i in range(frag_total) if not acked[i]]
-        if missing and self._expired(expires_at):
-            # Field fix (2026-09-18 evening): no reconcile QUERY and no
-            # re-drive for a packet the receiver has already given up on.
-            self._debug(f"DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r}: packet expired -- giving up.")
-            return False
         if reconcile and any(acked):
             # Pass-0 attempts are unrecorded (see send_one's record_result);
             # a real ACK is still real evidence the path works, recorded
@@ -6161,10 +6369,12 @@ class SmartMeshCoreInterface(Interface):
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
-            if self._expired(expires_at):
+            if attempt == 0 and self._expired(expires_at):
                 # Field fix (2026-09-18 evening): outgoing_max_age. Not a
                 # path failure (nothing was learned about the path), so no
                 # record_direct_send_result call; counted as a drop once.
+                # Attempt 0 only (page-load fix, same day): a retry is
+                # committed air, never expired mid-way.
                 self._outgoing_dropped_total += 1
                 RNS.log(
                     f"{self}: dropping DIRECT send to {peer_prefix!r}"
@@ -6483,7 +6693,7 @@ class SmartMeshCoreInterface(Interface):
             async with self._direct_exchange_lock(priority):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
-                if self._expired(expires_at):
+                if attempt == 0 and self._expired(expires_at):
                     # Field fix (2026-09-18 evening): the lock wait itself
                     # (225s in the drive-home capture) is where a queued
                     # packet most often ages out. Recorded, not transmitted;
@@ -6523,6 +6733,7 @@ class SmartMeshCoreInterface(Interface):
                 try:
                     sent = await self._send_direct_frame(
                         target, frame, attempt, time_critical=time_critical, gate_telemetry=gate_telemetry,
+                        duty_cycle_exempt=self._duty_cycle_exempt(priority),
                     )
                     ack_wait_start = time.monotonic()
                     rx_window["tx_at"] = ack_wait_start
@@ -6673,6 +6884,7 @@ class SmartMeshCoreInterface(Interface):
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
                     kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
+                    duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                 )
                 if send_exc is not None:
                     # Listened out the quiet window above first, same as any
@@ -6724,6 +6936,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _delayed_retry_pass(
         self, data: bytes, pkt_id: int, attempt: int, expires_at: Optional[float] = None,
+        duty_cycle_exempt: bool = False,
     ) -> None:
         delay = random.uniform(self.retransmit_jitter_min_s, self.retransmit_jitter_max_s)
         await asyncio.sleep(delay)
@@ -6736,9 +6949,11 @@ class SmartMeshCoreInterface(Interface):
             f"CHANNEL retry pass (attempt={attempt}) for pkt_id={pkt_id} "
             f"firing after {delay:.1f}s jitter."
         )
-        await self._send_channel_pass(data, pkt_id, attempt)
+        await self._send_channel_pass(data, pkt_id, attempt, duty_cycle_exempt=duty_cycle_exempt)
 
-    async def _send_channel_pass(self, data: bytes, pkt_id: int, attempt: int) -> None:
+    async def _send_channel_pass(
+        self, data: bytes, pkt_id: int, attempt: int, duty_cycle_exempt: bool = False,
+    ) -> None:
         """One full CHANNEL send pass for `data` under `pkt_id`, at a
         given `attempt` number -- re-fragments from scratch every time
         (§1), even though the fast-path-vs-multi-fragment shape decision
@@ -6746,7 +6961,7 @@ class SmartMeshCoreInterface(Interface):
         costs nothing and keeps this the single place that decides it."""
         fastpath_budget = self._channel_payload_budget()
         if len(data) <= fastpath_budget:
-            await self._send_channel_fastpath_frame(data, pkt_id, attempt)
+            await self._send_channel_fastpath_frame(data, pkt_id, attempt, duty_cycle_exempt)
             return
 
         # Per wire_format_design.md's "constraint one," ANNOUNCE is the
@@ -6767,11 +6982,13 @@ class SmartMeshCoreInterface(Interface):
             )
             return
 
-        await self._send_channel_multifragment_pass(data, pkt_id, attempt)
+        await self._send_channel_multifragment_pass(data, pkt_id, attempt, duty_cycle_exempt)
 
-    async def _send_channel_fastpath_frame(self, payload: bytes, pkt_id: int, attempt: int) -> None:
+    async def _send_channel_fastpath_frame(
+        self, payload: bytes, pkt_id: int, attempt: int, duty_cycle_exempt: bool = False,
+    ) -> None:
         frame = self._encode_channel_fastpath(payload, pkt_id, attempt)
-        await self._pre_transmit_gate(frame)
+        await self._pre_transmit_gate(frame, duty_cycle_exempt=duty_cycle_exempt)
         try:
             await self._run_command(
                 self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
@@ -6792,7 +7009,9 @@ class SmartMeshCoreInterface(Interface):
             f"{len(payload)}-byte payload ({len(frame)} chars on wire)."
         )
 
-    async def _send_channel_multifragment_pass(self, payload: bytes, pkt_id: int, attempt: int) -> None:
+    async def _send_channel_multifragment_pass(
+        self, payload: bytes, pkt_id: int, attempt: int, duty_cycle_exempt: bool = False,
+    ) -> None:
         """One CHANNEL retry pass (docs/reliability_engine_design.md §1-2):
         re-fragments `payload` fresh, sends every fragment (in a shuffled
         order by default) with independently-drawn inter-fragment
@@ -6824,7 +7043,7 @@ class SmartMeshCoreInterface(Interface):
             frame = self._encode_channel_multifragment(
                 chunks[frag_idx], pkt_id, frag_idx, frag_total, attempt
             )
-            await self._pre_transmit_gate(frame)
+            await self._pre_transmit_gate(frame, duty_cycle_exempt=duty_cycle_exempt)
             try:
                 await self._run_command(
                     self._mc_ready.commands.send_chan_msg(self.channel_idx, frame),
@@ -6877,7 +7096,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_direct_frame(
         self, target, frame: str, attempt: int = 0, time_critical: bool = False,
-        gate_telemetry: Optional[dict] = None,
+        gate_telemetry: Optional[dict] = None, duty_cycle_exempt: bool = False,
     ):
         """Sends one already-encoded DIRECT frame string (bare or
         multi-fragment shape -- this method doesn't care which) via
@@ -6913,9 +7132,10 @@ class SmartMeshCoreInterface(Interface):
         either way, and that's exactly the case a field-tuning analysis
         most wants visible."""
         quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s = await self._pre_transmit_gate(
-            frame, skip_quiet_defer=time_critical,
+            frame, skip_quiet_defer=time_critical, duty_cycle_exempt=duty_cycle_exempt,
         )
         if gate_telemetry is not None:
+            gate_telemetry["duty_cycle_exempt"] = duty_cycle_exempt
             gate_telemetry["quiet_defer_wait_s"] = quiet_defer_wait_s
             gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
             gate_telemetry["medium_hold_wait_s"] = medium_hold_wait_s
@@ -8029,6 +8249,30 @@ class SmartMeshCoreInterface(Interface):
         payload_symbols = 8 + max(0, -(-num // den)) * cr
         return t_preamble + payload_symbols * tsym
 
+    # MeshCore TXT_MSG framing (firmware: Mesh::createDatagram +
+    # Utils::encryptThenMAC + BaseChatMesh::composeMsgPacket, and the
+    # packet header): [header:1][path_len:1][path:N][dest_hash:1]
+    # [src_hash:1][MAC:2][AES-ECB(timestamp:4 + flags:1 + text + NUL:1)
+    # padded to 16]. Confirmed against the other radio's RX log in the
+    # 2026-09-18 page-load capture: every full 151-char fragment was
+    # heard as exactly 166 bytes = 2 + 4 + ceil16(151 + 6).
+    _TXT_MSG_FIXED_OVERHEAD_BYTES = 2 + 1 + 1 + 2
+    _TXT_MSG_PLAINTEXT_OVERHEAD_BYTES = 4 + 1 + 1
+
+    def _estimate_tx_airtime_s(self, frame: str, path_len: int = 0) -> float:
+        """Airtime of one of this node's own `send_msg`/`send_chan_msg`
+        frames: the LoRa time-on-air model (`_estimate_airtime_s`) over
+        the frame's real on-air size per the framing above, when the
+        radio's SF/BW/CR are known; else the flat bitrate estimate that
+        the duty-cycle limiter used before 2026-09-18 (evening). `path_len`
+        is the routed path's byte count (0 for zero-hop) -- one byte per
+        hop, so a caller without it loses almost nothing by omitting it."""
+        if self._radio_params is None:
+            return (len(frame) * 8) / max(1, self.duty_cycle_estimate_bitrate)
+        plaintext = len(frame.encode("utf-8")) + self._TXT_MSG_PLAINTEXT_OVERHEAD_BYTES
+        ciphertext = -(-plaintext // 16) * 16
+        return self._estimate_airtime_s(self._TXT_MSG_FIXED_OVERHEAD_BYTES + max(0, path_len) + ciphertext)
+
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT
     _RX_LOG_ACK_BEARING_TYPES = {0, 2}  # REQ, TEXT_MSG -- the receiver answers with an ACK (or PATH when flooded)
@@ -8675,6 +8919,7 @@ class SmartMeshCoreInterface(Interface):
                 self._unknown_dest_backoff_sweep(now)
                 self._path_response_rate_limit_sweep(now)
                 self._pending_link_request_sweep(now)
+                self._outgoing_inflight_sweep(now)
         except asyncio.CancelledError:
             pass
 
