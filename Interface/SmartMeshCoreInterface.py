@@ -1504,6 +1504,66 @@ from `priority`) and the CHANNEL path (`_send_broadcast_packet` from the
 header); bind and completion frames are unaffected. Captured per attempt
 as `duty_cycle_exempt`.
 
+**Field-diagnosed batch (2026-09-18, night -- Alpha 0.1.1 captures:
+`fieldtests/raw/Alpha0.1.1/`, a zero-hop NomadNet page session and an
+evening drive through 1-3 repeater hops, both sides captured).** Three
+fixes, each traced to a specific packet sequence:
+
+1. *The bare-DIRECT receive dedup broke an RNS contract and stalled a
+   Resource transfer.* RNS's `Transport.packet_filter` deliberately
+   exempts KEEPALIVE, RESOURCE, RESOURCE_REQ, RESOURCE_PRF, CACHE_REQUEST
+   and CHANNEL contexts from its own duplicate filter, because it
+   re-delivers byte-identical packets for them on purpose: a Resource
+   receiver accepts a part only if its map hash sits inside the current
+   receive window, so a part that arrives one slot early is discarded and
+   re-requested, and the sender answers with the same bytes. The zero-hop
+   page capture shows exactly that: a 35-byte last part arrived before
+   the 483-byte part ahead of it (17:38:33 vs :36), RNS discarded it,
+   re-requested it 16 more times over two minutes, the desktop re-sent it
+   16 times -- and the laptop's `_handle_incoming_frame` dropped every
+   copy after the first as a "duplicate bare DIRECT packet" (150s dedup
+   TTL), so RNS never got a second chance; the transfer died with a
+   cache-request and an ICL cancel. The dedup now consults the packet's
+   own RNS context and lets exactly RNS's own exempt set through
+   (`_RNS_NO_DEDUP_CONTEXTS`); everything else keeps the 2026-09-16
+   protection against this interface's own retry re-delivering a packet.
+2. *Fragmented sends gave up one fragment short.* Two PATH_RESPONSE
+   announces at 2 hops (drive capture, pkt 20 and 21) each delivered 2 of
+   3 fragments, the reconcile QUERY confirmed the receiver held them, and
+   the last fragment then exhausted `direct_send_attempts` (2) in pass 1
+   -- 3.5 minutes each, and the laptop never got a path to the desktop.
+   When the receiver provably holds part of the packet (any pass-0 ACK or
+   a reconcile answer), the remaining fragments are the whole difference
+   between wasted air and a delivered packet, so pass 1 now uses
+   `direct_fragment_finish_attempts` (default 4, the handshake budget)
+   instead of the ordinary budget. The reconcile answer is also applied
+   authoritatively now (`acked[i] = i in held` for every fragment, not
+   only the un-ACKed ones): the receiver's bucket is ground truth, and a
+   fragment it no longer holds must be re-driven whatever ACK we saw.
+3. *A re-issued packet restarted from zero.* When pkt 20 failed, RNS
+   re-answered the same path request with byte-identical bytes; the
+   interface gave it a fresh pkt_id and sent all three fragments again
+   while the receiver's bucket still held two of them under the old
+   pkt_id (`reassembly_idle_timeout` is 120s). `_resumable_sends` now
+   remembers, per (peer, payload hash), the pkt_id and per-fragment
+   delivery state of a failed fragmented send for 75% of the receiver's
+   idle timeout measured from the last confirmed delivery; a re-send of
+   identical bytes to the same peer inside that window reuses the pkt_id,
+   skips the fragments already held, and ALWAYS runs the reconcile QUERY
+   afterwards so a bucket the receiver has since evicted is detected (the
+   answer is authoritative, see 2) rather than assumed. Off for
+   handshake-priority sends, which never reconcile. Captured as a
+   `direct_resume` record.
+
+Also seen in the same captures and left alone: the hop-1 abort's first
+field firings (31 aborts at 5.0-6.3s in place of 20-28s timeouts; echo
+seen on 134 of 139 successful multi-hop attempts and every echo-less
+success ACKed inside its deadline, so no false abort); reconcile ANSWERs
+lost at 2-3 hops in 4 of 15 queries (single-shot by design -- a retried
+QUERY is the next candidate if this recurs); three local `send_msg`
+failures around the laptop's radio restarts with no degradation visible
+beforehand (command latency flat at 0.02-0.03s).
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -2184,6 +2244,22 @@ class SmartMeshCoreInterface(Interface):
         RNS.Packet.LRPROOF: "LRPROOF",
     }
 
+    # Alpha 0.1.1 fix (2026-09-18 night, see module docstring): the RNS
+    # packet contexts `RNS.Transport.packet_filter` exempts from its own
+    # duplicate filter because RNS legitimately re-delivers byte-identical
+    # packets for them (a Resource part re-requested after arriving
+    # outside the receive window, a keepalive, a cache request). Mirrored
+    # exactly -- the bare-DIRECT receive dedup must never be stricter than
+    # RNS itself.
+    _RNS_NO_DEDUP_CONTEXTS = frozenset({
+        RNS.Packet.KEEPALIVE,
+        RNS.Packet.RESOURCE_REQ,
+        RNS.Packet.RESOURCE_PRF,
+        RNS.Packet.RESOURCE,
+        RNS.Packet.CACHE_REQUEST,
+        RNS.Packet.CHANNEL,
+    })
+
     # --- Peer discovery / bind frames (docs/peer_discovery_design.md) ---
     # A marker distinct from MARKER ("R") -- this control frame carries no
     # RNS packet bytes at all and must never be handed to _decode_frame.
@@ -2587,6 +2663,12 @@ class SmartMeshCoreInterface(Interface):
         # resolved by _handle_incoming_completion_frame when a matching
         # ANSWER arrives, or left to time out if none ever does.
         self._completion_query_waiters = {}
+        # Alpha 0.1.1 (2026-09-18 night): (peer_prefix, payload truncated
+        # hash) -> {"pkt_id", "frag_total", "acked", "expires_at"} for a
+        # fragmented DIRECT send that failed with some fragments delivered
+        # -- see _send_direct_payload/_send_direct_fragmented's resume
+        # path. Swept by _resumable_sends_sweep.
+        self._resumable_sends = {}
 
         # Milestone 6: concurrent DIRECT sends to the same not-yet-(or no
         # longer-)resolved peer share one in-flight discover_path() call
@@ -2993,6 +3075,19 @@ class SmartMeshCoreInterface(Interface):
         # only delay it.
         self.direct_fragment_reconcile_enabled = _cfg_bool(cfg.get("direct_fragment_reconcile_enabled", "yes"))
         self.direct_fragment_pass0_attempts = int(cfg.get("direct_fragment_pass0_attempts", 1))
+
+        # Alpha 0.1.1 fixes (2026-09-18 night, see module docstring):
+        # once the receiver provably holds part of a fragmented packet
+        # (a pass-0 ACK, or a reconcile answer), the remaining fragments
+        # get this larger pass-1 budget -- the drive capture's two path-
+        # response announces each died one fragment short on the ordinary
+        # budget of 2, wasting the fragments already delivered. And a
+        # failed fragmented send is remembered so that RNS re-issuing the
+        # identical bytes (its normal retry) resumes the receiver's
+        # still-open bucket under the same pkt_id instead of starting a
+        # fresh three-fragment send.
+        self.direct_fragment_finish_attempts = int(cfg.get("direct_fragment_finish_attempts", 4))
+        self.direct_fragment_resume_enabled = _cfg_bool(cfg.get("direct_fragment_resume_enabled", "yes"))
 
         # Field-diagnosed (2026-09-18 drive-home capture, see module
         # docstring): give up on a multi-hop DIRECT attempt early when the
@@ -5109,6 +5204,13 @@ class SmartMeshCoreInterface(Interface):
 
         self._spawn_background_task(_wait_then_release())
 
+    def _resumable_sends_sweep(self, now: float) -> None:
+        """Alpha 0.1.1: a failed fragmented send is only worth resuming
+        while the receiver's bucket can still be alive."""
+        expired = [k for k, v in self._resumable_sends.items() if now >= v["expires_at"]]
+        for k in expired:
+            del self._resumable_sends[k]
+
     def _outgoing_inflight_sweep(self, now: float) -> None:
         """Safety net only: an entry should always be released by
         `_release_inflight_when_done`; anything older than ten minutes is
@@ -5956,16 +6058,34 @@ class SmartMeshCoreInterface(Interface):
         max_total_payload = per_fragment_budget * 255  # frag_total is a 1-byte field
         if per_fragment_budget <= 0 or len(data) > max_total_payload:
             return None
-        pkt_id = self._next_pkt_id()
+        # Alpha 0.1.1 (2026-09-18 night): resume a recently failed send of
+        # these exact bytes to this peer under its old pkt_id, so the
+        # fragments the receiver still holds aren't sent again. Only when
+        # the reconcile step will run afterwards to validate the assumption
+        # (never for handshake-priority sends, which don't reconcile).
+        resume_key = (peer_prefix, RNS.Identity.truncated_hash(data))
+        can_resume = (
+            self.direct_fragment_resume_enabled
+            and self.direct_fragment_reconcile_enabled
+            and self.direct_completion_check_enabled
+            and priority != self.PRIORITY_HANDSHAKE
+        )
+        resume = self._resumable_sends.get(resume_key) if can_resume else None
+        if resume is not None:
+            self._resumable_sends.pop(resume_key, None)
+            if time.monotonic() >= resume["expires_at"]:
+                resume = None
+        pkt_id = resume["pkt_id"] if resume is not None else self._next_pkt_id()
         return await self._send_direct_fragmented(
             target, peer_prefix, data, pkt_id, priority=priority, hop_count=hop_count,
-            expires_at=expires_at,
+            expires_at=expires_at, resume=resume, resume_key=resume_key,
         )
 
     async def _send_direct_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
         priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
         expires_at: Optional[float] = None,
+        resume: Optional[dict] = None, resume_key=None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's two-pass DIRECT-
         fragmentation structure, fixed by a logical review specifically
@@ -5995,6 +6115,26 @@ class SmartMeshCoreInterface(Interface):
         chunks = self._fragment_direct_payload(payload)
         frag_total = len(chunks)
         acked = [False] * frag_total
+        # Alpha 0.1.1 resume (see _send_direct_payload): start from what the
+        # receiver is believed to hold; the reconcile QUERY below is forced
+        # so that belief is checked against the receiver's actual bucket.
+        resumed = False
+        if resume is not None and resume.get("frag_total") == frag_total and len(resume.get("acked", ())) == frag_total:
+            acked = list(resume["acked"])
+            resumed = True
+            self._debug(
+                f"DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r}: RESUMING a failed send -- "
+                f"receiver believed to hold {[i for i, a in enumerate(acked) if a]} of {frag_total}."
+            )
+            if self._packet_capture_file is not None:
+                self._capture_event("out", {
+                    "event": "direct_resume", "peer_prefix": peer_prefix, "pkt_id": pkt_id,
+                    "frag_total": frag_total, "held_before": [i for i, a in enumerate(acked) if a],
+                })
+        # time.monotonic() of the most recent evidence that the receiver's
+        # bucket made progress (an ACK, or a reconcile answer) -- the
+        # receiver's idle clock restarts on each fragment it receives.
+        last_progress_at = time.monotonic() if resumed else None
         # Most recent fragmented send's identity -- observability only
         # (testscripts/zero_hop_peer_discovery_test.py --verify-query reads
         # it to ask the receiver what it holds for this exact pkt_id).
@@ -6058,42 +6198,63 @@ class SmartMeshCoreInterface(Interface):
         # Pass 0 is sent strictly in frag_idx order here (unlike the CHANNEL
         # path, this one never shuffles), so frag_idx > 0 is a reliable
         # "the receiver's clock is already ticking" test.
+        def remember_for_resume() -> None:
+            # Alpha 0.1.1: a failed send with something delivered is worth
+            # resuming if RNS re-issues these bytes while the receiver's
+            # bucket is still alive (its idle clock restarted at our last
+            # confirmed delivery; keep a 25% margin under its timeout).
+            if resume_key is None or not reconcile or not any(acked) or last_progress_at is None:
+                return
+            self._resumable_sends[resume_key] = {
+                "pkt_id": pkt_id, "frag_total": frag_total, "acked": list(acked),
+                "expires_at": last_progress_at + 0.75 * self.reassembly_idle_timeout_s,
+            }
+
         for frag_idx in range(frag_total):
+            if acked[frag_idx]:
+                continue  # resumed: the receiver already holds this one
             acked[frag_idx] = await send_one(
-                frag_idx, time_critical=(frag_idx > 0), pass_number=0,
+                frag_idx, time_critical=(frag_idx > 0 or resumed), pass_number=0,
                 attempts_override=pass0_attempts, record_result=not reconcile,
             )
+            if acked[frag_idx]:
+                last_progress_at = time.monotonic()
             if self.detached or not self.online:
                 return False
 
         missing = [i for i in range(frag_total) if not acked[i]]
-        if reconcile and any(acked):
-            # Pass-0 attempts are unrecorded (see send_one's record_result);
-            # a real ACK is still real evidence the path works, recorded
-            # once here so a fully successful send clears any stale-path
-            # failure count exactly as it did before this step.
+        if reconcile and any(acked) and not resumed:
             self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
-        if missing and reconcile:
+        # Alpha 0.1.1: a resumed send always asks, even when nothing looks
+        # missing -- the pre-marked fragments are a belief about the
+        # receiver's bucket, and the answer below is the ground truth.
+        if reconcile and (missing or resumed):
             answer = await self._query_remote_fragments(
                 target, peer_prefix, pkt_id, frag_total, stage="reconcile", priority=priority,
             )
             if self.detached or not self.online:
+                remember_for_resume()
                 return False
             if answer is not None:
                 held = set(range(frag_total)) if answer.complete else set(answer.held or ())
                 confirmed = [i for i in missing if i in held]
-                for i in confirmed:
-                    acked[i] = True
+                lost = [i for i in range(frag_total) if acked[i] and i not in held]
+                # Authoritative: the receiver's bucket decides, in both
+                # directions (Alpha 0.1.1 -- previously only un-ACKed
+                # fragments were updated, so a bucket the receiver had
+                # evicted could never be re-driven).
+                acked = [i in held for i in range(frag_total)]
                 if confirmed:
-                    # Data arrived, only the ACK(s) didn't: real evidence the
-                    # path works, so clear any failure count the same way a
-                    # real ACK would have.
                     self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
-                missing = [i for i in missing if i not in held]
+                    last_progress_at = time.monotonic()
+                elif held:
+                    last_progress_at = time.monotonic()
+                missing = [i for i in range(frag_total) if not acked[i]]
                 self._debug(
                     f"DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r}: reconcile -- "
                     f"receiver holds {sorted(held)}; {len(confirmed)} un-ACKed fragment(s) confirmed "
-                    f"delivered, {len(missing)} still missing."
+                    f"delivered, {len(lost)} believed-delivered fragment(s) NOT held, "
+                    f"{len(missing)} still missing."
                 )
                 if answer.complete:
                     RNS.log(
@@ -6102,23 +6263,31 @@ class SmartMeshCoreInterface(Interface):
                         f"already holds the complete message; skipping the re-drive pass.",
                         RNS.LOG_WARNING,
                     )
+                    self._resumable_sends.pop(resume_key, None)
                     return True
-            # No answer: no information -- fall through and re-drive every
-            # un-ACKed fragment, exactly as before this step.
         if missing:
+            # Alpha 0.1.1: when the receiver provably holds part of this
+            # packet, the rest is the whole difference between wasted air
+            # and a delivered packet -- spend the larger finishing budget.
+            partially_held = any(acked)
+            finish_attempts = self.direct_fragment_finish_attempts if (reconcile and partially_held) else None
             self._debug(
                 f"DIRECT fragmented send pkt_id={pkt_id} to {peer_prefix!r}: "
                 f"pass 1 re-driving {len(missing)}/{frag_total} still-missing "
-                f"fragment(s)."
+                f"fragment(s)" + (f" with the finishing budget ({finish_attempts} attempts)." if finish_attempts else ".")
             )
-            # Every pass-1 fragment is time-critical by definition -- already
-            # known missing, with the receiver's idle clock long since started.
             for frag_idx in missing:
-                acked[frag_idx] = await send_one(frag_idx, time_critical=True, pass_number=1)
+                acked[frag_idx] = await send_one(
+                    frag_idx, time_critical=True, pass_number=1, attempts_override=finish_attempts,
+                )
+                if acked[frag_idx]:
+                    last_progress_at = time.monotonic()
                 if self.detached or not self.online:
+                    remember_for_resume()
                     return False
 
         if all(acked):
+            self._resumable_sends.pop(resume_key, None)
             return True
 
         if self.direct_completion_check_enabled:
@@ -6141,8 +6310,10 @@ class SmartMeshCoreInterface(Interface):
                 # false trigger for the next unrelated send's stale-path
                 # threshold check.
                 self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                self._resumable_sends.pop(resume_key, None)
                 return True
 
+        remember_for_resume()
         return False
 
     async def _check_remote_completion(
@@ -8046,6 +8217,8 @@ class SmartMeshCoreInterface(Interface):
         self._ack_rtt_snapshot.pop(pubkey_prefix, None)
         self._echo_stats.pop(pubkey_prefix, None)
         self._last_firmware_ack_timeout_s.pop(pubkey_prefix, None)
+        for k in [k for k in self._resumable_sends if k[0] == pubkey_prefix]:
+            del self._resumable_sends[k]
         self._path_discovery_failures.pop(pubkey_prefix, None)
         self._path_discovery_backoff_until.pop(pubkey_prefix, None)
         self._direct_path_failures.pop(pubkey_prefix, None)
@@ -8613,12 +8786,21 @@ class SmartMeshCoreInterface(Interface):
             # without a dedup check here would deliver the same logical
             # packet to RNS core twice -- the one receive path that skipped
             # the dedup discipline every other receive path already has.
+            # Alpha 0.1.1 fix (2026-09-18 night, see module docstring): RNS
+            # re-delivers identical bytes on purpose for the contexts its
+            # own packet_filter exempts -- a Resource part re-requested
+            # after arriving outside the receive window stalled a whole
+            # transfer here when every re-send was dropped as a duplicate.
+            # Those contexts bypass the dedup; everything else keeps it.
+            rns_header = self._parse_rns_header(rns_payload)
+            rns_dedups = rns_header is None or rns_header.context not in self._RNS_NO_DEDUP_CONTEXTS
             dedup_key = ("~direct_bare", sender_token or "~anon", rns_payload)
-            if self._dedup_contains(dedup_key):
-                self._incoming_dropped_total += 1
-                self._debug(f"dropping duplicate bare DIRECT packet from {sender_token!r} (already delivered).")
-                return
-            self._dedup_add(dedup_key, rns_payload)
+            if rns_dedups:
+                if self._dedup_contains(dedup_key):
+                    self._incoming_dropped_total += 1
+                    self._debug(f"dropping duplicate bare DIRECT packet from {sender_token!r} (already delivered).")
+                    return
+                self._dedup_add(dedup_key, rns_payload)
             peer_prefix = self._canonical_peer_prefix(sender_token)
             self._observe_incoming_rns_packet(rns_payload, peer_prefix)
             
@@ -8920,6 +9102,7 @@ class SmartMeshCoreInterface(Interface):
                 self._path_response_rate_limit_sweep(now)
                 self._pending_link_request_sweep(now)
                 self._outgoing_inflight_sweep(now)
+                self._resumable_sends_sweep(now)
         except asyncio.CancelledError:
             pass
 
