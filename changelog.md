@@ -1,31 +1,122 @@
 # Changelog
 
-## Unreleased
+## alpha-0.1.1 (2026-09-18)
 
-### Fixed: DIRECT-supplement target selection ignored recent failure history
+Merge of `development` into `main`. This release is everything after the
+alpha 0.1.0 M0-M6 build: a code-review pass at the start of the cycle, a
+second one at the end, and between them a run of field-driven work whose
+common theme is moving this interface off fixed, guessed timings and onto
+measurements taken from the radio itself.
 
-Airtime-efficiency review (same pass that produced the completion-check
-fix below): `_select_direct_supplement_targets` (path-request DIRECT
-supplement) and `_select_bootstrap_supplement_targets` (unknown-destination
-DIRECT bootstrap supplement) both picked their capped target list by
-recency alone -- most-recently-confirmed/-seen first -- with no reference
-to `_direct_path_failures`. A peer that had just failed a DIRECT attempt,
-but hadn't yet crossed `direct_path_reset_threshold` (so was still fully
-"resolved" and eligible), could still win a scarce supplement slot purely
-on recency, ahead of an equally-recent peer this interface had no reason
-to doubt -- spending part of a capped, airtime-costing fan-out on a send
-statistically less likely to succeed.
+The headline changes: the companion firmware's raw-RX log is now tapped
+and used (measured per-peer ACK RTT drives the ACK timeout, a missing
+repeater echo aborts a dead first hop early, and an optional medium-busy
+model can hold transmits); DIRECT-fragmented sends send once and then
+reconcile against what the receiver says it actually holds, instead of
+blindly re-sending; duty-cycle accounting uses the real LoRa time-on-air
+formula at the radio's own SF/BW/CR instead of a bitrate guess; the
+outgoing queue drops duplicate and stale work rather than draining it as
+a late burst; and there is now an automated test suite plus a simulated
+mesh, so a change can be checked against multi-hop DIRECT behaviour
+before it goes near a real repeater.
 
-Fix: both now sort primarily by each candidate's own `_direct_path_
-failures` count (fewest first), falling back to the original recency
-ordering only as a tiebreaker among equally-healthy peers. Not a hard
-exclusion -- a struggling peer still gets picked once it's the least-bad
-option available, and the count itself naturally clears on a fresh
-success or drops the peer from candidacy entirely once a stale-path reset
-fires. Verified with dedicated unit tests (a failing-but-more-recent peer
-correctly loses its ranking to a healthier, older one in both functions)
-and a re-run of the existing CHANNEL-path fake-hardware smoke test showing
-no regression.
+Field evidence for this release lives in `fieldtests/raw/postAlpha0.1.0/`
+(a 2026-09-18 evening drive across 3, 2 and 1 hops down to zero hop, and
+a zero-hop NomadNet page load captured from both ends).
+
+### Added: RX-log awareness -- "lessen our reliance on arbitrary wait times"
+
+The largest single line of work in this release, built in four steps
+against a standing rule of field evidence before timing changes. The
+starting observation, from the 2026-09-16 1-hop capture: 43% of DIRECT
+attempts got no ACK and the mean `_direct_exchange_lock` wait was ~11s
+(max 49s), almost all of it queueing behind *other* sends' full ACK
+timeouts rather than behind the deliberate listen windows (~1.2s per
+attempt). So the lever is fewer collisions and faster failure detection,
+not shorter sleeps -- and every arbitrary sleep in this file exists to
+cover the same blind spot: between keying the radio and the ACK event,
+this interface knew nothing about what was on air.
+
+It turns out it can. The companion firmware's `MyMesh::logRxRaw` pushes
+every packet the radio decodes to the host, unconditionally, with no pref
+gating it, and the installed `meshcore` library parses it into
+`EventType.RX_LOG_DATA` with SNR/RSSI, route type, payload type, path
+length and path hashes -- including traffic not addressed to this node:
+other peers' DIRECT frames, flood repeats, ACKs in transit, and a
+repeater's echo of this node's own frame. All zero airtime, all
+previously thrown away.
+
+1. **Observe only (`rx_log_observe_enabled`, default on).** No routing or
+   timing behaviour changed in this step. Every overheard packet is
+   counted onto the `[STATS]` line (`rx_log_feed=seen|never|off` tells a
+   silent capture apart from a firmware that doesn't push the feed) and,
+   with packet capture on, written as one `rx_log` record: SNR/RSSI,
+   route/payload type, path, the 1-byte dest/src routing hashes, an ACK's
+   4-byte code (matchable against the `expected_ack` this node did or
+   didn't get), the library's `pkt_hash`, and two relative timings
+   (`since_last_rx_log_s`, `since_own_tx_s`). Subscribed only if the
+   installed library exposes the event -- an older library loses this
+   observability, not the interface. `testscripts/rx_log_monitor.py`
+   prints the feed live, transmits nothing, and needs no RNS, so a radio
+   can be checked before anything relies on it.
+2. **Measured ACK RTT drives the ACK timeout**
+   (`direct_ack_rtt_adaptive_enabled`, default on). Every real ACK folds
+   its MSG_SENT -> ACK latency into a per-peer Jacobson/Karels estimator;
+   once 3 samples exist the firmware-derived timeout is replaced by
+   `multiplier * (srtt + 4*rttvar)`, floored at 3.0s and *never* above
+   the firmware value it replaces -- so the worst case is exactly the old
+   behaviour. Karn-style invalidation on the first miss governed by the
+   measured value, and on every path change (an RTT over one path says
+   nothing about another). Chosen as the first timing change precisely
+   because it can only ever shorten a wait: a missed ACK holds the shared
+   DIRECT lock for the full timeout, which is where the wasted silence
+   was going. Measured zero-hop, the timeout stepped 5.80s (firmware) ->
+   4.38 -> 3.80 -> 3.37s against a near-deterministic 1.03s RTT.
+   Per-attempt capture records gained `ack_latency_s`,
+   `send_cmd_latency_s`, `ack_timeout_source`, the live RTT stats, and an
+   RX-log correlation window (`rx_echo_seen_s`, `rx_ack_seen_on_air_s`,
+   `rx_path_reply_seen_s`, `rx_foreign`) covering exactly the period the
+   attempt held the lock.
+3. **Have-bitmap completion answers and send-once-then-reconcile**
+   (`direct_fragment_reconcile_enabled`, default on) -- the one change
+   here that reduces transmissions rather than only reshaping waits. The
+   `"Q"` completion frame is now v2: an answer appends a have-bitmap, so
+   the receiver reports *which* fragments it holds (from the dedup cache
+   and from any still-open reassembly bucket), not just complete/not. A
+   fragmented send now transmits every fragment once, unrecorded against
+   the stale-path failure count, then sends ONE reconcile query if
+   anything lacks an ACK; fragments the receiver confirms are marked
+   delivered (and recorded as a success -- the data provably crossed the
+   path), and only the rest are re-driven. No answer means re-drive
+   everything, exactly as before. v1 frames still decode, a v1 query is
+   answered in v1, and a peer too old to parse v2 simply doesn't answer,
+   which is the pre-existing behaviour. The arithmetic: one query+answer
+   is two ~10-50-char frames, each blind retry is a full ~160-char
+   fragment plus its ACK -- a net saving whenever at least one "missing"
+   fragment was actually held, and the radio lock is released sooner in
+   every case. Link handshakes keep their own larger first-pass budget
+   and no reconcile: a lost handshake forces path rediscovery and the
+   extra round trip would only delay it.
+4. **RX-log-derived transmit holds (`rx_log_holds_enabled`, default
+   NO).** `_estimate_airtime_s` implements the real LoRa time-on-air
+   formula at the radio's own SF/BW/CR (read from SELF_INFO, with the
+   firmware's preamble rule and LDRO), replacing "seconds measured at
+   SF7" with something that scales -- a 102-byte frame is 0.58s at
+   SF7/BW62.5/CR8 and 4.4s at SF12/BW125. From that, every overheard
+   packet extends a predicted medium-busy window (a flood will be
+   re-flooded by every repeater; a routed DIRECT with N hops left has N
+   forwards and an ACK turnaround to come; an ACK on a direct route has
+   nothing following it). The model is *always* maintained and recorded
+   (`predicted_hold_s`, `hold_reason`, `medium_busy_remaining_s` on every
+   `rx_log` record) even with holds off, so a capture shows what they
+   would have done -- which is how the decision to enable them gets made.
+   With the flag on, transmits wait out the prediction (capped by
+   `rx_log_hold_max_s`) and the post-miss listen window is chosen from a
+   diagnosis (`target_busy` / `hop1_loss` / `downstream_loss` /
+   `no_info`) rather than a flat random range. The diagnosis is captured
+   either way. Left off by default: the multi-hop capture that would
+   justify flipping it showed small predicted holds, which fits link loss
+   rather than contention.
 
 ### Added: DIRECT-fragmented delivery completion check (phantom-ACK fix)
 
@@ -48,53 +139,251 @@ actually fine.
 
 Fix: a new lightweight `"Q"`-marker control frame (distinct from `"R"`
 RNS-payload frames and `"P"` bind frames), DIRECT-only since it requires
-already knowing the peer's authenticated identity. `_send_direct_
-fragmented` sends one QUERY (`pkt_id` + `frag_total`) only as a last
-resort, once both retry passes are exhausted and fragments still appear
-missing. The receiver answers directly from its own existing whole-packet
-dedup cache (`_add_channel_fragment` already records a completed DIRECT
-reassembly there under `(mode, sender_token, pkt_id, frag_total)` -- no
-new receive-side state needed) -- correctly using the raw, uncanonicalized
-sender token to match how that cache is actually keyed, verified with a
-dedicated unit test. If the receiver answers "complete," the sender treats
-the message as fully delivered and clears its recorded failure count for
-that peer (undoing the false-failure signal already recorded per-fragment
-during the retry passes), avoiding an unwarranted stale-path reset.
+already knowing the peer's authenticated identity, sent as a last resort
+once both retry passes are exhausted and fragments still appear missing.
+The receiver answers from its own existing whole-packet dedup cache -- no
+new receive-side state. If the receiver answers "complete," the sender
+treats the message as delivered and clears its recorded failure count for
+that peer, undoing the false-failure signal recorded per-fragment during
+the retry passes and avoiding an unwarranted stale-path reset. Fails safe:
+a peer that doesn't understand `"Q"` frames, or whose answer is itself
+lost, simply never answers and
+`direct_completion_check_timeout_s` (default 5.0s) elapses into exactly
+the old give-up behavior. New config: `direct_completion_check_enabled`,
+`direct_completion_check_timeout`. This frame is what step 3 above later
+extended into the v2 have-bitmap reconcile that now runs on the main path
+of every fragmented send. Deliberately scoped to DIRECT-fragmented sends:
+bare single-message DIRECT sends have no `pkt_id` and dedup on full
+payload bytes instead, which doesn't fit this query shape -- left as a
+known, smaller-impact gap.
 
-Fully backward-compatible and fails safe: a peer that doesn't understand
-`"Q"` frames, or whose own answer is itself lost -- the same class of loss
-this feature exists to route around, just at much lower stakes for one
-small frame -- simply never answers, and `direct_completion_check_timeout_s`
-(default 5.0s) elapses, falling back to exactly today's give-up behavior.
-New config: `direct_completion_check_enabled` (default on),
-`direct_completion_check_timeout` (default 5.0s). Deliberately scoped to
-DIRECT-fragmented sends only -- bare (single-message) DIRECT sends have no
-`pkt_id` and dedup on full payload bytes instead, which doesn't fit this
-same query shape without carrying the payload (or a hash of it) in the
-query itself; left as a known, smaller-impact gap for a future pass.
+### Fixed: DIRECT-supplement target selection ignored recent failure history
 
-Verified: a standalone round-trip test of the new frame encode/decode, a
-receive-side unit test (dedup-hit and dedup-miss query answers, answer-to-
-waiter-future correlation), and a send-side unit test (prompt-answer and
-timeout paths, including waiter cleanup) all pass; the existing
-`testscripts/fake_meshcore_repeater_sim.py` CHANNEL-path smoke tests show
-identical results before and after (this feature's own dispatch check
-sits in the DIRECT receive path and doesn't touch CHANNEL handling).
+`_select_direct_supplement_targets` (path-request DIRECT supplement) and
+`_select_bootstrap_supplement_targets` (unknown-destination DIRECT
+bootstrap supplement) both picked their capped target list by recency
+alone -- most-recently-confirmed/-seen first -- with no reference to
+`_direct_path_failures`. A peer that had just failed a DIRECT attempt, but
+hadn't yet crossed `direct_path_reset_threshold` (so was still fully
+"resolved" and eligible), could still win a scarce supplement slot purely
+on recency, ahead of an equally-recent peer this interface had no reason
+to doubt -- spending part of a capped, airtime-costing fan-out on a send
+statistically less likely to succeed.
 
-## alpha-0.1.1 (2026-09-16)
+Fix: both now sort primarily by each candidate's own failure count (fewest
+first), falling back to the original recency ordering only as a tiebreaker
+among equally-healthy peers. Not a hard exclusion -- a struggling peer
+still gets picked once it's the least-bad option available, and the count
+clears on a fresh success or drops the peer from candidacy entirely once a
+stale-path reset fires. Verified with dedicated unit tests and a re-run of
+the existing CHANNEL-path fake-hardware smoke test showing no regression.
 
-Code-review pass over `Interface/SmartMeshCoreInterface.py` (the M0-M6 alpha
-0.1.0 build plus its post-M6 field-driven fixes) -- eight independent review
-angles (correctness line-by-line scan, removed-behavior audit, cross-file
-tracer against the installed `meshcore` library and vendored RNS source,
-reuse/duplication, simplification, efficiency, altitude, and CLAUDE.md
-convention compliance), followed by manual verification of every candidate
-finding against the actual source (and, in one case, against the two
-angles that directly disagreed with each other) before anything was
-changed. No new functionality; every change below is a bug fix, a
-duplication cleanup, or a documented-but-deliberately-unfixed gap.
+### Fixed: incoming-quiet-defer caused a mutual reset feedback loop
 
-### Fixed: one real deadlock
+The 2026-09-16 incoming-quiet-defer feature collapsed multi-hop DIRECT
+delivery to 0/8 messages completed in a field test, after DIRECT timing
+knobs had been tweaked on both machines. Root cause:
+`_last_incoming_direct_at` was updated for *every* DIRECT frame heard --
+ACKs, PROOFs, completion checks, a fragment that completed its own bucket
+-- not just "a fragment with more of this transfer still coming," which
+was the feature's actual intent. On a link where both nodes constantly
+exchange that other traffic, a genuine 3s lull rarely occurred, so nearly
+every send got pushed toward the 15s patience ceiling. Confirmed against
+that night's captures: fragment gaps widening from ~20s to 60-90s within
+one run, then a 16-minute window with 0/58 outgoing DIRECT attempts
+succeeding.
+
+Two fixes, for the bug and for the pattern behind it (three field-driven
+additions in a row had each stacked a new serialized delay onto the same
+DIRECT send path without checking it against what was already there):
+
+1. **Narrowed trigger plus a retry exemption.** The timestamp is now set
+   only when a received fragment leaves its bucket still incomplete --
+   concrete evidence more fragments are coming, not "the channel was
+   occupied by something." Separately, a re-drive (a fragment already
+   known missing, racing the receiver's fixed reassembly deadline) skips
+   the quiet-defer courtesy wait entirely; a fresh send still pays it.
+   Duty-cycle throttling is untouched by either fix -- it is this node's
+   real airtime cap, not a heuristic, and a retry storm is exactly what it
+   exists to bound.
+2. **`_validate_direct_timing_budget`, run once at startup.** The
+   incident's actual trigger was tuning DIRECT knobs spread across five
+   `_configure_*` methods without checking they were still coherent
+   against `reassembly_idle_timeout_s` -- the fixed clock on the other end
+   of the same budget. Startup now computes the worst-case wall-clock cost
+   of one fragment surviving both retry passes and logs a warning if the
+   reassembly timeout is lower than that. It never silently overrides an
+   operator's config, and it is a floor on the real number rather than an
+   exact prediction (lock contention can't be bounded from config alone),
+   but a config that fails this check is confirmed too tight.
+
+### Fixed: first real multi-hop capture (evening drive) -- four fixes
+
+A 3-hop path that degraded to a dead first hop and then collapsed to zero
+hop as the car arrived home. Diagnosed from the capture and re-verified
+against the same JSONL before anything was changed:
+
+1. **Reconcile query timeout fell to its 5s floor at 3 hops, where the
+   query's own ACK alone takes ~4.5s.** Both reconcile queries in the
+   capture timed out at exactly 5.0s with no RTT samples -- because the
+   miss that triggers a reconcile is, by construction, a miss under the
+   measured timeout, and Karn invalidation had just discarded the stats
+   the query sizing needed. Karn is right not to *trust* that estimate for
+   the next ACK wait; it is still the best information for sizing a
+   two-frame exchange. Invalidated stats are now kept in a snapshot for
+   this purpose (missed-ACK case only -- a path change still drops
+   everything), and with no snapshot the query falls back to twice the
+   peer's last firmware hop-aware bound, capped as before.
+2. **Early abort on a dead first hop (`direct_hop1_abort_enabled`,
+   default yes).** The outage cost was the timeout, not collisions: nine
+   consecutive misses each burned the full 28s firmware timeout while the
+   RX log heard nothing at all -- no repeater forward of our own frame,
+   where every one of the 24 successful multi-hop attempts before the
+   outage had one (echo 0.84-3.58s, median 1.73s). The stale-path reset
+   needed 4 minutes to fire and the queue backed up 18 deep with 225s lock
+   waits. Each peer's echo timing is now learned (last 16 samples, cleared
+   on any path change) and, once 3 samples exist, an attempt waits only
+   `max(5s, 2.0 x that peer's slowest observed echo)` for *either* the ACK
+   or the echo; silence where a forward was due is positive evidence, so
+   the attempt is given up as a recorded failure and the reset fires in
+   ~30s instead of ~4 minutes. Guarded by the same capture's other
+   finding: 18 successful attempts in the last minute had no echo because
+   the laptop was already zero-hop while the interface still carried
+   `hop_count=3` -- an ACK always wins the race against a >=5s deadline,
+   so those keep succeeding. Self-disabling without an RX-log feed, never
+   applied at hop 0, never longer than the ACK timeout it shortens.
+3. **Outgoing path requests are coalesced per requested destination**
+   (20s window, mirroring the existing PATH_RESPONSE rule). RNS emitted 14
+   identical requests for one destination at 4-8s gaps -- explicit client
+   retries under Transport's own automatic floor -- and each became a
+   3-hop DIRECT exchange, driving queue depth to 7 on its own. Every path
+   request shares one pseudo-destination hash, so the key is the
+   *requested* hash read from the packet data.
+4. **Queued packets expire (`outgoing_max_age`, 120s; announces exempt).**
+   17 LXMF pings queued during the outage drained as a stale burst over
+   85s once the path came back. Expired packets are dropped and counted,
+   never recorded as a path failure. (Refined the same evening -- see
+   below.)
+
+### Fixed: zero-hop NomadNet page load -- three fixes
+
+Both sides captured. Link setup took 14s; the page's 12 Resource parts
+(60 DIRECT fragments) then took 7.6 minutes, during which the server
+transmitted 110 fragments -- every one ACKed, mean ACK 1.24s. The radio
+was not the problem:
+
+1. **The duty-cycle estimate was quantizing away a third of the policy's
+   own allowance.** A full 151-char fragment was estimated at 1.007s from
+   a flat bitrate, so three in one 10s window came to 3.02s -- a hair over
+   the 3.0s cap -- and the limiter admitted two per window, spending 304s
+   of the 509s transfer waiting. The other radio's RX log shows what a
+   fragment really is on air: 166 bytes with the firmware's framing, which
+   at SF7/BW62.5/CR8 is 0.877s by the step-4 time-on-air model; three of
+   those are 2.63s. The limiter now uses the model-derived figure whenever
+   SELF_INFO has provided radio parameters, falling back to the bitrate
+   estimate otherwise. The 30% policy itself is untouched -- it now admits
+   the three fragments per window it always allowed for.
+2. **`outgoing_max_age` was dropping fragments mid-packet.** All nine
+   expiries in the capture were fragments 2-4 of 5, in the first pass, of
+   parts whose earlier fragments had already been transmitted -- each
+   threw away air already spent, left the receiver's bucket to time out,
+   and made RNS re-request the whole part. Expiry is now decided once,
+   before a packet's first transmission, and never afterwards; and
+   packets carrying Resource data parts are exempt entirely, since RNS's
+   Resource layer owns their retransmission and this interface
+   second-guessing it can only add round trips.
+3. **RNS re-requested parts that were still queued here**, so half the
+   transfer was redundant: 26 Resource packets for 12 distinct payloads.
+   `process_outgoing` now drops a packet whose exact bytes are already
+   queued or in flight, keyed by the packet's truncated hash and released
+   only when every send task that packet spawned has finished -- never on
+   a timer, so a copy that genuinely failed can be re-sent the moment the
+   failure is known.
+
+### Changed: duty-cycle policy -- 60s window, and handshakes bypass the wait
+
+The duty-cycle window default is raised from 10s to 60s at the same 30%
+fraction (a user decision, superseding the original "30% of a 10 second
+period"). At SF7/BW62.5 the 10s window capped a 60-fragment page at
+roughly 3 minutes even with zero waste, because a burst could only ever
+reach the ~26% a 10s window quantizes to; over 60s a burst can use the
+full 18s of allowance before the limiter pauses it, and the "majority of
+the time listening" intent still holds over every rolling minute.
+
+Separately, link-maintenance traffic now bypasses the duty-cycle wait
+(`duty_cycle_exempt_handshake`, default yes). A burst of page data can
+consume the whole allowance, and a keepalive or link proof queued behind
+it would wait for budget while RNS's own link timers run -- losing the
+Link, which costs a full re-establishment, to protect a few hundred
+milliseconds of air. The exempt class is exactly the handshake priority
+tier that already jumps the DIRECT lock queue, so the two priority
+mechanisms now agree. That airtime is still *recorded* against the window,
+so ordinary data pays for it and the 30% ceiling stays honest; only the
+wait is skipped.
+
+### Fixed: code review pass (2026-09-18) -- coherence fixes
+
+A second review, this one checking that the cycle's design decisions still
+agreed with each other. Every finding was checked against the installed
+`meshcore` library, the firmware source, or RNS core in-process:
+
+1. **The `"Q"` completion exchange no longer breaks the shared-radio
+   invariant.** The DIRECT lock's contract is "held for the full
+   send+ACK-wait duration of every DIRECT exchange", yet the completion
+   query released it the instant the send command returned -- while the
+   query's own firmware ACK and the peer's answer were both still in
+   flight, so the next queued send could key the radio straight into the
+   reply this node was waiting for. Harmless when it was a last resort;
+   step 3 moved it onto the main path of every fragmented send, which made
+   it matter. The lock is now held from the query's transmit through the
+   answer or its timeout, exactly like an ACK wait. Both frames are also
+   marked time-critical, and the query inherits the send's own priority
+   instead of the lowest one: a reconcile step that queues behind every
+   ordinary send, while the receiver's reassembly clock counts down,
+   defeats its own purpose.
+2. **A missed ACK under the measured timeout no longer counts toward
+   `direct_path_reset_threshold`.** Step 2 promised the worst case was
+   exactly the old behaviour, but a miss under a timeout this interface
+   had tightened on its own was still reported as a genuine path failure.
+   The estimate is Karn-invalidated on that miss, so the next attempt runs
+   on the firmware timeout -- and a miss *there* still counts.
+3. **Successful Link establishments were being counted as
+   unknown-destination failures.** The unknown-destination attempt counter
+   fires for every link request to a destination with no known token, and
+   its only clearing signal was a token learned for that exact destination
+   hash -- but the reply to a link request is an LRPROOF whose destination
+   field is the *link_id*, and everything after it rides that link_id too.
+   Outside small-mesh mode, three perfectly good Links to the same
+   destination put it into a 5-60 minute backoff that stripped the DIRECT
+   bootstrap supplement from every later link request. Fix:
+   `_compute_link_id` replicates RNS's own link-id derivation (validated
+   in-process, byte-for-byte, against real `RNS.Packet`/`RNS.Link` for
+   several payload sizes including the ECPUBSIZE truncation branch); every
+   outgoing link request records `link_id -> destination_hash`, and a
+   matching incoming LRPROOF learns both mappings and clears that
+   destination's backoff.
+4. **Housekeeping:** the path-response rate limiter's table is now swept
+   like every other one; the startup timing-budget warning sums the terms
+   it actually names; `asyncio.get_event_loop()` -> `get_running_loop()`
+   where a coroutine already guarantees one.
+
+Docstring drift from the "lowered most hard coded delays for testing"
+commit was corrected in place rather than left to mislead the next reader:
+`SMALL_MESH_DIRECT_ONLY_MAX_PEERS` 2 -> 3, `direct_path_reset_threshold`
+2 -> 3, `direct_path_reset_min_age` 30 -> 60s,
+`path_discovery_quick_attempts` 3 -> 2, `direct_post_send_listen` 0-5s ->
+0.3-3s and its success range 0-0.5s -> 0-0.4s. The dated history entries
+are left as written; the live docstrings and `readme.md` state the current
+values.
+
+### Fixed: one real deadlock (code review pass, 2026-09-16)
+
+The first review of the cycle: eight independent angles (correctness scan,
+removed-behavior audit, cross-file tracer against the installed `meshcore`
+library and vendored RNS source, reuse/duplication, simplification,
+efficiency, altitude, and convention compliance), with every candidate
+finding manually verified against the actual source before anything was
+changed.
 
 - **`_PriorityAsyncLock.acquire()` could permanently deadlock every future
   DIRECT send.** Its `CancelledError` handler passed lock ownership to the
@@ -176,27 +465,29 @@ duplication cleanup, or a documented-but-deliberately-unfixed gap.
   runs (drawing from the same range a missed ACK uses), and the exception
   is re-raised afterward so the caller's own logging is unchanged.
 
-### Documented, not fixed: LRPROOF routing-peer resolution gap
+### Documented mid-cycle, then closed: LRPROOF routing-peer resolution gap
 
-- **`_resolve_routing_peer`'s PROOF-correlation lookup doesn't account
+- **`_resolve_routing_peer`'s PROOF-correlation lookup didn't account
   for LRPROOF's different wire layout.** `RNS.Packet.pack()` writes a
   Link's `link_id` (not a destination hash) into the field this
   interface reads as `destination_hash` when `context ==
   RNS.Packet.LRPROOF` (confirmed against the vendored RNS source). Since
   `_proof_correlation` is keyed by truncated hashes of previously-received
   packets, not link_ids, an outgoing LRPROOF (a Link-acceptance reply)
-  never correlates to a known peer through this table, even when that
-  peer is otherwise DIRECT-resolved. Effect is bounded to an efficiency
-  loss, not a correctness or security issue: `_dispatch_outgoing_
-  packet`'s existing case-3 fallback (broadcast + capped
-  DIRECT-bootstrap-supplement) still delivers it. A correct fix needs a
-  link_id -> peer table populated by replicating `RNS.Link.
-  link_id_from_lr_packet()`'s exact hashing (including its ECPUBSIZE-based
-  truncation), which was deliberately not attempted without real-hardware
-  validation, consistent with this file's existing precedent of leaving
-  an unvalidated crypto-adjacent computation flagged rather than guessed
-  at (see `record_direct_send_result`'s own `rssi`-parameter note). Left
-  as an explicit comment on `_resolve_routing_peer` for the next pass.
+  never correlated to a known peer through this table, even when that
+  peer was otherwise DIRECT-resolved. The effect was bounded to an
+  efficiency loss, not a correctness or security issue: the existing
+  broadcast + capped DIRECT-bootstrap-supplement fallback still delivered
+  it. The 2026-09-16 review deliberately left it flagged rather than
+  guessed at, since a correct fix needed RNS's exact link-id hashing
+  (including its ECPUBSIZE-based truncation) and real validation.
+  **Closed later in this same release** by the 2026-09-18 review's
+  `_compute_link_id` (item 3 above), validated byte-for-byte in-process
+  against real `RNS.Packet`/`RNS.Link`: an incoming link request from a
+  bound peer now records `link_id -> peer`, so this node's own outgoing
+  LRPROOF resolves DIRECT-primary instead of falling through to
+  broadcast. As a side effect the initiator's first post-handshake packet
+  also goes DIRECT immediately rather than after one broadcast round.
 
 ### Cleanup: duplicated logic consolidated
 
@@ -210,7 +501,8 @@ duplication cleanup, or a documented-but-deliberately-unfixed gap.
   `_send_direct_frame`, `_send_bind_frame`) -- both methods' own
   docstrings already claimed this but nothing enforced it structurally.
   Extracted into one `_pre_transmit_gate(frame)` helper used at all four
-  sites (and any future one).
+  sites (and any future one). This helper is also what later carried the
+  `is_redrive` exemption, the RX-log holds, and the gate telemetry.
 - **`_unknown_dest_attempts`/`_unknown_dest_backoff_until` had no
   periodic reclaim**, unlike `_dedup`/`_reassembly`/`_proof_correlation`
   (all three already swept every `REASSEMBLY_CLEANUP_INTERVAL_S`). A
@@ -221,22 +513,90 @@ duplication cleanup, or a documented-but-deliberately-unfixed gap.
   tracking) and `_unknown_dest_backoff_sweep`, wired into the same
   periodic pass as the other three tables.
 
+### Added: automated tests and a simulated mesh
+
+`python3 -m unittest discover -s tests` now runs a real suite: wire-format,
+RNS-header and reliability-engine unit tests (about a second), plus
+end-to-end scenarios that drive two real interface instances through
+simulated repeater hops (`SMCI_SKIP_SLOW=1` skips those). The simulated
+mesh in `testscripts/simmesh/` models DIRECT routing through repeaters,
+ACKs, path discovery, contacts, flood dedup, half-duplex, collisions and
+loss. `testscripts/fake_meshcore_repeater_sim.py` was rebuilt on top of it
+and runs any topology you describe (`--link A-R --link R-B --repeater R`);
+`testscripts/rns_multiprocess_sim.py` does the same with a full real
+Reticulum instance per node; `testscripts/calibrate_sim_from_captures.py`
+derives loss/latency settings for the simulator from real field captures.
+None of this replaces field testing -- simulated timing is not real radio
+timing -- but a change can now be checked against multi-hop DIRECT
+behaviour before it reaches a repeater.
+
+### Smaller fixes and observability
+
+- **`_z85_decode` raised `TypeError` instead of `ValueError` on non-string
+  input**, escaping the callers' own error handling. It now type-checks
+  first and raises the documented `ValueError`.
+- **The reconcile query's RTT-derived timeout is capped** at the same
+  ceiling an ACK wait has. Since that wait holds the DIRECT lock and the
+  estimator's initial spread makes `3*(srtt + 4*rttvar)` about nine times
+  the measured RTT, one unanswered query could otherwise hold the radio
+  for 20-30s at 1-2 hops.
+- **New capture fields for latency attribution**: per-attempt
+  `quiet_defer_wait_s` / `duty_cycle_wait_s` (so a capture shows how total
+  latency split across gating, queueing and ACK-waiting, instead of
+  needing separate log lines correlated by hand), `pass_number`,
+  `duty_cycle_exempt`, `miss_diagnosis`, and a new
+  `channel_fragment_sent` event -- the sender-side counterpart to the
+  existing CHANNEL receive record, carrying each fragment's position in
+  the shuffled send order separately from its logical index.
+- A fragmented DIRECT send now logs a "starting" line with
+  `pkt_id`/`frag_total`/`hop_count`, mirroring the CHANNEL path;
+  previously the first sign one existed was its first per-attempt line.
+- Hearing this node's own bare DIRECT frame is now logged rather than
+  passing silently.
+- Field-tuned defaults lowered after testing: `direct_post_send_listen`
+  0-5s -> 0.3-3s (success range 0-0.5s -> 0-0.4s), plus the
+  small-mesh/path-reset/path-discovery values listed under the review
+  pass above.
+
 ### Verification
 
-All fixes were re-verified with a real end-to-end run of
-`testscripts/fake_meshcore_repeater_sim.py` (bind-frame peer discovery,
-single-fragment and multi-fragment CHANNEL delivery) before and after this
-pass, with identical delivery results -- no regressions from the
-refactors. `python3 -m py_compile` was run after every edit.
+The 2026-09-16 review's fixes were re-verified with a real end-to-end run
+of `testscripts/fake_meshcore_repeater_sim.py` before and after, with
+identical delivery results, and `python3 -m py_compile` after every edit.
+Each RX-log step was verified on real hardware the same day (two Heltec V3
+companions on a live public mesh): step 1 confirmed the feed exists and
+that on-air ACK codes match the library's own `expected_ack`; step 2
+measured a 1.03s zero-hop RTT and watched the adaptive timeout converge on
+its floor; step 3 sent 3 packets x 3 fragments with 9/9 single-pass ACKs
+and a v2 bitmap answer read off the air; step 4 ran with holds on and saw
+them fire exactly where step 2's one collision had happened. The 2026-09-18
+review was checked with the simulator before and after (zero-hop
+fragmented, and the two-hop lossy-return-path case that drives the
+reconcile query). The two field batches above were each diagnosed from,
+and re-verified against, their own captures in
+`fieldtests/raw/postAlpha0.1.0/`.
 
-Several additional findings from the same review pass (a scattered
-small-mesh-mode check duplicated across three dispatcher call sites, three
-independent hardcoded administrative-context-policy special cases that
-could be generalized into one table, `_priority_tier` being recomputed
-rather than threaded through the outgoing-packet call chain,
+Known gaps carried into the next cycle: the `hop1_loss` and
+`downstream_loss` post-miss branches and the reconcile path itself are
+unit-checked and simulator-checked but have not been exercised by a clean
+multi-hop capture; RX-log transmit holds stay off by default until one
+confirms the model; and bare (single-message) DIRECT sends still have no
+completion-check equivalent.
+
+Several findings from the 2026-09-16 review (a scattered small-mesh-mode
+check duplicated across three dispatcher call sites, three independent
+hardcoded administrative-context-policy special cases that could be
+generalized into one table, `_priority_tier` being recomputed rather than
+threaded through the outgoing-packet call chain,
 `_direct_exchange_queue_depth` duplicating state already latent in
 `_PriorityAsyncLock`, and a low-severity redundant `_reset_stale_path`
 call when multiple fragments of one DIRECT-fragmented send fail in the
-same window) were judged to be real but lower-severity design/efficiency
-suggestions rather than bugs, and were left unchanged in this pass to keep
-the change set scoped to fixes with a concrete failure scenario.
+same window) were judged real but lower-severity design/efficiency
+suggestions rather than bugs, and were left unchanged to keep that change
+set scoped to fixes with a concrete failure scenario.
+
+## alpha-0.1.0 (2026-09-15)
+
+Initial alpha: milestones M0 through M6 of the rebuild, plus the post-M6
+field-driven fixes made against real hardware. See the module docstring in
+`Interface/SmartMeshCoreInterface.py` for the per-change history.

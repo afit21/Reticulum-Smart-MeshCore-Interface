@@ -12,9 +12,11 @@ This diagram isn't accurate to how the interface works but should give you a bas
 <img width="1083" height="502" alt="RNSMESHCOREINTERFACEDIAGRAM.png" src="https://github.com/user-attachments/assets/505840d1-2e79-494c-b930-09b395ab4ec0" />
 
 
-## Features (Version alpha0.1.0)
+## Features (Version alpha0.1.1)
 
 In short, this current version allows you to send LXMF messages and browse nomadnet sites over MeshCore. This interface has only been tested this interface over 1, 2 and 3 MeshCore repeater hops with two total RNS nodes communicating over this interface. See the [testing section](#testing) for more details.
+
+New in alpha 0.1.1: the interface now listens to the raw RX log from your companion radio, so instead of guessing with fixed delays it can measure what the mesh is actually doing — see the last seven rows of the table below.
 
 **Battle Tested** - Tested and confident this is reliable.
 
@@ -33,7 +35,14 @@ In short, this current version allows you to send LXMF messages and browse nomad
 | Meshcore Routing | Experimental | Route broadcast traffic over channels, and direct traffic over direct messages. The interface keeps a cache of which RNS addresses route to each MeshCore contact. If a low amount of peers are known, the interface sends broadcast traffic over direct message to avoid unnecessary floods. |
 | RNS Packet Aware Firewalling | Experimental | Inspects outgoing traffic and automatically drops unnecessary traffic. This is a sacrifice made to maintain respect for MeshCore users. |
 | Packet Aware Self-throttling | Working | Not just a speed limit. The interface tries to delay and prioritize packets. For example, packets related to a link handshake will be delayed so that less keep alive packets are required during the life of an RNS link.
-| Packet Capture Debug Tool | Battle tested | A built in packet capture tool used for debugging the interface |
+| Packet Capture Debug Tool | Battle tested | A built in packet capture tool used for debugging the interface. Also logs every packet the radio overhears, not just our own. |
+| Radio Traffic Awareness | Working | The interface taps the raw RX log from your companion radio, so it can see every packet the radio decodes — including traffic that isn't ours. Costs no airtime and no extra transmissions. |
+| Adaptive ACK Timing | Working | Measures the real round trip time to each peer and shortens its own ACK waits to match, instead of always waiting out a fixed worst case. It never waits longer than it did before, only shorter. |
+| Fragment Reconciliation | Experimental | After sending a fragmented message once, the interface asks the peer which fragments it actually holds and re-sends only the missing ones, instead of blindly repeating everything unacknowledged. |
+| Dead Hop Detection | Experimental | If the first repeater never echoes our frame when one was due, the attempt is abandoned early and a stale path gets re-discovered in about 30 seconds instead of 4 minutes. |
+| Airtime Duty Cycle | Working | Caps this interface at 30% of airtime over a rolling 60 seconds, calculated from real LoRa time-on-air at your radio's own settings. Link keepalive traffic skips the wait so links don't drop, but still counts against the cap. |
+| Queue Hygiene | Working | Drops packets whose bytes are already queued or in flight, and stale queued packets, so a backlog isn't dumped onto the mesh when a path comes back. |
+| Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear before transmitting. Off by default until there's more multi-hop data behind it. |
 
 ## Requirements
 
@@ -75,7 +84,7 @@ Reference config for a non-transfer node:
   baudrate = 115200
 ```
 
-Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~55 options — retry budgets, timeouts, spacing tiers, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods; see [`docs/interface_architecture.md`](docs/interface_architecture.md)'s "Config surface" section for a consolidated list.
+Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~98 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
 
 ## Roadmap (in no particular order)
 
@@ -103,6 +112,8 @@ All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet Me
 | 3 Hops          | Slow                     | Not working   |
 
 Please keep in mind that this project is in very early stages. This interface currently works better than all others I've been able to test.
+
+Alpha 0.1.1 field data (2026-09-18, raw captures in `fieldtests/raw/postAlpha0.1.0/`): a zero-hop NomadNet page load and an evening drive test that ran down through 3, 2 and 1 hops. Individual DIRECT frames were delivered 138/141 at 0 hops, 49/53 at 1 hop, 37/45 at 2 hops and 23/30 at 3 hops. That's per frame, not per message — a message split into several fragments is only as good as its worst fragment, which is why the table above is harsher than those numbers look.
 
 ### Automated tests and simulation (no hardware)
 
