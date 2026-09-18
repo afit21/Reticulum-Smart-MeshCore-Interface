@@ -71,6 +71,17 @@ rather than dropped (and raw is paused for that peer for the cooldown, without a
 verdict on the chain); only an unanswered send counts as a path failure. A path is
 only ever noted as not carrying raw when raw delivered nothing at all on it.
 
+### Changed: refactor pass (behaviour-preserving)
+
+Shared helpers replace the duplicated resume/reconcile bookkeeping in the
+text and raw fragmented senders (`_resume_state`, `_remember_resumable`,
+`_held_from_answer`), one Jacobson/Karels update serves both RTT
+estimators (`_rtt_sample`), per-peer path state is cleared from one list
+(`_clear_peer_path_stats`), and the ACK wait and post-attempt listen
+decision are their own methods (`_await_direct_ack`,
+`_post_attempt_listen_s`). No wire or behaviour change; the full suite
+and the simulated-mesh scenarios pass before and after.
+
 ### Added: capture records name the send method
 
 `direct_send_result` carries `method` (`z85_bare`, `z85_text` or `raw`)
