@@ -873,6 +873,71 @@ struggling peer still gets picked once it's the least-bad option
 available. Verified with dedicated unit tests plus a re-run of the
 CHANNEL-path fake-hardware smoke test showing no regression.
 
+**Field-diagnosed fix (2026-09-18): the incoming-quiet-defer feature
+(2026-09-16) caused a mutual reset feedback loop between two chatty
+nodes, collapsing multi-hop DIRECT delivery to 0/8 messages completed in
+that night's field test, with the user having "tweaked some of the
+delays" on both machines just beforehand.** Root cause, cross-diagnosed
+between this session and a second Claude Code session running on the
+user's laptop (over the real second radio) working the same incident from
+the other end: `_last_incoming_direct_at` was updated in
+`_on_contact_msg_recv` for *every* DIRECT frame heard -- ACKs, PROOFs,
+completion-checks, a fragment that completed its own bucket, not just "a
+fragment with more of this transfer still coming," which was the feature's
+actual intent per its own 2026-09-16 request ("wait for the incoming
+interface to either stop sending... to avoid keying the radio into the
+middle of a peer's own multi-fragment DIRECT burst"). On a link where both
+nodes are constantly exchanging that other traffic, a genuine 3s lull
+(`incoming_quiet_window_s`) rarely occurred, so nearly every send --
+including the fragment re-drives racing the receiver's own
+`reassembly_idle_timeout_s` -- got pushed toward the 15s patience ceiling
+(`incoming_quiet_defer_max_wait_s`). Confirmed directly against that
+night's packet captures pulled from the laptop: fragment gaps widening
+from ~20s to 60-90s apart within one run (`pkt_id=4`, `...083302.jsonl`),
+then a later window (`...091341.jsonl`) with zero incoming fragments and
+0/58 (0%) outgoing DIRECT attempts succeeding for 16+ minutes straight.
+
+Two fixes, addressing both the specific bug and the pattern behind it
+(this is the third field-driven addition in a row to stack a new
+serialized delay onto the same DIRECT send path without checking it
+against what else was already there -- see `_wait_for_incoming_quiet`'s
+own 2026-09-16 entry, the priority-lock and duty-cycle entries before it,
+and 2026-09-17's completion-check addition):
+
+1. **Narrowed trigger + retry exemption.** `_last_incoming_direct_at` is
+   now set only in `_handle_direct_multifragment_frame`, only when a
+   received fragment leaves its bucket still incomplete -- concrete
+   evidence of more fragments actually coming, not "the channel was
+   occupied by something." Separately, `_pre_transmit_gate` gained a
+   `skip_quiet_defer` parameter, threaded down as `is_redrive` from
+   `_send_direct_fragmented`'s pass-1 loop (and any internal attempt past
+   the first within `_send_direct_with_attempts`) through
+   `_send_direct_frame_and_wait_for_ack`/`_send_direct_frame`: a fragment
+   already known missing and racing a fixed receiver-side deadline
+   shouldn't pay a collision-avoidance courtesy delay a fresh send can
+   afford. `_throttle_for_duty_cycle` is untouched by either fix -- it's
+   this node's own real airtime cap, not a heuristic, and a retry storm is
+   exactly the case it exists to bound.
+
+2. **`_validate_direct_timing_budget`, run once at startup after every
+   `_configure_*` method.** The actual incident trigger wasn't the defer
+   feature alone -- it was tuning DIRECT timing knobs (spread across four
+   different `_configure_*` methods, each a separate field-driven fix
+   over the past three days) without checking they were still coherent
+   against `reassembly_idle_timeout_s`, the fixed clock on the other end
+   of the same budget. This computes the worst-case wall-clock cost of one
+   fragment surviving both of `_send_direct_fragmented`'s retry passes
+   from the DIRECT-side knobs alone (excluding real but unbounded queueing
+   contention) and logs a `RNS.LOG_WARNING` -- never silently overriding
+   an operator's explicit config -- if `reassembly_idle_timeout_s` is
+   lower than that. Meant to catch exactly this incident's own root
+   trigger ("tweaked some delays on both PCs") at the next startup,
+   instead of only being discoverable hours into a live field test.
+
+Not yet re-validated against real hardware (both machines' physical radios
+weren't set up at the time of this fix) -- next field test should confirm
+fragment re-drives now land promptly and multi-hop delivery recovers.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -1672,6 +1737,14 @@ class SmartMeshCoreInterface(Interface):
         self._configure_path_discovery(cfg)
         self._configure_peer_discovery(cfg)
         self._configure_observability(cfg)
+        # Field-diagnosed fix (2026-09-18, see module docstring): these
+        # timing knobs are spread across five different _configure_*
+        # methods above, each independently tunable, but they aren't
+        # actually independent -- the reassembly-idle-timeout side and the
+        # DIRECT-retry-latency side are two ends of the same budget. Must
+        # run after every _configure_* call above has set the values it
+        # reads.
+        self._validate_direct_timing_budget()
 
         # --- RNS core interface-contract attributes -------------------
         # RNS core reads these directly (Transport-layer MTU checks,
@@ -1721,12 +1794,16 @@ class SmartMeshCoreInterface(Interface):
         # time, but kept consistent with this file's own pattern for
         # per-connection state.
         self._duty_cycle_impl = None
-        # User-requested fix (2026-09-16): time.monotonic() of the most
-        # recently received DIRECT frame (any DIRECT frame heard on this
-        # channel, not just ones addressed to or decodable by this node --
-        # see incoming_quiet_window_s's own comment for why), or None if
-        # none has arrived yet this session. Set in _on_contact_msg_recv,
-        # read by _wait_for_incoming_quiet.
+        # User-requested fix (2026-09-16), narrowed 2026-09-18 -- see the
+        # module docstring's 2026-09-18 entry: time.monotonic() of the most
+        # recently received DIRECT fragment that left its own reassembly
+        # bucket still incomplete (i.e. concrete evidence the sender has
+        # more fragments of THIS transfer still to come), or None if
+        # nothing like that has arrived yet this session. No longer set for
+        # every DIRECT frame heard (ACKs, PROOFs, completion-checks, a
+        # fragment that completed its bucket) -- see
+        # _handle_direct_multifragment_frame, the only place this is set,
+        # and _wait_for_incoming_quiet, which reads it.
         self._last_incoming_direct_at = None
         # User-requested observability addition (2026-09-15, post-alpha-0.1.0
         # 2-hop field test): how many DIRECT send+ACK-wait cycles are
@@ -2408,10 +2485,10 @@ class SmartMeshCoreInterface(Interface):
         # ranges for now -- "we can tune this later" still applies. See
         # _send_direct_frame_and_wait_for_ack's own docstring for exactly
         # where each fires.
-        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.5))
-        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 3.0))
+        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.3))
+        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 3))
         self.direct_post_send_listen_success_min_s = float(cfg.get("direct_post_send_listen_success_min", 0.0))
-        self.direct_post_send_listen_success_max_s = float(cfg.get("direct_post_send_listen_success_max", 0.5))
+        self.direct_post_send_listen_success_max_s = float(cfg.get("direct_post_send_listen_success_max", 0.4))
 
         # The routed-mode ACK-wait ceiling §4 specifies (scaled off the
         # firmware's own hop-aware suggested_timeout, capped here). This
@@ -2454,6 +2531,72 @@ class SmartMeshCoreInterface(Interface):
         # storage path is known).
         self.packet_capture_enabled = _cfg_bool(cfg.get("packet_capture_enabled", "no"))
         self.packet_capture_dir = cfg.get("packet_capture_dir", None)
+
+    def _validate_direct_timing_budget(self) -> None:
+        """Field-diagnosed fix (2026-09-18, see module docstring's
+        2026-09-18 entry for the full incident this responds to): a
+        real field test broke multi-hop delivery entirely after several
+        individually-reasonable DIRECT timing knobs -- spread across
+        `_configure_fragmentation`, `_configure_retry`, `_configure_
+        transport`, and `_configure_peer_discovery`, each tuned in
+        isolation in a separate field-driven fix -- combined to let a
+        single fragment's worst-case retry cost approach or exceed
+        `reassembly_idle_timeout_s`, the fixed clock the *receiver* is
+        racing them against. Nothing before this method ever checked
+        that those two sides of the same budget were still compatible
+        after an operator (or a future field fix) changed one of them.
+
+        This computes the worst-case wall-clock cost of one fragment
+        surviving both of `_send_direct_fragmented`'s passes -- pass 0's
+        full `direct_send_attempts` budget, then pass 1's re-drive of the
+        same fragment, also up to `direct_send_attempts` -- and warns
+        (never silently changes anything: an operator's explicit config
+        is never overridden) if `reassembly_idle_timeout_s` is less than
+        that. Deliberately excludes `_direct_exchange_lock` queueing delay
+        (real, but contention-dependent -- how many *other* concurrent
+        messages are competing for the one radio isn't a function of this
+        interface's own config, so it can't be bounded from config alone
+        the way the components below can) and `_throttle_for_duty_cycle`
+        (bounded by `duty_cycle_window_s`, small relative to the ack-wait
+        ceiling below in practice). So this is a floor on the real number,
+        not an exact prediction -- a config that fails even this check is
+        confirmed too tight; one that passes isn't guaranteed safe under
+        heavy contention, just no longer broken by construction the way
+        2026-09-18's regression was.
+
+        Only the first attempt of pass 0 can pay `incoming_quiet_defer_
+        max_wait_s` -- every attempt after that (pass 0's own internal
+        retries, and all of pass 1) is a re-drive and skips that wait
+        entirely per this same date's `is_redrive` fix (`_pre_transmit_
+        gate`/`_send_direct_frame`), which is what makes this budget
+        meaningfully smaller than it was before that fix landed."""
+        first_attempt_s = self.direct_ack_timeout_routed_max_s + self.direct_post_send_listen_max_s
+        if self.incoming_quiet_defer_enabled:
+            first_attempt_s += self.incoming_quiet_defer_max_wait_s
+        redrive_attempt_s = self.direct_ack_timeout_routed_max_s + self.direct_post_send_listen_max_s
+
+        pass0_worst_case_s = first_attempt_s + (self.direct_send_attempts - 1) * redrive_attempt_s
+        pass1_worst_case_s = self.direct_send_attempts * redrive_attempt_s
+        worst_case_single_fragment_s = pass0_worst_case_s + pass1_worst_case_s
+
+        if self.reassembly_idle_timeout_s < worst_case_single_fragment_s:
+            RNS.log(
+                f"{self}: reassembly_idle_timeout ({self.reassembly_idle_timeout_s:.1f}s) is "
+                f"less than the worst-case time one fragment can take to survive both DIRECT "
+                f"retry passes ({worst_case_single_fragment_s:.1f}s, from direct_ack_timeout_"
+                f"routed_max={self.direct_ack_timeout_routed_max_s:.1f}s, direct_post_send_"
+                f"listen_max={self.direct_post_send_listen_max_s:.1f}s, incoming_quiet_defer_"
+                f"max_wait={self.incoming_quiet_defer_max_wait_s if self.incoming_quiet_defer_enabled else 0:.1f}s, "
+                f"direct_send_attempts={self.direct_send_attempts}) -- excluding real queueing "
+                f"delay behind other concurrent DIRECT exchanges, which only makes this worse. "
+                f"A DIRECT-fragmented message can genuinely need this long per fragment under "
+                f"real multi-hop loss; with the timeout set lower than the retry logic's own "
+                f"worst case, the receiver can give up and evict a bucket before the sender's "
+                f"own retry mechanism has had a fair chance to land it. Recommend raising "
+                f"reassembly_idle_timeout to at least {worst_case_single_fragment_s:.0f} (or "
+                f"lowering the DIRECT timing knobs above) before the next field test.",
+                RNS.LOG_WARNING,
+            )
 
     # -------------------------------------------------------------------
     # Startup helpers
@@ -2910,19 +3053,36 @@ class SmartMeshCoreInterface(Interface):
         mid multi-fragment transfer).
 
         A rolling window, not a single fixed sleep: hearing another
-        DIRECT frame while already waiting (`_last_incoming_direct_at`
-        moving forward, updated by `_on_contact_msg_recv` regardless of
-        this coroutine's own state) pushes the deadline out again, the
-        same "keeps checking, wakes exactly when the deadline moves"
-        shape `_DutyCycleLimiter.wait_for_budget` already uses. Since this
-        interface has no way to actually observe a peer's own airtime
-        budget or duty-cycle state, "or hit its airtime limit" is
+        in-progress DIRECT fragment while already waiting
+        (`_last_incoming_direct_at` moving forward, updated by
+        `_handle_direct_multifragment_frame` -- see that method's own
+        docstring for the 2026-09-18 narrowing) pushes the deadline out
+        again, the same "keeps checking, wakes exactly when the deadline
+        moves" shape `_DutyCycleLimiter.wait_for_budget` already uses.
+        Since this interface has no way to actually observe a peer's own
+        airtime budget or duty-cycle state, "or hit its airtime limit" is
         approximated by `incoming_quiet_defer_max_wait_s` -- a bound on
         this node's *own* patience, so a continuously-chatty peer can
         never starve this node's own outgoing traffic indefinitely.
         Returns the delay actually applied (0.0 if none was needed, e.g.
         nothing has been heard yet this session, or the last frame was
-        already longer ago than the quiet window)."""
+        already longer ago than the quiet window).
+
+        Field-diagnosed fix (2026-09-18): originally reset on *any* DIRECT
+        frame heard (ACKs, PROOFs, completion-checks, a fragment that
+        completed its own bucket), not just "this peer still has more
+        fragments of this transfer coming." On a link where both nodes are
+        constantly exchanging that other traffic, a genuine 3s lull rarely
+        occurred, so nearly every send -- including the fragment retries
+        racing the receiver's own `reassembly_idle_timeout_s` -- got pushed
+        toward the 15s patience ceiling. Real capture evidence
+        (2026-09-18 field test): 0/8 messages completed, fragment gaps
+        widening from ~20s to 60-90s apart within one run, then a later
+        window with zero incoming fragments and 0% outgoing DIRECT success
+        for 16+ minutes straight. See the module docstring's 2026-09-18
+        entry for the full root-cause writeup and the paired fix in
+        `_pre_transmit_gate`/`_send_direct_frame` (retries skip this wait
+        entirely -- they're already racing a clock, not being polite)."""
         if not self.incoming_quiet_defer_enabled or self._last_incoming_direct_at is None:
             return 0.0
         start = time.monotonic()
@@ -2948,7 +3108,7 @@ class SmartMeshCoreInterface(Interface):
             )
         return total_waited
 
-    async def _pre_transmit_gate(self, frame: str) -> None:
+    async def _pre_transmit_gate(self, frame: str, skip_quiet_defer: bool = False) -> None:
         """Code-review fix: `await self._wait_for_incoming_quiet()` then
         `await self._throttle_for_duty_cycle(frame)`, in that order, used
         to be copy-pasted verbatim at every one of this interface's radio-
@@ -2961,8 +3121,22 @@ class SmartMeshCoreInterface(Interface):
         line and silently reintroduce the airtime/collision problems these
         two mechanisms were field-fix additions for. One call here covers
         both, in the required order, for every current and future send
-        site."""
-        await self._wait_for_incoming_quiet()
+        site.
+
+        Field-diagnosed fix (2026-09-18, see module docstring): `skip_
+        quiet_defer` lets a caller that's already racing the receiver's
+        `reassembly_idle_timeout_s` -- a fragment re-drive, currently the
+        only such caller, threaded down from `_send_direct_fragmented`'s
+        pass-1 loop -- skip `_wait_for_incoming_quiet` entirely. That wait
+        is a heuristic collision-avoidance courtesy, reasonable for a fresh
+        send but actively counterproductive for a retry that's already at
+        risk of blowing the reassembly deadline on the other end: a late
+        retry is worse than a slightly-risky one. `_throttle_for_duty_
+        cycle` is never skipped -- it enforces this node's own real
+        self-imposed airtime cap, not a politeness heuristic, and a retry
+        storm is exactly the case that cap exists to bound."""
+        if not skip_quiet_defer:
+            await self._wait_for_incoming_quiet()
         await self._throttle_for_duty_cycle(frame)
 
     # -------------------------------------------------------------------
@@ -4473,7 +4647,7 @@ class SmartMeshCoreInterface(Interface):
         frag_total = len(chunks)
         acked = [False] * frag_total
 
-        async def send_one(frag_idx: int) -> bool:
+        async def send_one(frag_idx: int, is_redrive: bool = False) -> bool:
             return await self._send_direct_with_attempts(
                 target,
                 lambda attempt, c=chunks[frag_idx], fi=frag_idx, ft=frag_total: (
@@ -4481,7 +4655,7 @@ class SmartMeshCoreInterface(Interface):
                 ),
                 peer_prefix,
                 pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
-                hop_count=hop_count,
+                hop_count=hop_count, is_redrive=is_redrive,
             )
 
         for frag_idx in range(frag_total):
@@ -4496,8 +4670,14 @@ class SmartMeshCoreInterface(Interface):
                 f"pass 1 re-driving {len(missing)}/{frag_total} still-missing "
                 f"fragment(s)."
             )
+            # Field-diagnosed fix (2026-09-18, see module docstring):
+            # is_redrive=True here skips _pre_transmit_gate's incoming-
+            # quiet-defer wait for every pass-1 attempt -- these fragments
+            # are already known missing and racing reassembly_idle_
+            # timeout_s on the receiver, not making a fresh send that can
+            # afford to be polite about it.
             for frag_idx in missing:
-                acked[frag_idx] = await send_one(frag_idx)
+                acked[frag_idx] = await send_one(frag_idx, is_redrive=True)
                 if self.detached or not self.online:
                     return False
 
@@ -4597,7 +4777,7 @@ class SmartMeshCoreInterface(Interface):
     async def _send_direct_with_attempts(
         self, target: str, frame_builder, peer_prefix: str,
         pkt_id: Optional[int] = None, frag_idx: Optional[int] = None, frag_total: Optional[int] = None,
-        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None, is_redrive: bool = False,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -4632,7 +4812,16 @@ class SmartMeshCoreInterface(Interface):
         for a `PRIORITY_HANDSHAKE` exchange, `direct_send_attempts`
         (default 2) for everything else. See `direct_send_attempts_
         handshake`'s own comment for why a failed Link handshake deserves
-        more persistence than a failed DATA fragment, not less."""
+        more persistence than a failed DATA fragment, not less.
+
+        `is_redrive` (2026-09-18, see module docstring): True when this
+        whole call is itself `_send_direct_fragmented`'s pass-1 re-drive of
+        an already-known-missing fragment -- forwarded (along with `attempt
+        > 0`, an internal retry within this same call) to `_send_direct_
+        frame_and_wait_for_ack` as `is_redrive`, so `_pre_transmit_gate`
+        skips the incoming-quiet-defer wait for either case: both are
+        already racing the receiver's `reassembly_idle_timeout_s`, not
+        making a fresh, patience-affordable send."""
         attempts_budget = (
             self.direct_send_attempts_handshake if priority == self.PRIORITY_HANDSHAKE
             else self.direct_send_attempts
@@ -4646,7 +4835,7 @@ class SmartMeshCoreInterface(Interface):
                 ok, waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                     target, frame, attempt, peer_prefix=peer_prefix,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
-                    hop_count=hop_count,
+                    hop_count=hop_count, is_redrive=(is_redrive or attempt > 0),
                 )
             except Exception as exc:
                 RNS.log(
@@ -4675,6 +4864,7 @@ class SmartMeshCoreInterface(Interface):
         pkt_id: Optional[int] = None, frag_idx: Optional[int] = None, frag_total: Optional[int] = None,
         priority: int = PRIORITY_NORMAL,  # see _PriorityAsyncLock's own docstring
         hop_count: Optional[int] = None,  # capture-only, see _capture_direct_attempt_result's docstring
+        is_redrive: bool = False,  # forwarded to _send_direct_frame -> _pre_transmit_gate, see module docstring 2026-09-18
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -4771,7 +4961,7 @@ class SmartMeshCoreInterface(Interface):
                 # exactly as before.
                 send_exc = None
                 try:
-                    sent = await self._send_direct_frame(target, frame, attempt)
+                    sent = await self._send_direct_frame(target, frame, attempt, is_redrive=is_redrive)
 
                     payload_dict = sent.payload if isinstance(sent.payload, dict) else {}
                     expected_ack = payload_dict.get("expected_ack")
@@ -5048,7 +5238,7 @@ class SmartMeshCoreInterface(Interface):
         frame = self._encode_direct_bare(payload)
         return await self._send_direct_frame(target, frame)
 
-    async def _send_direct_frame(self, target, frame: str, attempt: int = 0):
+    async def _send_direct_frame(self, target, frame: str, attempt: int = 0, is_redrive: bool = False):
         """Sends one already-encoded DIRECT frame string (bare or
         multi-fragment shape -- this method doesn't care which) via
         `send_msg`, the one place either shape actually reaches the
@@ -5064,8 +5254,13 @@ class SmartMeshCoreInterface(Interface):
         correctly blocks that lock for the duration too -- nothing else
         should be transmitting during it either, for the same reason
         nothing else should be transmitting during the post-send listen
-        window that same caller already enforces."""
-        await self._pre_transmit_gate(frame)
+        window that same caller already enforces.
+
+        `is_redrive` (2026-09-18, see module docstring) is forwarded to
+        `_pre_transmit_gate` as `skip_quiet_defer` -- see that method's own
+        docstring for why a fragment re-drive shouldn't pay the incoming-
+        quiet-defer cost a fresh send can afford."""
+        await self._pre_transmit_gate(frame, skip_quiet_defer=is_redrive)
         result = await self._run_command(
             self._mc_ready.commands.send_msg(target, frame, attempt=attempt),
             "send_msg",
@@ -6124,13 +6319,10 @@ class SmartMeshCoreInterface(Interface):
     def _on_contact_msg_recv(self, event):
         if self.detached:
             return
-        # User-requested fix (2026-09-16): recorded as early as possible --
-        # before the marker check, before this even resolves to a valid
-        # frame this interface can decode -- since the point is "the
-        # channel was just occupied by someone," which is true even for a
-        # DIRECT frame that turns out malformed or not ours. See
-        # incoming_quiet_window_s's own comment.
-        self._last_incoming_direct_at = time.monotonic()
+        # Field-diagnosed fix (2026-09-18, see module docstring): this used
+        # to stamp _last_incoming_direct_at here, unconditionally, for
+        # every DIRECT frame heard -- see _handle_direct_multifragment_frame
+        # for where that timestamp is set now and why.
         payload = event.payload if isinstance(event.payload, dict) else {}
         text = payload.get("text", "")
         sender_token = payload.get("pubkey_prefix", "")
@@ -6232,7 +6424,16 @@ class SmartMeshCoreInterface(Interface):
         multi-fragment path can't do this at all (no sender identity to
         learn from), which is why `_add_channel_fragment` itself stays
         deliberately silent on this and this caller adds it instead of
-        pushing DIRECT-specific behavior down into the shared helper."""
+        pushing DIRECT-specific behavior down into the shared helper.
+
+        Field-diagnosed fix (2026-09-18, see module docstring): this is
+        also the only place `_last_incoming_direct_at` (`_wait_for_
+        incoming_quiet`'s trigger) gets set now, and only when this
+        fragment leaves its bucket still incomplete -- concrete evidence
+        this sender has more fragments of this specific transfer still
+        coming, unlike the old "any DIRECT frame heard" trigger that
+        counted its own ACKs/PROOFs/completion-checks and caused a mutual
+        reset feedback loop between two chatty nodes."""
         key = self._reassembly_key(header, sender_token, mode="direct")
 
         if self._dedup_contains(key):
@@ -6241,7 +6442,9 @@ class SmartMeshCoreInterface(Interface):
             return
 
         complete_data = self._add_channel_fragment(key, header, payload)
-        if complete_data is not None:
+        if complete_data is None:
+            self._last_incoming_direct_at = time.monotonic()
+        else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
             self._observe_incoming_rns_packet(complete_data, peer_prefix)
             self.process_incoming(
