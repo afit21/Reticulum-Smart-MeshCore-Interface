@@ -104,6 +104,10 @@ All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet Me
 
 Please keep in mind that this project is in very early stages. This interface currently works better than all others I've been able to test.
 
+### Automated tests and simulation (no hardware)
+
+`python3 -m unittest discover -s tests` runs the automated suite: wire-format, RNS-header and reliability-engine unit tests (about a second), plus end-to-end scenarios that run two real interface instances through simulated repeater hops (`SMCI_SKIP_SLOW=1` skips those). The simulated mesh lives in `testscripts/simmesh/` and models DIRECT routing through repeaters, ACKs, path discovery, contacts, flood dedup, half-duplex, collisions and loss. `testscripts/fake_meshcore_repeater_sim.py` runs the interface over any topology you describe (`--link A-R --link R-B --repeater R`), `testscripts/rns_multiprocess_sim.py` does the same with a full real Reticulum instance per node, and `testscripts/calibrate_sim_from_captures.py` derives loss/latency settings for the simulator from real field captures. None of this replaces the field table above — simulated timing is not real radio timing — but it lets a change be checked against multi-hop DIRECT behavior before it goes anywhere near a real repeater.
+
 ## Credits
 
 - [comms-engineer/RNS_Over_Meshcore](https://github.com/comms-engineer/RNS_Over_Meshcore) — inspiration taken from this project for the discovery protocol.

@@ -100,6 +100,28 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=90.0, help="Total seconds to run before reporting and exiting")
     parser.add_argument("--bind-timeout", type=float, default=60.0, help="Seconds to wait for bind-frame peer discovery")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Sender only: how many test DATA packets to send, one after another (default 1). "
+                             "Several are needed to exercise the measured-ACK-RTT timeout (2026-09-18 step 2), "
+                             "which only takes over from the firmware's guess after direct_ack_rtt_min_samples "
+                             "real ACKs from the peer.")
+    parser.add_argument("--repeat-interval", type=float, default=4.0,
+                        help="Sender only: seconds between successive test packets (default 4)")
+    parser.add_argument("--payload-size", type=int, default=0,
+                        help="Sender only: pad each test packet's payload to this many bytes so it needs "
+                             "DIRECT fragmentation (default 0 = the small single-fragment payload). ~120 bytes "
+                             "per fragment at the firmware's 160-char text limit.")
+    parser.add_argument("--verify-query", action="store_true",
+                        help="Sender only: after the last test packet, send one completion QUERY for it and "
+                             "print the receiver's have-bitmap ANSWER -- exercises the v2 'Q' frame "
+                             "(2026-09-18 step 3) over the air without needing a lost ACK to trigger it.")
+    parser.add_argument("--rx-log-holds", action="store_true",
+                        help="Enable the interface's RX-log-derived transmit holds (rx_log_holds_enabled, "
+                             "2026-09-18 step 4, default off) for this run.")
+    parser.add_argument("--packet-capture-dir", default=None,
+                        help="Enable the interface's own JSONL packet capture (packet_capture_enabled) into this "
+                             "directory -- includes the observe-only 'rx_log' records (2026-09-18) for every packet "
+                             "the radio overhears, so this test doubles as a check of that tap on real hardware.")
     args = parser.parse_args()
 
     module = _load_interface_module()
@@ -125,6 +147,9 @@ def main() -> None:
         # tighter, still-plausible window.
         bind_response_jitter_min=1.0,
         bind_response_jitter_max=4.0,
+        **({"packet_capture_enabled": "yes", "packet_capture_dir": args.packet_capture_dir}
+           if args.packet_capture_dir else {}),
+        **({"rx_log_holds_enabled": "yes"} if args.rx_log_holds else {}),
     )
 
     log(f"[{args.role}] connecting to {args.port}...")
@@ -177,10 +202,34 @@ def main() -> None:
                     type=RNS.Destination.SINGLE, hash=TEST_DEST_HASH, mtu=RNS.Reticulum.MTU,
                     encrypt=lambda data: b"\x00" * 16 + data,
                 )
-                packet = RNS.Packet(fake_dest, b"m5-zero-hop-direct-test-payload", packet_type=RNS.Packet.DATA)
-                packet.pack()
-                log(f"[{args.role}] sending test DATA/SINGLE packet DIRECT via process_outgoing()...")
-                iface.process_outgoing(packet.raw)
+                for i in range(max(1, args.repeat)):
+                    body = f"m5-zero-hop-direct-test-payload-{i}".encode()
+                    if args.payload_size > len(body):
+                        body = body + bytes((j * 7 + i) & 0xFF for j in range(args.payload_size - len(body)))
+                    packet = RNS.Packet(fake_dest, body, packet_type=RNS.Packet.DATA)
+                    packet.pack()
+                    log(f"[{args.role}] sending test DATA/SINGLE packet {i + 1}/{args.repeat} "
+                        f"({len(packet.raw)} bytes) DIRECT via process_outgoing()...")
+                    iface.process_outgoing(packet.raw)
+                    if i + 1 < args.repeat:
+                        time.sleep(args.repeat_interval)
+                if args.verify_query:
+                    # Wait for the outgoing worker/background send to finish, then ask
+                    # the receiver what it holds for the most recent fragmented pkt_id.
+                    time.sleep(max(5.0, args.repeat_interval))
+                    _wait_until(lambda: not iface._direct_exchange_lock.locked(), timeout=60)
+                    contact = iface._resolve_contact(peer_prefix)
+                    target = contact.get("public_key") if contact else None
+                    pkt_id = getattr(iface, "_last_fragmented_pkt_id", None)
+                    if target and pkt_id is not None:
+                        frag_total = getattr(iface, "_last_fragmented_frag_total", 0)
+                        log(f"[{args.role}] verify-query: asking {peer_prefix!r} what it holds for pkt_id={pkt_id} frag_total={frag_total}...")
+                        answer = asyncio.run_coroutine_threadsafe(
+                            iface._query_remote_fragments(target, peer_prefix, pkt_id, frag_total, stage="verify"), iface._loop
+                        ).result(timeout=30)
+                        log(f"[{args.role}] verify-query answer: {answer}")
+                    else:
+                        log(f"[{args.role}] verify-query: nothing fragmented was sent (use --payload-size), or no contact.")
 
         remaining = deadline - time.monotonic()
         if remaining > 0:
