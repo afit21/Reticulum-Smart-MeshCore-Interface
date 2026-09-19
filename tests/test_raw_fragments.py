@@ -304,8 +304,12 @@ class RawFragmentScenarios(unittest.TestCase):
         # Let the abandoned send wind down, then check it stopped early.
         time.sleep(3.0)
         rounds = {r["round"] for r in _events(a, "raw_fragment_sent")}
-        self.assertEqual(max(rounds), iface.direct_path_reset_threshold - 1,
-                         f"the send should stop after the round that tripped the reset, got rounds {sorted(rounds)}")
+        # 2026-09-19 (bidirectional-transfer fix): an unanswered reconcile
+        # no longer re-bursts, so on a dead path only round 0 carries data;
+        # the reset still trips after `direct_path_reset_threshold` silent
+        # query rounds and the send must have stopped by then.
+        self.assertLessEqual(max(rounds), iface.direct_path_reset_threshold - 1,
+                             f"the send should stop after the round that tripped the reset, got rounds {sorted(rounds)}")
         self.assertEqual(a.radio.contacts[b.radio.pubkey]["out_path_len"], -1, "reset_path never reached the radio")
 
         # Link comes back: the next raw send rediscovers and delivers.

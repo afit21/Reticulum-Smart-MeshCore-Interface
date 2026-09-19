@@ -2077,6 +2077,45 @@ path; its docstring has the threat-model reasoning (a misdirected PROOF is
 worth nothing to a spoofer, and the fallback already reached every bound
 peer). Verified: fast suite (`tests/test_field_fixes_0919.py`).
 
+**Field-diagnosed fix (2026-09-19, bidirectional zero-hop image transfer,
+`fieldtests/raw/Alpha0.1.2/*image_send2*`/`*image_recv2*`):** 10 of 40
+reconciles timed out, none of them to loss. The answering side knew the
+answer within a second and could not transmit it for up to 30 s (queue
+depth 9): its ANSWER sat at PRIORITY_NORMAL behind its own raw bursts.
+Verified in both captures for the desktop's pkt 1: fragment sent 12:22:38,
+laptop held it at 12:22:39, four queries timed out, two re-bursts of data
+the peer already had, answer finally through at 12:23:15. Across both
+nodes 5 fragments were genuinely lost (~6% under two-way load) and 3 data
+sends plus ~10 query/answer exchanges were waste. One claim in the field
+analysis did not hold: the laptop's timeouts were mostly at RTT-derived
+budgets (14-18 s), not the 5 s floor -- so budget alone cannot fix this.
+
+1. `PRIORITY_ANSWER`, a tier between HANDSHAKE and NORMAL, for the
+   reconcile ANSWER and (unless the send is a handshake) the QUERY. Tiers
+   renumbered HANDSHAKE 0 / ANSWER 1 / NORMAL 2 / LOW 3; the outgoing
+   PriorityQueue and `_PriorityAsyncLock` order by integer, nothing
+   compared the values numerically.
+2. Raw sends no longer re-burst after an unanswered reconcile: the round
+   re-queries, and bursts resume after an answered reconcile shows gaps
+   -- or, as a safety valve for answers that are systematically lost
+   rather than late, after `direct_raw_reburst_after_unanswered` (2)
+   consecutive silent rounds. A fallback strike is only counted for a
+   round that actually burst.
+3. The ANSWER budget adds one flat prior per exchange queued on this node
+   (at most four), capped at `direct_ack_timeout_routed_max_s` -- own
+   queue depth as the proxy for the peer's under two-way load.
+4. Found by the simulator while verifying 2: through a repeater the
+   ANSWER left the radio right behind the firmware's ACK for the QUERY
+   and reached the repeater while it was still forwarding that ACK --
+   six of six answers lost, which the old blind re-burst had been hiding.
+   `_send_completion_answer` now waits the same hop-scaled gap
+   `_raw_fragment_gap_s` gives raw fragments (sized for the ACK frame)
+   before transmitting; zero hop is unchanged.
+
+Verified: fast suite, the raw-fragment scenarios, and a delayed-answer
+scenario (`tests/test_field_fixes_0919.py::DelayedAnswerScenario`) that
+injects answer latency rather than loss, as the field analysis proposed.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -2702,7 +2741,15 @@ class SmartMeshCoreInterface(Interface):
     # would invite tuning with no evidence behind it. A third tier was
     # added below once real field data *did* argue for one.
     PRIORITY_HANDSHAKE = 0
-    PRIORITY_NORMAL = 1
+    # Field fix (2026-09-19, bidirectional image transfer): reconcile
+    # QUERY/ANSWER frames are tiny and a fragmented send on the other
+    # node is blocked on them, yet they queued at PRIORITY_NORMAL behind
+    # this node's own 4-fragment raw bursts -- a laptop ANSWER waited 30s
+    # at queue depth 9 for a question it could answer in one second, and
+    # 10 of 40 reconciles timed out for that reason alone. One tier above
+    # NORMAL, below HANDSHAKE: a Link handshake still goes first.
+    PRIORITY_ANSWER = 1
+    PRIORITY_NORMAL = 2
     # User-requested fix (2026-09-16, same field data as PATH_RESPONSE_
     # RATE_LIMIT_WINDOW_S's own raise above): PATH_RESPONSE currently
     # rides PRIORITY_NORMAL, the same tier as real user data, at both the
@@ -2719,7 +2766,7 @@ class SmartMeshCoreInterface(Interface):
     # it in `_PriorityAsyncLock`, so administrative traffic never blocks
     # what the user is actually waiting on, even during a retry storm
     # this interface can't fully suppress at the source.
-    PRIORITY_LOW = 2
+    PRIORITY_LOW = 3
 
     # Outgoing-queue shutdown sentinel. A bare `None` (M1/M2's sentinel)
     # would be unsafe now that queue items are (priority, seq, data,
@@ -3763,6 +3810,17 @@ class SmartMeshCoreInterface(Interface):
         # burst of airtime for nothing.
         self.direct_raw_reconcile_rounds = max(1, min(4, int(cfg.get("direct_raw_reconcile_rounds", 3))))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
+        # Field fix (2026-09-19, bidirectional image transfer): an unanswered
+        # reconcile round used to re-burst every un-ACKed fragment. In that
+        # capture 3 data sends went to a peer that already held the packet
+        # complete -- its answers were stuck behind its own bursts -- and
+        # each re-burst lengthened that queue. An unanswered round now
+        # re-queries; a burst is allowed again only after this many
+        # CONSECUTIVE unanswered rounds (a safety valve for answers that are
+        # systematically lost rather than merely late -- the simulated
+        # one-hop scenario produced exactly that). 1 restores the old
+        # re-burst-every-round; 0 never re-bursts on silence.
+        self.direct_raw_reburst_after_unanswered = int(cfg.get("direct_raw_reburst_after_unanswered", 2))
         # `direct_raw_fallback_strikes` answered reconciles in a row showing
         # a burst delivered nothing -> raw is paused for that peer for
         # `direct_raw_fallback_cooldown` and the packet goes as Z85 text on
@@ -7385,6 +7443,15 @@ class SmartMeshCoreInterface(Interface):
 
         rounds = max(1, self.direct_raw_reconcile_rounds)
         query_unanswered_rounds = 0
+        # Field fix (2026-09-19, bidirectional image transfer): an unanswered
+        # reconcile is "no information", and re-bursting every un-ACKed
+        # fragment on it is a guess that lengthens the peer's queue -- the
+        # very thing delaying its ANSWER. Bursts now only follow an answered
+        # reconcile (or start the send); an unanswered round re-queries,
+        # until `direct_raw_reburst_after_unanswered` consecutive silent
+        # rounds allow one more burst as a safety valve.
+        burst_allowed = True
+        consecutive_unanswered = 0
         for rnd in range(rounds):
             # Audit fix (2026-09-19): expiry was checked once, before the
             # first burst. Three rounds of bursts plus their query waits far
@@ -7399,7 +7466,13 @@ class SmartMeshCoreInterface(Interface):
                 )
                 return False
             missing = [i for i in range(frag_total) if not acked[i]]
-            if missing:
+            burst_this_round = bool(missing) and burst_allowed
+            if missing and not burst_this_round:
+                self._debug(
+                    f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} -- last reconcile "
+                    f"unanswered, re-querying instead of re-bursting {len(missing)} fragment(s)."
+                )
+            if burst_this_round:
                 async with self._direct_exchange_lock(priority):
                     for n, frag_idx in enumerate(missing):
                         if self.detached or not self.online:
@@ -7453,6 +7526,8 @@ class SmartMeshCoreInterface(Interface):
             self._record_query_path_evidence(peer_prefix, query_infos, answered=answer is not None)
             if answer is None:
                 query_unanswered_rounds += 1
+                consecutive_unanswered += 1
+                burst_allowed = 0 < self.direct_raw_reburst_after_unanswered <= consecutive_unanswered
                 self._debug(f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} reconcile unanswered.")
                 if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
                     return False
@@ -7464,12 +7539,16 @@ class SmartMeshCoreInterface(Interface):
                 # nothing" (reading it as an empty set once blacklisted a v1
                 # peer's whole repeater chain for a day). Unanswered round.
                 query_unanswered_rounds += 1
+                consecutive_unanswered += 1
+                burst_allowed = 0 < self.direct_raw_reburst_after_unanswered <= consecutive_unanswered
                 self._debug(
                     f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} answered v1 "
                     f"(no bitmap) -- no per-fragment information, treating as unanswered."
                 )
                 continue
             acked = [i in held for i in range(frag_total)]
+            burst_allowed = True
+            consecutive_unanswered = 0
             if held:
                 last_progress_at = time.monotonic()
             self._debug(
@@ -7480,7 +7559,9 @@ class SmartMeshCoreInterface(Interface):
                 self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
                 self._resumable_sends.pop(resume_key, None)
                 return True
-            if sum(acked) <= held_before and missing:
+            if sum(acked) <= held_before and burst_this_round:
+                # A strike needs a burst that provably delivered nothing; a
+                # re-query round sent no data and says nothing about raw.
                 empty_answered_bursts += 1
                 if empty_answered_bursts >= max(1, self.direct_raw_fallback_strikes):
                     # The text path works (the ANSWER came back) but raw
@@ -7825,6 +7906,22 @@ class SmartMeshCoreInterface(Interface):
         self._rtt_sample(self._query_rtt, peer_prefix, rtt_s)
 
     def _completion_query_timeout_s(self, peer_prefix: str, hop_count: Optional[int] = None) -> float:
+        """`_completion_query_timeout_base_s` plus a contention term
+        (2026-09-19, bidirectional image transfer): under two-way load the
+        peer's ANSWER queues behind the peer's own sends, and this node's
+        own `_direct_exchange_queue_depth` is the best local proxy for
+        that -- both sides were pushing an image. Each queued exchange
+        here adds one flat prior (`direct_completion_check_timeout_s`),
+        at most four, capped at `direct_ack_timeout_routed_max_s`. The
+        wait runs with the radio free, so a longer budget costs latency
+        on this packet, never airtime."""
+        base = self._completion_query_timeout_base_s(peer_prefix, hop_count)
+        contention = min(4, max(0, self._direct_exchange_queue_depth)) * self.direct_completion_check_timeout_s
+        if contention <= 0:
+            return base
+        return max(base, min(base + contention, self.direct_ack_timeout_routed_max_s))
+
+    def _completion_query_timeout_base_s(self, peer_prefix: str, hop_count: Optional[int] = None) -> float:
         """How long to wait for a completion ANSWER. In order of
         preference: the measured QUERY -> ANSWER round trip for this peer
         (`_query_rtt`, 2 x (srtt + 4*rttvar)); else the step-2 ACK RTT
@@ -7917,8 +8014,13 @@ class SmartMeshCoreInterface(Interface):
             # queries for up to 50s under bidirectional traffic.
             sent_at = time.monotonic()
             try:
+                # 2026-09-19: the QUERY rides PRIORITY_ANSWER (unless the
+                # enclosing send is a handshake, which is higher still) --
+                # see that constant's comment. A stalled transfer's one
+                # small question should not queue behind this node's own
+                # bulk bursts to other packets.
                 q_ok, q_waited_full = await self._send_direct_frame_and_wait_for_ack(
-                    target, frame, 0, peer_prefix=peer_prefix, priority=priority,
+                    target, frame, 0, peer_prefix=peer_prefix, priority=min(priority, self.PRIORITY_ANSWER),
                     time_critical=True, kind="completion_query", hop_count=hop_count,
                 )
                 # Field fix (2026-09-19 morning): the QUERY's own firmware
@@ -9854,10 +9956,29 @@ class SmartMeshCoreInterface(Interface):
             self.COMPLETION_TYPE_ANSWER, pkt_id, frag_total, complete=complete,
             held=held, version=version,
         )
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        # Simulation finding (2026-09-19, one-hop raw scenario): this
+        # ANSWER used to leave the radio right behind the firmware's own
+        # ACK for the QUERY, and through a repeater it reached the chain
+        # while the repeater was still forwarding that ACK -- half-duplex,
+        # so six of six answers were lost with no ACK. Exactly the
+        # fragment-chasing-fragment collision `_raw_fragment_gap_s` paces
+        # raw bursts for; the same hop-scaled gap here, sized for the ACK
+        # frame the repeater is busy with. Zero hop: no gap.
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix is not None else None
+        if resolved is not None:
+            hops = max(0, resolved.out_path_len)
+        else:
+            out_path_len = contact.get("out_path_len", 0) if isinstance(contact, dict) else 0
+            hops = 1 if out_path_len is None or out_path_len < 0 else int(out_path_len)
+        if hops > 0:
+            gap_s = self._raw_fragment_gap_s(hops, on_air_bytes=8 + hops)
+            if gap_s > 0:
+                await asyncio.sleep(gap_s)
         try:
             ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
-                target, frame, 0, peer_prefix=self._canonical_peer_prefix(sender_token),
-                priority=self.PRIORITY_NORMAL, time_critical=True, kind="completion_answer",
+                target, frame, 0, peer_prefix=peer_prefix,
+                priority=self.PRIORITY_ANSWER, time_critical=True, kind="completion_answer",
             )
             if not ok:
                 self._debug(

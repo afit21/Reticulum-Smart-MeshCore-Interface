@@ -11,7 +11,7 @@ import unittest
 
 import RNS
 
-from tests._support import SingleNodeCase, build_rns_packet, wait_until
+from tests._support import SingleNodeCase, build_rns_packet, wait_until, slow
 
 PEER = "abcdef012345"
 
@@ -188,6 +188,78 @@ class RawProofCorrelationTests(SingleNodeCase):
         proof = build_rns_packet("proof", dest_hash=os.urandom(16), payload=b"p")
         iface._correlate_raw_proof(proof, PEER)
         self.assertEqual(iface._proof_correlation, {})
+
+
+class ReconcilePriorityAndBudgetTests(SingleNodeCase):
+
+    def test_answer_tier_sits_between_handshake_and_normal(self):
+        iface = self.iface
+        self.assertLess(iface.PRIORITY_HANDSHAKE, iface.PRIORITY_ANSWER)
+        self.assertLess(iface.PRIORITY_ANSWER, iface.PRIORITY_NORMAL)
+        self.assertLess(iface.PRIORITY_NORMAL, iface.PRIORITY_LOW)
+        # RNS traffic itself never classifies into the ANSWER tier.
+        for kind in ("data", "announce", "path_request", "link_request", "proof", "lrproof", "path_response"):
+            self.assertNotEqual(iface._priority_tier(iface._parse_rns_header(build_rns_packet(kind))), iface.PRIORITY_ANSWER)
+
+    def test_answer_budget_grows_with_own_queue_depth_and_caps(self):
+        iface = self.iface
+        original = iface._direct_exchange_queue_depth
+        try:
+            iface._direct_exchange_queue_depth = 0
+            base = iface._completion_query_timeout_s(PEER, 0)
+            iface._direct_exchange_queue_depth = 2
+            self.assertAlmostEqual(iface._completion_query_timeout_s(PEER, 0), min(base + 2 * iface.direct_completion_check_timeout_s, iface.direct_ack_timeout_routed_max_s), places=6)
+            iface._direct_exchange_queue_depth = 40
+            widened = iface._completion_query_timeout_s(PEER, 0)
+            self.assertLessEqual(widened, max(base, iface.direct_ack_timeout_routed_max_s))
+            self.assertGreaterEqual(widened, base)
+        finally:
+            iface._direct_exchange_queue_depth = original
+
+
+@slow
+class DelayedAnswerScenario(unittest.TestCase):
+    """The field analysis's proposed test: inject answer *delay*, not loss.
+    The receiver holds every fragment after the first burst but its
+    ANSWER arrives after the querier's budget; the sender must re-query,
+    never re-burst data the peer already has, and finish once the late
+    answer lands."""
+
+    def tearDown(self):
+        self.mesh.stop()
+
+    def test_unanswered_round_requeries_instead_of_rebursting(self):
+        import asyncio
+        from tests.test_raw_fragments import _raw_mesh, _events
+        _, a, b = _raw_mesh(self, ["A-B"], seed=71)
+        original = b.iface._send_completion_answer
+
+        async def delayed(*args, **kwargs):
+            await asyncio.sleep(20.0)
+            await original(*args, **kwargs)
+
+        b.iface._send_completion_answer = delayed
+        big = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"late-answer-" + os.urandom(440))
+        a.send(big)
+        self.assertTrue(wait_until(lambda: big in b.owner.received, 30.0), "fragments never arrived")
+        self.assertTrue(wait_until(lambda: any(r.get("outcome") == "answered" for r in _events(a, "completion_check_result")), 90.0),
+                        "the late answer never got through")
+        time.sleep(2.0)
+        checks = _events(a, "completion_check_result")
+        self.assertGreaterEqual(sum(1 for r in checks if r.get("outcome") == "timeout"), 1, "no round was unanswered -- delay too short to exercise the fix")
+        sent = _events(a, "raw_fragment_sent")
+        frag_total = sent[0]["frag_total"]
+        rounds_with_data = sorted({r["round"] for r in sent})
+        valve = a.iface.direct_raw_reburst_after_unanswered
+        # The first silent round must re-query, not re-burst; only after
+        # `direct_raw_reburst_after_unanswered` consecutive silent rounds may
+        # one safety-valve burst follow. With the answer held 20s, rounds 0
+        # and 1 are silent, so round 2 may burst once -- never round 1.
+        self.assertNotIn(1, rounds_with_data, f"data was re-burst on the first unanswered round: {[(r['round'], r['frag_idx']) for r in sent]}")
+        self.assertTrue(all(rnd == 0 or rnd >= valve for rnd in rounds_with_data), f"burst before the valve threshold: {rounds_with_data}")
+        self.assertLessEqual(len(sent), 2 * frag_total, f"more than one safety-valve re-burst: {[(r['round'], r['frag_idx']) for r in sent]}")
+        self.assertEqual(b.owner.received.count(big), 1)
+        self.assertNotIn(b.prefix, a.iface._raw_disabled_until, "re-query rounds must not count as raw fallback strikes")
 
 
 class BindRerequestScheduleTests(SingleNodeCase):
