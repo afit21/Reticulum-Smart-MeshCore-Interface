@@ -2,6 +2,21 @@
 """
 rns_multiprocess_sim.py
 
+Two things live here:
+
+  * `node` -- one RNS end node: a real RNS.Reticulum loading the interface from a
+    config dir exactly as rnsd does, as responder (announces, counts probes)
+    or sender (path request, numbered probes, receipt-based accounting).
+    With `--backend real` it talks to a companion endpoint over TCP through
+    the installed `meshcore` library; this is what
+    testscripts/meshbench_scenarios.py spawns for each end of a scenario.
+  * `run` -- LEGACY (archived 2026-09-20, see CLAUDE.md "Legacy simulation
+    tooling"): the orchestrator that ran those nodes (`--backend sim`) over
+    the simmesh fake mesh. Kept runnable for reproducing old results;
+    superseded by the MeshBench scenario suite.
+
+The original description of the `run` mode follows.
+
 The full stack -- a real RNS.Reticulum per node, loading
 Interface/SmartMeshCoreInterface.py exactly the way rnsd does (from a
 config directory's interfaces/ folder), real RNS Transport, announces,
@@ -119,8 +134,13 @@ def run_node(args) -> None:
     def radio_factory() -> SimRadio:
         return SimRadio(args.name, RemoteAir(host, port, args.name, log=log), options=radio_options)
 
-    from simmesh.fake_meshcore import make_fake_meshcore_module
-    sys.modules["meshcore"] = make_fake_meshcore_module(radio_factory)
+    if args.backend == "sim":
+        from simmesh.fake_meshcore import make_fake_meshcore_module
+        sys.modules["meshcore"] = make_fake_meshcore_module(radio_factory)
+    # backend == "real": leave the installed meshcore library alone; --server
+    # is then a real companion endpoint speaking the firmware's serial
+    # protocol over TCP (a MeshBench-served node, or a real radio behind a
+    # TCP bridge) and the interface talks to it exactly as rnsd would.
 
     import RNS
     reticulum = RNS.Reticulum(configdir=configdir)
@@ -133,7 +153,43 @@ def run_node(args) -> None:
     status("iface_online", name=args.name)
 
     # Advert once now that the air link is up (the field-setup step).
-    iface._loop.call_soon_threadsafe(iface._mc.radio.cmd_send_advert)
+    if args.backend == "sim":
+        iface._loop.call_soon_threadsafe(iface._mc.radio.cmd_send_advert)
+    else:
+        import asyncio
+
+        async def _advert():
+            # Same lock the interface holds for its own MeshCore commands, so
+            # this does not interleave with one of its command/reply pairs.
+            async with iface._command_lock:
+                await iface._mc.commands.send_advert(flood=True)
+
+        asyncio.run_coroutine_threadsafe(_advert(), iface._loop).result(timeout=30)
+
+        # Re-advert on the same cadence the sim backend's radios use
+        # (RadioOptions.advert_interval_s): a companion only becomes another
+        # companion's *contact* through an advert, and a path can only be
+        # discovered to a contact, so a node that came up after its peer's
+        # one advert would otherwise never be reachable DIRECT. Real companion
+        # firmware does not re-advert on its own; in the field the operator
+        # does this by hand when bringing radios up.
+        def _readvert_loop():
+            # Random phase and a jittered interval: fired at online+0 and
+            # every round 60 s, the advert left 0.4-1.2 s behind the
+            # interface's own bind re-request (online +60/120/240 s) and was
+            # lost at the first repeater, still relaying that bind frame --
+            # a self-collision the field's hand-timed adverts do not have
+            # (seen on every one of A's first four adverts, 2026-09-20).
+            import random
+            time.sleep(random.uniform(5.0, 25.0))
+            while True:
+                time.sleep(args.advert_interval * random.uniform(0.9, 1.3))
+                try:
+                    asyncio.run_coroutine_threadsafe(_advert(), iface._loop).result(timeout=30)
+                except Exception as e:  # noqa: BLE001 - keep adverting; log and carry on
+                    print(f"[{args.name}] re-advert failed: {e}", flush=True)
+
+        threading.Thread(target=_readvert_loop, daemon=True).start()
 
     if args.role == "responder":
         identity = RNS.Identity()
@@ -180,17 +236,26 @@ def run_node(args) -> None:
         if sent:
             time.sleep(args.wait)
         payload = PAYLOAD_HEADER.pack(seq, time.time()) + os.urandom(max(0, args.size - PAYLOAD_HEADER.size))
-        receipt = RNS.Packet(request_destination, payload).send()
+        try:
+            receipt = RNS.Packet(request_destination, payload).send()
+        except (IOError, OSError) as e:
+            # RNS.Packet.pack() refuses a payload over ENCRYPTED_MDU (383 B for
+            # a SINGLE destination); report it as the outcome rather than
+            # dying without a "done" for the orchestrator to read.
+            status("done", name=args.name, sent=sent, delivered=delivered, rtts=[round(r, 3) for r in rtts],
+                   reason=f"packet send refused: {e}")
+            sys.exit(2)
         sent += 1
         probe_deadline = time.monotonic() + args.probe_timeout
         while receipt.status == RNS.PacketReceipt.SENT and time.monotonic() < probe_deadline:
             time.sleep(0.05)
+        resolved = {k: v.out_path_len for k, v in iface._resolved_paths.items()}
         if receipt.status == RNS.PacketReceipt.DELIVERED:
             delivered += 1
             rtts.append(receipt.get_rtt())
-            status("probe", name=args.name, seq=seq, delivered=True, rtt_s=round(receipt.get_rtt(), 3))
+            status("probe", name=args.name, seq=seq, delivered=True, rtt_s=round(receipt.get_rtt(), 3), resolved=resolved)
         else:
-            status("probe", name=args.name, seq=seq, delivered=False)
+            status("probe", name=args.name, seq=seq, delivered=False, resolved=resolved)
     status("done", name=args.name, sent=sent, delivered=delivered, rtts=[round(r, 3) for r in rtts],
            peers=list(iface._peers.keys()), resolved={k: v.out_path_len for k, v in iface._resolved_paths.items()})
     sys.exit(0 if delivered == sent else 2)
@@ -218,6 +283,7 @@ class NodeProcess:
                     event = json.loads(line[2:])
                 except json.JSONDecodeError:
                     continue
+                event["_t"] = time.monotonic()  # orchestrator-side arrival time, for time-to-X metrics
                 with self._lock:
                     self.events.append(event)
                 print(f"{time.strftime('%H:%M:%S')} [{self.name}] {event}", flush=True)
@@ -368,7 +434,9 @@ def main() -> None:
 
     node = sub.add_parser("node", help="(internal) one RNS node")
     node.add_argument("--name", required=True)
-    node.add_argument("--server", required=True)
+    node.add_argument("--server", required=True, help="host:port of the simmesh air server (sim) or of a companion endpoint (real)")
+    node.add_argument("--backend", choices=["sim", "real"], default="sim",
+                      help="sim: fake meshcore over the simmesh air; real: the installed meshcore library over TCP")
     node.add_argument("--role", choices=["responder", "sender"], required=True)
     node.add_argument("--dest", default=None)
     node.add_argument("--probes", type=int, default=5)

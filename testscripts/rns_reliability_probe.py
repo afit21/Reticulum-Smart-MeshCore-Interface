@@ -11,7 +11,7 @@ interface exactly the way MeshChat, NomadNet, or any other real RNS
 application does -- routing decisions, fragmentation, retries, and all --
 not the interface's internals directly (see testscripts/
 zero_hop_peer_discovery_test.py for that kind of white-box test, and
-testscripts/fake_meshcore_repeater_sim.py for topology-controlled
+testscripts/meshbench_scenarios.py (or the archived testscripts/legacy/fake_meshcore_repeater_sim.py) for topology-controlled
 simulation with no radio hardware at all).
 
 SETUP

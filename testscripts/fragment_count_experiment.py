@@ -8,7 +8,7 @@ device directly and sends/receives the *exact* on-wire multi-fragment
 framing Interface/SmartMeshCoreInterface.py uses (its own encoder/decoder,
 imported directly from that file, so this can never drift out of sync with
 what actually ships). For the same experiment with no hardware, see
-fake_meshcore_repeater_sim.py, which models the flood-dedup behavior this
+legacy/fake_meshcore_repeater_sim.py, which models the flood-dedup behavior this
 script measures.
 
 Why this exists: field testing (fieldtests/reports/alpha-0.1-snapshot2.md,
@@ -329,7 +329,7 @@ def main():
     common.add_argument("--baud", type=int, default=115200)
     common.add_argument("--channel-idx", type=int, default=35, help="must match the channel both radios are joined to")
     common.add_argument("--channel-name", default="RNSTunnel", help="programmed into the device's channel table at startup (matches this project's default)")
-    common.add_argument("--channel-secret", default="95add19b65c179fa0ad562c3756bb338", help="32 hex chars, must match on both ends -- matches this project's shared default secret")
+    common.add_argument("--channel-secret", default="95add19b65c179fa0ad562c3756bb338", help="32 hex chars, must match on both ends. This is a private test-channel secret, NOT the interface's DEFAULT_CHANNEL_SECRET_HEX; join both radios to the same private secret and never use a public channel on a live mesh")
 
     p_recv = sub.add_parser("receiver", parents=[common])
 

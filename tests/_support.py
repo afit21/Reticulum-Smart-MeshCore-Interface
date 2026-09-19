@@ -4,7 +4,8 @@ pytest dependency); pytest runs these too if installed.
 
     python3 -m unittest discover -s tests -v          # everything
     python3 -m unittest tests.test_wire_format -v     # one module
-    SMCI_SKIP_SLOW=1 python3 -m unittest discover -s tests   # unit tests only
+    python3 -m unittest tests.legacy.test_sim_scenarios   # archived simmesh scenarios, explicit only
+    (SMCI_SKIP_SLOW=1 still marks those as skipped; discover no longer collects them)
 
 A "unit" fixture here is a real SmartMeshCoreInterface brought online
 against a one-node simulated mesh (testscripts/simmesh) -- construction

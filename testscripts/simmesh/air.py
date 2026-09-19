@@ -17,8 +17,21 @@ Modeled (all deliberately simple):
     asymmetric links (data gets through, ACKs don't) are reproducible.
   - One seeded `random.Random` shared with the radios, so a fixed --seed
     gives a reproducible run for A/B comparisons.
+  - Listen-before-talk (added 2026-09-20, after the night-session
+    regression work): a node about to transmit while a neighbour it can
+    hear is on air defers, retrying every 120-360ms and forcing the send
+    after 4s -- the firmware's own `Dispatcher::checkSend()`
+    (`_radio->isReceiving()` -> `getCADFailRetryDelay()` =
+    `nextInt(1,4)*120` in Mesh.cpp, `getCADFailMaxDuration()` = 4000ms).
+    Without it the sim had every answering node key its reconcile ANSWER
+    straight over the repeater's relay of its own ACK, a collision real
+    radios never produce, and answer delivery through one repeater sat
+    at 5% regardless of what the interface did. A hidden node (a
+    transmitter the receiver's other neighbour cannot hear) still
+    collides exactly as before -- LBT only sees what the topology says
+    the transmitter hears. `lbt=False` restores the old behaviour.
 
-Not modeled: capture effect, CAD/LBT, RSSI-dependent loss, clock drift.
+Not modeled: capture effect, RSSI-dependent loss, clock drift.
 """
 import asyncio
 import collections
@@ -105,6 +118,7 @@ class AirStats:
     deliveries: collections.Counter = field(default_factory=collections.Counter)
     deaf_drops: collections.Counter = field(default_factory=collections.Counter)
     collision_drops: collections.Counter = field(default_factory=collections.Counter)
+    lbt_defers: collections.Counter = field(default_factory=collections.Counter)
     loss_drops: collections.Counter = field(default_factory=collections.Counter)
     by_type: collections.Counter = field(default_factory=collections.Counter)
 
@@ -112,6 +126,7 @@ class AirStats:
         return (
             f"tx={dict(self.transmissions)} delivered={sum(self.deliveries.values())} "
             f"half_duplex_deaf={sum(self.deaf_drops.values())} collisions={sum(self.collision_drops.values())} "
+            f"lbt_defers={sum(self.lbt_defers.values())} "
             f"lost={sum(self.loss_drops.values())} by_type={dict(self.by_type)}"
         )
 
@@ -121,6 +136,7 @@ class Air:
         self, adjacency: Dict[str, set], seed: Optional[int] = None, loss: float = 0.0,
         link_loss: Optional[Dict[Tuple[str, str], float]] = None, type_loss: Optional[Dict[str, float]] = None,
         airtime_base_ms: float = 50.0, airtime_per_byte_ms: float = 1.0, log: Optional[Callable] = None,
+        lbt: bool = True,
     ):
         self.adjacency: Dict[str, set] = {n: set(nb) for n, nb in adjacency.items()}
         for name, neighbors in list(self.adjacency.items()):
@@ -138,7 +154,13 @@ class Air:
         self.log = log or (lambda msg: None)
         self.stats = AirStats()
 
+        # Listen-before-talk (see the module docstring): firmware constants.
+        self.lbt = lbt
+        self.lbt_retry_min_s, self.lbt_retry_max_s, self.lbt_max_defer_s = 0.12, 0.36, 4.0
         self._busy_until: Dict[str, float] = {name: 0.0 for name in self.adjacency}
+        # One outbound queue per radio: sends from one node go out in the
+        # order issued, one at a time (created lazily on the air's loop).
+        self._tx_locks: Dict[str, asyncio.Lock] = {}
         # Recent (start, end) transmissions per node, for half-duplex and
         # collision checks. Bounded: nothing looks back further than one
         # packet's airtime plus queueing.
@@ -213,18 +235,49 @@ class Air:
         """Thread-safe, fire-and-forget: the firmware's own send is too."""
         self._loop.call_soon_threadsafe(self._loop.create_task, self._transmit(from_name, packet))
 
+    def _neighbor_on_air(self, name: str, at: float) -> Optional[str]:
+        """A neighbour of `name` transmitting at time `at` -- what the
+        firmware's `isReceiving()` sees (a preamble/CAD hit from anyone
+        this radio can hear)."""
+        for other in self.adjacency.get(name, ()):
+            for (s, e) in self._tx_log.get(other, ()):
+                if s <= at < e:
+                    return other
+        return None
+
     async def _transmit(self, from_name: str, packet: SimPacket) -> None:
         airtime = self.airtime_s(packet.size)
+        lock = self._tx_locks.get(from_name)
+        if lock is None:
+            lock = self._tx_locks[from_name] = asyncio.Lock()
         # One radio, one transmission at a time: a send issued while this
         # node is still on air queues behind it (the firmware's outbound
         # queue), it doesn't overlap itself.
-        start = max(time.monotonic(), self._busy_until.get(from_name, 0.0))
-        end = start + airtime
-        self._busy_until[from_name] = end
-        self._tx_log[from_name].append((start, end))
-        delay = start - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
+        async with lock:
+            delay = self._busy_until.get(from_name, 0.0) - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self.lbt:
+                # Listen-before-talk: defer while a neighbour is on air,
+                # the firmware's own retry cadence, forced after 4s.
+                first_busy_at = None
+                while True:
+                    now = time.monotonic()
+                    busy = self._neighbor_on_air(from_name, now)
+                    if busy is None:
+                        break
+                    if first_busy_at is None:
+                        first_busy_at = now
+                    elif now - first_busy_at > self.lbt_max_defer_s:
+                        self.log(f"[AIR] {from_name} CAD busy for {self.lbt_max_defer_s:.0f}s -- forcing {packet.typename} out.")
+                        break
+                    self.stats.lbt_defers[from_name] += 1
+                    self.log(f"[AIR] {from_name} hears {busy} on air -- deferring {packet.typename} (LBT).")
+                    await asyncio.sleep(self.rng.uniform(self.lbt_retry_min_s, self.lbt_retry_max_s))
+            start = time.monotonic()
+            end = start + airtime
+            self._busy_until[from_name] = end
+            self._tx_log[from_name].append((start, end))
         self.stats.transmissions[from_name] += 1
         self.stats.by_type[packet.typename] += 1
         self.log(

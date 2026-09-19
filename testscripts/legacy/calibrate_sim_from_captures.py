@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+LEGACY (archived 2026-09-20, see CLAUDE.md "Legacy simulation tooling"): this
+produced --profile values for the simmesh-based fake_meshcore_repeater_sim.py,
+now superseded by testscripts/meshbench_scenarios.py (real firmware, modelled
+RF). Kept for reading old results.
+
 calibrate_sim_from_captures.py
 
 Reads the interface's own JSONL packet captures from real field tests

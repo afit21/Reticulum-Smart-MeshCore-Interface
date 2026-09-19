@@ -2,6 +2,15 @@
 simmesh -- an in-process simulated MeshCore mesh for exercising
 Interface/SmartMeshCoreInterface.py with no radio hardware.
 
+Role since 2026-09-20 (see CLAUDE.md "Legacy simulation tooling"): the fake
+`meshcore` library and one-process fake firmware that the unit suite under
+tests/ brings a real interface up against in milliseconds. The multi-hop
+air/radio model below is what the archived simulators in testscripts/legacy/
+and tests/legacy/ drove; that fidelity role now belongs to
+testscripts/meshbench_scenarios.py, which runs the interface against real
+MeshCore firmware under MeshBench. Keep the library semantics here faithful
+(the unit tests depend on them); do not extend the air model.
+
 Three layers, each independently reusable:
 
   air.py            The physics: topology (who can hear whom), per-node

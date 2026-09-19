@@ -6,7 +6,7 @@ Milestone 5 field test: bind-frame peer discovery and DIRECT routing/ACK
 between two real, physically-adjacent (zero-hop, no repeater) MeshCore
 radios. Constructs a real SmartMeshCoreInterface directly (bypassing RNS
 Reticulum/Transport, same "talk to the interface" isolation
-testscripts/relay_delivery_test.py and fake_meshcore_repeater_sim.py use)
+testscripts/relay_delivery_test.py and meshbench_scenarios.py use)
 against a real serial-connected radio.
 
 SAFETY: always pass --channel-secret with a private, non-default value

@@ -7,6 +7,270 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Fixed: night-session fixes revised against the simulators and the MeshBench findings (2026-09-20)
+
+Six interface changes, no wire-format change (module docstring entry
+"Review of the night-session fixes against the simulators, plus the
+MeshBench real-firmware findings (2026-09-20)" has the evidence):
+
+- **In-flight cap back on at 2** (`direct_fragmented_max_in_flight` 0 -> 2).
+  Simulated one-hop page transfer, twelve 483-byte Resource parts, three
+  seeds: with the non-dropping, priority-aware cap every part arrived in
+  181-243 s with raw completion 90-100%; with it off, 3-10 of 12 in 600 s.
+  The scenario helper had never built a valid part before this pass (a
+  hard-coded packing overhead of 34 where a LINK packet packs 19), so the
+  earlier numbers quoted for it came from plain-DATA runs.
+- **Quiet window anchored at the QUERY's ACK, 2.0 + 3.0 s x hops, RTT-
+  adaptive upward** (srtt + 2 x rttvar after three samples), only after an
+  ACK, still capped by the answer budget. Measured from the transmit, the
+  first cut covered 19-32% of the one-hop answers that actually arrived.
+- **Raw-fragment gap includes the frame's own airtime** (`(1 + factor x
+  hops) x airtime`, MeshBench finding 2): `send_raw_data` returns when the
+  frame is queued, not when it is off the air.
+- **Completion ANSWER waits out the QUERY's ACK relay** (ACK airtime x
+  (1 + 2.5 x hops), MeshBench finding 3).
+- **SELF_INFO radio block bounded** (SF 5-12, BW 7.8-500 kHz, CR 5-8),
+  refreshed after the interface's own `set_radio`, and a WARNING when one
+  frame's airtime exceeds the whole duty-cycle budget (finding 1).
+- **Small-mesh DIRECT-to-all skips the broadcast spacing** (finding 4).
+
+Verified: fast suite 167 OK, slow in-process scenarios 9/9, simulated page
+transfer on the new defaults (12/12 in 227 s, raw 92%, seed 11), MeshBench
+`relay` PASS 5/8 with the RNS path up in 33 s (was 159 s) and
+`large_payload` PASS 2/6 (was FAIL 1/6) with first raw bursts delivering
+2-4 of 4 fragments instead of 3 of 4 with fragment 1 always lost;
+`zero_hop` 6/8 and `two_hop` 2/8 in the same batch, the latter with no
+DIRECT path resolved because B's advert never crossed two repeaters
+(finding 7, untouched by these changes). Tests:
+`tests/test_meshbench_findings_0920.py`.
+
+### Added: MeshBench real-firmware test tier (2026-09-20)
+
+`testscripts/meshbench_scenarios.py` (first written as `meshbench_relay_test.py`) runs the full stack (real `RNS.Reticulum`
+per node, the interface loaded as `rnsd` loads it, the real `meshcore` library
+over TCP) against [MeshBench](https://meshbench.github.io/), where every
+simulated companion and repeater is the actual MeshCore firmware compiled
+natively and only the radio channel is modelled. Two scenarios: `relay`
+(A - R - B, asserts delivery, a 1-hop resolved path from the firmware's own
+path discovery, and that R relayed on air) and `failover` (A - {R1, R2} - B,
+R1's firmware stopped mid-run, asserts stale-path reset -> rediscovery via
+R2). `rns_multiprocess_sim.py node` gained `--backend real` for this (the
+installed `meshcore` library against a TCP companion endpoint instead of the
+fake over the simmesh air) and now reports the interface's resolved paths per
+probe. Nothing in the interface changed.
+
+MeshBench was installed and the `relay` scenario run the same day (build
+3b56c11 + working tree, 916.575 MHz / 62.5 kHz / SF7 / CR8 on every node,
+A - R - B with A and B 16 km apart and out of each other's reach, checked
+against MeshBench's own event log: 0 direct A<->B receptions). Findings:
+
+- The interface came online against real `companion_radio` v1.17.1 firmware
+  over TCP unchanged, bound its peer over CHANNEL, and resolved a 1-hop
+  DIRECT path from the firmware's own path discovery; probes crossed the real
+  `simple_repeater` (103 relays).
+- A companion's single flood advert at bring-up was lost at the repeater
+  because the repeater was still relaying that node's bind frame ("its own
+  transmitter was keyed"), so the far side never had it as a contact and
+  ignored its path-discovery REQs -- everything fell back to CHANNEL until a
+  re-advert landed. Real companion firmware never re-adverts on its own; the
+  test harness now does, on the sim backend's cadence. Worth knowing for the
+  field: the interface itself never sends an advert.
+- Delivery through the repeater was 2/5 with hop-1 DIRECT attempts ~50%
+  successful on an idealised channel. 62 of ~80 missed receptions were
+  half-duplex collisions at R between the two hidden endpoints, and the
+  colliding frames were mostly the interface's own completion QUERY/ANSWER
+  reconcile traffic plus DIRECT announces and path requests -- the mechanism
+  the 2026-09-19 night-session fix above was aimed at, now reproducible
+  without a repeater in the field.
+- The firmware's `suggested_timeout` at one hop was 4.6 s for small frames
+  and 6.4-10 s for full-size fragments, in line with the field's ~10.6 s.
+
+#### Legacy simulation tooling archived (2026-09-20)
+
+By the user's decision the simmesh-based fidelity tier is legacy:
+`testscripts/fake_meshcore_repeater_sim.py` and
+`calibrate_sim_from_captures.py` moved to `testscripts/legacy/`,
+`tests/test_sim_scenarios.py` to `tests/legacy/` (not a package, so
+`unittest discover` no longer collects it; `SMCI_SKIP_SLOW` is moot), and
+`rns_multiprocess_sim.py`'s `run` orchestrator is marked legacy while its
+`node` subcommand stays as the MeshBench suite's RNS end node. `simmesh`
+itself remains as the unit suite's fake `meshcore`. CLAUDE.md has the
+rationale and the verification order (unit suite -> MeshBench scenario ->
+field test).
+
+#### Scenario suite results (2026-09-20, later the same night)
+
+`meshbench_scenarios.py` grew into eight scenarios (`list` prints them); all
+eight were run, four of them in parallel by subagents, each reading the
+interface's capture against MeshBench's event log. Results, build 3b56c11 +
+working tree, production timing, 916.575/62.5/SF7/CR8 on every node:
+
+| scenario | result | what it showed |
+|---|---|---|
+| zero_hop | PASS 5/5, 0 hops, RNS path 8 s | the bench case; only losses are the two radios' own half-duplex |
+| relay | PASS 5/8, 1 hop, RNS path 159 s | hop-1 DIRECT attempts 42%/43%; 54 of R's misses half-duplex, 21 of them the 39 B QUERY/ANSWER frames |
+| two_hop | PASS 6/8, 2 hops, RNS path 158 s | firmware suggested_timeout 6.7 s for a 40 B QUERY at 2 hops; all 3 completion ANSWERs lost the same way (see below) |
+| repeater_returns | PASS 7/12 | R died after probe 3: stale path reset in 57 s, rediscovered 6 s after R's restart, 5/6 delivered afterwards |
+| failover (cold standby) | PASS 5/10, 1 hop | R1 died after probe 3 and R2 started: stale path reset, 1-hop path rediscovered through a repeater never seen before, probe 5 delivered 78 s after the swap; the original hot-pair layout never brought up (see overlap_default) |
+| large_payload (383 B) | FAIL 1/6 on delivery floor | B received 5/6 probes; fragment 1 of 4 lost at R in 7/7 probes (see below), PROOFs starved on the way back |
+| busy_repeater | FAIL 0/0, RNS path never | C's chatter caused only ~20% of the loss; B's 2-fragment announces never both arrived under A's own request traffic |
+| overlap_default | informational, RNS path never | two repeaters relayed every flood both (23/23), 19 overlapped, the far end lost all 19 |
+
+Interface behaviour the suite surfaced (evidence in the scenario logs; the
+interface itself is unchanged -- these are findings, not fixes):
+
+1. **Bad SELF_INFO radio block disables outbound traffic silently.** A
+   fresh-booted companion reported `radio_bw` as 63 (0.063 kHz after the
+   library's /1000), which the check at `_fetch_own_identity` (`sf >= 5 and
+   bw > 0 and 5 <= cr <= 8`) accepts, so `_estimate_airtime_s` priced a
+   38 B frame at 1160 s and the duty-cycle limiter let one frame out per
+   60 s window -- B sent 2 CHANNEL fragments in 3 minutes and every
+   announce/PATH_RESPONSE queued behind them (`relay --seed 11`). Real
+   Heltecs report sane values, but the failure mode is one absurd
+   parameter -> one frame a minute, unlogged. Proposed: bound the check
+   (5 <= sf <= 12, 7.8 <= bw_khz <= 500), refresh `_radio_params` after the
+   interface's own `set_radio`, and log at WARNING when a single frame's
+   estimate exceeds the whole duty-cycle budget.
+2. **The gap after a raw fragment is timed from the send command, not from
+   the end of the frame's airtime.** `_raw_fragment_gap_s` (2.0 x hops x
+   airtime) starts when `send_raw_data` returns OK, which the firmware gives
+   when the frame is *queued*; the fragment's own ~1.3 s on air eats most of
+   it, so the next fragment or the completion QUERY leaves ~0.9 s after the
+   fragment ends -- inside the repeater's 1.3 s relay of it -- and the
+   repeater, half duplex, loses the new frame. Seen on 7/7 second fragments
+   in large_payload, 7/9 QUERYs in relay, 3/3 second announce fragments in
+   relay, 23 of R's 34 half-duplex misses in repeater_returns. A gap of
+   airtime x (1 + factor x hops), started after the estimated end of the
+   frame, would remove most of the one-hop self-collisions.
+3. **Completion ANSWER leaves exactly as the repeater relays the firmware's
+   ACK for the QUERY.** At two hops all three ANSWERs (`two_hop`) went out
+   the millisecond B's own ACK ended, i.e. as R2 keyed its relay of that
+   ACK, and were lost. A short hold after receiving a routed DIRECT message
+   (~ACK airtime x 2.5 x hops) before the next own transmission would cover
+   it.
+4. **Small-mesh DIRECT-to-all sleeps a CHANNEL-sized spacing it never
+   needs.** `_send_direct_supplement` waits `uniform(5, 10) x hops` seconds
+   before the DIRECT copy of an unknown-destination packet (14-18 s at two
+   hops), spacing meant to clear a CHANNEL broadcast that small-mesh mode
+   does not send; most of probe 6's 51 s RTT in two_hop.
+5. **Startup burst.** REQ, bind frame and (harness) advert leave within
+   0.7 s of coming online; the repeater is still relaying the first when the
+   others arrive, and the first path-discovery attempt was lost to it in
+   every run that had a repeater.
+6. Stale-path resets fired correctly after a dead repeater (57 s) but also
+   as false positives under pure congestion (large_payload: A reset the path
+   to B while B was completing A's packet; B reset after three lost PROOFs).
+7. **RNS bring-up through one repeater is a coin flip at 180 s.** Both
+   MeshCore paths were discovered within ~45 s in every run, but the RNS path
+   (B's PATH_RESPONSE announce, 167 B = two CHANNEL fragments, or a 2-fragment
+   raw DIRECT send once bound) took 53 s, 69 s, 158 s and 159 s in the runs
+   that passed and never arrived within 180 s in three others. Each fragment
+   is ~50% at one hop, both must arrive, A's own path request every 20 s
+   plus its DIRECT supplement is most of what they collide with, and B
+   rate-limits the responses it does get to send (`announce_rate_limited`
+   6-18 per run). The scenario harness now allows 420 s and requests every
+   40 s so bring-up variance does not mask the staged events, but a fresh
+   multi-hop bring-up in the field has the same odds.
+
+MeshBench-side caveats recorded in the script's docstring: `node.start`
+starts every stopped node; per-node filesystems are keyed by node name (the
+script now gives each run its own `MESHBENCH_NODEFS`); engine airtime runs
+1.2-1.45x RadioLib's formula for the configured settings, so absolute
+latencies here are ~30% pessimistic; two repeaters that both hear a source
+both relay it (MeshCore v1.17.1 never cancels a queued relay), so any
+hot-pair layout collides at the endpoints.
+
+### Fixed: raw-fragment DIRECT performance at one hop (2026-09-19 night session)
+
+`fieldtests/raw/Alpha0.1.2/*nighttest*` (build 3b56c11) compared like for
+like at one MeshCore hop with `fieldtests/raw/binaryfieldtest/` (e87cca8):
+reconcile answers that arrived 85% -> 48%, raw sends completing without
+text fallback 8/8 -> 16/20, raw send median duration 28s -> 39s, six
+packets dropped for want of an in-flight slot, and the 12-part page
+transfer cancelled by RNS after 469s. Zero hop stayed at 96-100%. Four
+changes, in order of effect (module docstring entry "Field regression
+fixed (2026-09-19 night session)" has the packet-level evidence):
+
+- **Radio-quiet window after every reconcile QUERY.** The querier's next
+  raw burst started the instant its QUERY was ACKed and met the ANSWER at
+  the repeater (a hidden node: 22 of 24 lost answers were never decoded by
+  the querier's radio). The QUERY now keeps the radio lock until its answer
+  arrives or `direct_completion_quiet_base` (1.5s) +
+  `direct_completion_quiet_per_hop` (2.5s) x hops has passed since its
+  transmit, capped by the answer budget and charged against it; the rest
+  of the wait is still radio-free. Anchored at the transmit, the window has closed before a
+  zero-hop ACK is in, so zero hop is untouched. `direct_attempt_result`
+  records the hold as `quiet_hold_s`.
+- **Raw pauses only after repeated evidence.** One answered-but-incomplete
+  raw send used to pause raw for the peer for 600s (21:45:14: one unlucky
+  fragment sent the next 46 page parts as text). It is a soft strike now;
+  raw pauses at `direct_raw_incomplete_strikes` (2) in a row, a completed
+  raw send clears the count, and `direct_raw_fallback_cooldown` is 120s
+  (was 600). The two-strike "burst delivered nothing" rule and the
+  per-path verdict are unchanged.
+- **The per-peer in-flight cap is off by default** (`direct_fragmented_
+  max_in_flight` 2 -> 0). It did not reduce reconcile timeouts (desktop 53%
+  vs 35% the evening before), fragmented sends waited a median 30s for a
+  slot, and six packets were dropped as `slot_expired` -- two of them data
+  behind two 30-minute LXMF announces holding both slots. When enabled it
+  is now priority-aware (`_PriorityAsyncSemaphore`), announce-class sends
+  get a single slot of their own, and a send whose slot wait times out
+  proceeds with a warning instead of being dropped (`slot_expired` is
+  gone; `slot_wait_s` stays).
+- **Re-burst after unanswered reconciles** (`direct_raw_reburst_after_
+  unanswered`): unchanged at 2. The one simulated seed measured at 1 was
+  no better (see the table), not enough evidence to move a default.
+
+Kept, because they measured well: the hop-aware ACK ceiling, the
+completion-answer caps and hop-aware floor, the v3 completion nonce, the
+plain-PROOF priority tier, `direct_hop1_abort_default` and the per-path raw
+verdict. No wire-format change; a 3b56c11 peer interoperates.
+
+**Simulator fidelity fix found on the way (`testscripts/simmesh/air.py`):
+the air model had no listen-before-talk.** Reproducing the night session
+in the simulator first gave 5% answer delivery at one hop under every
+configuration, including a full radio hold; the air log showed why -- the
+answering node keyed its ANSWER 0.3s after its own firmware ACK, while the
+repeater was still relaying that ACK, and the half-duplex repeater missed
+it every time. Real radios never do that: `Dispatcher::checkSend()` defers
+on `_radio->isReceiving()` (retry `nextInt(1,4)*120` ms, forced after 4s).
+The air now models exactly that (`lbt=True`, `lbt_defers` in its stats);
+a hidden node still collides as before, since LBT only hears what the
+topology says a transmitter can hear. With it in place a single one-hop
+raw packet reconciles cleanly, and the A/B below is against that model.
+
+Simulator A/B (`tests/_support`/`simmesh` harness, A-R-B, twelve 483-byte
+parts sent back to back, seeds 11/21/31, loss 0.06 during the transfer
+and airtime 200ms + 1ms/byte -- the one-hop loss from
+`calibrate_sim_from_captures.py fieldtests/raw/Alpha0.1.2` with the airtime
+base scaled from 605ms so a run takes minutes; FAST_TIMING throughout;
+logic checks, not delivery-rate predictions):
+
+| configuration (seed 11; seed 21 where run)      | answers | raw completion | slot drops | delivered @900s | median delivery |
+|--------------------------------------------------|---------|----------------|------------|-----------------|-----------------|
+| baseline 3b56c11                                 | 41% / 67% | 2/3 / 4/6    | 6 / 5      | 6/12 / 7/12     | 104s / 64s      |
+| all four changes, defaults                       | 63%     | 7/8            | 0          | 8/12            | 68s             |
+| defaults, quiet window off                       | 74% / 58% | 4/4 / 4/4    | 0          | 4/12 / 4/12     | 54s / 66s       |
+| defaults, one-strike 600s pause (old rule)       | 84%     | 7/8            | 0          | 8/12            | 69s             |
+| defaults, cap re-enabled at 2 (priority, no drop)| 80% / 75% | 10/10 / 8/8  | 0          | 10/12 / 8/12    | 66s / 57s       |
+| defaults, re-burst after 1 unanswered            | 61%     | 4/4            | 0          | 4/12            | 105s            |
+
+Read with care: one or two seeds each, and every run used plain DATA parts
+that hit `outgoing_max_age` (120s) partway through -- hence "delivered
+@900s" under 12 everywhere; the scenario now uses Resource-class parts and
+has not been re-run. What the table does support: the baseline reproduces
+the field's shape (answers in the 40s, slot drops, an unfinished page); no
+configuration of the new code drops anything; and the non-dropping cap at
+2 was the strongest configuration in the sim, which argues for a field
+check of the 2 -> 0 default rather than treating it as settled.
+
+Tests: `tests/test_raw_fragments.py::NightSessionFixes` (unit, passing),
+`tests/test_second_audit_0919.py::FragmentedSendsPerPeerAreBounded`
+(updated to the new cap semantics, passing), and `NightSessionScenarios`
+(simulated one-hop page transfer, bidirectional answer-queueing bound,
+three-hop mixed traffic with the cap enabled) -- written, gated behind
+`SMCI_RUN_UNVERIFIED=1` until run to a pass.
+
 ### Fixed: first multi-hop raw-fragment field test (2026-09-19 morning) -- two fixes
 
 Both sides captured (laptop at 2 hops, desktop's path back at 4 hops).

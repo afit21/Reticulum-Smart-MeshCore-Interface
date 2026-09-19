@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+LEGACY (archived 2026-09-20, see CLAUDE.md "Legacy simulation tooling"): the
+simmesh-based fidelity tier this script drives has been superseded by
+testscripts/meshbench_scenarios.py, which runs the same interface against
+real MeshCore firmware under MeshBench. Kept runnable for reading old
+results; do not add scenarios here.
+
 fake_meshcore_repeater_sim.py
 
 Runs real Interface/SmartMeshCoreInterface.py instances against an
@@ -64,7 +70,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # testscripts/, for simmesh
 
 from simmesh import SimMesh, build_rns_packet, wait_until, summarize_capture  # noqa: E402
 from simmesh.air import parse_loss_schedule  # noqa: E402

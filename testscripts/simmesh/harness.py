@@ -1,7 +1,8 @@
 """
 Glue between the simulated mesh and real SmartMeshCoreInterface
-instances, shared by testscripts/fake_meshcore_repeater_sim.py, the
-unit/integration tests under tests/, and rns_multiprocess_sim.py.
+instances, shared by the unit tests under tests/, testscripts/meshbench_scenarios.py
+(capture summaries only) and the archived testscripts/legacy/fake_meshcore_repeater_sim.py
+and rns_multiprocess_sim.py `run` mode.
 
 The interface is loaded from Interface/SmartMeshCoreInterface.py by path
 (no package), constructed directly with a RecordingOwner standing in for
@@ -149,6 +150,7 @@ def build_rns_packet(kind: str, dest_hash: bytes = TEST_DEST_HASH, payload: byte
       link_request  LINKREQUEST / SINGLE   -> handshake priority
       proof         PROOF / SINGLE         -> proof-correlation routing
       lrproof       PROOF, context LRPROOF -> delayed link proof
+      resource      DATA / LINK, context RESOURCE -> a Resource part (never expires)
     """
     kinds = {
         "data": (RNS.Packet.DATA, RNS.Destination.SINGLE, RNS.Packet.NONE),
@@ -159,6 +161,11 @@ def build_rns_packet(kind: str, dest_hash: bytes = TEST_DEST_HASH, payload: byte
         "lrproof": (RNS.Packet.PROOF, RNS.Destination.LINK, RNS.Packet.LRPROOF),
         "path_response": (RNS.Packet.DATA, RNS.Destination.SINGLE, RNS.Packet.PATH_RESPONSE),
         "link_data": (RNS.Packet.DATA, RNS.Destination.LINK, RNS.Packet.NONE),
+        # A Resource data part on a Link (2026-09-20): context RESOURCE, which
+        # the interface exempts from outgoing_max_age (RNS's Resource layer
+        # owns the retry) -- the field's 483-byte page parts are this class,
+        # and a plain "data" stand-in expires after 120s mid-transfer.
+        "resource": (RNS.Packet.DATA, RNS.Destination.LINK, RNS.Packet.RESOURCE),
         "link_close": (RNS.Packet.DATA, RNS.Destination.LINK, RNS.Packet.LINKCLOSE),
     }
     if kind not in kinds:

@@ -26,8 +26,10 @@ plumbing). M1 added the wire format and bare single-fragment CHANNEL/
 DIRECT send/receive. M2 added outgoing fragmentation for a packet too
 large for one CHANNEL message (multi-fragment header shape, shuffled
 fragment order, tiered inter-fragment spacing -- zero-hop/known-N-hop
-tiers implemented and unit-tested, but fed `hop_count=None` for now since
-no live topology data source exists until Milestone 4/5), incoming
+tiers implemented and unit-tested, fed `hop_count=None` at the time since
+no live topology data source existed until Milestone 4/5 -- the DIRECT-
+fragmented sender has passed the resolved path's `out_path_len` since M5,
+while the CHANNEL multi-fragment path still passes `None`), incoming
 reassembly (buffer keying, including the `0x40`/`"~coop"` branch
 cooperative broadcast needs even though nothing sets that bit until
 Milestone 7; bounded capacity with oldest-by-last-progress eviction; an
@@ -210,7 +212,7 @@ supplement pattern":
     CHANNEL fallback on a DIRECT failure (DIRECT is primary once
     resolved, not a supplement); repeated failures feed Milestone 4's
     already-built stale-path detection through a new
-    `_send_direct_and_await_ack` helper that waits for the real
+    `_send_direct_frame_and_wait_for_ack` helper that waits for the real
     firmware ACK (correlated by the `meshcore` library's own
     `expected_ack`/`EventType.ACK` `code`-attribute mechanism -- genuine
     per-request correlation, confirmed against the installed library's
@@ -255,7 +257,7 @@ between two physical MeshCore radios confirmed the entire M5 chain
 working end-to-end: bind-frame peer discovery, `discover_path()`
 resolving in one attempt at `out_path_len=0`, the routing dispatcher
 sending a DATA/SINGLE packet DIRECT, a real firmware ACK correlating
-correctly via `_send_direct_and_await_ack`, and §7's opportunistic
+correctly via `_send_direct_frame_and_wait_for_ack`, and §7's opportunistic
 token/PROOF-correlation learning populating for real off that same
 DIRECT receive.
 
@@ -1623,7 +1625,8 @@ adding a second one):
   a peer that has not advertised the bit still gets text fragments.
 - *Self-disabling fallback.* If a reconcile ANSWER arrives (the text
   path works) but shows the burst delivered nothing, twice, raw is
-  disabled for that peer for `direct_raw_fallback_cooldown` (600s) and
+  disabled for that peer for `direct_raw_fallback_cooldown` (600s then;
+  120s since 2026-09-19 night) and
   the packet is re-sent as text fragments -- the guard for the one
   unverified assumption, that every repeater on the path forwards
   PAYLOAD_TYPE_RAW_CUSTOM (Mesh.cpp forwards DIRECT packets by route type
@@ -2339,8 +2342,9 @@ The fixes:
     Per-peer samples still win when present; else the pool; else the
     default, sized at twice the largest echo seen all session (median 2.0s,
     max 4.0s at 1-3 hops). 0 restores samples-only arming.
- 3. **At most `direct_fragmented_max_in_flight` (2) fragmented sends per
-    peer at once**, the slot held across bursts AND reconcile windows, so
+ 3. **At most `direct_fragmented_max_in_flight` (2 in this build; the
+    default is 0 since the "Field regression fixed (2026-09-19 night
+    session)" entry below) fragmented sends per peer at once**, the slot held across bursts AND reconcile windows, so
     packets to one peer complete roughly in RNS's order; handshake class
     bypasses it; a packet that cannot get a slot within outgoing_max_age is
     dropped even if its class is expiry-exempt (RNS has re-requested it by
@@ -2351,6 +2355,179 @@ The fixes:
     v3 QUERY; both nodes must run this build).
 
 Regression tests: `tests/test_second_audit_0919.py`.
+
+**Field regression fixed (2026-09-19 night session, `fieldtests/raw/
+Alpha0.1.2/*nighttest*`, build 3b56c11 -- the 12-part page at one hop):
+raw-fragment DIRECT performance restored to the e87cca8 shape.** Three
+sessions compared like for like at ONE MeshCore hop, desktop
+(7bd024b5d082) serving the laptop (343377c464a7): `fieldtests/raw/
+binaryfieldtest/` (e87cca8, 2026-09-18 night), `fieldtests/raw/
+postAlpha0.1.1/*eveningtest*` (3c0a836) and `fieldtests/raw/Alpha0.1.2/
+*nighttest*` (3b56c11):
+
+    one hop, desktop -> laptop                    e87cca8      3b56c11
+    reconcile answers sent in-window that arrived  11/13 (85%)  22/46 (48%)
+    raw sends completing without text fallback     8/8          16/20
+    raw send median duration                       28s          39s (74s evening)
+    packets dropped for want of an in-flight slot  0            6
+    12-part page transfer                          done         cancelled by RNS, 469s
+
+Zero hop was 96-100% answer delivery in every build. Root causes, in
+order of effect, and what changed:
+
+ 1. **The radio-free answer wait let the querier key over its own answer
+    at the repeater.** e87cca8 held `_direct_exchange_lock` from the
+    QUERY's transmit through the ANSWER wait; commit 1919074 made the wait
+    radio-free (to stop a node's own ANSWERs queueing 50s behind its
+    waits), which lets the querier's next raw burst start the instant the
+    QUERY is ACKed. Through a repeater the answerer is a hidden node and
+    the collision happens at the repeater: the querier's RX log shows 22 of
+    the night's 24 lost answers were never decoded by its radio at all. At
+    zero hop the firmware's listen-before-talk prevents it, which is why
+    zero hop never moved. Fix: `_send_direct_frame_and_wait_for_ack` takes
+    an optional `quiet_wait` future and `quiet_window_s`; after the ACK and
+    the listen delay it keeps the lock until the future resolves or the
+    window has elapsed since the frame's own MSG_SENT (`asyncio.shield`,
+    so the caller's future survives the timeout; anchored at the real
+    transmit because under concurrent sends the QUERY first waits 5-10s
+    for this very lock, which a deadline fixed earlier would have spent).
+    `_query_remote_fragments` passes its answer future and a window of
+    `direct_completion_quiet_base (1.5) + direct_completion_quiet_per_hop
+    (2.5) x hops`, capped by the answer budget
+    (`_completion_quiet_window_s`) and CHARGED against it; the rest of
+    the budget is waited radio-free (review fix 2026-09-20: the first
+    cut started the budget after the hold, which would have quietly
+    extended the capped answer wait by the hold; the ack-wait method now
+    hands back `quiet_info` so the caller accounts for it and still
+    measures a round trip for an answer that arrived inside the hold). Sizing: query receipt -> ANSWER on air at the
+    answerer is median 1.3s, one repeater forward 1.5-3s. Anchored at the
+    transmit, the window has already closed by the time a zero-hop ACK is
+    in, so zero hop is untouched by construction. The hold is captured as
+    `quiet_hold_s` on `direct_attempt_result`.
+ 2. **One incomplete raw send paused raw for 600s.** The "answered but
+    incomplete after every round" exit paused raw unconditionally: at
+    21:45:14 one part lost the same fragment three rounds running and the
+    next 46 page parts went as five text fragments plus five ACKs each.
+    e87cca8 only paused after two answered reconciles proved a burst
+    delivered nothing. Fix: that exit records a SOFT strike
+    (`_raw_incomplete_strikes`, per peer) and pauses raw only at
+    `direct_raw_incomplete_strikes` (2) consecutive ones; a completed raw
+    send clears the count, as does a path change. `direct_raw_fallback_
+    cooldown` 600 -> 120. The two-strike "delivered nothing" rule, the
+    per-path verdict and the text fallback of the current packet are
+    unchanged.
+ 3. **The per-peer in-flight cap dropped packets and did not help.**
+    `direct_fragmented_max_in_flight` (2, added in 3b56c11) was a FIFO
+    `asyncio.Semaphore` held through every reconcile round: desktop
+    fragmented sends waited a median 30s for a slot, four 483-byte Resource
+    parts were dropped after the 120s slot budget (`slot_expired`), two
+    laptop data packets were dropped while both slots were held by
+    30-minute LXMF announces reconciling at two hops -- and reconcile
+    timeouts did not improve (desktop 53% vs 35% the evening before). Fix:
+    default 2 -> 0 (off). When enabled: `_PriorityAsyncSemaphore` (the
+    counting form of `_PriorityAsyncLock`'s waiter ordering), a separate
+    single slot for announce-class sends (PRIORITY_LOW: ANNOUNCE,
+    PATH_RESPONSE) so they cannot occupy the data slots, and a send whose
+    slot wait times out PROCEEDS with a warning instead of dropping --
+    `slot_expired` no longer exists. `slot_wait_s` stays on
+    `direct_send_result`.
+ 4. **Re-query instead of re-burst** (`direct_raw_reburst_after_
+    unanswered`, 2, commit 8bbb12e): 10 of the night's 59 desktop raw
+    rounds sent no data. To be decided by simulation; NOT changed in this
+    pass -- see the closing note below.
+
+Kept unchanged, because they measured well: the hop-aware ACK ceiling
+(`direct_ack_timeout_base/_per_hop`), the completion-answer caps and
+hop-aware floor (`_completion_query_timeout_s`), the v3 completion nonce,
+the plain-PROOF priority tier, `direct_hop1_abort_default`, and the
+per-path raw verdict (`_note_raw_fallback_outcome`). No CHANNEL fallback
+for DIRECT traffic was added, and the wire format is unchanged (a 3b56c11
+peer interoperates).
+
+Verification status (2026-09-20, the session was asked to wrap up before
+the simulated scenarios had been run to a pass): the unit tests
+(`tests/test_raw_fragments.py::NightSessionFixes`,
+`tests/test_second_audit_0919.py::FragmentedSendsPerPeerAreBounded`) pass;
+the simulated scenarios (`NightSessionScenarios` in test_raw_fragments.py:
+one-hop 12-part page, bidirectional answer-queueing bound, three-hop
+mixed traffic with the cap on) are written but gated behind
+`SMCI_RUN_UNVERIFIED=1` until someone has run them. Two simulator
+findings from the partial A/B, recorded in `changelog.md`: the air model
+lacked the firmware's listen-before-talk (added, `simmesh/air.py`), and
+the scenario's parts must be Resource class or `outgoing_max_age` expires
+them mid-transfer. Seed-11 numbers on the corrected air model, plain DATA
+parts: baseline 3b56c11 answered 41% with 6 slot drops and 6/12 delivered
+at 900s; all four changes at defaults 63%, no drops, 8/12; the same with
+the (now non-dropping) cap re-enabled at 2: 80%, 10/12 -- the cap did
+BETTER in the sim than in the field, so the 2 -> 0 default deserves a
+field check rather than being taken as settled. Change 4's re-burst
+default stays at 2: the single seed measured for 1 (61% answered, 4/12
+delivered vs 63% and 8/12 at 2) is not enough to move it.
+
+**Review of the night-session fixes against the simulators, plus the MeshBench
+real-firmware findings (2026-09-20).** Two sources of evidence: the simulated
+one-hop page transfer (`tests/test_raw_fragments.py::NightSessionScenarios`
+and its helpers, twelve 483-byte Resource parts through one repeater,
+calibrated loss, three seeds -- whose helper had never built a valid part
+until this pass, so every earlier number quoted for it came from plain-DATA
+runs that expired mid-transfer), and `testscripts/meshbench_scenarios.py`
+against real MeshCore v1.17.1 firmware (changelog, "MeshBench real-firmware
+test tier"). Six changes, none to the wire format:
+
+ 1. **The in-flight cap is back on at 2** (`direct_fragmented_max_in_flight`
+    0 -> 2). In the simulated page transfer the non-dropping, priority-
+    aware cap was the single most effective change: 12/12 parts in 181-243s
+    with raw completion 90-100% on every seed, against 3-10 of 12 in 600s
+    with the cap off. What the night session held against the cap (dropped
+    parts, announces starving data) is exactly what the rewrite removed.
+ 2. **The reconcile quiet window is anchored at the QUERY's ACK, sized
+    2.0 + 3.0 x hops, and grows with the measured round trip** (srtt + 2 x
+    rttvar once three samples exist), still capped by the answer budget and
+    only held after an ACK. The first cut measured 1.5 + 2.5 x hops from
+    the transmit, which the ACK's own round trip consumed: in the field
+    captures answers reached the querier (from the ACK) at one hop p50
+    3.7-4.5s and p90 9-11s, so that window covered 19-32% of the answers
+    that arrived, and in the simulated transfer a 9s window beat it on every
+    seed. In MeshBench the hold now releases ~0.7s after the ACK when the
+    answer is coming and runs its 5s when it is not.
+ 3. **The raw-fragment gap includes the frame's own airtime** through
+    repeaters: `(1 + direct_raw_hop_gap_factor x hops) x airtime`. MeshBench
+    finding 2: `send_raw_data` returns OK when the frame is queued, so the
+    old gap of `factor x hops x airtime` had the fragment's ~1.3s on air
+    eaten out of it and the next fragment or QUERY left ~0.9s after the
+    frame ended, inside the repeater's relay -- 7/7 second fragments lost at
+    R in `large_payload`, 7/9 QUERYs in `relay`. After: first bursts deliver
+    2-4 of 4 fragments per packet instead of 3 of 4 with fragment 1 always
+    missing, and `large_payload` delivered 2/6 round trips (was 1/6).
+ 4. **A completion ANSWER waits out the QUERY's ACK relay** before it
+    leaves (`_completion_answer_hold_s`: ACK airtime x (1 + 2.5 x hops),
+    zero at zero hop). MeshBench finding 3: the firmware ACKs the QUERY at
+    once and the repeater relays that ACK; the ANSWER used to go out the
+    millisecond the ACK's airtime ended and all three two-hop ANSWERs in
+    `two_hop` were lost that way.
+ 5. **The SELF_INFO radio block is bounded** (`_parse_radio_params`: SF
+    5-12, BW 7.8-500 kHz, CR 5-8), refreshed after the interface's own
+    `set_radio`, and a single frame whose airtime estimate exceeds the whole
+    duty-cycle budget is logged at WARNING once. MeshBench finding 1: a
+    fresh-booted companion reported bw as 0.063 kHz, the old check accepted
+    it, a 38-byte frame was priced at 1160s and the node sent one frame per
+    minute with nothing in the log.
+ 6. **Small-mesh DIRECT-to-all no longer sleeps the CHANNEL spacing.**
+    `_send_direct_supplement` takes `alongside_broadcast`; the hop-scaled
+    5-10s x hops gap exists to clear a broadcast of the same packet, which
+    `_send_direct_to_all_peers` never sends (MeshBench finding 4: most of
+    one two-hop probe's 51s round trip).
+
+Verification: fast suite 167 tests, the slow in-process scenarios 9/9, the
+simulated page transfer on the new defaults (seed 11: 12/12 in 227s, raw
+completion 92%), and MeshBench `relay` PASS 5/8 (RNS path in 33s, was 159s),
+`large_payload` PASS 2/6 (was FAIL 1/6), `zero_hop` 6/8 and `two_hop` 2/8
+with no DIRECT path ever resolved because B's advert never survived two
+repeaters -- the bring-up coin flip of MeshBench finding 7, on code paths
+none of these changes touch. Tests: `tests/test_meshbench_findings_0920.py`,
+and the updated gap, cap-default and quiet-window cases. Still open from the
+MeshBench report: the startup burst (finding 5), stale-path resets under
+pure congestion (6), and the bring-up odds through repeaters (7).
 
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
@@ -2385,9 +2562,9 @@ notes):
      method must be used somewhere else in this file, or a user setting it
      gets no error and no effect -- the exact bug class
      (`firmware_text_limit` parsed, documented, and never read) this
-     project already hit once. `tests/test_smart_meshcore_interface_config.py`
-     enforces this with a static AST scan, mirroring
-     `tests/test_config_usage.py`'s pattern for the old implementation.
+     project already hit once. No automated check enforces this: the AST
+     scan this entry once cited (`tests/test_smart_meshcore_interface_
+     config.py`) was never committed. Verify by hand when adding a key.
 """
 
 import asyncio
@@ -2756,6 +2933,92 @@ class _PriorityLockContext:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._lock.release()
+
+
+class _PriorityAsyncSemaphore:
+    """The counting variant of `_PriorityAsyncLock` (field fix, 2026-09-19
+    night): `capacity` holders at once, and when it is full the waiters
+    are served highest priority (lowest integer) first, FIFO within a
+    tier -- exactly the waiter ordering the radio lock uses, instead of
+    `asyncio.Semaphore`'s strict FIFO.
+
+    Why: the per-peer in-flight cap on fragmented sends
+    (`direct_fragmented_max_in_flight`, second audit 2026-09-19 evening)
+    was a plain `asyncio.Semaphore`. In the night session
+    (`fieldtests/raw/Alpha0.1.2/*nighttest*`) that FIFO ignored priority
+    and was held across every reconcile round: the desktop's fragmented
+    sends waited a median 30s for a slot, and two of the laptop's data
+    packets were dropped while both of its slots were held by two
+    30-minute LXMF announces reconciling at two hops. With this class a
+    data packet arriving behind two queued announces is granted the next
+    slot before them; and announce-class sends get a slot of their own
+    (see `_fragmented_send_slot`), so they cannot occupy the data slots at
+    all.
+
+    Same cancellation contract as `_PriorityAsyncLock`: a waiter cancelled
+    before it is granted just leaves the queue; one cancelled in the
+    instant after being granted passes the permit on. `locked()` reports
+    whether a new acquire would have to wait."""
+
+    def __init__(self, capacity: int):
+        self._capacity = max(1, int(capacity))
+        self._holders = 0
+        self._waiters: "dict[int, collections.deque]" = {}
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def locked(self) -> bool:
+        return self._holders >= self._capacity
+
+    def holders(self) -> int:
+        return self._holders
+
+    def waiting(self) -> int:
+        return sum(len(dq) for dq in self._waiters.values())
+
+    async def acquire(self, priority: int) -> None:
+        if self._holders < self._capacity and not self._waiters:
+            self._holders += 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.setdefault(priority, collections.deque()).append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            dq = self._waiters.get(priority)
+            if dq is not None and fut in dq:
+                dq.remove(fut)
+                if not dq:
+                    del self._waiters[priority]
+            elif fut.done() and not fut.cancelled():
+                # Granted in the same instant we were cancelled: the permit
+                # counted for us already -- hand it on, or free it.
+                if not self._wake_next():
+                    self._holders -= 1
+            raise
+
+    def release(self) -> None:
+        if self._holders <= 0:
+            raise RuntimeError("_PriorityAsyncSemaphore released too many times")
+        # The permit passes straight to the next waiter (holders unchanged)
+        # or is freed when nobody is waiting.
+        if not self._wake_next():
+            self._holders -= 1
+
+    def _wake_next(self) -> bool:
+        for tier in sorted(self._waiters.keys()):
+            dq = self._waiters[tier]
+            while dq:
+                fut = dq.popleft()
+                if not fut.done():
+                    fut.set_result(None)
+                    if not dq:
+                        del self._waiters[tier]
+                    return True
+            del self._waiters[tier]
+        return False
 
 
 class _DutyCycleLimiter:
@@ -3422,6 +3685,8 @@ class SmartMeshCoreInterface(Interface):
         # peer_prefix -> asyncio.Semaphore bounding how many fragmented
         # sends (raw or text) to that peer may be in flight at once; see
         # direct_fragmented_max_in_flight. Created lazily on the loop.
+        # Keyed (peer_prefix, "data"|"announce") since 2026-09-19 night --
+        # see _fragmented_send_slot.
         self._fragmented_send_slots = {}
         # Step 2: the currently open per-attempt RX-log correlation window
         # (None when no DIRECT attempt is in flight). Opened/closed by
@@ -3596,6 +3861,12 @@ class SmartMeshCoreInterface(Interface):
         # until which raw is disabled for that peer (fallback to text), and
         # receive-side counters for the [STATS] line.
         self._raw_disabled_until = {}
+        # Field fix (2026-09-19 night): peer_prefix -> consecutive raw sends
+        # that were answered-but-incomplete after every round. The pause
+        # above is set only once this reaches direct_raw_incomplete_strikes;
+        # a raw send that completes resets it. See _send_direct_raw_
+        # fragmented's closing block for the 21:45:14 incident.
+        self._raw_incomplete_strikes = {}
         # Per-PATH verdicts (user's design, 2026-09-18 night): out_path_hex
         # -> {"since", "peer"} for a repeater chain that provably drops
         # raw packets (Z85 text got through where raw did not), and the
@@ -3729,8 +4000,8 @@ class SmartMeshCoreInterface(Interface):
 
     # -------------------------------------------------------------------
     # Config loading (design invariant #3: every value read here must be
-    # used somewhere else in this file -- see
-    # tests/test_smart_meshcore_interface_config.py)
+    # used somewhere else in this file -- no automated check exists,
+    # verify by hand when adding a key)
     # -------------------------------------------------------------------
 
     def _configure_identity(self, cfg):
@@ -3930,11 +4201,11 @@ class SmartMeshCoreInterface(Interface):
 
     def _configure_fragmentation(self, cfg):
         # Inter-fragment spacing tiers (docs/reliability_engine_design.md
-        # §2). The zero-hop and known-N-hop tiers are wired into
-        # _fragment_spacing_range() and unit-tested, but this milestone
-        # has no live hop-count data source yet (Milestone 4/5's path
-        # discovery/peer-topology work) -- every real send today resolves
-        # to the flat unknown-multi-hop range below.
+        # §2), selected by _fragment_spacing_range(). The DIRECT-fragmented
+        # sender passes the resolved path's out_path_len (zero-hop or
+        # known-N-hop tier); the CHANNEL multi-fragment path passes None and
+        # gets the flat unknown-multi-hop range below, since a broadcast has
+        # no single audience depth.
         self.fragment_delay_min_s = float(cfg.get("fragment_delay_min", 5.0))
         self.fragment_delay_max_s = float(cfg.get("fragment_delay_max", 10.0))
         self.fragment_delay_zero_hop_min_s = float(cfg.get("fragment_delay_zero_hop_min", 0.5))
@@ -4045,6 +4316,37 @@ class SmartMeshCoreInterface(Interface):
         self.direct_completion_check_timeout_per_hop_s = float(
             cfg.get("direct_completion_check_timeout_per_hop", 2.5)
         )
+        # Field fix (2026-09-19 night): the RADIO-QUIET WINDOW a reconcile
+        # QUERY keeps the radio lock for after its own firmware ACK, so this
+        # node is not keying while the ANSWER it just asked for crosses the
+        # repeater chain (see _query_remote_fragments and _send_direct_frame_
+        # and_wait_for_ack's quiet_wait block). The deadline is
+        # `base + per_hop x hops` after the QUERY's own transmit (its
+        # MSG_SENT moment, so a lock wait before it does not eat the window),
+        # capped by the answer budget itself. Sizing, from `fieldtests/raw/
+        # Alpha0.1.2/*nighttest*`: query receipt -> ANSWER on air at the
+        # answerer is median 1.3s, and one repeater forward is 1.5-3s per hop
+        # (the session's own rx-log echo gap: median 1.75s, p90 2.72s).
+        # Anchoring at the transmit rather than at the ACK is what keeps zero
+        # hop all but untouched: 1.5s is about the zero-hop ACK latency
+        # itself (1.45s median), so the hold there is a few hundred
+        # milliseconds, and zero hop measured 96-100% answer delivery in every
+        # build with no quiet window at all. 0 for both keys disables the
+        # window and restores the fully radio-free answer wait (commit
+        # 1919074).
+        # Review (2026-09-20): the window is now measured from the QUERY's
+        # firmware ACK, not its transmit, and sized 2.0 + 3.0 x hops. Measured
+        # in the night and evening captures, answers reached the querier
+        # (from the QUERY's ACK) at one hop p50 3.7-4.5s, p90 9-11s; the first
+        # cut (1.5 + 2.5 x hops from the transmit, i.e. ~1s after a one-hop
+        # ACK) covered only 19-32% of the answers that actually arrived and
+        # the simulated one-hop page transfer showed a 9s window beating it on
+        # every seed (12/12 parts vs 6-9/12). When three query round trips
+        # have been measured for the peer, the window grows to srtt + 2 x
+        # rttvar if that is larger, so a slow chain gets the quiet it needs
+        # without a config change; the answer budget still caps it.
+        self.direct_completion_quiet_base_s = float(cfg.get("direct_completion_quiet_base", 2.0))
+        self.direct_completion_quiet_per_hop_s = float(cfg.get("direct_completion_quiet_per_hop", 3.0))
 
         # Step 3 of "lessen our reliance on arbitrary wait times"
         # (2026-09-18, see module docstring): send-once-then-reconcile for
@@ -4109,9 +4411,31 @@ class SmartMeshCoreInterface(Interface):
         # minutes. Two slots keeps the pipeline full (one packet's fragments
         # can go while the other waits on its answer) without the fan-out.
         # 0 disables the cap. Handshake-class sends bypass it.
+        #
+        # Field fix (2026-09-19 night, `fieldtests/raw/Alpha0.1.2/*nighttest*`):
+        # default 2 -> 0 (off). The first session with the cap on measured
+        # against its own purpose: reconcile timeouts did NOT improve
+        # (desktop 53% timed out vs 35% the evening before), while the cap
+        # cost plenty -- the desktop's fragmented sends waited a median 30s
+        # for a slot, four 483-byte Resource parts were dropped after the
+        # 120s slot budget ("slot_expired"), and two of the laptop's data
+        # packets were dropped while both its slots were held by 30-minute
+        # LXMF announces reconciling at two hops. The half-duplex loss the
+        # cap was meant to reduce is addressed at its actual location now
+        # (the reconcile QUERY's quiet window, direct_completion_quiet_*).
+        # When enabled, the slot is priority-aware, announce-class sends
+        # get a slot of their own, and a send that cannot get a slot in time
+        # proceeds with a warning instead of being dropped -- see
+        # _fragmented_send_slot / _PriorityAsyncSemaphore.
+        # Review (2026-09-20, simulated one-hop page A/B, seeds 11/21/31, 12 x
+        # 483-byte Resource parts, calibrated loss): with the drop removed and
+        # the slots priority-aware, the cap is the single most effective
+        # change in the set -- every part delivered in 181-243s with raw
+        # completion 90-100%, against 3-10 of 12 parts in 600s with the cap
+        # off. The night session's objections (dropped parts, announces
+        # starving data) are what the rewrite removed, so the default is 2
+        # again; the field check the night entry asked for is still owed.
         self.direct_fragmented_max_in_flight = int(cfg.get("direct_fragmented_max_in_flight", 2))
-        # Second audit (2026-09-19 evening session): how many fragmented
-        # sends (raw or text, each
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
@@ -4153,7 +4477,28 @@ class SmartMeshCoreInterface(Interface):
         # unsupported_ttl` and the peer's pause is lifted; a new path is
         # always tried raw-first again (user's design, 2026-09-18 night).
         self.direct_raw_fallback_strikes = int(cfg.get("direct_raw_fallback_strikes", 2))
-        self.direct_raw_fallback_cooldown_s = float(cfg.get("direct_raw_fallback_cooldown", 600.0))
+        # Field fix (2026-09-19 night, `fieldtests/raw/Alpha0.1.2/*nighttest*`):
+        # 600 -> 120. At 21:45:14 ONE raw send lost the same fragment three
+        # rounds running and the pause that followed sent the next 46 page
+        # parts as five Z85 text fragments plus five ACKs each, for ten
+        # minutes -- on a path that had just carried 16 of 20 raw sends to
+        # completion. The pause is a hedge against a chain that does not
+        # carry raw at all (the strike rule above proves that case within
+        # two answered reconciles); a lossy-but-working chain only needs a
+        # short breather before raw is worth trying again.
+        self.direct_raw_fallback_cooldown_s = float(cfg.get("direct_raw_fallback_cooldown", 120.0))
+        # Field fix (2026-09-19 night): how many CONSECUTIVE raw sends may end
+        # answered-but-incomplete (the receiver held part of the packet after
+        # every round, the text path took the rest) before raw is paused for
+        # the cooldown. The e87cca8 build -- 8 of 8 raw sends completing at
+        # one hop, 85% answer delivery -- only ever paused on the strike rule
+        # above; the unconditional pause after a single incomplete send
+        # (review, 2026-09-19) is what turned one unlucky fragment into ten
+        # minutes of text. A completed raw send clears the count. 1 restores
+        # the pause-on-first-incomplete behaviour; 0 never pauses on
+        # incomplete sends (the two-strike "delivered nothing" rule and the
+        # per-path verdict are unaffected either way).
+        self.direct_raw_incomplete_strikes = int(cfg.get("direct_raw_incomplete_strikes", 2))
         self.direct_raw_path_unsupported_ttl_s = float(cfg.get("direct_raw_path_unsupported_ttl", 86400.0))
 
         # Field-diagnosed (2026-09-18 drive-home capture, see module
@@ -4190,7 +4535,9 @@ class SmartMeshCoreInterface(Interface):
         # this is dropped instead of sent -- 17 LXMF pings queued through
         # a 4-minute outage drained as a stale burst the moment the path
         # came back. ANNOUNCE is exempt (idempotent, and RNS won't re-send
-        # one soon). 0 disables. Default matches reassembly_idle_timeout.
+        # one soon). 0 disables. (The default matched reassembly_idle_timeout's
+        # 120s when added; that timeout is 200s since 2026-09-19 and the two
+        # are independent.)
         # Refined the same evening (page-load capture, see module
         # docstring): the decision is made ONCE, before a packet's first
         # transmission -- never between fragments or attempts, where a drop
@@ -4225,10 +4572,10 @@ class SmartMeshCoreInterface(Interface):
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
         self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 1.8))
 
-        # Stale cached-DIRECT-path detection (§8) -- not yet wired into an
-        # actual DIRECT send path (Milestone 5+ adds the routing decisions
-        # that call record_direct_send_result() for real); the mechanism
-        # and its config surface exist now, unit-tested directly.
+        # Stale cached-DIRECT-path detection (§8). Built and unit-tested in
+        # Milestone 4; since Milestone 5 every live DIRECT send path feeds it
+        # through record_direct_send_result() (_send_direct_with_attempts,
+        # the raw sender's reconcile-query evidence, _send_direct_supplement).
         self.direct_path_reset_threshold = int(cfg.get("direct_path_reset_threshold", 3))
         self.direct_path_reset_rssi_floor = float(cfg.get("direct_path_reset_rssi_floor", -105.0))
         self.direct_path_reset_patience_multiplier = float(
@@ -4951,6 +5298,7 @@ class SmartMeshCoreInterface(Interface):
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
+        quiet_hold_s: Optional[float] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -5066,6 +5414,11 @@ class SmartMeshCoreInterface(Interface):
             # User-requested (2026-09-18 evening): handshake-class frames
             # skip the duty-cycle wait (airtime still charged).
             "duty_cycle_exempt": duty_cycle_exempt,
+            # Field fix (2026-09-19 night): how long this attempt kept the
+            # radio lock AFTER its listen delay waiting for the answer it
+            # asked for -- the hidden-node quiet window, non-null only on a
+            # reconcile QUERY. See _send_direct_frame_and_wait_for_ack.
+            "quiet_hold_s": round(quiet_hold_s, 3) if quiet_hold_s is not None else None,
         })
 
     def _capture_channel_fragment_sent(
@@ -5139,7 +5492,10 @@ class SmartMeshCoreInterface(Interface):
             "method": method,
             "fallback_from_raw": fallback_from_raw,
             # Second audit (2026-09-19 evening): how long this fragmented
-            # send waited for one of direct_fragmented_max_in_flight slots.
+            # send waited for one of direct_fragmented_max_in_flight slots
+            # (None when the cap is off -- the default since 2026-09-19
+            # night; a send that timed out waiting still goes, so this can
+            # equal the whole slot budget).
             "slot_wait_s": round(slot_wait_s, 3) if slot_wait_s is not None else None,
         })
 
@@ -5312,6 +5668,18 @@ class SmartMeshCoreInterface(Interface):
         if not self.duty_cycle_enabled or self.duty_cycle_estimate_bitrate <= 0:
             return 0.0
         estimated_s = self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes)
+        budget_s = self.duty_cycle_window_s * self.duty_cycle_max_fraction
+        if estimated_s > budget_s and not getattr(self, "_duty_cycle_overrun_warned", False):
+            # MeshBench finding 1 (2026-09-20): one absurd radio parameter
+            # turned into one frame per window with nothing in the log.
+            self._duty_cycle_overrun_warned = True
+            RNS.log(
+                f"{self}: a single {len(frame)}-char frame is estimated at {estimated_s:.0f}s of airtime, "
+                f"more than the whole duty-cycle budget ({budget_s:.0f}s per {self.duty_cycle_window_s:.0f}s window) "
+                f"-- radio params {self._radio_params!r}; outbound traffic will crawl at one frame per window "
+                f"until the radio block is sane.",
+                RNS.LOG_WARNING,
+            )
         if exempt:
             # Link-maintenance traffic: charged, never delayed.
             self._duty_cycle.record(estimated_s)
@@ -5609,17 +5977,38 @@ class SmartMeshCoreInterface(Interface):
             self._own_node_name = info.get("name", "")
             node_key = info.get("public_key", "")
             self._own_pubkey_hex = node_key.lower()
-            try:
-                sf, bw, cr = int(info.get("radio_sf", 0)), float(info.get("radio_bw", 0)), int(info.get("radio_cr", 0))
-                if sf >= 5 and bw > 0 and 5 <= cr <= 8:
-                    self._radio_params = (sf, bw, cr)
-            except (TypeError, ValueError):
-                pass
+            params = self._parse_radio_params(info)
+            if params is not None:
+                self._radio_params = params
+            elif any(k in info for k in ("radio_sf", "radio_bw", "radio_cr")):
+                RNS.log(
+                    f"{self}: SELF_INFO radio block is implausible (sf={info.get('radio_sf')!r} "
+                    f"bw={info.get('radio_bw')!r}kHz cr={info.get('radio_cr')!r}) -- ignoring it; airtime "
+                    f"estimates fall back to duty_cycle_estimate_bitrate until a sane block arrives.",
+                    RNS.LOG_WARNING,
+                )
             RNS.log(
                 f"{self}: node identity '{self._own_node_name}' "
                 f"key={node_key[:16]}...",
                 RNS.LOG_INFO,
             )
+
+    @staticmethod
+    def _parse_radio_params(info: dict) -> "Optional[tuple]":
+        """The radio's (sf, bw_khz, cr) from a SELF_INFO payload, or None
+        when the block is missing or implausible. MeshBench finding 1
+        (2026-09-20): a fresh-booted companion once reported bw as 0.063 kHz,
+        which the old check (`sf >= 5 and bw > 0`) accepted; the LoRa model
+        then priced a 38-byte frame at 1160s and the duty-cycle limiter let
+        one frame out per minute, unlogged. LoRa bounds: SF 5-12, BW 7.8-500
+        kHz, CR 5-8."""
+        try:
+            sf, bw, cr = int(info.get("radio_sf", 0)), float(info.get("radio_bw", 0)), int(info.get("radio_cr", 0))
+        except (TypeError, ValueError):
+            return None
+        if 5 <= sf <= 12 and 7.8 <= bw <= 500.0 and 5 <= cr <= 8:
+            return (sf, bw, cr)
+        return None
 
     async def _async_setup(self):
         self._command_lock_impl = asyncio.Lock()
@@ -5663,6 +6052,13 @@ class SmartMeshCoreInterface(Interface):
                     f"bw={self.radio_bw}kHz sf={self.radio_sf} cr={self.radio_cr}).",
                     RNS.LOG_INFO,
                 )
+                # MeshBench finding 1 (2026-09-20): the airtime model must
+                # follow the override, not the pre-override SELF_INFO block.
+                params = self._parse_radio_params(
+                    {"radio_sf": self.radio_sf, "radio_bw": self.radio_bw, "radio_cr": self.radio_cr}
+                )
+                if params is not None:
+                    self._radio_params = params
             except Exception as exc:
                 RNS.log(
                     f"{self}: radio override failed: {exc} -- continuing "
@@ -6287,6 +6683,7 @@ class SmartMeshCoreInterface(Interface):
         self._last_firmware_ack_timeout_s.pop(peer_prefix, None)
         self._query_rtt.pop(peer_prefix, None)
         self._raw_disabled_until.pop(peer_prefix, None)
+        self._raw_incomplete_strikes.pop(peer_prefix, None)
         self._direct_path_recent_success.pop(peer_prefix, None)
         for k in [k for k in self._raw_fallback_pending if k[0] == peer_prefix]:
             self._raw_fallback_pending.pop(k, None)
@@ -6336,9 +6733,10 @@ class SmartMeshCoreInterface(Interface):
         flat fallback. For a mixed *all-known* audience, the caller is
         responsible for resolving that to a single `hop_count` first, by
         the maximum hop count present (§2's mixed-known-hop rule) --
-        this method only implements per-value tier selection, since
-        Milestone 2 has no audience/topology concept yet to do that
-        resolution against (every real call today passes `None`)."""
+        this method only implements per-value tier selection. Callers
+        today: the DIRECT-fragmented sender passes the resolved path's
+        `out_path_len`; the CHANNEL multi-fragment path passes `None`,
+        since a broadcast has no single audience depth."""
         if hop_count == 0:
             return (self.fragment_delay_zero_hop_min_s, self.fragment_delay_zero_hop_max_s)
         if hop_count is not None and hop_count >= 1:
@@ -6807,6 +7205,7 @@ class SmartMeshCoreInterface(Interface):
             task = self._spawn_background_task(
                 self._send_direct_supplement(
                     data, peer_prefix, trigger_discovery=True, priority=priority, expires_at=expires_at,
+                    alongside_broadcast=False,
                 )
             )
             tasks.append(task)
@@ -7594,6 +7993,7 @@ class SmartMeshCoreInterface(Interface):
     async def _send_direct_supplement(
         self, data: bytes, peer_prefix: str, trigger_discovery: bool = False,
         priority: int = PRIORITY_NORMAL, expires_at: Optional[float] = None,
+        alongside_broadcast: bool = True,
     ) -> bool:
         """A DIRECT copy of `data` to one bound peer, fired alongside a
         mandatory broadcast this method never gates or is gated by (see
@@ -7635,8 +8035,14 @@ class SmartMeshCoreInterface(Interface):
         # half-duplex-deaf-repeater collision risk this supplement would
         # otherwise recreate against the broadcast's own fragment(s) if
         # fired with zero spacing.
-        spacing_min, spacing_max = self._fragment_spacing_range(hop_count=resolved.out_path_len)
-        await asyncio.sleep(random.uniform(spacing_min, spacing_max))
+        # MeshBench finding 4 (2026-09-20): the spacing exists to clear the
+        # broadcast this copy rides alongside. Small-mesh DIRECT-to-all sends
+        # no broadcast (see _send_direct_to_all_peers), yet paid 5-10s x hops
+        # here -- most of one two-hop probe's 51s round trip -- so that caller
+        # passes alongside_broadcast=False and skips it.
+        spacing_s = self._supplement_spacing_s(resolved.out_path_len, alongside_broadcast)
+        if spacing_s > 0:
+            await asyncio.sleep(spacing_s)
         if self.detached or not self.online:
             return False
         if self._expired(expires_at):
@@ -7690,6 +8096,16 @@ class SmartMeshCoreInterface(Interface):
             )
             return False
         return True
+
+    def _supplement_spacing_s(self, hop_count: Optional[int], alongside_broadcast: bool) -> float:
+        """The pre-send spacing for one DIRECT supplement: the design's
+        hop-scaled inter-message gap when a broadcast of the same packet is
+        on air alongside it, nothing otherwise (MeshBench finding 4,
+        2026-09-20)."""
+        if not alongside_broadcast:
+            return 0.0
+        spacing_min, spacing_max = self._fragment_spacing_range(hop_count=hop_count)
+        return random.uniform(spacing_min, spacing_max)
 
     async def _send_direct_packet(
         self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str,
@@ -7826,13 +8242,21 @@ class SmartMeshCoreInterface(Interface):
         # -- see that option's comment for the three measured costs of the
         # unbounded fan-out. The slot is held for the WHOLE send (bursts and
         # reconcile windows alike), so packets to one peer complete roughly
-        # in the order RNS handed them over. A packet that cannot get a slot
-        # within outgoing_max_age is dropped here even when its class is
-        # exempt from expiry (Resource parts): RNS's own part timer is far
-        # shorter than that, so it has re-requested the part already and a
-        # late copy would only be discarded as out-of-window on arrival.
+        # in the order RNS handed them over.
+        #
+        # Field fix (2026-09-19 night, `fieldtests/raw/Alpha0.1.2/*nighttest*`):
+        # OFF by default now (see the option's comment for why the cap did
+        # not achieve its purpose), and when enabled the slot is priority-
+        # aware (`_PriorityAsyncSemaphore`), announce-class sends have a slot
+        # of their own, and a send that cannot get a slot within its budget
+        # PROCEEDS with a warning instead of being dropped. The night session
+        # dropped four 483-byte Resource parts and two of the laptop's data
+        # packets this way (method="slot_expired") -- a drop the receiver
+        # then had to notice and re-request through RNS, which is strictly
+        # slower than sending late. The slot is a pacing hint, not a gate.
         slot = self._fragmented_send_slot(peer_prefix, priority)
         slot_wait_s = 0.0
+        slot_held = False
         if slot is not None:
             wait_started = time.monotonic()
             slot_budget_s = max(0.0, min(
@@ -7840,22 +8264,19 @@ class SmartMeshCoreInterface(Interface):
                 (expires_at - wait_started) if expires_at is not None else self.outgoing_max_age_s,
             ))
             try:
-                await asyncio.wait_for(slot.acquire(), timeout=slot_budget_s)
+                await asyncio.wait_for(slot.acquire(priority), timeout=slot_budget_s)
+                slot_held = True
             except asyncio.TimeoutError:
-                self._outgoing_dropped_total += 1
-                send_info["method"] = "slot_expired"
-                send_info["slot_wait_s"] = round(time.monotonic() - wait_started, 3)
                 RNS.log(
-                    f"{self}: dropping fragmented DIRECT send to {peer_prefix!r} ({len(data)} bytes) -- "
-                    f"waited {slot_budget_s:.0f}s for one of {self.direct_fragmented_max_in_flight} "
-                    f"in-flight slots without getting one (outgoing_max_age); RNS will re-request "
-                    f"the data if it still wants it.",
+                    f"{self}: fragmented DIRECT send to {peer_prefix!r} ({len(data)} bytes) waited "
+                    f"{slot_budget_s:.0f}s for one of {slot.capacity} in-flight slot(s) without getting one "
+                    f"({slot.holders()} held, {slot.waiting()} still queued) -- sending anyway rather than "
+                    f"dropping it (field fix 2026-09-19 night).",
                     RNS.LOG_WARNING,
                 )
-                return False
             slot_wait_s = time.monotonic() - wait_started
             send_info["slot_wait_s"] = round(slot_wait_s, 3)
-            if slot_wait_s > 1.0:
+            if slot_wait_s > 1.0 and slot_held:
                 self._debug(
                     f"fragmented DIRECT send to {peer_prefix!r} waited {slot_wait_s:.1f}s for an "
                     f"in-flight slot (direct_fragmented_max_in_flight={self.direct_fragmented_max_in_flight})."
@@ -7866,20 +8287,34 @@ class SmartMeshCoreInterface(Interface):
                 expires_at=expires_at, send_info=send_info,
             )
         finally:
-            if slot is not None:
+            if slot_held:
                 slot.release()
 
-    def _fragmented_send_slot(self, peer_prefix: str, priority: int) -> "Optional[asyncio.Semaphore]":
+    def _fragmented_send_slot(self, peer_prefix: str, priority: int) -> "Optional[_PriorityAsyncSemaphore]":
         """The per-peer semaphore bounding concurrent fragmented sends, or
         None when the cap is off or the send is handshake class (a Link
         handshake never waits behind bulk transfers). Created lazily so it
-        binds to the interface's own event loop."""
+        binds to the interface's own event loop.
+
+        Field fix (2026-09-19 night): two semaphores per peer, not one.
+        Announce-class sends (`PRIORITY_LOW`: ANNOUNCE, PATH_RESPONSE --
+        see `_priority_tier`) share a single-permit slot of their own, so
+        a 30-minute LXMF announce reconciling at two hops can never occupy
+        a data slot: in the night capture both of the laptop's data slots
+        were held by exactly such announces when two data packets were
+        dropped. Everything else shares the `direct_fragmented_max_in_
+        flight` data slots, served by priority (`_PriorityAsyncSemaphore`)
+        rather than arrival order."""
         if self.direct_fragmented_max_in_flight <= 0 or priority == self.PRIORITY_HANDSHAKE:
             return None
-        slot = self._fragmented_send_slots.get(peer_prefix)
-        if slot is None:
-            slot = asyncio.Semaphore(self.direct_fragmented_max_in_flight)
-            self._fragmented_send_slots[peer_prefix] = slot
+        if priority == self.PRIORITY_LOW:
+            key, capacity = (peer_prefix, "announce"), 1
+        else:
+            key, capacity = (peer_prefix, "data"), self.direct_fragmented_max_in_flight
+        slot = self._fragmented_send_slots.get(key)
+        if slot is None or slot.capacity != capacity:
+            slot = _PriorityAsyncSemaphore(capacity)
+            self._fragmented_send_slots[key] = slot
         return slot
 
     async def _send_direct_fragmented_payload(
@@ -7971,7 +8406,15 @@ class SmartMeshCoreInterface(Interface):
         raw field test passed with."""
         if hops <= 0:
             return max(0.0, self.direct_raw_zero_hop_gap_s)
-        return max(0.0, self.direct_raw_hop_gap_factor * hops * self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes))
+        # MeshBench finding 2 (2026-09-20, real firmware): the gap starts when
+        # send_raw_data returns OK, which the firmware gives when the frame is
+        # QUEUED, so the fragment's own airtime was eaten out of the gap and
+        # the next fragment (or the QUERY) left ~0.9s after the frame ended,
+        # inside the repeater's relay of it -- 7/7 second fragments lost at R
+        # in large_payload, 7/9 QUERYs in relay. The frame's own airtime is
+        # now added on top of the hop-scaled term.
+        airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
+        return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
 
     def _record_query_path_evidence(self, peer_prefix: str, infos: "list[dict]", answered: bool = False) -> None:
         """One raw reconcile round's QUERY sends, as stale-path evidence
@@ -8183,6 +8626,9 @@ class SmartMeshCoreInterface(Interface):
             if all(acked):
                 self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
                 self._resumable_sends.pop(resume_key, None)
+                # Field fix (2026-09-19 night): a completed raw send is the
+                # evidence that clears the soft incomplete-strike count.
+                self._raw_incomplete_strikes.pop(peer_prefix, None)
                 return True
             if sum(acked) <= held_before and burst_this_round:
                 # A strike needs a burst that provably delivered nothing; a
@@ -8235,11 +8681,30 @@ class SmartMeshCoreInterface(Interface):
         # and raw made progress, it just did not finish under this loss.
         # Not a path failure and not a verdict on the chain -- hand the packet
         # to the Z85 text path (per-fragment ACKs, finishing budget) rather
-        # than drop it, and pause raw for this peer for the cooldown so the
-        # next packets under the same loss go straight to text instead of
-        # each spending three raw rounds first (review, 2026-09-19). The
-        # receiver's raw bucket is remembered for resume.
-        self._raw_disabled_until[peer_prefix] = time.monotonic() + self.direct_raw_fallback_cooldown_s
+        # than drop it. The receiver's raw bucket is remembered for resume.
+        #
+        # Field fix (2026-09-19 night): this used to pause raw for the peer
+        # unconditionally, so the next packets under the same loss would go
+        # straight to text instead of each spending three raw rounds first
+        # (review, 2026-09-19). The night capture (`fieldtests/raw/Alpha0.1.2/
+        # desktop_afipc_20260919T212602_nighttest.jsonl`) shows the cost: at
+        # 21:45:14 one part lost the same fragment three rounds running,
+        # and the 600s pause that followed carried the next 46 page parts as
+        # five text fragments plus five ACKs each -- on a path where 16 of
+        # the session's 20 raw sends had completed. One incomplete send is
+        # one unlucky fragment, not evidence about the chain: the e87cca8
+        # build (8 of 8 raw sends complete at one hop) only ever paused on
+        # the two-strike "delivered nothing" rule above. So this is now a
+        # SOFT strike, and raw pauses only when `direct_raw_incomplete_
+        # strikes` (2) consecutive raw sends to this peer end this way; a
+        # completed raw send clears the count (a path change clears it too,
+        # via _clear_peer_path_stats).
+        strikes = self._raw_incomplete_strikes.get(peer_prefix, 0) + 1
+        self._raw_incomplete_strikes[peer_prefix] = strikes
+        pause_raw = 0 < self.direct_raw_incomplete_strikes <= strikes
+        if pause_raw:
+            self._raw_disabled_until[peer_prefix] = time.monotonic() + self.direct_raw_fallback_cooldown_s
+            self._raw_incomplete_strikes.pop(peer_prefix, None)
         # Review (2026-09-19): the chain verdict is about the whole send, not
         # the strike sequence -- if raw delivered nothing in any round while
         # the text-path reconcile was answered at least once, this is the
@@ -8251,7 +8716,10 @@ class SmartMeshCoreInterface(Interface):
             f"{self}: RAW fragmented send pkt_id={pkt_id} to {peer_prefix!r} incomplete after {rounds} round(s) "
             f"(receiver holds {sum(acked)}/{frag_total}) -- re-sending as Z85 text"
             + ("; nothing arrived raw, so a successful text send notes the path." if not any(acked) else ".")
-            ,
+            + (f" Raw paused for this peer for {self.direct_raw_fallback_cooldown_s:.0f}s "
+               f"({strikes} consecutive incomplete raw send(s))." if pause_raw
+               else f" Incomplete-send strike {strikes} of {self.direct_raw_incomplete_strikes} -- "
+                    f"the next packet still goes raw-first."),
             RNS.LOG_WARNING,
         )
         return None
@@ -8596,6 +9064,35 @@ class SmartMeshCoreInterface(Interface):
             timeout_s += self.rx_log_hold_max_s
         return min(max(timeout_s, floor_s), cap_s)
 
+    def _completion_quiet_window_s(self, hop_count: Optional[int], timeout_s: float,
+                                   peer_prefix: Optional[str] = None) -> Optional[float]:
+        """How long after a reconcile QUERY's firmware ACK the radio-quiet
+        window lasts (field fix 2026-09-19 night; re-anchored at the ACK and
+        made RTT-adaptive 2026-09-20, see `direct_completion_quiet_base_s`):
+        `base + per_hop x hops` (or the measured round trip's srtt + 2 x
+        rttvar when larger), never more than
+        `timeout_s` (the answer budget -- the window can only move time
+        that was being spent waiting anyway). None when the window is
+        disabled (both keys 0), so the answer wait is fully radio-free as
+        it was in commit 1919074. `_send_direct_frame_and_wait_for_ack`
+        anchors it at the frame's MSG_SENT moment."""
+        if self.direct_completion_quiet_base_s <= 0 and self.direct_completion_quiet_per_hop_s <= 0:
+            return None
+        if hop_count is None and peer_prefix is not None:
+            # Same fallback as _completion_query_timeout_cap_s: the peer's
+            # resolved path knows the hop count when the caller did not.
+            resolved = self._resolved_paths.get(peer_prefix)
+            hop_count = resolved.out_path_len if resolved is not None else 0
+        hops = max(0, hop_count if hop_count is not None else 0)
+        window_s = self.direct_completion_quiet_base_s + self.direct_completion_quiet_per_hop_s * hops
+        # Review (2026-09-20): adaptive upward from the measured QUERY -> ANSWER
+        # round trip (itself measured from the QUERY's ACK, the same anchor
+        # this window uses) once three samples exist; the budget still caps it.
+        qs = self._query_rtt.get(peer_prefix) if peer_prefix else None
+        if qs is not None and qs.get("samples", 0) >= 3:
+            window_s = max(window_s, qs["srtt"] + 2.0 * qs["rttvar"])
+        return max(0.0, min(timeout_s, window_s))
+
     async def _query_remote_fragments(
         self, target: str, peer_prefix: str, pkt_id: int, frag_total: int, stage: str,
         priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
@@ -8611,9 +9108,13 @@ class SmartMeshCoreInterface(Interface):
 
         The QUERY is sent as one ordinary ACKed DIRECT exchange (lock held
         through its transmit and firmware ACK by `_send_direct_frame_and_
-        wait_for_ack`), and the ANSWER is then awaited with the radio free
-        -- see the comment at that call site for why holding the lock
-        through the answer wait was reverted. `priority` is the enclosing
+        wait_for_ack`), the lock is then kept for a short hop-scaled
+        radio-quiet window (`direct_completion_quiet_base` + `..._per_hop`
+        x hops after the transmit -- field fix 2026-09-19 night, the
+        hidden-node collision at the repeater), and the rest of the ANSWER
+        budget is awaited with the radio free -- see the comment at that
+        call site for why holding the lock through the WHOLE answer wait
+        was reverted. `priority` is the enclosing
         send's own tier (the reconcile stage sits inside a fragmented send
         whose receiver-side clock is already running; queueing it behind
         every ordinary send at PRIORITY_LOW defeated its purpose), and the
@@ -8647,6 +9148,21 @@ class SmartMeshCoreInterface(Interface):
             # review's shape) blocked this node's own ANSWERs to the peer's
             # queries for up to 50s under bidirectional traffic.
             sent_at = time.monotonic()
+            # Field fix (2026-09-19 night): the first seconds of that answer
+            # wait are NOT radio-free any more. `_send_direct_frame_and_wait_
+            # for_ack` keeps the lock past its own listen delay until this
+            # query's answer future resolves or this deadline passes -- the
+            # span in which the ANSWER is actually crossing the repeater
+            # chain, where the querier's own next burst would collide with it
+            # at the repeater (a hidden node from both ends). See
+            # `direct_completion_quiet_base_s` for the measured sizing and
+            # the module docstring's 2026-09-19 night entry for the answer-
+            # delivery numbers that motivated it. Anchored at the QUERY's own
+            # transmit (inside the ack-wait method, after any lock wait) and
+            # never longer than the answer budget itself, so this can only
+            # ever move time that was already being spent waiting.
+            quiet_window_s = self._completion_quiet_window_s(hop_count, timeout_s, peer_prefix)
+            quiet_info: dict = {}
             try:
                 # 2026-09-19: the QUERY rides PRIORITY_ANSWER (unless the
                 # enclosing send is a handshake, which is higher still) --
@@ -8667,6 +9183,7 @@ class SmartMeshCoreInterface(Interface):
                     target, frame, query_nonce & 0x03, peer_prefix=peer_prefix,
                     priority=min(priority, self.PRIORITY_ANSWER),
                     time_critical=True, kind="completion_query", hop_count=hop_count,
+                    quiet_wait=fut, quiet_window_s=quiet_window_s, quiet_info=quiet_info,
                 )
                 # Field fix (2026-09-19 morning): the QUERY's own firmware
                 # ACK outcome, for the caller's stale-path evidence
@@ -8697,28 +9214,42 @@ class SmartMeshCoreInterface(Interface):
             # of those cost a full re-drive of fragments the receiver already
             # held (or, on the raw path, a false fallback strike).
             answer_wait_start = time.monotonic()
-            remaining = timeout_s
+            # Field fix (2026-09-19 night; review fix 2026-09-20): the quiet
+            # hold already spent part of this budget with the radio held --
+            # it is charged here, so the window moves waiting time rather
+            # than adding to it (the evening session's evidence is that a
+            # longer budget marks bad conditions, it does not repair them).
+            # The round trip is measured from the QUERY's ACK either way: for
+            # an answer that arrived inside the hold, from the timestamps
+            # the ack-wait method handed back; otherwise from here (which
+            # is the same point, since the hold ended before this line).
+            quiet_hold_s = float(quiet_info.get("hold_s", 0.0) or 0.0)
+            remaining = max(0.0, timeout_s - quiet_hold_s)
+            rtt_origin = quiet_info.get("ack_done_at", answer_wait_start)
             try:
                 got: _CompletionFrame = await asyncio.wait_for(fut, timeout=remaining)
                 answer = got
                 outcome = "answered"
-                # Measured from the same point the budget starts, so the
-                # estimator models the peer's reply latency rather than this
-                # node's own queueing (which would inflate every later
-                # timeout and hold the radio longer on failures).
-                self._record_query_rtt(peer_prefix, time.monotonic() - answer_wait_start)
+                # Measured from the QUERY's ACK, so the estimator models the
+                # peer's reply latency rather than this node's own queueing
+                # (which would inflate every later timeout and hold the
+                # radio longer on failures).
+                answered_at = quiet_info.get("answered_at") or time.monotonic()
+                self._record_query_rtt(peer_prefix, answered_at - rtt_origin)
                 self._debug(
                     f"completion ANSWER ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
                     f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
-                    f"after {time.monotonic() - answer_wait_start:.1f}s "
-                    f"({time.monotonic() - sent_at:.1f}s including the QUERY's own send)."
+                    f"after {answered_at - rtt_origin:.1f}s from its ACK "
+                    f"({quiet_hold_s:.1f}s of it inside the quiet hold; "
+                    f"{time.monotonic() - sent_at:.1f}s including the QUERY's own send)."
                 )
                 return got
             except asyncio.TimeoutError:
                 outcome = "timeout"
                 self._debug(
                     f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
-                    f"no answer within {timeout_s:.1f}s -- no information, proceeding as if unanswered."
+                    f"no answer within {timeout_s:.1f}s ({quiet_hold_s:.1f}s of it as the quiet hold) -- "
+                    f"no information, proceeding as if unanswered."
                 )
                 return None
         finally:
@@ -9227,6 +9758,9 @@ class SmartMeshCoreInterface(Interface):
         pass_number: Optional[int] = None,  # capture-only, see _capture_direct_attempt_result's docstring
         kind: Optional[str] = None,  # capture-only: None for an "R" frame, "completion_answer" for a "Q" ANSWER (2026-09-18 review)
         expires_at: Optional[float] = None,  # outgoing_max_age deadline (2026-09-18 evening), see _expired
+        quiet_wait: "Optional[asyncio.Future]" = None,  # field fix 2026-09-19 night, see the quiet-window block below
+        quiet_window_s: Optional[float] = None,  # seconds after this frame's own transmit (MSG_SENT) the hold may last
+        quiet_info: Optional[dict] = None,  # out-param: "hold_s", "ack_done_at", "answered_at" (see the quiet-window block)
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -9342,6 +9876,7 @@ class SmartMeshCoreInterface(Interface):
                 ack_latency_s = None
                 send_cmd_latency_s = None
                 hop1_abort_deadline_s = None
+                ack_done_at = None
                 rx_window = self._open_rx_log_window(target)
                 try:
                     sent = await self._send_direct_frame(
@@ -9357,6 +9892,7 @@ class SmartMeshCoreInterface(Interface):
                      ack_latency_s, hop1_abort_deadline_s) = await self._await_direct_ack(
                         sent, peer_prefix, hop_count, rx_window, ack_wait_start,
                     )
+                    ack_done_at = time.monotonic()
                 except Exception as exc:
                     send_exc = exc
                     ok, waited_full_timeout, ack_timeout_s = False, False, None
@@ -9399,6 +9935,75 @@ class SmartMeshCoreInterface(Interface):
                 if listen_delay_s > 0:
                     await asyncio.sleep(listen_delay_s)
 
+                # Field fix (2026-09-19 night, `fieldtests/raw/Alpha0.1.2/
+                # *nighttest*` vs `fieldtests/raw/binaryfieldtest/`): an
+                # optional RADIO-QUIET WINDOW, held after the listen delay
+                # and still under _direct_exchange_lock, until `quiet_wait`
+                # resolves or `quiet_window_s` has elapsed since this frame's
+                # MSG_SENT. Only the reconcile
+                # QUERY uses it (see _query_remote_fragments): at one hop the
+                # answering node is a hidden node, so the querier starting
+                # its next raw burst the instant the QUERY is ACKed collides
+                # with the ANSWER *at the repeater*, where neither radio's
+                # listen-before-talk can see it. The night session lost 24
+                # answers at one hop; the querier's own RX log shows 22 of
+                # them were never decoded by its radio at all. Answer
+                # delivery fell from 85% (e87cca8, which held the lock
+                # through the whole answer wait) to 48% once commit 1919074
+                # made that wait radio-free. This window is the narrow part
+                # of that hold -- the seconds the answer is actually in the
+                # chain -- and the rest of the budget is still waited with
+                # the radio free, so a node's own ANSWERs cannot queue 50s
+                # behind its waits the way the full hold made them.
+                # asyncio.shield keeps the caller's future alive when this
+                # wait_for times out: the answer may still arrive during the
+                # radio-free remainder, and cancelling it here would discard
+                # it. The window is measured from THIS frame's own transmit
+                # (`ack_wait_start`, the MSG_SENT moment) rather than from
+                # when the caller decided to send: under concurrent sends the
+                # QUERY can wait 5-10s for this very lock first (the diagnostic
+                # sim run showed exactly that), and a deadline fixed before
+                # that wait would be spent before the frame ever left. Zero
+                # hop is deliberately all but unaffected -- 1.5s from the
+                # transmit is about the zero-hop ACK latency itself (1.45s
+                # median in the night captures), so the hold there is a few
+                # hundred milliseconds at most, and the firmware's own LBT
+                # covers that case anyway (zero hop measured 96-100% answer
+                # delivery in every build).
+                # `quiet_info` (review fix, 2026-09-20) hands the caller what
+                # it needs to keep its own accounting honest: the hold is
+                # charged against the caller's answer budget (otherwise the
+                # window would silently EXTEND the budget the field evidence
+                # capped), and an answer that arrives inside the hold still
+                # gets a round-trip sample measured from the ACK, as one
+                # arriving after it would.
+                quiet_hold_s = None
+                # Review (2026-09-20): anchored at the ACK, and only after an
+                # ACK -- a QUERY whose ACK never came has no answer worth
+                # holding the radio for (its answer budget still runs radio-
+                # free), and anchoring at the transmit spent the whole window
+                # on the ACK's own round trip (see direct_completion_quiet_base_s).
+                if (quiet_wait is not None and quiet_window_s is not None and send_exc is None
+                        and ok and ack_done_at is not None):
+                    if quiet_info is not None:
+                        quiet_info["ack_done_at"] = ack_done_at
+                    quiet_remaining_s = ack_done_at + quiet_window_s - time.monotonic()
+                    if quiet_remaining_s > 0:
+                        quiet_started = time.monotonic()
+                        try:
+                            await asyncio.wait_for(asyncio.shield(quiet_wait), timeout=quiet_remaining_s)
+                            if quiet_info is not None:
+                                quiet_info["answered_at"] = time.monotonic()
+                        except asyncio.TimeoutError:
+                            pass
+                        except Exception:
+                            # The awaited future failing is the caller's
+                            # business, not this radio hold's.
+                            pass
+                        quiet_hold_s = time.monotonic() - quiet_started
+                    if quiet_info is not None:
+                        quiet_info["hold_s"] = quiet_hold_s or 0.0
+
                 self._debug(
                     f"DIRECT attempt={attempt} to {peer_prefix!r} "
                     f"(pkt_id={pkt_id} frag_idx={frag_idx}/{frag_total}): ok={ok} "
@@ -9409,7 +10014,8 @@ class SmartMeshCoreInterface(Interface):
                     f"rx_window: echo={rx_window['echo_seen_s']} ack_on_air={rx_window['ack_seen_on_air_s']} "
                     f"path_reply={rx_window['path_reply_seen_s']} foreign={rx_window['foreign_rx_count']} "
                     f"miss_diagnosis={miss_diagnosis} medium_busy_remaining={medium_busy_remaining_s:.2f}s "
-                    f"medium_hold_wait={gate_telemetry.get('medium_hold_wait_s')}"
+                    f"medium_hold_wait={gate_telemetry.get('medium_hold_wait_s')} "
+                    f"quiet_hold={quiet_hold_s if quiet_hold_s is None else round(quiet_hold_s, 2)}"
                     + (f" (local send exception: {send_exc})" if send_exc is not None else "") + "."
                 )
                 self._capture_direct_attempt_result(
@@ -9424,6 +10030,7 @@ class SmartMeshCoreInterface(Interface):
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
                     kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
+                    quiet_hold_s=quiet_hold_s,
                 )
                 if send_exc is not None:
                     # Listened out the quiet window above first, same as any
@@ -10716,10 +11323,9 @@ class SmartMeshCoreInterface(Interface):
         else:
             out_path_len = contact.get("out_path_len", 0) if isinstance(contact, dict) else 0
             hops = 1 if out_path_len is None or out_path_len < 0 else int(out_path_len)
-        if hops > 0:
-            gap_s = self._raw_fragment_gap_s(hops, on_air_bytes=8 + hops)
-            if gap_s > 0:
-                await asyncio.sleep(gap_s)
+        gap_s = self._completion_answer_hold_s(hops)
+        if gap_s > 0:
+            await asyncio.sleep(gap_s)
         try:
             ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                 target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
@@ -10735,6 +11341,21 @@ class SmartMeshCoreInterface(Interface):
                 f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) failed "
                 f"locally: {exc}."
             )
+
+    def _completion_answer_hold_s(self, hops: int) -> float:
+        """Quiet time before a completion ANSWER leaves, through repeaters
+        (MeshBench finding 3, 2026-09-20, real firmware): the firmware ACKs
+        the QUERY the instant it arrives, and every repeater in the chain
+        then relays that ACK; the ANSWER used to go out the millisecond the
+        ACK's own airtime ended, exactly as the first repeater keyed its
+        relay of it, and all three two-hop ANSWERs in `two_hop` were lost
+        that way. The ACK's airtime x (1 + 2.5 x hops) covers the relay
+        chain including the repeaters' random forward delay (0 to 1.5
+        airtimes each). Zero hop: no relay, no hold."""
+        if hops <= 0:
+            return 0.0
+        ack_airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=12)
+        return max(0.0, ack_airtime_s * (1.0 + 2.5 * hops))
 
     async def _peer_ttl_sweep_loop(self) -> None:
         """§6: a peer (and any RNS-token bindings linked to it, §7) is

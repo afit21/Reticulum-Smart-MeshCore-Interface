@@ -10,6 +10,7 @@ flag on, so their bind frames advertise the capability) over the
 simulated mesh, including loss on the raw packet type and the text
 fallback when raw frames never arrive.
 """
+import asyncio
 import os
 import time
 import unittest
@@ -186,10 +187,13 @@ class RawGapAndPathEvidence(SingleNodeCase):
         airtime_small = iface._estimate_tx_airtime_s("", on_air_bytes=70)
         self.assertGreater(airtime_big, airtime_small)
         self.assertEqual(iface._raw_fragment_gap_s(0, 175), iface.direct_raw_zero_hop_gap_s)
-        # one hop: exactly the pre-fix gap the 2026-09-18 field test passed with
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(1, 175), iface.direct_raw_hop_gap_factor * airtime_big)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(4, 175), 4 * iface.direct_raw_hop_gap_factor * airtime_big)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(2, 70), 2 * iface.direct_raw_hop_gap_factor * airtime_small)
+        # MeshBench finding 2 (2026-09-20): the frame's own airtime is on top of
+        # the hop-scaled term, because the gap starts when the firmware has
+        # only QUEUED the frame.
+        f = iface.direct_raw_hop_gap_factor
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(1, 175), (1 + f) * airtime_big)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(4, 175), (1 + 4 * f) * airtime_big)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(2, 70), (1 + 2 * f) * airtime_small)
         self.assertLess(iface._raw_fragment_gap_s(2, 70), iface._raw_fragment_gap_s(2, 175))
 
     def test_query_round_outcomes_feed_the_stale_path_counter(self):
@@ -220,6 +224,374 @@ class RawGapAndPathEvidence(SingleNodeCase):
             self.assertNotIn(peer, iface._direct_path_failures)
         finally:
             iface._direct_path_failures.pop(peer, None)
+
+
+class NightSessionFixes(SingleNodeCase):
+    """Field fixes from the 2026-09-19 night session (`fieldtests/raw/
+    Alpha0.1.2/*nighttest*`, build 3b56c11) compared like-for-like at one
+    hop with e87cca8 (`fieldtests/raw/binaryfieldtest/`): reconcile answers
+    that arrived fell from 11 of 13 (85%) to 22 of 46 (48%), raw sends
+    completing without text fallback from 8 of 8 to 16 of 20, raw send
+    median duration rose from 28s to 39s, and a 12-part page transfer was
+    cancelled by RNS after 469s. Zero hop stayed at 96-100%.
+
+    Change 1: the reconcile QUERY keeps the radio lock for a short
+    hop-scaled quiet window after its ACK, so the querier is not keying
+    while the ANSWER crosses the repeater (a hidden node: 22 of the 24
+    lost answers were never decoded by the querier's radio at all).
+    Change 2: one incomplete raw send is a soft strike, not a 600s pause.
+    Change 3: the in-flight cap is off by default and cannot drop.
+    """
+
+    PEER = "abcdef012345"
+
+    def setUp(self):
+        iface = self.iface
+        self._saved = {k: getattr(iface, k) for k in (
+            "direct_completion_quiet_base_s", "direct_completion_quiet_per_hop_s",
+            "direct_post_send_listen_success_min_s", "direct_post_send_listen_success_max_s",
+            "direct_raw_incomplete_strikes", "direct_raw_zero_hop_gap_s", "direct_raw_fragments_enabled",
+            "_send_direct_frame", "_await_direct_ack", "_send_raw_fragment", "_query_remote_fragments",
+            "_capture_direct_attempt_result", "_raw_path_reset_mid_send",
+        )}
+        iface._raw_incomplete_strikes.clear()
+        iface._raw_disabled_until.clear()
+
+    def tearDown(self):
+        iface = self.iface
+        for k, v in self._saved.items():
+            setattr(iface, k, v)
+        iface._raw_incomplete_strikes.clear()
+        iface._raw_disabled_until.clear()
+        iface._peers.pop(self.PEER, None)
+        iface._resolved_paths.pop(self.PEER, None)
+
+    # --- Change 1: the quiet window -------------------------------------
+
+    def test_quiet_window_scales_with_hops_and_is_clamped_to_the_answer_budget(self):
+        iface = self.iface
+        iface.direct_completion_quiet_base_s = 1.5
+        iface.direct_completion_quiet_per_hop_s = 2.5
+        self.assertAlmostEqual(iface._completion_quiet_window_s(0, 15.0), 1.5)
+        self.assertAlmostEqual(iface._completion_quiet_window_s(1, 15.0), 4.0)
+        self.assertAlmostEqual(iface._completion_quiet_window_s(2, 15.0), 6.5)
+        self.assertAlmostEqual(iface._completion_quiet_window_s(None, 15.0), 1.5, "unknown hops = zero-hop window")
+        # never longer than the answer budget itself
+        self.assertAlmostEqual(iface._completion_quiet_window_s(3, 5.0), 5.0)
+        self.assertAlmostEqual(iface._completion_quiet_window_s(10, 15.0), 15.0)
+        # both keys 0 -> no window at all (the fully radio-free wait of commit 1919074)
+        iface.direct_completion_quiet_base_s = 0.0
+        iface.direct_completion_quiet_per_hop_s = 0.0
+        self.assertIsNone(iface._completion_quiet_window_s(2, 15.0))
+        iface.direct_completion_quiet_per_hop_s = 2.5
+        self.assertAlmostEqual(iface._completion_quiet_window_s(0, 15.0), 0.0, "per-hop only: nothing at zero hop")
+        self.assertAlmostEqual(iface._completion_quiet_window_s(2, 15.0), 5.0)
+
+    def _stub_ack_path(self):
+        """Make _send_direct_frame_and_wait_for_ack run without a radio:
+        the send 'succeeds' at once and the ACK arrives instantly."""
+        iface = self.iface
+        captured = []
+
+        async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False):
+            return {}
+
+        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start):
+            await asyncio.sleep(0.05)      # a (short) ACK latency, so the window is measured from MSG_SENT
+            return True, False, 1.0, "test", 0.05, None
+
+        def fake_capture(*args, **kwargs):
+            captured.append(kwargs)
+
+        iface._send_direct_frame = fake_send
+        iface._await_direct_ack = fake_ack
+        iface._capture_direct_attempt_result = fake_capture
+        iface.direct_post_send_listen_success_min_s = 0.0
+        iface.direct_post_send_listen_success_max_s = 0.0
+        return captured
+
+    def test_lock_is_held_through_the_quiet_window_then_released(self):
+        iface = self.iface
+        captured = self._stub_ack_path()
+
+        async def drive():
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            started = time.monotonic()
+            sender = asyncio.ensure_future(iface._send_direct_frame_and_wait_for_ack(
+                "ab" * 32, "Qx", 0, peer_prefix=self.PEER, hop_count=1, kind="completion_query",
+                quiet_wait=fut, quiet_window_s=0.6,
+            ))
+            await asyncio.sleep(0.05)
+            # A second contender for the radio cannot get it until the window ends.
+            contender_started = time.monotonic()
+            async with iface._direct_exchange_lock(iface.PRIORITY_HANDSHAKE):
+                got_lock_after = time.monotonic() - contender_started
+            ok, _ = await sender
+            return ok, got_lock_after, time.monotonic() - started, fut
+
+        ok, got_lock_after, total, fut = self.node.run_on_loop(drive(), timeout=10.0)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(got_lock_after, 0.45, "the lock must stay held for the whole window")
+        self.assertLess(total, 1.5)
+        self.assertFalse(fut.cancelled(), "asyncio.shield: the caller's answer future must survive the window timeout")
+        self.assertFalse(fut.done())
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0]["quiet_hold_s"])
+        self.assertGreaterEqual(captured[0]["quiet_hold_s"], 0.45)
+        fut.cancel()
+
+    def test_window_is_measured_from_the_transmit_not_from_the_lock_wait(self):
+        """Diagnostic sim run: QUERYs waited 5-10s for the radio lock under
+        concurrent sends. A window fixed before that wait would be spent
+        before the frame left; it must start at the frame's own MSG_SENT."""
+        iface = self.iface
+        captured = self._stub_ack_path()
+
+        async def drive():
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            async with iface._direct_exchange_lock(iface.PRIORITY_NORMAL):
+                sender = asyncio.ensure_future(iface._send_direct_frame_and_wait_for_ack(
+                    "ab" * 32, "Qx", 0, peer_prefix=self.PEER, hop_count=1, kind="completion_query",
+                    quiet_wait=fut, quiet_window_s=0.5,
+                ))
+                await asyncio.sleep(0.7)       # longer than the whole window: the QUERY is still queued
+            released_at = time.monotonic()
+            ok, _ = await sender
+            fut.cancel()
+            return ok, time.monotonic() - released_at
+
+        ok, after_release = self.node.run_on_loop(drive(), timeout=10.0)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(captured[0]["quiet_hold_s"], 0.35, "the window must survive a lock wait longer than itself")
+        self.assertGreaterEqual(after_release, 0.4)
+
+    def test_lock_is_released_early_when_the_answer_arrives(self):
+        iface = self.iface
+        captured = self._stub_ack_path()
+
+        async def drive():
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            started = time.monotonic()
+            sender = asyncio.ensure_future(iface._send_direct_frame_and_wait_for_ack(
+                "ab" * 32, "Qx", 0, peer_prefix=self.PEER, hop_count=2, kind="completion_query",
+                quiet_wait=fut, quiet_window_s=5.0,
+            ))
+            await asyncio.sleep(0.15)
+            fut.set_result("answer")
+            ok, _ = await sender
+            return ok, time.monotonic() - started
+
+        ok, total = self.node.run_on_loop(drive(), timeout=10.0)
+        self.assertTrue(ok)
+        self.assertLess(total, 1.0, "the answer resolving must end the hold at once, not at the 5s deadline")
+        self.assertGreaterEqual(captured[0]["quiet_hold_s"], 0.1)
+
+    def test_no_hold_when_the_window_has_passed_or_no_future_is_given(self):
+        """A zero window holds nothing (review 2026-09-20: the window is
+        measured from the ACK now, so it can no longer be consumed by the
+        ACK's own latency; disabling it is a zero-length window)."""
+        iface = self.iface
+        captured = self._stub_ack_path()
+
+        async def drive():
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            started = time.monotonic()
+            await iface._send_direct_frame_and_wait_for_ack(
+                "ab" * 32, "Qx", 0, peer_prefix=self.PEER, hop_count=0,
+                quiet_wait=fut, quiet_window_s=0.0,
+            )
+            t_past = time.monotonic() - started
+            started = time.monotonic()
+            await iface._send_direct_frame_and_wait_for_ack("ab" * 32, "Rx", 0, peer_prefix=self.PEER, hop_count=1)
+            t_none = time.monotonic() - started
+            fut.cancel()
+            return t_past, t_none
+
+        t_past, t_none = self.node.run_on_loop(drive(), timeout=10.0)
+        self.assertLess(t_past, 0.3)
+        self.assertLess(t_none, 0.3)
+        self.assertEqual([c["quiet_hold_s"] for c in captured], [None, None])
+
+    def test_quiet_hold_is_charged_against_the_answer_budget_and_rtt_is_kept(self):
+        """Review fix (2026-09-20): the hold must move waiting time, not add
+        to it -- total answer wait == timeout_s, not hold + timeout_s -- and
+        an answer arriving inside the hold still yields an RTT sample."""
+        iface = self.iface
+        self._stub_ack_path()
+        iface.direct_completion_quiet_base_s = 0.6
+        iface.direct_completion_quiet_per_hop_s = 0.0
+        saved = (iface.direct_completion_check_timeout_s, iface.direct_completion_check_timeout_per_hop_s,
+                 iface.rx_log_holds_enabled)
+        iface.direct_completion_check_timeout_s = 1.0
+        iface.direct_completion_check_timeout_per_hop_s = 0.0
+        iface.rx_log_holds_enabled = False
+        iface._query_rtt.pop(self.PEER, None)
+        iface._last_firmware_ack_timeout_s.pop(self.PEER, None)
+        try:
+            async def unanswered():
+                started = time.monotonic()
+                got = await iface._query_remote_fragments("ab" * 32, self.PEER, 7, 4, stage="test", hop_count=0)
+                return got, time.monotonic() - started
+
+            got, total = self.node.run_on_loop(unanswered(), timeout=10.0)
+            self.assertIsNone(got)
+            # ~0.05s ACK + 0.55s hold + (1.0 - 0.55)s radio-free = ~1.05s, NOT ~1.6s
+            self.assertLess(total, 1.35, f"the hold was added to the budget instead of charged against it ({total:.2f}s)")
+            self.assertGreaterEqual(total, 0.95)
+
+            async def answered_inside_hold():
+                async def reply():
+                    await asyncio.sleep(0.25)
+                    key = (self.PEER, 8)
+                    fut, frag_total, nonce = iface._completion_query_waiters[key]
+                    fut.set_result(self.module._CompletionFrame(3, iface.COMPLETION_TYPE_ANSWER, True, 8, 4,
+                                                                frozenset(range(4)), nonce))
+                asyncio.ensure_future(reply())
+                started = time.monotonic()
+                got = await iface._query_remote_fragments("ab" * 32, self.PEER, 8, 4, stage="test", hop_count=0)
+                return got, time.monotonic() - started
+
+            got, total = self.node.run_on_loop(answered_inside_hold(), timeout=10.0)
+            self.assertIsNotNone(got)
+            self.assertTrue(got.complete)
+            self.assertLess(total, 0.6, "the answer must end the wait at once")
+            self.assertIn(self.PEER, iface._query_rtt, "an answer inside the hold must still produce an RTT sample")
+            self.assertGreater(iface._query_rtt[self.PEER]["srtt"], 0.1)
+            self.assertLess(iface._query_rtt[self.PEER]["srtt"], 0.5)
+        finally:
+            (iface.direct_completion_check_timeout_s, iface.direct_completion_check_timeout_per_hop_s,
+             iface.rx_log_holds_enabled) = saved
+            iface._query_rtt.pop(self.PEER, None)
+
+    # --- Change 2: soft strikes -----------------------------------------
+
+    def _raw_send(self, held_per_round):
+        """Run one _send_direct_raw_fragmented against stubbed radio calls.
+        `held_per_round` is what the (stubbed) reconcile answer says the
+        receiver holds after each round; True means complete."""
+        iface, M = self.iface, self.module
+        rounds = iter(held_per_round)
+
+        async def fake_raw(path, frame, priority, telemetry=None):
+            return True
+
+        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=2, hop_count=None, send_info=None):
+            if send_info is not None:
+                send_info["acked"] = True
+                send_info["waited_full_timeout"] = True
+            held = next(rounds)
+            if held is True:
+                return M._CompletionFrame(3, iface.COMPLETION_TYPE_ANSWER, True, pkt_id, frag_total, frozenset(range(frag_total)), 0)
+            return M._CompletionFrame(3, iface.COMPLETION_TYPE_ANSWER, False, pkt_id, frag_total, frozenset(held), 0)
+
+        async def no_reset(*a, **k):
+            return False
+
+        iface._send_raw_fragment = fake_raw
+        iface._query_remote_fragments = fake_query
+        iface._raw_path_reset_mid_send = no_reset
+        iface.direct_raw_zero_hop_gap_s = 0.0
+        payload = os.urandom(483)
+        return self.node.run_on_loop(
+            iface._send_direct_raw_fragmented("ab" * 32, self.PEER, payload, iface._next_pkt_id(),
+                                              priority=iface.PRIORITY_NORMAL, hop_count=0),
+            timeout=30.0)
+
+    def test_incomplete_raw_sends_pause_raw_only_after_two_strikes(self):
+        """21:45:14 in the night capture: ONE part lost the same fragment
+        three rounds running and the 600s pause that followed sent 46 page
+        parts as text. e87cca8 (8 of 8 raw completions) never paused on a
+        single incomplete send."""
+        iface, M = self.iface, self.module
+        iface.direct_raw_fragments_enabled = True
+        iface.direct_raw_incomplete_strikes = 2
+        self.on_loop(iface._register_peer, self.PEER, None, "test", None, True)
+        iface._resolved_paths[self.PEER] = M._ResolvedPath(out_path_hex="", out_path_len=0, out_path_hash_len=1,
+                                                          resolved_at=time.monotonic())
+        # Three answered rounds, progress every round, never fragment 3 --
+        # so the two-strike "burst delivered nothing" rule (unchanged) does
+        # not fire and only the closing incomplete block is exercised.
+        incomplete = [{0}, {0, 1}, {0, 1, 2}]
+        # first incomplete send: text fallback, soft strike, raw still eligible
+        self.assertIsNone(self._raw_send(incomplete))
+        self.assertEqual(iface._raw_incomplete_strikes.get(self.PEER), 1)
+        self.assertNotIn(self.PEER, iface._raw_disabled_until)
+        self.assertTrue(iface._raw_fragments_eligible(self.PEER, iface.PRIORITY_NORMAL))
+        # second in a row: now raw pauses for the cooldown and the count resets
+        self.assertIsNone(self._raw_send(incomplete))
+        self.assertIn(self.PEER, iface._raw_disabled_until)
+        self.assertNotIn(self.PEER, iface._raw_incomplete_strikes)
+        self.assertFalse(iface._raw_fragments_eligible(self.PEER, iface.PRIORITY_NORMAL))
+        self.assertAlmostEqual(iface._raw_disabled_until[self.PEER] - time.monotonic(),
+                               iface.direct_raw_fallback_cooldown_s, delta=2.0)
+        self.assertEqual(iface.direct_raw_fallback_cooldown_s, 120.0, "600 -> 120 (night session)")
+
+    def test_a_completed_raw_send_clears_the_strike_and_so_does_a_path_change(self):
+        iface, M = self.iface, self.module
+        iface.direct_raw_fragments_enabled = True
+        iface.direct_raw_incomplete_strikes = 2
+        self.on_loop(iface._register_peer, self.PEER, None, "test", None, True)
+        iface._resolved_paths[self.PEER] = M._ResolvedPath(out_path_hex="", out_path_len=0, out_path_hash_len=1,
+                                                          resolved_at=time.monotonic())
+        self.assertIsNone(self._raw_send([{0}, {0, 1}, {0, 1, 2}]))
+        self.assertEqual(iface._raw_incomplete_strikes.get(self.PEER), 1)
+        # a raw send that completes (second round) clears it
+        self.assertTrue(self._raw_send([{0, 2}, True]))
+        self.assertNotIn(self.PEER, iface._raw_incomplete_strikes)
+        # and so does a path change, like every other per-path measurement
+        self.assertIsNone(self._raw_send([{0}, {0, 1}, {0, 1, 2}]))
+        self.assertEqual(iface._raw_incomplete_strikes.get(self.PEER), 1)
+        iface._clear_peer_path_stats(self.PEER, "test")
+        self.assertNotIn(self.PEER, iface._raw_incomplete_strikes)
+        # strikes=1 restores the old pause-on-first-incomplete behaviour
+        iface.direct_raw_incomplete_strikes = 1
+        self.assertIsNone(self._raw_send([{0}, {0, 1}, {0, 1, 2}]))
+        self.assertIn(self.PEER, iface._raw_disabled_until)
+
+    # --- Change 3: the priority semaphore ---------------------------------
+
+    def test_priority_semaphore_orders_waiters_by_tier_and_transfers_permits(self):
+        M = self.module
+
+        async def drive():
+            sem = M._PriorityAsyncSemaphore(2)
+            order = []
+            await sem.acquire(2); await sem.acquire(2)
+            self.assertTrue(sem.locked())
+
+            async def waiter(tag, prio):
+                await sem.acquire(prio)
+                order.append(tag)
+                await asyncio.sleep(0.02)
+                sem.release()
+
+            tasks = [asyncio.ensure_future(waiter("low1", 3)), asyncio.ensure_future(waiter("norm1", 2))]
+            await asyncio.sleep(0.01)
+            tasks.append(asyncio.ensure_future(waiter("norm2", 2)))
+            tasks.append(asyncio.ensure_future(waiter("answer", 1)))
+            await asyncio.sleep(0.01)
+            self.assertEqual(sem.waiting(), 4)
+            sem.release(); sem.release()
+            await asyncio.gather(*tasks)
+            self.assertEqual(sem.holders(), 0)
+            self.assertFalse(sem.locked())
+            # a waiter cancelled while queued just leaves the line
+            await sem.acquire(2); await sem.acquire(2)
+            t = asyncio.ensure_future(sem.acquire(2))
+            await asyncio.sleep(0.01)
+            t.cancel()
+            await asyncio.sleep(0.01)
+            self.assertEqual(sem.waiting(), 0)
+            sem.release(); sem.release()
+            self.assertEqual(sem.holders(), 0)
+            return order
+
+        order = self.node.run_on_loop(drive(), timeout=10.0)
+        self.assertEqual(order, ["answer", "norm1", "norm2", "low1"])
 
 
 def _raw_mesh(test, links, repeaters=(), seed=1, config=None):
@@ -347,6 +719,208 @@ class RawFragmentScenarios(unittest.TestCase):
         a.send(alive)
         self.assertTrue(wait_until(lambda: alive in b.owner.received, 90.0), "raw send after rediscovery never delivered")
         self.assertIn(b.prefix, iface._resolved_paths)
+
+
+# --- Night-session scenarios (2026-09-19, see NightSessionFixes) ------------
+
+# Loss and airtime derived from the night captures with
+# testscripts/calibrate_sim_from_captures.py fieldtests/raw/Alpha0.1.2
+# (global loss 0.114, per-hop estimate 0.062 at one hop, airtime 605.5ms +
+# 1.0ms/byte). The airtime base is scaled to 200ms so a 12-packet transfer
+# runs in minutes rather than tens of minutes under FAST_TIMING; the
+# collision geometry the scenario exists to reproduce (a hidden node's
+# answer meeting the querier's next burst at the repeater) only needs
+# transmissions long enough to overlap, which they still are.
+PAGE_PROFILE = {"loss": 0.06, "airtime_base_ms": 200.0, "airtime_per_byte_ms": 1.0}
+PAGE_PART_BYTES = 483          # a packed RNS Resource part, as in the field
+
+
+def _page_parts(dest_hash, n, size=PAGE_PART_BYTES, tag=b"page"):
+    # "resource" (context RESOURCE, like the field's page parts) so the
+    # parts are exempt from outgoing_max_age: with plain "data" the tail of
+    # a 12-part transfer expired at 120s in the sim, which is not what the
+    # field transfer does (RNS's Resource layer owns that retry).
+    # The packing overhead is measured from a probe rather than assumed: a
+    # LINK-destination packet packs 19 bytes of header, not the 34 a
+    # hard-coded constant once claimed (review, 2026-09-20 -- every run of
+    # this scenario had failed on the size assertion below).
+    overhead = len(build_rns_packet("resource", dest_hash=dest_hash, payload=b""))
+    parts = [build_rns_packet("resource", dest_hash=dest_hash,
+                              payload=(tag + b"-%02d-" % i) + os.urandom(size - overhead - len(tag + b"-%02d-" % i)))
+             for i in range(n)]
+    assert all(len(p) == size for p in parts), [len(p) for p in parts]
+    return parts
+
+
+def _page_mesh(test, links, repeaters, seed, config=None, profile=PAGE_PROFILE):
+    """A calibrated mesh brought up loss-free (an operator pressing advert),
+    with the profile's loss applied to the transfer phase only."""
+    from tests.test_sim_scenarios import _bring_up
+    quiet_rns()
+    mesh = SimMesh(links, repeaters=repeaters, seed=seed, capture_dir=tempfile.mkdtemp(prefix="smci-page-cap-"),
+                   airtime_base_ms=profile["airtime_base_ms"], airtime_per_byte_ms=profile["airtime_per_byte_ms"])
+    test.mesh = mesh
+    _bring_up(mesh, ["A", "B"], timeout=90.0, config={**RAW_CFG, **(config or {})})
+    a, b = mesh.nodes["A"], mesh.nodes["B"]
+    for x, y in ((a, b), (b, a)):
+        y.send(build_rns_packet("data", dest_hash=y.dest_hash, payload=b"prime"))
+        assert wait_until(lambda: y.dest_hash in x.iface._rns_token_peer, 60.0), "token never learned"
+        assert x.iface._peers[y.prefix].raw_fragments is True
+    wait_until(lambda: not a.iface._direct_exchange_lock_impl.locked() and not b.iface._direct_exchange_lock_impl.locked(), 30.0)
+    mesh.air.loss = profile["loss"]
+    return mesh, a, b
+
+
+def _page_stats(node):
+    recs = node.capture_records()
+    checks = [r for r in recs if r.get("event") == "completion_check_result"]
+    results = [r for r in recs if r.get("event") == "direct_send_result"]
+    raw = [r for r in results if r.get("method") == "raw"]
+    fell_back = [r for r in results if r.get("fallback_from_raw")]
+    answered = sum(1 for r in checks if r.get("outcome") == "answered")
+    return {
+        "checks": len(checks), "answered": answered,
+        "answer_rate": answered / len(checks) if checks else None,
+        "raw_complete": len(raw), "text_fallbacks": len(fell_back),
+        "raw_completion": len(raw) / (len(raw) + len(fell_back)) if (raw or fell_back) else None,
+        "slot_expired": sum(1 for r in results if r.get("method") == "slot_expired"),
+        "answer_lock_waits": [r.get("lock_wait_s") for r in recs
+                              if r.get("event") == "direct_attempt_result" and r.get("kind") == "completion_answer"],
+    }
+
+
+@slow
+@unittest.skipUnless(os.environ.get("SMCI_RUN_UNVERIFIED"), "written 2026-09-20 but not yet run to a pass -- see the class docstring")
+class NightSessionScenarios(unittest.TestCase):
+    """Simulated forms of the 2026-09-19 night regression (module docstring,
+    "Field regression fixed (2026-09-19 night session)"). Timing here is
+    FAST_TIMING over a calibrated air model: these check the interface's
+    logic under the field's collision geometry, not real delivery rates.
+
+    STATUS (2026-09-20): written, NOT yet verified to pass -- the session
+    that wrote them was asked to wrap up first. Gated behind
+    SMCI_RUN_UNVERIFIED=1 so the suite stays green until someone runs them
+    (each takes up to 15 minutes). Two things were learned on the way that
+    the numbers below already reflect: the air model gained the firmware's
+    listen-before-talk (without it the answerer keyed its ANSWER over the
+    repeater's relay of its own ACK every time, 5% answer delivery in every
+    configuration), and the parts must be Resource class -- plain DATA
+    expires at outgoing_max_age (120s) partway through a 12-part transfer,
+    which is why every run below shows fewer than 12 delivered at 900s.
+    The measurements below were taken with plain DATA parts and should be
+    re-run with the "resource" kind now used here.
+
+    BASELINE, unmodified 3b56c11 interface on the LBT air model, seed 11 /
+    21 (plain DATA parts, 12 x 483B, loss 0.06, airtime 200ms+1ms/B):
+      answered 7/17 (41%) / 12/18 (67%); raw completion 2/3 / 4/6;
+      slot_expired drops 6 / 5; delivered 6/12 / 7/12 at 900s.
+    All four changes at their defaults, seed 11: answered 17/27 (63%),
+    raw completion 7/8, no drops, delivered 8/12 at 900s. With the cap
+    re-enabled at 2 (now priority-aware, non-dropping): 16/20 (80%) /
+    15/20 (75%), raw 10/10 / 8/8, delivered 10/12 / 8/12 -- the best
+    configuration in the sim, which is worth knowing given the field
+    session that motivated turning it off.
+    """
+
+    def tearDown(self):
+        self.mesh.stop()
+
+    def _one_hop_page(self, seed, config=None, n=12):
+        _, a, b = _page_mesh(self, ["A-R", "R-B"], ["R"], seed, config=config)
+        self.assertEqual(a.resolved_paths[b.prefix].out_path_len, 1)
+        parts = _page_parts(b.dest_hash, n)
+        started = time.monotonic()
+        for p in parts:
+            a.send(p)
+        done = wait_until(lambda: all(p in b.owner.received for p in parts), 600.0)
+        elapsed = time.monotonic() - started
+        time.sleep(3.0)
+        stats = _page_stats(a)
+        stats["elapsed_s"] = round(elapsed, 1)
+        stats["delivered"] = sum(1 for p in parts if p in b.owner.received)
+        return done, stats
+
+    def test_one_hop_page_transfer_completes_with_answers_and_raw_intact(self):
+        """(a) A-R-B, twelve 483-byte parts back to back. Acceptance: every
+        part delivered, answers >= 80%, raw completion >= 90%, no drops."""
+        totals = {"checks": 0, "answered": 0, "raw_complete": 0, "text_fallbacks": 0, "slot_expired": 0}
+        per_seed = []
+        for seed in (11, 21):
+            done, stats = self._one_hop_page(seed)
+            per_seed.append((seed, stats))
+            self.assertTrue(done, f"seed {seed}: page transfer incomplete: {stats}")
+            for k in totals:
+                totals[k] += stats[k]
+            self.mesh.stop()
+        answer_rate = totals["answered"] / max(1, totals["checks"])
+        raw_completion = totals["raw_complete"] / max(1, totals["raw_complete"] + totals["text_fallbacks"])
+        self.assertGreaterEqual(answer_rate, 0.80, f"answer delivery {answer_rate:.0%}: {per_seed}")
+        self.assertGreaterEqual(raw_completion, 0.90, f"raw completion {raw_completion:.0%}: {per_seed}")
+        self.assertEqual(totals["slot_expired"], 0)
+
+    def test_one_hop_page_transfer_records_the_quiet_hold(self):
+        """The quiet window is what changed at one hop; the capture must
+        show it (quiet_hold_s on the QUERY attempts, None everywhere else)."""
+        done, stats = self._one_hop_page(31, n=4)
+        self.assertTrue(done, stats)
+        attempts = [r for r in self.mesh.nodes["A"].capture_records() if r.get("event") == "direct_attempt_result"]
+        query_holds = [r["quiet_hold_s"] for r in attempts if r.get("kind") == "completion_query"]
+        other_holds = [r["quiet_hold_s"] for r in attempts if r.get("kind") != "completion_query"]
+        self.assertTrue(query_holds, "no completion QUERY attempts captured")
+        self.assertTrue(any(h is not None and h > 0 for h in query_holds), query_holds)
+        self.assertTrue(all(h is None for h in other_holds))
+
+    def test_bidirectional_answers_do_not_queue_behind_the_lock(self):
+        """(b) Both nodes send twelve parts to each other at once. The
+        radio-free remainder of the answer wait is what keeps a node's own
+        ANSWERs from queueing 50s behind its waits (commit 1919074); the
+        quiet window must not bring that back. Bound: no completion ANSWER
+        waits more than 10s for the lock."""
+        _, a, b = _page_mesh(self, ["A-R", "R-B"], ["R"], seed=41)
+        pa = _page_parts(b.dest_hash, 12, tag=b"ab")
+        pb = _page_parts(a.dest_hash, 12, tag=b"ba")
+        for x, y in zip(pa, pb):
+            a.send(x)
+            b.send(y)
+        done = wait_until(lambda: all(p in b.owner.received for p in pa) and all(p in a.owner.received for p in pb), 900.0)
+        time.sleep(3.0)
+        sa, sb = _page_stats(a), _page_stats(b)
+        self.assertTrue(done, f"bidirectional transfer incomplete: A={sa} B={sb}")
+        waits = [w for w in sa["answer_lock_waits"] + sb["answer_lock_waits"] if w is not None]
+        self.assertTrue(waits, "no completion ANSWERs captured")
+        self.assertLessEqual(max(waits), 10.0, f"an ANSWER waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
+        self.assertEqual(sa["slot_expired"] + sb["slot_expired"], 0)
+
+    def test_three_hop_mixed_traffic_with_the_cap_enabled_never_drops(self):
+        """(c) A-R1-R2-R3-B, announces and data mixed, the in-flight cap
+        ENABLED (2): the night session dropped six packets as slot_expired;
+        a slot wait that times out now proceeds instead. No drops, and the
+        announce-class sends must not have held a data slot."""
+        _, a, b = _page_mesh(self, ["A-R1", "R1-R2", "R2-R3", "R3-B"], ["R1", "R2", "R3"], seed=51,
+                             config={"direct_fragmented_max_in_flight": "2"})
+        self.assertEqual(a.resolved_paths[b.prefix].out_path_len, 3)
+        iface = a.iface
+        self.assertEqual(iface.direct_fragmented_max_in_flight, 2)
+        data = _page_parts(b.dest_hash, 4, tag=b"d3")
+        announces = [build_rns_packet("announce", dest_hash=b.dest_hash, payload=b"ann-%d-" % i + os.urandom(200))
+                     for i in range(3)]
+        for i, p in enumerate(data):
+            a.send(p)
+            if i < len(announces):
+                a.send(announces[i])
+        wait_until(lambda: all(p in b.owner.received for p in data), 900.0)
+        time.sleep(3.0)
+        recs = a.capture_records()
+        results = [r for r in recs if r.get("event") == "direct_send_result"]
+        self.assertTrue(results, "no DIRECT sends captured")
+        self.assertEqual([r for r in results if r.get("method") == "slot_expired"], [])
+        self.assertEqual(sum(1 for p in data if p in b.owner.received), 4, "every data part must arrive")
+        self.assertTrue(any(r.get("slot_wait_s") is not None for r in results), "the cap was in effect")
+        # both slot kinds were created: announces went through their own
+        self.assertIn((b.prefix, "announce"), iface._fragmented_send_slots)
+        self.assertIn((b.prefix, "data"), iface._fragmented_send_slots)
+        for slot in iface._fragmented_send_slots.values():
+            self.assertEqual(slot.holders(), 0, "every permit released")
 
 
 if __name__ == "__main__":

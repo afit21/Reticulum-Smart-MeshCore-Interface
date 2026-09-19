@@ -1,4 +1,13 @@
 """
+LEGACY (archived 2026-09-20, see CLAUDE.md "Legacy simulation tooling"): these
+scenarios ran two interfaces through the simmesh fake firmware. Superseded by
+testscripts/meshbench_scenarios.py, which stages the same incidents (stale-path
+reset -> rediscovery, a repeater that dies and returns, multi-fragment DIRECT
+at one/two hops) against real MeshCore firmware. Not collected by
+`unittest discover` (this directory is deliberately not a package); run
+explicitly with `python3 -m unittest tests.legacy.test_sim_scenarios` from the
+repo root if an old result needs reproducing.
+
 End-to-end scenarios: real SmartMeshCoreInterface instances over the
 simulated mesh, exercising the DIRECT-primary transport through
 repeater hops -- the cases two adjacent bench radios cannot produce.
@@ -23,10 +32,10 @@ def _setup_mesh(links, repeaters=(), seed=1, **kw):
     return mesh
 
 
-def _bring_up(mesh, names, timeout=40.0):
+def _bring_up(mesh, names, timeout=40.0, config=None):
     """Create nodes, advert, bind, resolve DIRECT paths both ways."""
     for n in names:
-        mesh.add_node(n)
+        mesh.add_node(n, config=dict(config) if config else None)
     mesh.advert_all()
     try:
         # Re-adverts if the first flood didn't reach everyone (audit fix
