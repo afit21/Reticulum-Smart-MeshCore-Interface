@@ -12,12 +12,21 @@ This diagram isn't 100% accurate to how the interface works but should give you 
 <img width="1156" height="700" alt="senddiagram" src="https://github.com/user-attachments/assets/f5efbb53-4530-4287-ad89-6438dbd2a88f" />
 
 
+## TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
 
-## Features (Version alpha0.1.1)
+This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.2) I have airtime capped at 30% which in my field tests is the minimum which allows for a usable Nomadnet experience.
+
+As more data is collected, we can move this to a dynamic cap to automically increase this based on other factors such as MeshCore hop count, the Mesh's radio settings, etc.
+
+As this project is under a GPL license, there is nothing stopping you from lifting the caps in your own fork, however I would consider doing this on an established MeshCore Mesh for the sake of personal performance without testing wreckless and disrespectful to those who contribute to the infrustrucure you're using.
+
+In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
+
+## Features (Version alpha0.1.2)
 
 In short, this current version allows you to send LXMF messages and browse nomadnet sites over MeshCore. This interface has only been tested this interface over 1, 2 and 3 MeshCore repeater hops with two total RNS nodes communicating over this interface. See the [testing section](#testing) for more details.
 
-New in alpha 0.1.1: the interface now listens to the raw RX log from your companion radio, so instead of guessing with fixed delays it can measure what the mesh is actually doing — see the last seven rows of the table below.
+New in alpha 0.1.2: Raw data is now sent by default while using Z85 encoding as a fallback if a repeater in the path doesn't support raw binary messages.
 
 **Battle Tested** - Tested and confident this is reliable.
 
@@ -88,38 +97,58 @@ Reference config for a non-transfer node:
 
 Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~98 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
 
-## Roadmap (in no particular order)
 
-### Efficiency
-Improve the efficiency of data transfers
-
-### Dynamic transmit & listed timing
-Once more data has been collected, the goal is to have the interface automatically adjust it's own parameters situationally to adjust to traffic conditions, radio settings, and distance from target peers.
-
-### Improved packet inspection and filtering
-Tune the packet inspection and filtering functions to more make better decisions
-
-## Testing
+## Field Testing
 
 This table summarizes the real world scenarios that I've tested the interface against.
-Hops in this table refer to MeshCore Hops.
+Hops in this table refer to MeshCore Hops. Note - This is the results with airtime useage capped at 30% as is hard-coded and not configurable by design. A dynamic airtime usage cap is in the roadmap.
 
 All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet MeshCore network.
 
 |                 | LXMF Messages (MeshChat) | Nomad Network |
 | --------------- | ------------------------ | ------------- |
 | 0 Hops (direct) | Works Well               | Works Well    |
-| 1 Hop           | Slow                     | Unreliable    |
-| 2 Hops          | Slow                     | Not working   |
-| 3 Hops          | Slow                     | Not working   |
+| 1 Hop           | Works Well               | Slow          |
+| 2 Hops          | Works Well               | Slow          |
+| 3 Hops          | Works Well               | Slow          |
 
-Please keep in mind that this project is in very early stages. This interface currently works better than all others I've been able to test.
 
-Alpha 0.1.1 field data (2026-09-18, raw captures in `fieldtests/raw/postAlpha0.1.0/`): a zero-hop NomadNet page load and an evening drive test that ran down through 3, 2 and 1 hops. Individual DIRECT frames were delivered 138/141 at 0 hops, 49/53 at 1 hop, 37/45 at 2 hops and 23/30 at 3 hops. That's per frame, not per message — a message split into several fragments is only as good as its worst fragment, which is why the table above is harsher than those numbers look.
+Reference speeds - SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz:
+|         | One Direction | Bidirectional | RNS Latency |
+| ------- | ------------- | ------------- | ----------- |
+| 0 Hops  | 391bps        | 338 bps       | 1672ms      |
 
-### Automated tests and simulation (no hardware)
 
-`python3 -m unittest discover -s tests` runs the automated suite: wire-format, RNS-header and reliability-engine unit tests (about a second), plus end-to-end scenarios that run two real interface instances through simulated repeater hops (`SMCI_SKIP_SLOW=1` skips those). The simulated mesh lives in `testscripts/simmesh/` and models DIRECT routing through repeaters, ACKs, path discovery, contacts, flood dedup, half-duplex, collisions and loss. `testscripts/fake_meshcore_repeater_sim.py` runs the interface over any topology you describe (`--link A-R --link R-B --repeater R`), `testscripts/rns_multiprocess_sim.py` does the same with a full real Reticulum instance per node, and `testscripts/calibrate_sim_from_captures.py` derives loss/latency settings for the simulator from real field captures. None of this replaces the field table above — simulated timing is not real radio timing — but it lets a change be checked against multi-hop DIRECT behavior before it goes anywhere near a real repeater.
+Please keep in mind that this project is in very early stages. However, this interface currently works better than all others I've been able to test.
+
+## Roadmap (in no particular order)
+
+- Airtime efficiency improvements - Always looking to optimise airtime usage
+
+- A dynamic airtime usage cap is in the roadmap
+
+- Improve security - Security so far has not been a focus.
+
+- Enforce rate limiting as a reciever - This feautre is intended to discourage others from 
+
+- Airtime limiting improvements - I've picked fairly arbitrary numbers for airtime limits. This will later be evaluated against real-world data. I suspect a feature to limit airtime based on the radio settings a MeshCore mesh uses would be the path forward here
+
+- Automatically update MeshCore companion settings to optimise for this purpose
+
+- Overall reliability - Always looking for methods to improve the reliability of this interface
+
+- Compatibility with other MeshCore interfaces - I'd like to make this interface automatically detect other popular MeshCore interfaces and translate our own direct transmits to be able to speak with them
+
+- Remove meshcore_py dependency - Bake in a meshcore library to allow for easy install
+
+- Smarter routing - Better advertise node's routing functions and optimise paths to avoid unesessary MeshCore traffic.
+
+- Better accounting for radio conditions. This interface will adapt to radio conditions. More testing in the real world is required inorder to improve this capability.
+
+- Better compatability with LXMF clients other than MeshChat
+
+- Smarter traffic throttling
+
 
 ## Credits
 
@@ -128,6 +157,12 @@ Alpha 0.1.1 field data (2026-09-18, raw captures in `fieldtests/raw/postAlpha0.1
 
 ## Contributing
 Packet captures from your field tests are always appreciated if you'd like to contact me or submit a pull request adding your tests to the fieldtests folder.
+
+Enable packet captures with:
+``` ini
+  [[Smart MeshCore Interface]]
+    packet_capture_enabled = yes
+```
 
 Feel free to contribute code if you'd like to by opening a pull request :)
 
