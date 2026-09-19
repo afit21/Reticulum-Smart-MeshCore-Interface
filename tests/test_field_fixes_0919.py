@@ -163,22 +163,39 @@ class RawProofCorrelationTests(SingleNodeCase):
         data = build_rns_packet("data", dest_hash=os.urandom(16), payload=b"raw-received")
         truncated, proof_hdr = self._proof_header_for(data)
         self._bind_and_resolve(PEER)
-        iface._correlate_raw_proof(data, PEER)
+        iface._observe_raw_received_packet(data, PEER)
         self.assertIn(truncated, iface._proof_correlation)
         self.assertEqual(iface._resolve_routing_peer(proof_hdr), PEER)
-        # Only the proof correlation is recorded -- never an RNS token.
-        self.assertNotIn(iface._parse_rns_header(data).destination_hash, iface._rns_token_peer)
+        # Widened 2026-09-19 afternoon: a bound, path-resolved peer's raw
+        # receive teaches the token too, exactly as its text frames do.
+        self.assertEqual(iface._rns_token_peer.get(iface._parse_rns_header(data).destination_hash), PEER)
+
+    def test_raw_received_announce_teaches_route(self):
+        # The field case: the desktop's path-response ANNOUNCE for d4c70c4b
+        # arrived raw five times and the laptop learned nothing, then backed
+        # off and dropped 17 DATA packets to a destination that was answering.
+        iface = self.iface
+        dest = os.urandom(16)
+        announce = build_rns_packet("path_response", dest_hash=dest, payload=b"announce-ish" + os.urandom(120))
+        iface._observe_raw_received_packet(announce, PEER)             # not bound: nothing
+        self.assertNotIn(dest, iface._rns_token_peer)
+        self._bind_and_resolve(PEER)
+        iface._record_unknown_dest_attempt(dest)
+        iface._observe_raw_received_packet(announce, PEER)
+        self.assertEqual(iface._rns_token_peer.get(dest), PEER)
+        self.assertFalse(iface._unknown_dest_in_backoff(dest))
+        self.assertEqual(iface._resolve_routing_peer(iface._parse_rns_header(build_rns_packet("data", dest_hash=dest))), PEER)
 
     def test_untrusted_claim_is_ignored(self):
         iface = self.iface
         data = build_rns_packet("data", dest_hash=os.urandom(16), payload=b"raw-received")
         truncated, proof_hdr = self._proof_header_for(data)
-        iface._correlate_raw_proof(data, PEER)                # not bound
+        iface._observe_raw_received_packet(data, PEER)                # not bound
         self.assertNotIn(truncated, iface._proof_correlation)
         iface._peers[PEER] = self.module._PeerRecord(pubkey_prefix=PEER, has_upstream_rns=False, last_seen=time.time())
-        iface._correlate_raw_proof(data, PEER)                # bound, no resolved path
+        iface._observe_raw_received_packet(data, PEER)                # bound, no resolved path
         self.assertNotIn(truncated, iface._proof_correlation)
-        iface._correlate_raw_proof(data, None)
+        iface._observe_raw_received_packet(data, None)
         self.assertNotIn(truncated, iface._proof_correlation)
         self.assertIsNone(iface._resolve_routing_peer(proof_hdr))
 
@@ -186,7 +203,7 @@ class RawProofCorrelationTests(SingleNodeCase):
         iface = self.iface
         self._bind_and_resolve(PEER)
         proof = build_rns_packet("proof", dest_hash=os.urandom(16), payload=b"p")
-        iface._correlate_raw_proof(proof, PEER)
+        iface._observe_raw_received_packet(proof, PEER)
         self.assertEqual(iface._proof_correlation, {})
 
 
@@ -260,6 +277,51 @@ class DelayedAnswerScenario(unittest.TestCase):
         self.assertLessEqual(len(sent), 2 * frag_total, f"more than one safety-valve re-burst: {[(r['round'], r['frag_idx']) for r in sent]}")
         self.assertEqual(b.owner.received.count(big), 1)
         self.assertNotIn(b.prefix, a.iface._raw_disabled_until, "re-query rounds must not count as raw fallback strikes")
+
+
+class BootstrapProofLearningTests(SingleNodeCase):
+    """A destination whose replies are delivery PROOFs (plain DATA, LXMF
+    without a Link) never announces DIRECT, so the unknown-destination
+    bootstrap could count three delivered sends as three failures and
+    back off for 300 s. The proof must teach the route instead."""
+
+    def setUp(self):
+        self.iface._peers.clear()
+        self.iface._pending_dest_proofs.clear()
+        self.iface._unknown_dest_attempts.clear()
+        self.iface._unknown_dest_backoff_until.clear()
+
+    def test_delivery_proof_learns_route_and_clears_backoff(self):
+        iface = self.iface
+        iface._peers[PEER] = self.module._PeerRecord(pubkey_prefix=PEER, has_upstream_rns=False, last_seen=time.time())
+        dest = os.urandom(16)
+        data = build_rns_packet("data", dest_hash=dest, payload=b"bootstrap")
+        header = iface._parse_rns_header(data)
+        for _ in range(iface.UNKNOWN_DEST_BOOTSTRAP_FAILURE_THRESHOLD):
+            iface._record_unknown_dest_attempt(dest)
+            iface._remember_bootstrap_send(data, header)
+        self.assertTrue(iface._unknown_dest_in_backoff(dest))
+        truncated = iface._compute_truncated_hash(data, header.header_type)
+        self.assertIn(truncated, iface._pending_dest_proofs)
+        proof = build_rns_packet("proof", dest_hash=truncated, payload=b"sig")
+        self.on_loop(iface._observe_incoming_rns_packet, proof, PEER)
+        self.assertEqual(iface._rns_token_peer.get(dest), PEER)
+        self.assertFalse(iface._unknown_dest_in_backoff(dest))
+        self.assertNotIn(truncated, iface._pending_dest_proofs)
+        # From here the destination routes DIRECT-primary.
+        self.assertEqual(iface._resolve_routing_peer(header), PEER)
+
+    def test_only_data_sends_are_remembered_and_entries_expire(self):
+        iface = self.iface
+        dest = os.urandom(16)
+        ann = build_rns_packet("announce", dest_hash=dest, payload=b"a")
+        iface._remember_bootstrap_send(ann, iface._parse_rns_header(ann))
+        self.assertEqual(iface._pending_dest_proofs, {})
+        data = build_rns_packet("data", dest_hash=dest, payload=b"d")
+        iface._remember_bootstrap_send(data, iface._parse_rns_header(data))
+        self.assertEqual(len(iface._pending_dest_proofs), 1)
+        iface._pending_dest_proofs_sweep(time.monotonic() + iface.proof_correlation_ttl_s + 1)
+        self.assertEqual(iface._pending_dest_proofs, {})
 
 
 class BindRerequestScheduleTests(SingleNodeCase):

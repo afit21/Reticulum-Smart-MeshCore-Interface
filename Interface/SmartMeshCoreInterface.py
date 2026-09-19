@@ -2071,7 +2071,8 @@ in `fieldtests/raw/Alpha0.1.2`):** a packet received as raw fragments had
 its PROOF routed `small_mesh_direct_all_unknown_dest` (seen twice, right
 after each `direct_raw_multifragment` receive) because the raw path skips
 `_observe_incoming_rns_packet` and so never filled `_proof_correlation`.
-`_correlate_raw_proof` now records the correlation -- nothing else -- when
+`_correlate_raw_proof` (widened and renamed `_observe_raw_received_packet`
+later that day, see below) now records the correlation -- nothing else -- when
 the raw frame's claimed source is an already-bound peer with a resolved
 path; its docstring has the threat-model reasoning (a misdirected PROOF is
 worth nothing to a spoofer, and the fallback already reached every bound
@@ -2115,6 +2116,28 @@ budgets (14-18 s), not the 5 s floor -- so budget alone cannot fix this.
 Verified: fast suite, the raw-fragment scenarios, and a delayed-answer
 scenario (`tests/test_field_fixes_0919.py::DelayedAnswerScenario`) that
 injects answer latency rather than loss, as the field analysis proposed.
+
+**Field-diagnosed fix (2026-09-19 afternoon, `fieldtests/raw/Alpha0.1.2/
+*_fieldtest.jsonl`, 12:50-15:36, zero-hop then 1-2 hops):** the laptop
+dropped 17 DATA packets to d4c70c4b between 12:55:43 and 13:00:19 as
+`unknown_dest_backoff_drop`, while the desktop received every copy it did
+send (20 in all) and proved them. Two gaps combined: (1) the desktop's
+path-response ANNOUNCEs for that destination arrived raw (a 3-fragment
+announce always does now) and the raw path learned nothing from them --
+`_observe_raw_received_packet` now runs the full observe step for a
+bound, path-resolved peer, the same trust a text-frame announce from that
+peer already gets; (2) a destination whose replies are PROOFs rather than
+announces could never satisfy "a token was learned", so three delivered
+bootstrap sends still counted as three failures --
+`_remember_bootstrap_send` keeps the packet's truncated hash and the
+PROOF branch of `_observe_incoming_rns_packet` learns the route and
+clears the backoff when that proof comes back, mirroring the LRPROOF
+path. Same session, also confirmed in the field: reconcile ANSWERs at
+one hop got 4 of 16 (laptop) and 10 of 23 (desktop) ACKs, with 20 of the
+desktop's 25 reconciles timing out -- the ANSWER-behind-the-ACK loss the
+simulator found earlier that day (fix 4 above; not in the field build).
+Dead-hop abort fired 5 times at 5-6 s. Verified: fast suite
+(`tests/test_field_fixes_0919.py`).
 
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
@@ -3299,6 +3322,11 @@ class SmartMeshCoreInterface(Interface):
         # proves reachable -- see _compute_link_id/_observe_incoming_rns_
         # packet's PROOF branch. Swept by _pending_link_request_sweep.
         self._pending_link_requests = {}
+        # truncated packet hash -> (destination_hash, expiry) for a DATA
+        # packet sent by the unknown-destination bootstrap: its delivery
+        # PROOF proves the destination is reachable through whoever sent
+        # the proof (2026-09-19, see _remember_bootstrap_send).
+        self._pending_dest_proofs = {}
         
         
         self._contact_refresh_task = None
@@ -6404,6 +6432,32 @@ class SmartMeshCoreInterface(Interface):
                 RNS.LOG_WARNING,
             )
 
+    def _remember_bootstrap_send(self, data: bytes, header: Optional[_RnsHeader]) -> None:
+        """Field fix (2026-09-19 afternoon, `fieldtests/raw/Alpha0.1.2`): the
+        unknown-destination backoff counts bootstrap attempts "with no token
+        ever learned" as failures, but a destination whose replies are
+        PROOFs (a plain DATA delivery, LXMF without a Link) never teaches a
+        token that way -- the laptop's three bootstrap sends to d4c70c4b
+        were all delivered and proved, and the interface still backed off
+        and dropped the next 17. Remember the packet's truncated hash (the
+        exact value its PROOF will carry as destination-hash field) so
+        `_observe_incoming_rns_packet`'s PROOF branch can learn the route
+        and clear the backoff when that proof arrives DIRECT -- the same
+        shape `_pending_link_requests` uses for LRPROOFs."""
+        if header is None or header.destination_hash is None or header.packet_type != RNS.Packet.DATA:
+            return
+        truncated_hash = self._compute_truncated_hash(data, header.header_type)
+        if truncated_hash is None:
+            return
+        self._pending_dest_proofs[truncated_hash] = (
+            header.destination_hash, time.monotonic() + self.proof_correlation_ttl_s,
+        )
+
+    def _pending_dest_proofs_sweep(self, now: float) -> None:
+        stale = [k for k, (_dest, expiry) in self._pending_dest_proofs.items() if now >= expiry]
+        for k in stale:
+            del self._pending_dest_proofs[k]
+
     def _clear_unknown_dest_backoff(self, destination_hash: bytes) -> None:
         self._unknown_dest_attempts.pop(destination_hash, None)
         self._unknown_dest_backoff_until.pop(destination_hash, None)
@@ -6830,6 +6884,7 @@ class SmartMeshCoreInterface(Interface):
                     candidate_peers=self._all_bound_peer_prefixes(),
                 )
                 self._record_unknown_dest_attempt(header.destination_hash)
+                self._remember_bootstrap_send(data, header)
                 await self._send_direct_to_all_peers(
                     data, header, priority=self._priority_tier(header), expires_at=expires_at, spawned=spawned,
                 )
@@ -6846,6 +6901,7 @@ class SmartMeshCoreInterface(Interface):
                     spawned.append(task)
             if bootstrap_targets:
                 self._record_unknown_dest_attempt(header.destination_hash)
+                self._remember_bootstrap_send(data, header)
             self._debug(
                 f"routing decision: no known peer for this destination -- "
                 f"CHANNEL broadcast"
@@ -10114,7 +10170,7 @@ class SmartMeshCoreInterface(Interface):
                 f"least-recently-learned token {evicted.hex()[:12]}."
             )
 
-    def _correlate_raw_proof(self, data: bytes, claimed_peer_prefix: Optional[str]) -> None:
+    def _observe_raw_received_packet(self, data: bytes, claimed_peer_prefix: Optional[str]) -> None:
         """Field-diagnosed (2026-09-19, zero-hop image transfer, both
         captures): a packet received as raw fragments never had its
         outgoing PROOF attributed to a peer -- `_proof_correlation` is
@@ -10125,38 +10181,40 @@ class SmartMeshCoreInterface(Interface):
         branch: DIRECT-to-all in small-mesh mode, a CHANNEL broadcast
         beyond three peers -- the transport raw exists to avoid.
 
-        This records ONLY the proof correlation, and only when the claimed
-        prefix is a peer this node has already bound (bind frame) AND
-        holds a resolved DIRECT path to. Threat model: a spoofer who
-        claims a bound peer's prefix can at worst misdirect one PROOF to
-        that peer -- a PROOF is cryptographically bound to the packet it
-        proves, so it is useless to anyone else, and RNS simply re-sends
-        the data. That is no wider than the fallback's own behaviour
-        (small-mesh DIRECT-to-all already reaches every bound peer, the
-        spoofer included) and strictly narrower than a broadcast. No RNS
-        token is learned here: a token would steer *data* to the claimed
-        peer, which is a different exposure."""
+        Only when the claimed prefix is a peer this node has already bound
+        (bind frame) AND holds a resolved DIRECT path to. Threat model: a
+        spoofer who claims a bound peer's prefix can at worst misdirect one
+        PROOF to that peer -- a PROOF is cryptographically bound to the
+        packet it proves, so it is useless to anyone else, and RNS simply
+        re-sends the data. That is no wider than the fallback's own
+        behaviour (small-mesh DIRECT-to-all already reaches every bound
+        peer, the spoofer included) and strictly narrower than a broadcast.
+
+        Widened the same afternoon (field test `fieldtests/raw/Alpha0.1.2/
+        *T1250*`): with the same guard, the whole observe step runs -- RNS
+        tokens included. The laptop received the desktop's path-response
+        ANNOUNCEs for d4c70c4b five times as raw fragments (a 3-fragment
+        announce always goes raw now), learned nothing from any of them,
+        bootstrapped three DATA sends, then hit the 300 s unknown-
+        destination backoff and dropped 17 packets to a destination that
+        was answering every one. A token from a raw frame steers *data*
+        to the claimed peer, which is why it was withheld -- but that
+        peer is one this node already routes to on the strength of an
+        authenticated bind frame, and a text-frame ANNOUNCE from the same
+        peer teaches the same token today. The residual exposure is a
+        third party who knows a bound peer's 6-byte prefix steering one
+        destination's traffic to that (legitimate) peer, a nuisance
+        bounded by the token's own expiry, against a default that dropped
+        real traffic for five minutes."""
         if claimed_peer_prefix is None:
             return
         if claimed_peer_prefix not in self._peers or claimed_peer_prefix not in self._resolved_paths:
             self._debug(
-                f"_correlate_raw_proof: {claimed_peer_prefix!r} is not a bound peer with a "
-                f"resolved path -- not trusting a raw frame's claim for this packet's PROOF."
+                f"_observe_raw_received_packet: {claimed_peer_prefix!r} is not a bound peer with a "
+                f"resolved path -- not trusting a raw frame's source claim; nothing learned."
             )
             return
-        header = self._parse_rns_header(data)
-        if header is None or header.packet_type == RNS.Packet.PROOF:
-            return
-        truncated_hash = self._compute_truncated_hash(data, header.header_type)
-        if truncated_hash is None:
-            return
-        self._proof_correlation[truncated_hash] = (
-            claimed_peer_prefix, time.monotonic() + self.proof_correlation_ttl_s,
-        )
-        self._debug(
-            f"_correlate_raw_proof: PROOF for {truncated_hash.hex()} will route to bound, "
-            f"resolved peer {claimed_peer_prefix!r} (raw receive; no token learned)."
-        )
+        self._observe_incoming_rns_packet(data, claimed_peer_prefix)
 
     def _observe_incoming_rns_packet(self, data: bytes, sender_peer_prefix: Optional[str]) -> None:
         """§7: populated only from the DIRECT receive path -- a CHANNEL
@@ -10198,6 +10256,18 @@ class SmartMeshCoreInterface(Interface):
             # backoff (previously three good Links to the same destination
             # counted as three "failures" -- see the module docstring's
             # 2026-09-18 review entry).
+            delivered = self._pending_dest_proofs.pop(header.destination_hash, None)
+            if delivered is not None:
+                proved_dest, _expiry = delivered
+                self._learn_rns_token(proved_dest, sender_peer_prefix)
+                self._clear_unknown_dest_backoff(proved_dest)
+                self._debug(
+                    f"_observe_incoming_rns_packet: PROOF from {sender_peer_prefix!r} for a bootstrap "
+                    f"DATA send to {proved_dest.hex()} -- destination is reachable through this peer; "
+                    f"token learned, unknown-destination backoff cleared "
+                    f"(rns_tokens_learned now {len(self._rns_token_peer)})."
+                )
+                return
             pending = self._pending_link_requests.pop(header.destination_hash, None)
             if pending is not None:
                 requested_dest, _expiry = pending
@@ -10842,11 +10912,12 @@ class SmartMeshCoreInterface(Interface):
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
             else:
                 # raw=True (2026-09-18 night): the src prefix in a raw frame
-                # is unauthenticated, so no token is learned from it. The one
-                # thing recorded (2026-09-19) is where this packet's PROOF
-                # should go, and only for a peer this node already trusts --
-                # see _correlate_raw_proof.
-                self._correlate_raw_proof(complete_data, peer_prefix)
+                # is unauthenticated, so nothing is learned from it -- unless
+                # the claimed peer is one this node already binds and routes
+                # to (2026-09-19, twice in one day: first the PROOF
+                # correlation, then the token learning a raw ANNOUNCE was
+                # silently denied) -- see _observe_raw_received_packet.
+                self._observe_raw_received_packet(complete_data, peer_prefix)
             self.process_incoming(
                 complete_data, transport="direct_raw_multifragment" if raw else "direct_multifragment",
                 sender_peer_prefix=peer_prefix, frag_total=header.frag_total, pkt_id=header.pkt_id,
@@ -11079,6 +11150,7 @@ class SmartMeshCoreInterface(Interface):
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
                 self._closed_links_sweep(now)
+                self._pending_dest_proofs_sweep(now)
                 for path_hex in [p for p, n in self._raw_unsupported_paths.items()
                                  if now - n["since"] >= self.direct_raw_path_unsupported_ttl_s]:
                     del self._raw_unsupported_paths[path_hex]
