@@ -350,6 +350,28 @@ class SimMesh:
         for i, radio in enumerate(self.all_radios()):
             radio.advert_later(i * spacing_s + self.air.rng.uniform(0, 0.2))
 
+    def advert_until_contacts(self, rounds: int = 4, timeout: float = 20.0) -> bool:
+        """`advert_all` until every end node knows every other, or `rounds`
+        tries are used up. Returns whether contacts populated.
+
+        Audit fix (2026-09-19): `advert_all` sends exactly ONE un-retried
+        advert per radio. Across a single repeater that is reliable enough,
+        but on a 2-repeater chain half-duplex deafness and collisions ate the
+        advert flood often enough that bring-up failed for most seeds -- a
+        probe of the 3-link A-R1-R2-B chain found 2 of 3 seeds never
+        populating contacts at all. The one scenario in the suite with two
+        repeaters (`test_two_hop_fragmented_with_phantom_ack_loss`) therefore
+        never actually ran: it died in its own setup assertion, which reads
+        like a product bug rather than a harness one. Retrying is also what a
+        real operator does -- you press advert again when a node hasn't
+        appeared -- so this is closer to the field procedure, not a fudge."""
+        for attempt in range(max(1, rounds)):
+            if attempt:
+                self.advert_all()
+            if self.wait_contacts(timeout):
+                return True
+        return False
+
     def wait_contacts(self, timeout: float = 20.0) -> bool:
         """Every end node's radio has every other end node as a contact."""
         names = list(self.nodes)

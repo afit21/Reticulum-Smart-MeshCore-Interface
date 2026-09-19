@@ -50,7 +50,7 @@ from typing import Callable, Dict, Optional
 
 from .air import (
     ROUTE_DIRECT, ROUTE_FLOOD, ROUTE_TYPE_CODES, MAX_PATH_HASHES,
-    PTYPE_ACK, PTYPE_ADVERT, PTYPE_GRP_TXT, PTYPE_PATH, PTYPE_REQ, PTYPE_TXT_MSG,
+    PTYPE_ACK, PTYPE_ADVERT, PTYPE_GRP_TXT, PTYPE_PATH, PTYPE_RAW_CUSTOM, PTYPE_REQ, PTYPE_TXT_MSG,
     SimPacket,
 )
 
@@ -224,12 +224,21 @@ class SimRadio:
         self._seen.append(pkt.pkt_id)
         self._tx(pkt)
 
-    def cmd_send_chan_msg(self, channel_idx: int, text: str) -> None:
+    def cmd_send_chan_msg(self, channel_idx: int, text: str, ts: Optional[int] = None) -> None:
         # The firmware prepends "<name>: " exactly once at the origin;
         # repeaters relay the text verbatim.
+        #
+        # `ts` is injectable purely so a test can send the SAME packet twice
+        # and actually get the same `pkt_id` (audit fix, 2026-09-19): the id
+        # is a content hash, and with `int(time.time())` inside the body two
+        # "identical" sends straddling a wall-clock second boundary hashed
+        # differently, so the flood-dedup test failed intermittently
+        # (observed 2 of 3 runs). The real firmware timestamps the same way;
+        # this only removes the race from the test's control flow.
         pkt = SimPacket(
             route=ROUTE_FLOOD, ptype=PTYPE_GRP_TXT, src=self.name, src_hash=self.hash_byte, dst=None, dst_hash=None,
-            body={"chan": channel_idx, "text": f"{self.name}: {text}", "ts": int(time.time())},
+            body={"chan": channel_idx, "text": f"{self.name}: {text}",
+                  "ts": int(time.time()) if ts is None else int(ts)},
         )
         self._seen.append(pkt.pkt_id)
         self._tx(pkt)
@@ -258,6 +267,23 @@ class SimRadio:
             "expected_ack": bytes.fromhex(ack),
             "suggested_timeout": self._suggested_timeout_ms(route, len(path), pkt.size),
         }
+
+    def cmd_send_raw_data(self, path: bytes, payload: bytes) -> bool:
+        """CMD_SEND_RAW_DATA (25): `Mesh::createRawData` + `sendDirect(path)`.
+        Source-routed DIRECT, no ACK, no encryption; delivered to every
+        node that hears it with the path exhausted (`Mesh.cpp`
+        PAYLOAD_TYPE_RAW_CUSTOM: markSeen + onRawDataRecv). Firmware
+        limits: payload <= 174 - path_len on this frame, >= 4 bytes."""
+        if len(payload) < 4 or len(payload) + len(path) + 2 > 176:
+            return False
+        pkt = SimPacket(
+            route=ROUTE_DIRECT, ptype=PTYPE_RAW_CUSTOM, src=self.name, src_hash=self.hash_byte, dst=None, dst_hash=None,
+            body={"payload": bytes(payload).hex()}, path=tuple(path), size=2 + len(path) + len(payload),
+        )
+        self._seen.append(pkt.pkt_id)
+        self.counters["raw_sent"] += 1
+        self._tx(pkt)
+        return True
 
     def cmd_send_path_discovery(self, dst_pubkey_hex: str) -> Optional[dict]:
         contact = self._contact_for_prefix(dst_pubkey_hex)
@@ -359,6 +385,8 @@ class SimRadio:
             self._on_path_request(packet)
         elif ptype == PTYPE_PATH:
             self._on_path_response(packet)
+        elif ptype == PTYPE_RAW_CUSTOM:
+            self._on_raw_custom(packet)
 
     def _on_advert(self, packet: SimPacket) -> None:
         if packet.src == self.name:
@@ -401,6 +429,23 @@ class SimRadio:
         self._seen.append(ack.pkt_id)
         self.counters["ack_sent_" + route.lower()] += 1
         self._tx(ack)
+
+    def _on_raw_custom(self, packet: SimPacket) -> None:
+        """PAYLOAD_TYPE_RAW_CUSTOM at a node whose path is exhausted: the
+        firmware dedups it (`wasSeen`), so a byte-identical retry is
+        dropped, then pushes PUSH_CODE_RAW_DATA (SNR, RSSI, reserved,
+        payload) -- no ACK, no sender identity."""
+        if packet.pkt_id in self._seen:
+            self.counters["raw_dedup_dropped"] += 1
+            return
+        self._seen.append(packet.pkt_id)
+        if packet.src == self.name:
+            return
+        self.counters["raw_received"] += 1
+        self._push_event("RAW_DATA", {
+            "SNR": round(self.rng.uniform(6.0, 12.0), 2), "RSSI": -50 - 12 * len(packet.path),
+            "payload": packet.body["payload"],
+        })
 
     def _on_ack(self, packet: SimPacket) -> None:
         code = packet.body.get("ack")
@@ -461,6 +506,8 @@ class SimRadio:
             return
         if packet.ptype == PTYPE_ACK:
             pkt_payload = bytes.fromhex(packet.body["ack"])
+        elif packet.ptype == PTYPE_RAW_CUSTOM:
+            pkt_payload = bytes.fromhex(packet.body["payload"])[:4]
         elif packet.dst_hash is not None:
             pkt_payload = bytes([packet.dst_hash, packet.src_hash])
         else:

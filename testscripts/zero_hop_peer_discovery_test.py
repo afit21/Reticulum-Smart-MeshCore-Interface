@@ -118,6 +118,10 @@ def main() -> None:
     parser.add_argument("--rx-log-holds", action="store_true",
                         help="Enable the interface's RX-log-derived transmit holds (rx_log_holds_enabled, "
                              "2026-09-18 step 4, default off) for this run.")
+    parser.add_argument("--raw-fragments", action="store_true",
+                        help="Enable raw binary DIRECT fragments (direct_raw_fragments_enabled, 2026-09-18, "
+                             "default off) for this run -- BOTH radios must run with it so the bind frames "
+                             "advertise the capability; use with --payload-size to force fragmentation.")
     parser.add_argument("--packet-capture-dir", default=None,
                         help="Enable the interface's own JSONL packet capture (packet_capture_enabled) into this "
                              "directory -- includes the observe-only 'rx_log' records (2026-09-18) for every packet "
@@ -150,6 +154,7 @@ def main() -> None:
         **({"packet_capture_enabled": "yes", "packet_capture_dir": args.packet_capture_dir}
            if args.packet_capture_dir else {}),
         **({"rx_log_holds_enabled": "yes"} if args.rx_log_holds else {}),
+        **({"direct_raw_fragments_enabled": "yes"} if args.raw_fragments else {}),
     )
 
     log(f"[{args.role}] connecting to {args.port}...")

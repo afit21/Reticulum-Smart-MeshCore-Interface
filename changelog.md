@@ -1,5 +1,121 @@
 # Changelog
 
+## unreleased (since alpha-0.1.1, 2026-09-18 night)
+
+Field evidence: `fieldtests/raw/Alpha0.1.1/` -- a zero-hop NomadNet page
+session and an evening drive through 1-3 repeater hops, both sides
+captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
+DIRECT fragments" entries carry the packet-level detail.
+
+### Fixed: bare-DIRECT receive dedup stalled a Resource transfer
+
+RNS's `Transport.packet_filter` exempts KEEPALIVE, RESOURCE, RESOURCE_REQ,
+RESOURCE_PRF, CACHE_REQUEST and CHANNEL from its own duplicate filter
+because it re-delivers byte-identical packets for them on purpose: a
+Resource part arriving one slot ahead of the receiver's window is
+discarded and re-requested, and the sender answers with the same bytes.
+The interface's bare-DIRECT dedup (150s, keyed on payload bytes) dropped
+every copy after the first -- 16 re-sends of one 35-byte part over two
+minutes in the page capture, until the transfer was cancelled. The dedup
+now consults the packet's RNS context and lets exactly RNS's own exempt
+set through (`_RNS_NO_DEDUP_CONTEXTS`).
+
+### Fixed: fragmented sends gave up one fragment short; re-sends restarted from zero
+
+Two PATH_RESPONSE announces at 2 hops each delivered 2 of 3 fragments,
+the reconcile confirmed it, and the last fragment then exhausted the
+ordinary budget of 2 -- 3.5 minutes each, and the laptop never got a path.
+Now: once the receiver provably holds part of a packet, pass 1 uses
+`direct_fragment_finish_attempts` (4); the reconcile answer is applied
+authoritatively in both directions; and a failed fragmented send is
+remembered per (peer, payload hash) so that RNS re-issuing the identical
+bytes resumes the receiver's still-open bucket under the same pkt_id,
+sends only the gaps, and always reconciles (`direct_fragment_resume_
+enabled`, never for handshake priority). Tests: `tests/test_alpha011_
+fixes.py`.
+
+### Added: raw binary DIRECT fragments (on by default after the first field test)
+
+`direct_raw_fragments_enabled`. A packet too large for one text frame
+goes to a peer that advertised `BIND_CAP_RAW_FRAGMENTS` as MeshCore raw
+packets (`CMD_SEND_RAW_DATA` / `EventType.RAW_DATA`): a 13-byte header
+(`[ver|attempt][dst_prefix:2][src_prefix:6][pkt_id:2][frag_idx][frag_
+total]`) and up to 157 bytes of RNS payload per fragment at zero hop
+(firmware limits: 173 received, 174 minus path sent), no Z85, no text
+framing, no per-fragment ACK. A 483-byte Resource part is 4 raw fragments
+instead of 5 text ones plus 5 ACKs, about 43% less sender airtime and no
+ACK idle. Reliability is the existing have-bitmap reconcile: burst the
+missing fragments under the radio lock, ask, repeat (`direct_raw_
+reconcile_rounds`, `direct_raw_query_attempts`); resume works unchanged;
+if two answered reconciles show a burst delivered nothing, raw is
+disabled for that peer for `direct_raw_fallback_cooldown` and the packet
+is re-sent as text. Raw frames carry an unauthenticated src prefix, so
+nothing is learned from them. The simulator gained the RAW_CUSTOM packet
+type with the firmware's seen-dedup; tests in `tests/test_raw_fragments.
+py`; `zero_hop_peer_discovery_test.py --raw-fragments`. Switched on by
+default after the field test below; a peer that has not advertised the
+capability still receives text fragments.
+
+### Changed: raw-first with a per-path Z85 fallback verdict (user's design)
+
+The fallback note is now kept per path (the repeater chain) rather than
+per peer: after `direct_raw_fallback_strikes` answered reconciles show a
+burst delivered nothing, raw is paused for the peer and the packet goes
+as Z85 text on the same path; if that succeeds the path is noted as not
+carrying raw packets for `direct_raw_path_unsupported_ttl` (a day) and
+the peer's pause is lifted, if it fails nothing is concluded about raw.
+A new path is always tried raw-first again. `[STATS]` lists the noted
+paths. A raw send that runs out of rounds with its reconciles answered
+(the path is alive, the loss was just too high) is re-sent as Z85 text
+rather than dropped (and raw is paused for that peer for the cooldown, without a
+verdict on the chain); only an unanswered send counts as a path failure. A path is
+only ever noted as not carrying raw when raw delivered nothing at all on it.
+
+### Changed: refactor pass (behaviour-preserving)
+
+Shared helpers replace the duplicated resume/reconcile bookkeeping in the
+text and raw fragmented senders (`_resume_state`, `_remember_resumable`,
+`_held_from_answer`), one Jacobson/Karels update serves both RTT
+estimators (`_rtt_sample`), per-peer path state is cleared from one list
+(`_clear_peer_path_stats`), and the ACK wait and post-attempt listen
+decision are their own methods (`_await_direct_ack`,
+`_post_attempt_listen_s`). No wire or behaviour change; the full suite
+and the simulated-mesh scenarios pass before and after.
+
+### Added: capture records name the send method
+
+`direct_send_result` carries `method` (`z85_bare`, `z85_text` or `raw`)
+and `fallback_from_raw`; `fragment_received` carries `raw`. The
+receiver-side `transport` field (`direct_raw_multifragment` vs
+`direct_multifragment`) already distinguished them.
+
+### Fixed: first raw field test (2026-09-18 night) -- reconcile timing under load
+
+The field run (`fieldtests/raw/binaryfieldtest/`, both sides captured)
+confirmed the public repeater forwards raw packets: 35/35 raw packets at
+zero hop and 483-byte parts through one repeater in two rounds each. It
+also showed the reconcile QUERY running at the flat 5s floor after a
+path change (raw bursts give the ACK-RTT estimator nothing to learn
+from) and, worse, completion ANSWERs waiting up to 50s for the radio
+lock because the node's own queries held it while idle. Now the
+QUERY -> ANSWER round trip is measured per peer (`_query_rtt`) with a
+hop-scaled prior before any sample exists, and the QUERY is sent as an
+ordinary ACKed exchange with the ANSWER awaited radio-free. Overheard raw
+packets are named `RAW_CUSTOM` in the RX log.
+
+### Fixed: two pre-existing robustness issues surfaced by the test suite
+
+An interface that was never `detach()`ed pinned the process at exit (the
+outgoing worker's unbounded `queue.get()` in a non-daemon executor
+thread); the worker now waits in one-second slices. And proactive path
+discovery on bind could stay denied until real traffic flowed, because it
+raced the peer's telemetry grant and then sat in backoff; one retry after
+the bind-response window (`_discover_path_after_bind`) settles it. Both
+reproduced on the committed alpha-0.1.1 tree, so neither is a regression
+from the changes above. The scenario tests also stop their mesh when
+setup fails and wait for the sender's attempt record instead of racing
+it.
+
 ## alpha-0.1.1 (2026-09-18)
 
 Merge of `development` into `main`. This release is everything after the
