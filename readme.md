@@ -8,8 +8,9 @@ This project aims to let you access Nomadnet and send LXMF messages over a MeshC
 
 The project also aims to be as easy as possible to configure on your RNS nodes. In most situations, a minimal config is needed, just setup your MeshCore companion radio with the MeshCore app before using the interface.
 
-This diagram isn't accurate to how the interface works but should give you a basic idea :)
-<img width="1083" height="502" alt="RNSMESHCOREINTERFACEDIAGRAM.png" src="https://github.com/user-attachments/assets/505840d1-2e79-494c-b930-09b395ab4ec0" />
+This diagram isn't 100% accurate to how the interface works but should give you a basic idea :)
+<img width="1156" height="700" alt="senddiagram" src="https://github.com/user-attachments/assets/f5efbb53-4530-4287-ad89-6438dbd2a88f" />
+
 
 
 ## Features (Version alpha0.1.1)
