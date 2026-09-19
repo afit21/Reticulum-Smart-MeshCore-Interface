@@ -97,12 +97,26 @@ class CompletionQueryTimeout(SingleNodeCase):
         iface._query_rtt.pop(peer, None); iface._ack_rtt.pop(peer, None); iface._ack_rtt_snapshot.pop(peer, None)
         iface._last_firmware_ack_timeout_s.pop(peer, None)
         base = iface.direct_completion_check_timeout_s
+        cap = iface.direct_completion_check_timeout_max_s
+        # 2026-09-19 evening field session: the unbounded `x (1 + hops)` prior
+        # is gone. The hop count now does two bounded things -- it adds
+        # `direct_completion_check_timeout_per_hop_s` to the FLOOR (a first
+        # query at depth, before any RTT sample exists, still gets room: the
+        # session measured query->answer p90 at 11.7-16.1s) and it selects
+        # which CEILING applies. Both are hard-capped, which the old prior
+        # was not. See `direct_completion_check_timeout_max_s` for the
+        # evidence and the module docstring's evening entry for the walk-back.
+        per_hop = iface.direct_completion_check_timeout_per_hop_s
         self.assertEqual(iface._completion_query_timeout_s(peer, hop_count=0), base)
-        self.assertEqual(iface._completion_query_timeout_s(peer, hop_count=1), 2 * base)
-        self.assertEqual(iface._completion_query_timeout_s(peer, hop_count=3), 4 * base)
-        iface._record_query_rtt(peer, 3.0)                      # srtt 3, rttvar 1.5 -> 2*(3+6) = 18, capped at the routed max
+        self.assertAlmostEqual(iface._completion_query_timeout_s(peer, hop_count=1), base + per_hop)
+        self.assertAlmostEqual(iface._completion_query_timeout_s(peer, hop_count=3),
+                               min(base + 3 * per_hop, iface._completion_query_timeout_cap_s(3)))
+        self.assertLessEqual(iface._completion_query_timeout_s(peer, hop_count=3),
+                             iface._completion_query_timeout_cap_s(3),
+                             "the hop-aware floor must still obey the ceiling")
+        iface._record_query_rtt(peer, 3.0)                      # srtt 3, rttvar 1.5 -> 2*(3+6) = 18, now clamped to the cap
         self.assertAlmostEqual(iface._completion_query_timeout_s(peer, hop_count=0),
-                               max(base, min(18.0, iface.direct_ack_timeout_routed_max_s)))
+                               max(base, min(18.0, cap)))
         for _ in range(20):
             iface._record_query_rtt(peer, 3.0)                  # converges: rttvar -> 0, 2*srtt = 6
         self.assertLess(iface._completion_query_timeout_s(peer, hop_count=0), 8.0)
@@ -268,6 +282,20 @@ class RawFragmentScenarios(unittest.TestCase):
         self.assertTrue(wait_until(lambda: big in b.owner.received, 60.0), "raw transfer through a repeater never delivered")
         self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 4)
         self.assertGreaterEqual(len(_events(a, "raw_fragment_sent")), 4)
+
+        # Phase 2's premise is "raw is enabled for this peer and the chain
+        # drops it", so establish that premise rather than inheriting phase
+        # 1's luck. Phase 1 can lose a single raw fragment to ordinary
+        # collision/loss at the repeater hop -- sim captures from a failing
+        # run show B holding [1,2,3] of pkt_id 0 and A falling back to text,
+        # which sets the per-peer raw pause for
+        # `direct_raw_fallback_cooldown_s`. Phase 2 would then never attempt
+        # raw at all and this test would fail for a reason unrelated to the
+        # per-path verdict it exists to check. (The pause-on-partial-delivery
+        # behaviour itself is a separate question, noted for the user.)
+        a.iface._raw_disabled_until.pop(b.prefix, None)
+        self.assertTrue(a.iface._raw_fragments_eligible(b.prefix, a.iface.PRIORITY_NORMAL),
+                        "raw must be eligible before the chain is made to drop it")
 
         # The chain stops carrying raw packets: Z85 text gets through, so the
         # PATH is noted and raw is not probed again on it.

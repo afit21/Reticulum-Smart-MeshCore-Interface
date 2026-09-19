@@ -116,7 +116,9 @@ class CompletionAnswerCorrelation(SingleNodeCase):
 
     async def _register(self, pkt_id, frag_total):
         fut = asyncio.get_running_loop().create_future()
-        self.iface._completion_query_waiters[(self.PEER, pkt_id)] = (fut, frag_total)
+        # (fut, frag_total, nonce) since the 2026-09-19 nonce fix; None nonce
+        # means "unverifiable", which must still be accepted.
+        self.iface._completion_query_waiters[(self.PEER, pkt_id)] = (fut, frag_total, None)
         self.addCleanup(self.iface._completion_query_waiters.pop, (self.PEER, pkt_id), None)
         return fut
 

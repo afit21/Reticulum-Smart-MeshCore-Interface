@@ -214,24 +214,66 @@ class ReconcilePriorityAndBudgetTests(SingleNodeCase):
         self.assertLess(iface.PRIORITY_HANDSHAKE, iface.PRIORITY_ANSWER)
         self.assertLess(iface.PRIORITY_ANSWER, iface.PRIORITY_NORMAL)
         self.assertLess(iface.PRIORITY_NORMAL, iface.PRIORITY_LOW)
-        # RNS traffic itself never classifies into the ANSWER tier.
-        for kind in ("data", "announce", "path_request", "link_request", "proof", "lrproof", "path_response"):
+        # Of RNS's own traffic only a plain delivery PROOF classifies into
+        # the ANSWER tier (second audit, 2026-09-19 evening: at HANDSHAKE it
+        # starved completion ANSWERs for up to 55s).
+        for kind in ("data", "announce", "path_request", "link_request", "lrproof", "path_response"):
             self.assertNotEqual(iface._priority_tier(iface._parse_rns_header(build_rns_packet(kind))), iface.PRIORITY_ANSWER)
+        self.assertEqual(iface._priority_tier(iface._parse_rns_header(build_rns_packet("proof"))), iface.PRIORITY_ANSWER)
 
-    def test_answer_budget_grows_with_own_queue_depth_and_caps(self):
+    def test_answer_budget_is_capped_and_ignores_own_queue_depth(self):
+        """Superseded by the 2026-09-19 evening field session. This used to
+        assert that the budget GREW with `_direct_exchange_queue_depth` (a
+        local proxy for the peer's congestion). The session's 190 completion
+        checks refuted the premise: 96% of answers that ever arrived did so
+        within 15s, every band beyond 20s produced two answers in the whole
+        session, and the answer rate FELL as the budget grew (92% at 10-20s
+        vs 34% at 40-45s) -- a long budget marks bad conditions rather than
+        curing them. The budget is now floor..cap with no contention term."""
         iface = self.iface
         original = iface._direct_exchange_queue_depth
         try:
             iface._direct_exchange_queue_depth = 0
             base = iface._completion_query_timeout_s(PEER, 0)
-            iface._direct_exchange_queue_depth = 2
-            self.assertAlmostEqual(iface._completion_query_timeout_s(PEER, 0), min(base + 2 * iface.direct_completion_check_timeout_s, iface.direct_ack_timeout_routed_max_s), places=6)
-            iface._direct_exchange_queue_depth = 40
-            widened = iface._completion_query_timeout_s(PEER, 0)
-            self.assertLessEqual(widened, max(base, iface.direct_ack_timeout_routed_max_s))
-            self.assertGreaterEqual(widened, base)
+            for depth in (2, 8, 40):
+                iface._direct_exchange_queue_depth = depth
+                self.assertAlmostEqual(
+                    iface._completion_query_timeout_s(PEER, 0), base, places=6,
+                    msg=f"queue depth {depth} must not change the answer budget any more",
+                )
         finally:
             iface._direct_exchange_queue_depth = original
+
+    def test_answer_budget_respects_floor_and_cap(self):
+        iface = self.iface
+        floor_s = iface.direct_completion_check_timeout_s
+        cap_s = iface.direct_completion_check_timeout_max_s
+        multi_cap_s = iface.direct_completion_check_timeout_max_multihop_s
+        iface._query_rtt.pop(PEER, None)
+        iface._last_firmware_ack_timeout_s.pop(PEER, None)
+        # No information at all -> the hop-aware floor, itself clamped by the
+        # ceiling. (Corrected while testing the cap: a flat floor at every hop
+        # count took a first query at 1 hop from 10s to 5s, below the 11.7-16.1s
+        # p90 the same session measured for query->answer. The cap is the fix;
+        # the floor stays hop-aware.)
+        per_hop_s = iface.direct_completion_check_timeout_per_hop_s
+        for hops in (0, 1, 2, 3):
+            expected = min(floor_s + per_hop_s * hops,
+                           iface._completion_query_timeout_cap_s(hops))
+            self.assertAlmostEqual(iface._completion_query_timeout_s(PEER, hops), expected,
+                                   places=6, msg=f"hops={hops}")
+        self.assertEqual(iface._completion_query_timeout_s(PEER, 0), floor_s)
+        # A big firmware bound cannot push it past the cap.
+        iface._last_firmware_ack_timeout_s[PEER] = 28.0
+        self.assertEqual(iface._completion_query_timeout_s(PEER, 0), cap_s)
+        self.assertEqual(iface._completion_query_timeout_s(PEER, 1), cap_s)
+        self.assertEqual(iface._completion_query_timeout_s(PEER, 2), multi_cap_s)
+        # A fast measured round trip pulls it back down to the zero-hop floor.
+        iface._last_firmware_ack_timeout_s.pop(PEER, None)
+        for _ in range(20):
+            iface._record_query_rtt(PEER, 0.8)
+        self.assertEqual(iface._completion_query_timeout_s(PEER, 0), floor_s)
+        self.assertLessEqual(iface._completion_query_timeout_s(PEER, 2), multi_cap_s)
 
 
 @slow
