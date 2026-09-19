@@ -2066,6 +2066,17 @@ drive-home (3-hop -> zero-hop) capture left open after that day's fixes:**
 Verified: fast suite (`tests/test_field_fixes_0919.py` covers each), the
 simulated-mesh scenarios; the field test that follows is the real check.
 
+**Field-diagnosed fix (2026-09-19, zero-hop image transfer, both captures
+in `fieldtests/raw/Alpha0.1.2`):** a packet received as raw fragments had
+its PROOF routed `small_mesh_direct_all_unknown_dest` (seen twice, right
+after each `direct_raw_multifragment` receive) because the raw path skips
+`_observe_incoming_rns_packet` and so never filled `_proof_correlation`.
+`_correlate_raw_proof` now records the correlation -- nothing else -- when
+the raw frame's claimed source is an already-bound peer with a resolved
+path; its docstring has the threat-model reasoning (a misdirected PROOF is
+worth nothing to a spoofer, and the fallback already reached every bound
+peer). Verified: fast suite (`tests/test_field_fixes_0919.py`).
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -9982,6 +9993,50 @@ class SmartMeshCoreInterface(Interface):
                 f"least-recently-learned token {evicted.hex()[:12]}."
             )
 
+    def _correlate_raw_proof(self, data: bytes, claimed_peer_prefix: Optional[str]) -> None:
+        """Field-diagnosed (2026-09-19, zero-hop image transfer, both
+        captures): a packet received as raw fragments never had its
+        outgoing PROOF attributed to a peer -- `_proof_correlation` is
+        only filled by `_observe_incoming_rns_packet`, which the raw path
+        skips because a raw frame's source prefix is unauthenticated. The
+        proof (its destination-hash field is the proved packet's truncated
+        hash, in no table) then fell through to the unknown-destination
+        branch: DIRECT-to-all in small-mesh mode, a CHANNEL broadcast
+        beyond three peers -- the transport raw exists to avoid.
+
+        This records ONLY the proof correlation, and only when the claimed
+        prefix is a peer this node has already bound (bind frame) AND
+        holds a resolved DIRECT path to. Threat model: a spoofer who
+        claims a bound peer's prefix can at worst misdirect one PROOF to
+        that peer -- a PROOF is cryptographically bound to the packet it
+        proves, so it is useless to anyone else, and RNS simply re-sends
+        the data. That is no wider than the fallback's own behaviour
+        (small-mesh DIRECT-to-all already reaches every bound peer, the
+        spoofer included) and strictly narrower than a broadcast. No RNS
+        token is learned here: a token would steer *data* to the claimed
+        peer, which is a different exposure."""
+        if claimed_peer_prefix is None:
+            return
+        if claimed_peer_prefix not in self._peers or claimed_peer_prefix not in self._resolved_paths:
+            self._debug(
+                f"_correlate_raw_proof: {claimed_peer_prefix!r} is not a bound peer with a "
+                f"resolved path -- not trusting a raw frame's claim for this packet's PROOF."
+            )
+            return
+        header = self._parse_rns_header(data)
+        if header is None or header.packet_type == RNS.Packet.PROOF:
+            return
+        truncated_hash = self._compute_truncated_hash(data, header.header_type)
+        if truncated_hash is None:
+            return
+        self._proof_correlation[truncated_hash] = (
+            claimed_peer_prefix, time.monotonic() + self.proof_correlation_ttl_s,
+        )
+        self._debug(
+            f"_correlate_raw_proof: PROOF for {truncated_hash.hex()} will route to bound, "
+            f"resolved peer {claimed_peer_prefix!r} (raw receive; no token learned)."
+        )
+
     def _observe_incoming_rns_packet(self, data: bytes, sender_peer_prefix: Optional[str]) -> None:
         """§7: populated only from the DIRECT receive path -- a CHANNEL
         "R" frame carries no sender pubkey at all
@@ -10664,9 +10719,13 @@ class SmartMeshCoreInterface(Interface):
             peer_prefix = self._canonical_peer_prefix(sender_token)
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
-            # raw=True (2026-09-18 night): the src prefix in a raw frame is
-            # unauthenticated, so nothing is learned from it -- the packet
-            # is only delivered.
+            else:
+                # raw=True (2026-09-18 night): the src prefix in a raw frame
+                # is unauthenticated, so no token is learned from it. The one
+                # thing recorded (2026-09-19) is where this packet's PROOF
+                # should go, and only for a peer this node already trusts --
+                # see _correlate_raw_proof.
+                self._correlate_raw_proof(complete_data, peer_prefix)
             self.process_incoming(
                 complete_data, transport="direct_raw_multifragment" if raw else "direct_multifragment",
                 sender_peer_prefix=peer_prefix, frag_total=header.frag_total, pkt_id=header.pkt_id,

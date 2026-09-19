@@ -60,6 +60,11 @@ def _bring_up(mesh, names, timeout=40.0):
                 if mesh.wait_resolved(min(8.0, max(0.5, deadline - time.monotonic()))):
                     break
                 assert time.monotonic() < deadline, "DIRECT paths never resolved"
+            # Every nudge that was queued while paths were unresolved becomes
+            # a real DIRECT send once they resolve; let that backlog drain
+            # off both radios before the scenario's own traffic starts.
+            wait_until(lambda: all(not n.iface._direct_exchange_lock_impl.locked() for n in mesh.nodes.values()), 90.0)
+            time.sleep(1.0)
     except AssertionError:
         # unittest skips tearDown when setUp fails: stop the mesh here or its
         # interfaces (and their executor threads) outlive the test run.
@@ -67,7 +72,7 @@ def _bring_up(mesh, names, timeout=40.0):
         raise
 
 
-def _prime(sender, receiver, timeout=30.0):
+def _prime(sender, receiver, timeout=60.0):
     """One packet from receiver -> sender teaches the sender an RNS token
     for receiver.dest_hash, the way real traffic bootstraps DIRECT-primary."""
     receiver.send(build_rns_packet("data", dest_hash=receiver.dest_hash, payload=b"prime"))

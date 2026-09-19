@@ -142,6 +142,54 @@ class ClosedLinkTests(SingleNodeCase):
         self.assertTrue(wait_until(lambda: iface._outgoing_dropped_total == dropped_before + 1, 10.0))
 
 
+class RawProofCorrelationTests(SingleNodeCase):
+
+    def setUp(self):
+        self.iface._peers.clear()
+        self.iface._resolved_paths.clear()
+        self.iface._proof_correlation.clear()
+
+    def _bind_and_resolve(self, prefix):
+        self.iface._peers[prefix] = self.module._PeerRecord(pubkey_prefix=prefix, has_upstream_rns=False, last_seen=time.time())
+        self.iface._resolved_paths[prefix] = self.module._ResolvedPath("", 0, 1, time.monotonic())
+
+    def _proof_header_for(self, data):
+        header = self.iface._parse_rns_header(data)
+        truncated = self.iface._compute_truncated_hash(data, header.header_type)
+        return truncated, self.iface._parse_rns_header(build_rns_packet("proof", dest_hash=truncated))
+
+    def test_proof_routes_to_bound_resolved_peer_after_raw_receive(self):
+        iface = self.iface
+        data = build_rns_packet("data", dest_hash=os.urandom(16), payload=b"raw-received")
+        truncated, proof_hdr = self._proof_header_for(data)
+        self._bind_and_resolve(PEER)
+        iface._correlate_raw_proof(data, PEER)
+        self.assertIn(truncated, iface._proof_correlation)
+        self.assertEqual(iface._resolve_routing_peer(proof_hdr), PEER)
+        # Only the proof correlation is recorded -- never an RNS token.
+        self.assertNotIn(iface._parse_rns_header(data).destination_hash, iface._rns_token_peer)
+
+    def test_untrusted_claim_is_ignored(self):
+        iface = self.iface
+        data = build_rns_packet("data", dest_hash=os.urandom(16), payload=b"raw-received")
+        truncated, proof_hdr = self._proof_header_for(data)
+        iface._correlate_raw_proof(data, PEER)                # not bound
+        self.assertNotIn(truncated, iface._proof_correlation)
+        iface._peers[PEER] = self.module._PeerRecord(pubkey_prefix=PEER, has_upstream_rns=False, last_seen=time.time())
+        iface._correlate_raw_proof(data, PEER)                # bound, no resolved path
+        self.assertNotIn(truncated, iface._proof_correlation)
+        iface._correlate_raw_proof(data, None)
+        self.assertNotIn(truncated, iface._proof_correlation)
+        self.assertIsNone(iface._resolve_routing_peer(proof_hdr))
+
+    def test_proof_packets_themselves_are_never_correlated(self):
+        iface = self.iface
+        self._bind_and_resolve(PEER)
+        proof = build_rns_packet("proof", dest_hash=os.urandom(16), payload=b"p")
+        iface._correlate_raw_proof(proof, PEER)
+        self.assertEqual(iface._proof_correlation, {})
+
+
 class BindRerequestScheduleTests(SingleNodeCase):
 
     def test_doubles_from_initial_to_cap(self):
