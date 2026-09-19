@@ -1605,9 +1605,10 @@ adding a second one):
   (~0.72s each at SF7/BW62.5/CR8) instead of 5 text ones plus 5 ACKs --
   about 43% less sender airtime, and no ACK idle at all.
 - *Reliability = the reconcile bitmap.* `_send_direct_raw_fragmented`
-  bursts every missing fragment under `_direct_exchange_lock` (spaced by
-  `direct_raw_zero_hop_gap`, or `direct_raw_hop_gap_factor` x airtime
-  when a repeater must forward each one first), releases the lock, then
+  bursts every missing fragment under `_direct_exchange_lock` (each
+  followed by `direct_raw_zero_hop_gap`, or `direct_raw_hop_gap_factor` x
+  hops x its airtime when repeaters must each forward it first -- see
+  `_raw_fragment_gap_s` and the 2026-09-19 morning entry), releases the lock, then
   asks the receiver what it holds with the existing `"Q"` QUERY (up to
   `direct_raw_query_attempts` tries), applies the answer authoritatively
   and repeats for up to `direct_raw_reconcile_rounds`. Resume
@@ -1947,6 +1948,77 @@ then-ask); and moving this docstring's dated history into `changelog.md`,
 which now duplicates most of it -- CLAUDE.md names this docstring the
 authoritative design record, so where the history lives is the user's
 call.
+
+**Field-diagnosed batch (2026-09-19 morning, the first raw-fragment field
+test through 2 and 4 repeater hops; both sides captured, user asked "what's
+going on?" from the field and then for the fixes).** The laptop drove out
+to 2 hops (76,19 / d6,19); the desktop still held the zero-hop path to it
+from the night before. Three findings, two fixes:
+
+1. *The desktop sat on the dead zero-hop path for 3.5 minutes.* Every one
+   of the laptop's 12 path requests ARRIVED (desktop rx_log), but the
+   desktop's firmware ACKs went back down the stale zero-hop path, so the
+   laptop saw every send as `downstream_loss`; the laptop's own stale
+   detector reset its side after 3 full-timeout failures (09:59:52). The
+   desktop meanwhile answered each request with the 235-byte
+   PATH_RESPONSE as raw fragments over path_len 0: three whole sends
+   (pkt 14/15/16, 09:58:23-10:01:05, 18 raw frames and 17 full-timeout
+   QUERY misses into nothing) before its own reset fired, because the raw
+   sender recorded one path failure per exhausted send and the QUERY
+   exchanges recorded none. Fix: `_record_query_path_evidence` -- each
+   raw round's QUERYs (ACKed DIRECT exchanges over the cached path) feed
+   `record_direct_send_result`: an ACK or an ANSWER clears the counter, a
+   round in which every QUERY attempt missed after its full timeout counts
+   one failure (per round, never per attempt, so one lost ACK still is not
+   a path failure). `_query_remote_fragments` reports the QUERY's own ACK
+   outcome through a `send_info` out-param. Replaying the capture, the
+   desktop would have reset at ~09:59:34 instead of 10:01:05, before the
+   second and third wasted sends. `_raw_path_reset_mid_send` then
+   abandons a send's remaining rounds once its path is gone (remembered
+   for resume), instead of bursting them down a path known dead. What
+   actually delivered the announce was the small-mesh CHANNEL last resort
+   (3 fragments via repeater 19, 10:01:21-10:01:43), added by the audit
+   the night before.
+
+2. *Raw fragments through repeaters lost exactly one of every two.* Once
+   paths existed (laptop->desktop 2 hops; desktop->laptop 4 hops -- 19,
+   d6, 4f, 76, asymmetric because MeshCore learns whichever flood copy
+   arrives first), every 2-fragment raw send in both directions delivered
+   one fragment (laptop pkt 0/1/2, desktop pkt 19/20). The inter-fragment
+   gap was `direct_raw_hop_gap_factor` (2) x airtime regardless of hop
+   count: 1.87s at 2 hops, 2.0s at 4. A fragment needs ~hops x airtime
+   just to clear a half-duplex repeater chain, plus each repeater's random
+   forward delay (simple_repeater `getDirectRetransmitDelay`: rand(0..5)
+   x `direct_tx_delay_factor` 0.3 x airtime = 0-1.5 airtimes per hop), so
+   the second fragment always reached some repeater while it was still
+   transmitting the first. Confirmations: solo re-sends of the missing
+   fragment at 2 hops arrived (laptop pkt 2 completed on round 1,
+   10:03:50 -- the one LXMF message that got through; PROOF back at
+   10:04:19); at 4 hops the desktop's re-sends were chased by the QUERY
+   ~1s later and that QUERY then died at hop 1 with no echo
+   (`hop1_abort`, 10:04:32); the laptop's pkt 0 second fragment and pkt 1
+   first fragment went out 0.02s apart because the second send took the
+   lock between the first send's burst and its QUERY; and after both
+   desktop packets fell back to text, the ACK-paced text fragments went
+   5/5 through 4 hops (10:06, 7-9s ACKs). Fix: `_raw_fragment_gap_s` --
+   the gap is per fragment, factor x hops x that fragment's airtime,
+   follows the LAST fragment too, and is slept with `_direct_exchange_
+   lock` still held, so neither the QUERY nor another send can enter the
+   chain until the fragment has cleared it. At one hop this is exactly
+   the pre-fix gap the 2026-09-18 raw field test passed with; zero hop is
+   unchanged (`direct_raw_zero_hop_gap`). Cost: raw at N hops now paces
+   at ~2N airtimes per fragment, about what the text path's ACK round
+   trip costs, so raw's win through repeaters shrinks to the 12% larger
+   payload and the absent per-fragment ACKs; at zero hop nothing changes.
+
+3. *Not fixed, noted.* The two directions' paths differ (2 vs 4 hops)
+   and the interface uses whatever the firmware discovered; RNS re-sent
+   the same LXMF message three times as three different ciphertexts
+   (pkt 0/1/2), which `_outgoing_inflight`'s payload-hash dedup cannot
+   see; pkt 0 and 1 expired at `outgoing_max_age` after their 45s QUERY
+   timeouts. Verified: fast suite, `RawFragmentScenarios` (zero-hop, one-
+   hop, and the new stale-path-within-one-send scenario) -- the user asked
+   for the test suite only, not the standalone simulator runs.
 
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
@@ -3588,10 +3660,13 @@ class SmartMeshCoreInterface(Interface):
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
-        # Spacing between fragments of one burst: a flat gap at zero hop
-        # (the receiver sends no ACK, so only its own processing needs
-        # covering), or this many airtimes when a repeater must forward
-        # each fragment before it can hear the next one.
+        # Quiet time after each fragment of a burst (the last one included):
+        # a flat gap at zero hop (the receiver sends no ACK, so only its own
+        # processing needs covering), or this factor x hop count x the
+        # fragment's airtime through repeaters -- each repeater in the chain
+        # must re-transmit the fragment (after the firmware's random 0-1.5
+        # airtime delay) before it can hear the next one. See
+        # _raw_fragment_gap_s for the 2026-09-19 field evidence.
         self.direct_raw_zero_hop_gap_s = float(cfg.get("direct_raw_zero_hop_gap", 0.15))
         self.direct_raw_hop_gap_factor = float(cfg.get("direct_raw_hop_gap_factor", 2.0))
         # Burst-then-ask rounds per packet, and QUERY tries per round.
@@ -7011,6 +7086,75 @@ class SmartMeshCoreInterface(Interface):
         self.txb += len(frame)
         return True
 
+    def _raw_fragment_gap_s(self, hops: int, on_air_bytes: int) -> float:
+        """Quiet time after one raw fragment before this node transmits
+        anything else (2026-09-19 morning field test, both captures).
+
+        Zero hop: `direct_raw_zero_hop_gap` flat -- the receiver sends no
+        ACK, only its own processing needs covering. Through repeaters:
+        `direct_raw_hop_gap_factor` x `hops` x the fragment's own airtime.
+        The chain is a half-duplex pipeline: each repeater re-transmits the
+        fragment after a random delay (simple_repeater `getDirectRetransmit
+        Delay`: rand(0..5) x `direct_tx_delay_factor` 0.3 x airtime, so 0 to
+        1.5 airtimes per hop) and cannot hear the next fragment while it
+        does. The pre-fix gap was 2 airtimes regardless of hop count; at 2
+        and 4 hops every 2-fragment raw send in both directions lost
+        exactly one fragment (laptop pkt 0/1/2, desktop pkt 19/20), and
+        solo re-sends of the missing one arrived. `hops` x airtime is the
+        chain's collision-free floor with no repeater delay at all; the
+        factor of 2 sits between the firmware's mean (1.75x per hop) and
+        worst case (2.5x). At one hop this equals the pre-fix gap the first
+        raw field test passed with."""
+        if hops <= 0:
+            return max(0.0, self.direct_raw_zero_hop_gap_s)
+        return max(0.0, self.direct_raw_hop_gap_factor * hops * self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes))
+
+    def _record_query_path_evidence(self, peer_prefix: str, infos: "list[dict]", answered: bool = False) -> None:
+        """One raw reconcile round's QUERY sends, as stale-path evidence
+        (2026-09-19 morning field test). Each QUERY is an ACKed DIRECT
+        exchange over the cached path, so its firmware ACK proves the
+        path, and `direct_raw_query_attempts` consecutive full-timeout
+        misses disprove it as strongly as one text send's exhausted
+        `direct_send_attempts` budget does. Before this, a raw send
+        recorded one failure only after all its rounds were exhausted and
+        the QUERYs recorded nothing: the desktop sat on a dead zero-hop
+        path through 17 consecutive full-timeout QUERY misses and three
+        whole 70s sends (09:58:23-10:01:05) before `record_direct_send_
+        result` reached its threshold of 3. Counted per round, not per
+        attempt, so a single lost ACK still is not a path failure."""
+        if not infos:
+            return
+        if answered or any(i.get("acked") for i in infos):
+            # An ANSWER proves the path even if the QUERY's own ACK was lost.
+            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+        elif all(i.get("waited_full_timeout") for i in infos):
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+
+    async def _raw_path_reset_mid_send(
+        self, peer_prefix: str, path: bytes, pkt_id: int, rnd: int, acked: list, frag_total: int, remember,
+    ) -> bool:
+        """True when the path this raw send was started on is no longer
+        the peer's resolved path (reset by `_reset_stale_path`, possibly
+        from this send's own QUERY evidence, or re-resolved elsewhere):
+        the remaining rounds would burst fragments source-routed down a
+        path already known to be dead. The send is remembered for resume
+        and abandoned; the next packet for this peer goes through
+        discovery. `asyncio.sleep(0)` first lets the background reset
+        task spawned a moment ago run before the check."""
+        await asyncio.sleep(0)
+        resolved = self._resolved_paths.get(peer_prefix)
+        if resolved is not None and (resolved.out_path_hex or "") == path.hex():
+            return False
+        remember()
+        self._outgoing_dropped_total += 1
+        RNS.log(
+            f"{self}: RAW send pkt_id={pkt_id} to {peer_prefix!r}: path {path.hex() or '<zero-hop>'} was reset "
+            f"after round {rnd} -- abandoning the remaining rounds rather than bursting down a dead path; "
+            f"receiver holds {sum(acked)}/{frag_total}.",
+            RNS.LOG_WARNING,
+        )
+        return True
+
     async def _send_direct_raw_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
         priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
@@ -7048,10 +7192,10 @@ class SmartMeshCoreInterface(Interface):
             f"RAW fragmented send starting: pkt_id={pkt_id} to {peer_prefix!r} frag_total={frag_total} "
             f"budget={budget}B path_len={len(path)} hop_count={hop_count}{' (resumed)' if resumed else ''}."
         )
-        if hop_count is not None and hop_count >= 1:
-            gap_s = self.direct_raw_hop_gap_factor * self._estimate_tx_airtime_s("", on_air_bytes=2 + len(path) + self.RAW_HEADER_SIZE + budget)
-        else:
-            gap_s = self.direct_raw_zero_hop_gap_s
+        # Field fix (2026-09-19 morning): the gap is per fragment, scaled by
+        # the number of repeaters that must each forward it before the
+        # chain is clear -- see _raw_fragment_gap_s.
+        gap_hops = max(0, hop_count if hop_count is not None else len(path))
         last_progress_at = time.monotonic() if resumed else None
         empty_answered_bursts = 0
 
@@ -7098,22 +7242,39 @@ class SmartMeshCoreInterface(Interface):
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
                             })
-                        if n < len(missing) - 1 and gap_s > 0:
+                        # Field fix (2026-09-19 morning): the gap follows EVERY
+                        # fragment, the last one included, and is slept with
+                        # the lock still held -- so the QUERY below (and any
+                        # other send waiting on the lock) cannot enter the
+                        # repeater chain while this fragment is still
+                        # working its way down it.
+                        gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
+                        if gap_s > 0:
                             await asyncio.sleep(gap_s)
             held_before = sum(acked)
             answer = None
+            query_infos: list = []
             for q in range(max(1, self.direct_raw_query_attempts)):
+                info: dict = {}
                 answer = await self._query_remote_fragments(
                     target, peer_prefix, pkt_id, frag_total, stage=f"raw{rnd}", priority=priority, hop_count=hop_count,
+                    send_info=info,
                 )
+                query_infos.append(info)
                 if answer is not None or self.detached or not self.online:
                     break
             if self.detached or not self.online:
                 remember()
                 return False
+            # Field fix (2026-09-19 morning): the QUERYs are ACKed DIRECT
+            # exchanges over the cached path -- their firmware ACKs are the
+            # same stale-path evidence the text path's sends feed.
+            self._record_query_path_evidence(peer_prefix, query_infos, answered=answer is not None)
             if answer is None:
                 query_unanswered_rounds += 1
                 self._debug(f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} reconcile unanswered.")
+                if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
+                    return False
                 continue
             held = self._held_from_answer(answer, frag_total)
             if held is None:
@@ -7534,6 +7695,7 @@ class SmartMeshCoreInterface(Interface):
     async def _query_remote_fragments(
         self, target: str, peer_prefix: str, pkt_id: int, frag_total: int, stage: str,
         priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+        send_info: Optional[dict] = None,
     ) -> Optional[_CompletionFrame]:
         """Step 3 (2026-09-18, see module docstring): one `"Q"` QUERY to the
         receiver, answered with its have-bitmap (v2) or a bare complete
@@ -7574,11 +7736,21 @@ class SmartMeshCoreInterface(Interface):
             # queries for up to 50s under bidirectional traffic.
             sent_at = time.monotonic()
             try:
-                await self._send_direct_frame_and_wait_for_ack(
+                q_ok, q_waited_full = await self._send_direct_frame_and_wait_for_ack(
                     target, frame, 0, peer_prefix=peer_prefix, priority=priority,
                     time_critical=True, kind="completion_query", hop_count=hop_count,
                 )
+                # Field fix (2026-09-19 morning): the QUERY's own firmware
+                # ACK outcome, for the caller's stale-path evidence
+                # (_record_query_path_evidence). `send_info` is the same
+                # out-param shape _send_direct_payload uses.
+                if send_info is not None:
+                    send_info["acked"] = bool(q_ok)
+                    send_info["waited_full_timeout"] = bool(q_waited_full)
             except Exception as exc:
+                if send_info is not None:
+                    send_info["acked"] = False
+                    send_info["waited_full_timeout"] = False
                 self._debug(
                     f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
                     f"send failed locally: {exc} -- treating as no answer."

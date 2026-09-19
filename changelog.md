@@ -7,6 +7,39 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Fixed: first multi-hop raw-fragment field test (2026-09-19 morning) -- two fixes
+
+Both sides captured (laptop at 2 hops, desktop's path back at 4 hops).
+
+- **Raw fragments through repeaters lost one of every two.** The gap
+  between raw fragments was 2 airtimes regardless of hop count, but a
+  fragment needs about hops x airtime to clear a half-duplex repeater
+  chain, plus each repeater's random forward delay (0 to 1.5 airtimes in
+  the simple_repeater firmware). Every 2-fragment raw send in both
+  directions delivered exactly one fragment; solo re-sends arrived. The
+  gap is now `direct_raw_hop_gap_factor` x hops x the fragment's own
+  airtime (`_raw_fragment_gap_s`), follows the last fragment too, and is
+  slept with the radio lock held so the reconcile QUERY (or another
+  send's burst) cannot enter the chain early. Zero hop and one hop are
+  unchanged from the gaps the earlier field tests passed with.
+- **A raw sender on a dead cached path took three whole sends to notice.**
+  The desktop kept the previous night's zero-hop path to the laptop and
+  answered its path requests with raw fragments down it for 3.5 minutes
+  (18 raw frames and 17 full-timeout QUERY misses), because the raw sender
+  recorded one stale-path failure per exhausted send and the QUERY
+  exchanges recorded none. Each raw round's QUERYs now feed
+  `record_direct_send_result` (`_record_query_path_evidence`: an ACK or
+  ANSWER clears the counter, a round whose every QUERY attempt missed
+  after its full timeout counts one failure), and a send abandons its
+  remaining rounds once its path has been reset
+  (`_raw_path_reset_mid_send`). Its firmware's ACKs went down the same
+  dead path, which is why the laptop saw every arriving send as lost.
+
+Noted, not changed: the two directions' discovered paths differed (2 vs
+4 hops); RNS re-sent one LXMF message as three distinct ciphertexts that
+no payload-hash dedup can fold. Tests: `RawGapAndPathEvidence` (unit) and
+`RawFragmentScenarios.test_stale_path_reset_within_one_raw_send`.
+
 ### Fixed: bare-DIRECT receive dedup stalled a Resource transfer
 
 RNS's `Transport.packet_filter` exempts KEEPALIVE, RESOURCE, RESOURCE_REQ,

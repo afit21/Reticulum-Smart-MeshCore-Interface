@@ -161,12 +161,59 @@ class PerPathFallbackVerdict(SingleNodeCase):
         iface._raw_disabled_until.clear()
 
 
-def _raw_mesh(test, links, repeaters=(), seed=1):
+class RawGapAndPathEvidence(SingleNodeCase):
+    """First multi-hop raw field test (2026-09-19 morning, see the module
+    docstring's entry): the inter-fragment gap scales with the repeater
+    chain, and a round's QUERY ACKs feed the stale-path detector."""
+
+    def test_gap_scales_with_hops_and_follows_the_fragment_airtime(self):
+        iface = self.iface
+        airtime_big = iface._estimate_tx_airtime_s("", on_air_bytes=175)
+        airtime_small = iface._estimate_tx_airtime_s("", on_air_bytes=70)
+        self.assertGreater(airtime_big, airtime_small)
+        self.assertEqual(iface._raw_fragment_gap_s(0, 175), iface.direct_raw_zero_hop_gap_s)
+        # one hop: exactly the pre-fix gap the 2026-09-18 field test passed with
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(1, 175), iface.direct_raw_hop_gap_factor * airtime_big)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(4, 175), 4 * iface.direct_raw_hop_gap_factor * airtime_big)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(2, 70), 2 * iface.direct_raw_hop_gap_factor * airtime_small)
+        self.assertLess(iface._raw_fragment_gap_s(2, 70), iface._raw_fragment_gap_s(2, 175))
+
+    def test_query_round_outcomes_feed_the_stale_path_counter(self):
+        iface = self.iface
+        peer = "abcdef012345"
+        miss = {"acked": False, "waited_full_timeout": True}
+        cut_short = {"acked": False, "waited_full_timeout": False}
+        hit = {"acked": True, "waited_full_timeout": True}
+        try:
+            iface._direct_path_failures.pop(peer, None)
+            self.on_loop(iface._record_query_path_evidence, peer, [])
+            self.assertNotIn(peer, iface._direct_path_failures)
+            # a round of full-timeout misses is one failure, not one per attempt
+            self.on_loop(iface._record_query_path_evidence, peer, [miss, miss])
+            self.assertEqual(iface._direct_path_failures.get(peer), 1)
+            # an attempt cut short by this engine's own ceiling proves nothing
+            self.on_loop(iface._record_query_path_evidence, peer, [miss, cut_short])
+            self.assertEqual(iface._direct_path_failures.get(peer), 1)
+            self.on_loop(iface._record_query_path_evidence, peer, [miss, miss])
+            self.assertEqual(iface._direct_path_failures.get(peer), 2)
+            # one ACKed QUERY clears the counter
+            self.on_loop(iface._record_query_path_evidence, peer, [miss, hit])
+            self.assertNotIn(peer, iface._direct_path_failures)
+            # so does an ANSWER whose QUERY ACK was lost
+            self.on_loop(iface._record_query_path_evidence, peer, [miss, miss])
+            self.assertEqual(iface._direct_path_failures.get(peer), 1)
+            self.on_loop(lambda: iface._record_query_path_evidence(peer, [miss, miss], answered=True))
+            self.assertNotIn(peer, iface._direct_path_failures)
+        finally:
+            iface._direct_path_failures.pop(peer, None)
+
+
+def _raw_mesh(test, links, repeaters=(), seed=1, config=None):
     quiet_rns()
     mesh = SimMesh(links, repeaters=repeaters, seed=seed, capture_dir=tempfile.mkdtemp(prefix="smci-raw-cap-"))
     test.mesh = mesh   # assigned before any assertion so tearDown can always stop it
     for n in ("A", "B"):
-        mesh.add_node(n, config=dict(RAW_CFG))
+        mesh.add_node(n, config={**RAW_CFG, **(config or {})})
     mesh.advert_all()
     assert mesh.wait_contacts(40.0), "contacts never populated"
     assert mesh.wait_bound(40.0), "bind-frame discovery never completed"
@@ -240,6 +287,34 @@ class RawFragmentScenarios(unittest.TestCase):
         a.send(big3)
         self.assertTrue(wait_until(lambda: big3 in b.owner.received, 90.0))
         self.assertEqual(len(_events(a, "raw_fragment_sent")), raw_before, "a noted chain must not be probed with raw again")
+
+    def test_stale_path_reset_within_one_raw_send(self):
+        """2026-09-19 morning field test: the desktop burst three whole raw
+        sends down a dead zero-hop path before its stale-path reset fired,
+        because the reconcile QUERYs recorded no evidence. Now each
+        unanswered round counts, and the send stops once the path is gone."""
+        _, a, b = _raw_mesh(self, ["A-B"], seed=61, config={"direct_path_reset_threshold": "2"})
+        iface = a.iface
+        time.sleep(max(0.0, iface.direct_path_reset_min_age_s - (time.monotonic() - iface._resolved_paths[b.prefix].resolved_at)))
+        self.mesh.air.link_loss[("A", "B")] = 1.0
+        self.mesh.air.link_loss[("B", "A")] = 1.0
+        dead = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"raw-dead-" + os.urandom(440))
+        a.send(dead)
+        self.assertTrue(wait_until(lambda: b.prefix not in iface._resolved_paths, 90.0), "stale path was never reset")
+        # Let the abandoned send wind down, then check it stopped early.
+        time.sleep(3.0)
+        rounds = {r["round"] for r in _events(a, "raw_fragment_sent")}
+        self.assertEqual(max(rounds), iface.direct_path_reset_threshold - 1,
+                         f"the send should stop after the round that tripped the reset, got rounds {sorted(rounds)}")
+        self.assertEqual(a.radio.contacts[b.radio.pubkey]["out_path_len"], -1, "reset_path never reached the radio")
+
+        # Link comes back: the next raw send rediscovers and delivers.
+        self.mesh.air.link_loss.clear()
+        self.assertTrue(wait_until(lambda: not iface._path_discovery_in_backoff(b.prefix), 30.0))
+        alive = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"raw-alive-" + os.urandom(440))
+        a.send(alive)
+        self.assertTrue(wait_until(lambda: alive in b.owner.received, 90.0), "raw send after rediscovery never delivered")
+        self.assertIn(b.prefix, iface._resolved_paths)
 
 
 if __name__ == "__main__":
