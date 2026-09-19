@@ -158,6 +158,8 @@ def build_rns_packet(kind: str, dest_hash: bytes = TEST_DEST_HASH, payload: byte
         "proof": (RNS.Packet.PROOF, RNS.Destination.SINGLE, RNS.Packet.NONE),
         "lrproof": (RNS.Packet.PROOF, RNS.Destination.LINK, RNS.Packet.LRPROOF),
         "path_response": (RNS.Packet.DATA, RNS.Destination.SINGLE, RNS.Packet.PATH_RESPONSE),
+        "link_data": (RNS.Packet.DATA, RNS.Destination.LINK, RNS.Packet.NONE),
+        "link_close": (RNS.Packet.DATA, RNS.Destination.LINK, RNS.Packet.LINKCLOSE),
     }
     if kind not in kinds:
         raise ValueError(f"unknown packet kind {kind!r} (choose from {sorted(kinds)})")

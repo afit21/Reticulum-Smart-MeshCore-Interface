@@ -200,6 +200,15 @@ class Air:
             p = max(p, self.type_loss.get(typename, 0.0))
         return p
 
+    def schedule_link_loss(self, at_s: float, from_name: str, to_name: str, prob: float) -> None:
+        """Change one direction's loss `at_s` seconds from now -- a link
+        that degrades and recovers over time (the 2026-09-18 drive-home
+        capture: a repeater hop sliding from usable to dead and back)."""
+        def _apply():
+            self.link_loss[(from_name, to_name)] = prob
+            self.log(f"[AIR] t+{at_s:.0f}s: loss {from_name}>{to_name} = {prob}")
+        self._loop.call_soon_threadsafe(self._loop.call_later, at_s, _apply)
+
     def transmit(self, from_name: str, packet: SimPacket) -> None:
         """Thread-safe, fire-and-forget: the firmware's own send is too."""
         self._loop.call_soon_threadsafe(self._loop.create_task, self._transmit(from_name, packet))
@@ -286,6 +295,19 @@ def parse_type_loss(specs) -> Dict[str, float]:
             out[name.strip().upper()] = float(prob)
         except ValueError:
             raise ValueError(f"type loss {spec!r} must be of the form TYPENAME=probability")
+    return out
+
+
+def parse_loss_schedule(specs):
+    """`["60:A>R1=1.0", "240:A>R1=0.0"]` -> [(at_s, from, to, prob), ...]."""
+    out = []
+    for spec in specs or ():
+        try:
+            at, rest = spec.split(":", 1)
+            (pair, prob), = parse_link_loss([rest]).items()
+            out.append((float(at), pair[0], pair[1], prob))
+        except ValueError:
+            raise ValueError(f"loss schedule {spec!r} must be of the form SECONDS:FROM>TO=probability")
     return out
 
 

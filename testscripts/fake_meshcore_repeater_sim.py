@@ -40,7 +40,14 @@ USAGE
     # Two hops with a lossy return path (ACKs get lost, data doesn't):
     python3 fake_meshcore_repeater_sim.py --link A-R1 --link R1-R2 --link R2-B \\
         --repeater R1 --repeater R2 --send-from A --send-to B \\
-        --link-loss R1>A=0.6 --count 3 --payload-size 300 --seed 3
+        --link-loss 'R1>A=0.6' --count 3 --payload-size 300 --seed 3
+
+    # A first hop that dies 20 s after the first send and recovers at 110 s
+    # (the 2026-09-18 drive-home outage shape) -- quote anything with '>'
+    # or the shell treats it as a redirection:
+    python3 fake_meshcore_repeater_sim.py --link A-R --link R-B --repeater R \\
+        --send-from A --send-to B --count 8 --interval 15 \\
+        --loss-at '20:A>R=1.0' --loss-at '110:A>R=0.0' --seed 12
 
     # A path request / announce instead of DATA, with capture output:
     python3 fake_meshcore_repeater_sim.py --link A-R --link R-B --repeater R \\
@@ -60,6 +67,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from simmesh import SimMesh, build_rns_packet, wait_until, summarize_capture  # noqa: E402
+from simmesh.air import parse_loss_schedule  # noqa: E402
 from simmesh.harness import format_summary  # noqa: E402
 from simmesh.radio import RadioOptions  # noqa: E402
 
@@ -77,9 +85,17 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=2.0, help="Seconds between sends")
     parser.add_argument("--loss", type=float, default=0.0, help="Per-delivery loss probability, every link (default 0)")
     parser.add_argument("--link-loss", action="append", default=[], metavar="FROM>TO=P",
-                        help="Directional loss override, e.g. R>A=0.5 makes the return path lossy. Repeatable.")
+                        help="Directional loss override, e.g. 'R>A=0.5' makes the return path lossy (quote it: '>' is a shell "
+                             "redirection). Repeatable.")
     parser.add_argument("--type-loss", action="append", default=[], metavar="TYPENAME=P",
                         help="Loss by MeshCore payload type, e.g. ACK=1.0 (data arrives, ACKs never do -- the phantom-ACK case). Repeatable.")
+    parser.add_argument("--loss-at", action="append", default=[], metavar="SECONDS:FROM>TO=P",
+                        help="Change one direction's loss at a time offset from the first send, e.g. '60:A>R1=1.0' then "
+                             "'240:A>R1=0.0' replays a first hop that dies and comes back (quote it: '>' is a shell "
+                             "redirection). Repeatable.")
+    parser.add_argument("--iface-option", action="append", default=[], metavar="KEY=VALUE",
+                        help="Interface config override applied to every node (after the timing profile), e.g. "
+                             "peer_discovery_rerequest_interval=20 or reassembly_idle_timeout=200. Repeatable.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--airtime-base-ms", type=float, default=None)
     parser.add_argument("--airtime-per-byte-ms", type=float, default=None)
@@ -126,6 +142,8 @@ def main() -> None:
     for name in (args.send_from, args.send_to):
         if name not in end_nodes:
             parser.error(f"{name!r} must be a non-repeater node in the --link topology")
+    iface_overrides = dict(kv.split("=", 1) for kv in args.iface_option)
+    loss_schedule = parse_loss_schedule(args.loss_at)
 
     log(f"Topology: {{ {', '.join(f'{k}: {sorted(v)}' for k, v in mesh.air.adjacency.items())} }} "
         f"repeaters={sorted(repeaters)} seed={args.seed} loss={loss} link_loss={mesh.air.link_loss} type_loss={mesh.air.type_loss} "
@@ -133,13 +151,13 @@ def main() -> None:
 
     try:
         for name in end_nodes:
-            mesh.add_node(name)
+            mesh.add_node(name, config=iface_overrides)
         sender, receiver = mesh.nodes[args.send_from], mesh.nodes[args.send_to]
 
         if not args.no_auto_advert:
-            log("Every radio adverts once (the 'press advert on each radio' field-setup step)...")
-            mesh.advert_all()
-            if not mesh.wait_contacts(args.bind_timeout):
+            log("Every radio adverts, repeated until every node holds every other as a contact (the 'press advert "
+                "on each radio until it shows up' field-setup step)...")
+            if not mesh.advert_until_contacts(rounds=6, timeout=max(10.0, args.bind_timeout / 3)):
                 log("WARNING: not every node has every other as a contact -- continuing anyway.")
         log(f"Waiting up to {args.bind_timeout:.0f}s for bind-frame peer discovery...")
         if not mesh.wait_bound(args.bind_timeout):
@@ -156,7 +174,10 @@ def main() -> None:
             primed = wait_until(lambda: receiver.dest_hash in sender.iface._rns_token_peer, timeout=30.0)
             log(f"Priming {'succeeded' if primed else 'did NOT complete (sender will route without a token)'}.")
 
-        log(f"Sending {args.count} x {args.packet_type} ({args.payload_size}B) from {sender.name} to {receiver.name}...")
+        for at_s, frm, to, prob in loss_schedule:
+            mesh.air.schedule_link_loss(at_s, frm, to, prob)
+        log(f"Sending {args.count} x {args.packet_type} ({args.payload_size}B) from {sender.name} to {receiver.name}..."
+            + (f" loss schedule: {loss_schedule}" if loss_schedule else ""))
         marker_base = len(receiver.owner.received)
         for i in range(args.count):
             marker = f"sim-probe-{i}-".encode()

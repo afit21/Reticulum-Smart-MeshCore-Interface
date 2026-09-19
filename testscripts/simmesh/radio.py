@@ -82,11 +82,18 @@ class RadioOptions:
     require_telemetry_permission: bool = True
     flood_relay_jitter_airtimes: float = 5.0
     direct_relay_jitter_airtimes: float = 1.0
-    # Approximation of the firmware's suggested_timeout arithmetic.
-    timeout_direct_per_hop_factor: float = 2.4
-    timeout_direct_base_ms: float = 500.0
-    timeout_flood_hops_assumed: int = 8
-    timeout_flood_base_ms: float = 1000.0
+    # The companion firmware's own suggested_timeout arithmetic
+    # (examples/companion_radio/MyMesh.cpp calcDirectTimeoutMillisFor /
+    # calcFloodTimeoutMillisFor):
+    #   direct: BASE + (airtime * PERHOP_FACTOR + PERHOP_EXTRA) * (hops + 1)
+    #   flood:  BASE + FLOOD_FACTOR * airtime
+    # With a calibrated airtime (~0.7-0.9 s for a full text frame at the
+    # field radios' settings) this reproduces the 2026-09-18 captures'
+    # ~6 / 10.6 / 16 / 28 s at 0 / 1 / 2 / 3 hops.
+    timeout_base_ms: float = 500.0
+    timeout_direct_perhop_factor: float = 6.0
+    timeout_direct_perhop_extra_ms: float = 250.0
+    timeout_flood_factor: float = 16.0
 
 
 class SimRadio:
@@ -209,8 +216,8 @@ class SimRadio:
         est = self._airtime_ms(size)
         o = self.options
         if route == ROUTE_DIRECT:
-            return int((path_len + 1) * o.timeout_direct_per_hop_factor * est + o.timeout_direct_base_ms)
-        return int(o.timeout_flood_hops_assumed * o.timeout_direct_per_hop_factor * est + o.timeout_flood_base_ms)
+            return int(o.timeout_base_ms + (est * o.timeout_direct_perhop_factor + o.timeout_direct_perhop_extra_ms) * (path_len + 1))
+        return int(o.timeout_base_ms + o.timeout_flood_factor * est)
 
     # -- commands (called by the fake library, on self.loop) ----------------------
 

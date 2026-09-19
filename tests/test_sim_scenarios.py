@@ -39,14 +39,27 @@ def _bring_up(mesh, names, timeout=40.0):
             # bounded (POST_BIND_DISCOVERY_ROUNDS), and on a 2-repeater chain
             # all of those rounds can fall inside the window where the far
             # node's ADVERT has not arrived yet. The interface's documented
-            # recovery for that is "the next send resolves it", so nudge one
+            # recovery for that is "the next send resolves it", so nudge a
             # small packet each way and wait again -- which is what a real
             # deployment does, rather than the harness demanding that
-            # unsolicited discovery alone always win the race.
-            for name in names:
-                node = mesh.nodes[name]
-                node.send(build_rns_packet("data", dest_hash=node.dest_hash, payload=b"nudge"))
-            assert mesh.wait_resolved(timeout), "DIRECT paths never resolved"
+            # unsolicited discovery alone always win the race. Repeated:
+            # a single nudge that lands inside a path-discovery backoff
+            # window triggers no discovery at all (it takes the small-mesh
+            # broadcast last resort instead), so keep nudging, spaced past
+            # the fast profile's backoff, until the paths resolve. Each
+            # nudge goes to a FRESH destination hash: three bootstrap
+            # attempts for the same unknown destination trip the
+            # interface's unknown-destination backoff (300s), after which
+            # further nudges to it are dropped without any discovery.
+            deadline = time.monotonic() + timeout
+            while True:
+                for name in names:
+                    node = mesh.nodes[name]
+                    if len(node.iface._resolved_paths) < len(names) - 1:
+                        node.send(build_rns_packet("data", dest_hash=os.urandom(16), payload=b"nudge"))
+                if mesh.wait_resolved(min(8.0, max(0.5, deadline - time.monotonic()))):
+                    break
+                assert time.monotonic() < deadline, "DIRECT paths never resolved"
     except AssertionError:
         # unittest skips tearDown when setUp fails: stop the mesh here or its
         # interfaces (and their executor threads) outlive the test run.
@@ -108,6 +121,14 @@ class ZeroHopScenarios(unittest.TestCase):
 
     def test_bare_direct_retry_never_delivers_twice(self):
         _prime(self.a, self.b)
+        # _prime returns as soon as A has learned the token, while B's own
+        # priming exchange is still waiting for its ACK. Switching ACK loss
+        # on right then makes B retry on the same cadence as A's probe
+        # attempts, and the two half-duplex radios can key over each other
+        # twice in a row (seen once: both sides' attempts at the same
+        # seconds, neither heard). Let B's exchange finish first.
+        self.assertTrue(wait_until(lambda: not self.b.iface._direct_exchange_lock_impl.locked(), 15.0))
+        time.sleep(1.0)
         self.mesh.air.type_loss["ACK"] = 1.0
         self.a.send(build_rns_packet("data", dest_hash=self.b.dest_hash, payload=b"probe-noack"))
         deadline = time.monotonic() + 25.0
