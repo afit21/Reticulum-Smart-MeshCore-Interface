@@ -91,7 +91,9 @@ By the user's decision the simmesh-based fidelity tier is legacy:
 `testscripts/fake_meshcore_repeater_sim.py` and
 `calibrate_sim_from_captures.py` moved to `testscripts/legacy/`,
 `tests/test_sim_scenarios.py` to `tests/legacy/` (not a package, so
-`unittest discover` no longer collects it; `SMCI_SKIP_SLOW` is moot), and
+`unittest discover` no longer collects it; `SMCI_SKIP_SLOW=1` still skips the
+`@slow` two-node scenarios that remain in the unit files), its shared
+bring-up helpers moved to `tests/_support.py`, and
 `rns_multiprocess_sim.py`'s `run` orchestrator is marked legacy while its
 `node` subcommand stays as the MeshBench suite's RNS end node. `simmesh`
 itself remains as the unit suite's fake `meshcore`. CLAUDE.md has the

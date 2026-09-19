@@ -31,7 +31,10 @@ from .fake_meshcore import make_fake_meshcore_module
 from .radio import RadioOptions, SimRadio, node_prefix, node_pubkey
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-INTERFACE_PATH = os.path.join(REPO_ROOT, "Interface", "SmartMeshCoreInterface.py")
+# SMCI_INTERFACE_PATH overrides the interface under test (2026-09-20): lets a
+# scenario run against a saved copy of another build, e.g. a control run of
+# the pre-edit tree, without touching the working file.
+INTERFACE_PATH = os.environ.get("SMCI_INTERFACE_PATH") or os.path.join(REPO_ROOT, "Interface", "SmartMeshCoreInterface.py")
 
 # Same 16-byte fixed destination the zero-hop field test hardcodes.
 TEST_DEST_HASH = bytes.fromhex("5a" * 16)

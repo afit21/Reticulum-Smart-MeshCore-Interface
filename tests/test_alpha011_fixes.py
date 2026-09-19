@@ -20,7 +20,7 @@ import unittest
 import RNS
 
 from tests._support import SingleNodeCase, slow, wait_until, build_rns_packet
-from tests.test_sim_scenarios import _setup_mesh, _bring_up, _prime
+from tests._support import _setup_mesh, _bring_up, _prime
 
 
 def _link_packet(context: int, data: bytes) -> bytes:
