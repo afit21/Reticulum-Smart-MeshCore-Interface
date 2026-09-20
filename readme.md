@@ -22,11 +22,13 @@ As this project is under a GPL license, there is nothing stopping you from lifti
 
 In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
 
-## Features (Version alpha0.1.3)
+## Features (Version alpha0.1.4)
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
 
 New in alpha 0.1.2: raw binary data is sent by default, with Z85 text as a fallback if a repeater in the path doesn't support raw messages.
+
+New in alpha 0.1.4: less airtime per delivered byte. Fragment reports no longer wait for a MeshCore ACK, one report covers a whole window of parts, a large packet is three raw fragments instead of four, and from one hop up each burst carries a parity fragment so a single lost fragment is repaired without a retry round. **Both nodes must run alpha 0.1.4 or later** - the reconcile and raw-fragment wire formats changed, and an older node will not decode them. New config keys (all optional, defaults shown): `direct_report_noack = yes`, `direct_report_debounce = yes`, `direct_raw_window_enabled = yes`, `direct_raw_window_collect = 0.75`, `direct_raw_window_max_parts = 6`, `direct_raw_parity_enabled = yes`, `direct_raw_parity_min_hops = 1`, `proof_max_age = 45`, `announce_cache_ttl = 3600`, `path_request_local_answer_min_interval = 120`; `direct_raw_report_wait_base` is now 4 s and `direct_raw_report_wait_per_hop` 2.5 s.
 
 **Battle Tested** - Tested and confident this is reliable.
 
@@ -48,12 +50,13 @@ New in alpha 0.1.2: raw binary data is sent by default, with Z85 text as a fallb
 | Packet Capture Debug Tool | Battle Tested | Built-in packet capture for debugging the interface. Also logs every packet the radio overhears, not just our own. |
 | Radio Traffic Awareness | Working | Taps the companion radio's raw RX log to see every packet it decodes, including traffic that isn't ours. Costs no airtime. |
 | Adaptive ACK Timing | Working | Measures the real round trip to each peer and shortens ACK waits to match, never waiting longer than the hop-scaled ceiling. A missed ACK doubles the next wait rather than discarding the measurement. |
-| Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.2 or later. |
+| Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.4 or later (the wire format changed in 0.1.4). |
 | Dead Hop Detection | Experimental | If the first repeater never echoes our frame, the attempt is abandoned early and a stale path is re-discovered in about 30 seconds instead of 4 minutes. |
 | Airtime Duty Cycle | Working | Caps the interface at 30% airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings. Link keepalives skip the wait but still count against the cap. |
 | Queue Hygiene | Working | Drops duplicate, stale and closed-link packets from the queue so a backlog isn't dumped onto the mesh when a path comes back, and forwards at most one spontaneous announce per destination every 5 minutes. |
 | Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear. Off by default. |
 | Raw Binary Fragments | Experimental | On by default. Packets too large for one text message go to a capable peer as MeshCore raw binary packets: no Z85, no text framing, no per-fragment ACK (about 43% less sender airtime). Reliability comes from Fragment Reconciliation; if raw never arrives on a path but text does, that path falls back to text for a while. Older peers still get text fragments. **Privacy note:** MeshCore raw packets are not encrypted or authenticated by the firmware. Your contents are still end-to-end encrypted by Reticulum, but the RNS packet header and both nodes' key prefixes are visible on air, and a third party could inject a fragment (Reticulum rejects it, but the transfer has to be re-sent). Set `direct_raw_fragments_enabled = no` to stay fully inside MeshCore's encryption. |
+| Parity Fragments | Experimental | From one MeshCore hop up, each burst of raw fragments ends with an XOR parity fragment, so a receiver that lost exactly one fragment rebuilds it instead of waiting for a retry round. Off at zero hops by default (`direct_raw_parity_min_hops`). |
 
 ## Requirements
 
@@ -95,7 +98,7 @@ Reference config for a non-transfer node:
   baudrate = 115200
 ```
 
-Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~98 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
+Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~140 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
 
 
 ## Field Testing
@@ -165,6 +168,8 @@ Enable packet captures with:
 ```
 
 Feel free to contribute code if you'd like to by opening a pull request :)
+
+The interface file is assembled: the source lives in `Interface/src/smci/` (one module per concern) and `python3 Interface/build_interface.py` builds `Interface/SmartMeshCoreInterface.py` from it. Edit the sources, run the build, and commit both; the unit suite is `python3 -m unittest discover -s tests`.
 
 ## AI Usage
 

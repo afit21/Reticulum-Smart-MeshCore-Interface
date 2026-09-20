@@ -13,7 +13,8 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.3 plus the 2026-09-20 airtime / throughput pass; the
+STATUS -- alpha 0.1.4 (alpha 0.1.3 plus the 2026-09-20 airtime / throughput
+pass; both nodes must run it, the "Q" and raw wire formats changed); the
 dated account of every design decision and field-driven fix from alpha
 0.1.0 (2026-09-15) onward is `docs/history.md` (moved out of this
 docstring on 2026-09-20, phase 2 of that pass, unchanged), with the
