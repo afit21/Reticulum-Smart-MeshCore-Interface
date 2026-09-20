@@ -721,17 +721,15 @@ class RawFragmentScenarios(unittest.TestCase):
         self.assertIn(b.prefix, iface._resolved_paths)
 
 
-# --- Night-session scenarios (2026-09-19, see NightSessionFixes) ------------
+# --- Night-session page-transfer helpers (2026-09-19, see NightSessionFixes) --
+#
+# The simulated-repeater forms of the 2026-09-19 night regression (one-hop and
+# three-hop page transfers over simmesh's multi-hop air model) moved to
+# tests/legacy/test_night_session_scenarios.py on 2026-09-20: that tier is
+# archived, and the one-hop page transfer now runs against real firmware as
+# the MeshBench `page_transfer` / `page_transfer_bidir` scenarios. What stays
+# here is the zero-hop form, which the unit suite can run for real.
 
-# Loss and airtime derived from the night captures with
-# testscripts/calibrate_sim_from_captures.py fieldtests/raw/Alpha0.1.2
-# (global loss 0.114, per-hop estimate 0.062 at one hop, airtime 605.5ms +
-# 1.0ms/byte). The airtime base is scaled to 200ms so a 12-packet transfer
-# runs in minutes rather than tens of minutes under FAST_TIMING; the
-# collision geometry the scenario exists to reproduce (a hidden node's
-# answer meeting the querier's next burst at the repeater) only needs
-# transmissions long enough to overlap, which they still are.
-PAGE_PROFILE = {"loss": 0.06, "airtime_base_ms": 200.0, "airtime_per_byte_ms": 1.0}
 PAGE_PART_BYTES = 483          # a packed RNS Resource part, as in the field
 
 
@@ -752,25 +750,6 @@ def _page_parts(dest_hash, n, size=PAGE_PART_BYTES, tag=b"page"):
     return parts
 
 
-def _page_mesh(test, links, repeaters, seed, config=None, profile=PAGE_PROFILE):
-    """A calibrated mesh brought up loss-free (an operator pressing advert),
-    with the profile's loss applied to the transfer phase only."""
-    from tests.test_sim_scenarios import _bring_up
-    quiet_rns()
-    mesh = SimMesh(links, repeaters=repeaters, seed=seed, capture_dir=tempfile.mkdtemp(prefix="smci-page-cap-"),
-                   airtime_base_ms=profile["airtime_base_ms"], airtime_per_byte_ms=profile["airtime_per_byte_ms"])
-    test.mesh = mesh
-    _bring_up(mesh, ["A", "B"], timeout=90.0, config={**RAW_CFG, **(config or {})})
-    a, b = mesh.nodes["A"], mesh.nodes["B"]
-    for x, y in ((a, b), (b, a)):
-        y.send(build_rns_packet("data", dest_hash=y.dest_hash, payload=b"prime"))
-        assert wait_until(lambda: y.dest_hash in x.iface._rns_token_peer, 60.0), "token never learned"
-        assert x.iface._peers[y.prefix].raw_fragments is True
-    wait_until(lambda: not a.iface._direct_exchange_lock_impl.locked() and not b.iface._direct_exchange_lock_impl.locked(), 30.0)
-    mesh.air.loss = profile["loss"]
-    return mesh, a, b
-
-
 def _page_stats(node):
     recs = node.capture_records()
     checks = [r for r in recs if r.get("event") == "completion_check_result"]
@@ -785,142 +764,63 @@ def _page_stats(node):
         "raw_completion": len(raw) / (len(raw) + len(fell_back)) if (raw or fell_back) else None,
         "slot_expired": sum(1 for r in results if r.get("method") == "slot_expired"),
         "answer_lock_waits": [r.get("lock_wait_s") for r in recs
-                              if r.get("event") == "direct_attempt_result" and r.get("kind") == "completion_answer"],
+                              if r.get("event") == "direct_attempt_result" and r.get("kind") in ("completion_answer", "completion_report")],
     }
 
 
+
 @slow
-@unittest.skipUnless(os.environ.get("SMCI_RUN_UNVERIFIED"), "written 2026-09-20 but not yet run to a pass -- see the class docstring")
-class NightSessionScenarios(unittest.TestCase):
-    """Simulated forms of the 2026-09-19 night regression (module docstring,
-    "Field regression fixed (2026-09-19 night session)"). Timing here is
-    FAST_TIMING over a calibrated air model: these check the interface's
-    logic under the field's collision geometry, not real delivery rates.
-
-    STATUS (2026-09-20): written, NOT yet verified to pass -- the session
-    that wrote them was asked to wrap up first. Gated behind
-    SMCI_RUN_UNVERIFIED=1 so the suite stays green until someone runs them
-    (each takes up to 15 minutes). Two things were learned on the way that
-    the numbers below already reflect: the air model gained the firmware's
-    listen-before-talk (without it the answerer keyed its ANSWER over the
-    repeater's relay of its own ACK every time, 5% answer delivery in every
-    configuration), and the parts must be Resource class -- plain DATA
-    expires at outgoing_max_age (120s) partway through a 12-part transfer,
-    which is why every run below shows fewer than 12 delivered at 900s.
-    The measurements below were taken with plain DATA parts and should be
-    re-run with the "resource" kind now used here.
-
-    BASELINE, unmodified 3b56c11 interface on the LBT air model, seed 11 /
-    21 (plain DATA parts, 12 x 483B, loss 0.06, airtime 200ms+1ms/B):
-      answered 7/17 (41%) / 12/18 (67%); raw completion 2/3 / 4/6;
-      slot_expired drops 6 / 5; delivered 6/12 / 7/12 at 900s.
-    All four changes at their defaults, seed 11: answered 17/27 (63%),
-    raw completion 7/8, no drops, delivered 8/12 at 900s. With the cap
-    re-enabled at 2 (now priority-aware, non-dropping): 16/20 (80%) /
-    15/20 (75%), raw 10/10 / 8/8, delivered 10/12 / 8/12 -- the best
-    configuration in the sim, which is worth knowing given the field
-    session that motivated turning it off.
-    """
+class ZeroHopBidirectionalPageTransfer(unittest.TestCase):
+    """Both nodes send a twelve-part page (12 x 483 B Resource-class parts)
+    to each other at once over a zero-hop link, the unit-tier form of the
+    2026-09-19 night regression in which a node's completion ANSWERs queued
+    tens of seconds behind its own bursts. Until 2026-09-20 this existed only
+    as an unverified simmesh multi-hop scenario gated behind
+    SMCI_RUN_UNVERIFIED; this version runs (FAST_TIMING, default airtime,
+    no loss) and pins: every part delivered both ways; no send dropped as
+    `slot_expired`; no completion ANSWER or REPORT waited more than 10 s for
+    the radio lock; and the transfer finished without a text fallback.
+    The one-hop and bidirectional-under-loss forms are the MeshBench
+    `page_transfer_bidir` scenario."""
 
     def tearDown(self):
         self.mesh.stop()
 
-    def _one_hop_page(self, seed, config=None, n=12):
-        _, a, b = _page_mesh(self, ["A-R", "R-B"], ["R"], seed, config=config)
-        self.assertEqual(a.resolved_paths[b.prefix].out_path_len, 1)
-        parts = _page_parts(b.dest_hash, n)
-        started = time.monotonic()
-        for p in parts:
-            a.send(p)
-        done = wait_until(lambda: all(p in b.owner.received for p in parts), 600.0)
-        elapsed = time.monotonic() - started
-        time.sleep(3.0)
-        stats = _page_stats(a)
-        stats["elapsed_s"] = round(elapsed, 1)
-        stats["delivered"] = sum(1 for p in parts if p in b.owner.received)
-        return done, stats
-
-    def test_one_hop_page_transfer_completes_with_answers_and_raw_intact(self):
-        """(a) A-R-B, twelve 483-byte parts back to back. Acceptance: every
-        part delivered, answers >= 80%, raw completion >= 90%, no drops."""
-        totals = {"checks": 0, "answered": 0, "raw_complete": 0, "text_fallbacks": 0, "slot_expired": 0}
-        per_seed = []
-        for seed in (11, 21):
-            done, stats = self._one_hop_page(seed)
-            per_seed.append((seed, stats))
-            self.assertTrue(done, f"seed {seed}: page transfer incomplete: {stats}")
-            for k in totals:
-                totals[k] += stats[k]
-            self.mesh.stop()
-        answer_rate = totals["answered"] / max(1, totals["checks"])
-        raw_completion = totals["raw_complete"] / max(1, totals["raw_complete"] + totals["text_fallbacks"])
-        self.assertGreaterEqual(answer_rate, 0.80, f"answer delivery {answer_rate:.0%}: {per_seed}")
-        self.assertGreaterEqual(raw_completion, 0.90, f"raw completion {raw_completion:.0%}: {per_seed}")
-        self.assertEqual(totals["slot_expired"], 0)
-
-    def test_one_hop_page_transfer_records_the_quiet_hold(self):
-        """The quiet window is what changed at one hop; the capture must
-        show it (quiet_hold_s on the QUERY attempts, None everywhere else)."""
-        done, stats = self._one_hop_page(31, n=4)
-        self.assertTrue(done, stats)
-        attempts = [r for r in self.mesh.nodes["A"].capture_records() if r.get("event") == "direct_attempt_result"]
-        query_holds = [r["quiet_hold_s"] for r in attempts if r.get("kind") == "completion_query"]
-        other_holds = [r["quiet_hold_s"] for r in attempts if r.get("kind") != "completion_query"]
-        self.assertTrue(query_holds, "no completion QUERY attempts captured")
-        self.assertTrue(any(h is not None and h > 0 for h in query_holds), query_holds)
-        self.assertTrue(all(h is None for h in other_holds))
-
-    def test_bidirectional_answers_do_not_queue_behind_the_lock(self):
-        """(b) Both nodes send twelve parts to each other at once. The
-        radio-free remainder of the answer wait is what keeps a node's own
-        ANSWERs from queueing 50s behind its waits (commit 1919074); the
-        quiet window must not bring that back. Bound: no completion ANSWER
-        waits more than 10s for the lock."""
-        _, a, b = _page_mesh(self, ["A-R", "R-B"], ["R"], seed=41)
+    def test_both_ways_at_once_completes_without_drops_or_lock_starvation(self):
+        quiet_rns()
+        mesh = SimMesh(["A-B"], seed=41, capture_dir=tempfile.mkdtemp(prefix="smci-page-cap-"))
+        self.mesh = mesh
+        for n in ("A", "B"):
+            mesh.add_node(n, config={**RAW_CFG, "peer_discovery_target_peers": "1"})
+        mesh.advert_all()
+        self.assertTrue(mesh.wait_contacts(40.0))
+        self.assertTrue(mesh.wait_bound(40.0))
+        self.assertTrue(mesh.wait_resolved(60.0))
+        a, b = mesh.nodes["A"], mesh.nodes["B"]
+        for x, y in ((a, b), (b, a)):
+            y.send(build_rns_packet("data", dest_hash=y.dest_hash, payload=b"prime"))
+            self.assertTrue(wait_until(lambda: y.dest_hash in x.iface._rns_token_peer, 30.0), "token never learned")
+            self.assertTrue(x.iface._peers[y.prefix].raw_fragments)
+        wait_until(lambda: not a.iface._direct_exchange_lock_impl.locked() and not b.iface._direct_exchange_lock_impl.locked(), 30.0)
         pa = _page_parts(b.dest_hash, 12, tag=b"ab")
         pb = _page_parts(a.dest_hash, 12, tag=b"ba")
+        started = time.monotonic()
         for x, y in zip(pa, pb):
             a.send(x)
             b.send(y)
-        done = wait_until(lambda: all(p in b.owner.received for p in pa) and all(p in a.owner.received for p in pb), 900.0)
-        time.sleep(3.0)
+        done = wait_until(lambda: all(p in b.owner.received for p in pa) and all(p in a.owner.received for p in pb), 600.0)
+        elapsed = time.monotonic() - started
+        time.sleep(2.0)
         sa, sb = _page_stats(a), _page_stats(b)
-        self.assertTrue(done, f"bidirectional transfer incomplete: A={sa} B={sb}")
+        delivered = (sum(1 for p in pa if p in b.owner.received), sum(1 for p in pb if p in a.owner.received))
+        self.assertTrue(done, f"bidirectional transfer incomplete after {elapsed:.0f}s: delivered {delivered}; A={sa} B={sb}")
+        self.assertEqual(sa["slot_expired"] + sb["slot_expired"], 0, (sa, sb))
+        self.assertEqual(sa["text_fallbacks"] + sb["text_fallbacks"], 0, (sa, sb))
         waits = [w for w in sa["answer_lock_waits"] + sb["answer_lock_waits"] if w is not None]
-        self.assertTrue(waits, "no completion ANSWERs captured")
-        self.assertLessEqual(max(waits), 10.0, f"an ANSWER waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
-        self.assertEqual(sa["slot_expired"] + sb["slot_expired"], 0)
-
-    def test_three_hop_mixed_traffic_with_the_cap_enabled_never_drops(self):
-        """(c) A-R1-R2-R3-B, announces and data mixed, the in-flight cap
-        ENABLED (2): the night session dropped six packets as slot_expired;
-        a slot wait that times out now proceeds instead. No drops, and the
-        announce-class sends must not have held a data slot."""
-        _, a, b = _page_mesh(self, ["A-R1", "R1-R2", "R2-R3", "R3-B"], ["R1", "R2", "R3"], seed=51,
-                             config={"direct_fragmented_max_in_flight": "2"})
-        self.assertEqual(a.resolved_paths[b.prefix].out_path_len, 3)
-        iface = a.iface
-        self.assertEqual(iface.direct_fragmented_max_in_flight, 2)
-        data = _page_parts(b.dest_hash, 4, tag=b"d3")
-        announces = [build_rns_packet("announce", dest_hash=b.dest_hash, payload=b"ann-%d-" % i + os.urandom(200))
-                     for i in range(3)]
-        for i, p in enumerate(data):
-            a.send(p)
-            if i < len(announces):
-                a.send(announces[i])
-        wait_until(lambda: all(p in b.owner.received for p in data), 900.0)
-        time.sleep(3.0)
-        recs = a.capture_records()
-        results = [r for r in recs if r.get("event") == "direct_send_result"]
-        self.assertTrue(results, "no DIRECT sends captured")
-        self.assertEqual([r for r in results if r.get("method") == "slot_expired"], [])
-        self.assertEqual(sum(1 for p in data if p in b.owner.received), 4, "every data part must arrive")
-        self.assertTrue(any(r.get("slot_wait_s") is not None for r in results), "the cap was in effect")
-        # both slot kinds were created: announces went through their own
-        self.assertIn((b.prefix, "announce"), iface._fragmented_send_slots)
-        self.assertIn((b.prefix, "data"), iface._fragmented_send_slots)
-        for slot in iface._fragmented_send_slots.values():
-            self.assertEqual(slot.holders(), 0, "every permit released")
+        if waits:
+            self.assertLessEqual(max(waits), 10.0, f"an ANSWER/REPORT waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
+        checks = sa["checks"] + sb["checks"]
+        self.assertGreater(checks, 0, "no completion checks recorded")
 
 
 if __name__ == "__main__":

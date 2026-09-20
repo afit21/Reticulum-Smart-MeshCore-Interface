@@ -7,6 +7,94 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
+
+The 2026-09-20 comparison work listed what the suite could not tell us; this
+pass closes the gaps that do not need a MeshBench fix upstream. Nothing in
+`Interface/SmartMeshCoreInterface.py` changed.
+
+**MeshBench scenarios** (`testscripts/meshbench_scenarios.py`; `list` prints them all):
+
+- Traffic modes. `rns_multiprocess_sim.py node` gained `--traffic probe|link|resource`: one unit is
+  a PROVE_ALL DATA packet as before, an RNS Link handshake (LINKREQUEST -> LRPROOF, reported against
+  MeshChat's 15 s window, `--link-deadline`), or a real `RNS.Resource` over a Link (`--resource-size`
+  5100 B = 12 parts at the Link MDU, the field's NomadNet page; reports parts, re-sent parts,
+  complete / failed / timed out, wall time). The responder can push its own Resource back on every
+  Link (`--respond-resource-size`) for bidirectional load.
+- New scenarios: `page_transfer` (one hop, three 12-part pages), `page_transfer_bidir` (both ends
+  sending pages at once -- the 2026-09-19 night geometry), `duty_cycle_pages` (zero hop, back-to-back
+  pages under the 30 %/60 s limiter), `link_setup` and `link_setup_two_hop` (handshake times at one
+  and two hops), `bring_up` (two_hop topology, no probes: time to a DIRECT path at each end and the
+  path requests it took), `three_hop` (A-R1-R2-R3-B), `many_peers` (five companions each with an RNS
+  node, so the sender has four bound peers and small-mesh mode is off -- the CHANNEL / supplement
+  routing runs against firmware for the first time; hard check on `bound_peers` and
+  `small_mesh_mode=False` in the capture), `mixed_builds` (responder on `git:d7dcba9`, the tree
+  before the completion report, so the protocol change is checked against a peer without it;
+  `--responder-interface` takes a path or `git:<rev>`), `companion_restart` (the sender's companion
+  firmware rebooted mid-run; informational) and `soak` (`--duration`, default 30 min, with health
+  snapshots: RSS, threads, sizes of the interface's growable maps).
+- `two_hop`, `three_hop` and `link_setup_two_hop` now hold the sender until BOTH ends have a DIRECT
+  path (`--start-after-paths`, `--gate-timeout` 600 s), so they measure their hop count rather than
+  the advert coin flip that dominated `two_hop` on 2026-09-20; `bring_up` measures that on purpose.
+- Late deliveries: a PROOF that arrives after the 60 s probe timeout is reported as late
+  (`--late-grace` 90 s) instead of counted as lost, and the RTT distribution (min / median / p90 /
+  max) is reported, so the timeout is no longer a cliff between PASS and FAIL.
+- `suite` subcommand: several scenarios x several seeds (default 7, 11, 13), `--parallel` runs at a
+  time, `run.log` per run, then `summary.md` / `summary.json` with per-run rows and per-scenario
+  medians with ranges; `--write-baseline tests/baselines/<file>.md` regenerates a baseline file in
+  one command. `report` subcommand summarises finished run directories.
+
+**Analysis** (`testscripts/meshbench_report.py`, the summariser that produced the 2026-09-20 tables,
+moved out of the session's scratch directory): every `run` now embeds it in `result.json`
+("analysis") and prints it -- per-hop attempt success and ACK latency, attempt kinds, completion
+checks by outcome, raw fragments by reconcile round, the wait breakdown (lock / ACK / listen / quiet
+hold / duty cycle / slot), per-part burst landings and time-to-complete, on-air transmissions and
+bytes per node from MeshBench's events, misses by cause with the **LBT-preventable** share (a
+half-duplex miss where the receiver keyed its own transmitter into a frame already arriving -- the
+case the real firmware defers and MeshBench v0.1.0 does not model), and an airtime ledger (on-air
+bytes per RNS byte accepted, per delivered unit). `--timeline` prints the merged event timeline.
+
+**Unit tier** (`SMCI_SKIP_SLOW=1 python3 -m unittest discover -s tests`: 178 -> 199 tests, 7 skipped slow ones; the four gated simmesh scenarios left the count):
+
+- `tests/test_shipped_defaults.py` pins every default each `_configure_*` method sets on an empty
+  config block (133 keys), since FAST_TIMING makes them unpinnable through the live interface;
+  `python3 tests/test_shipped_defaults.py --dump` regenerates the literals after a deliberate change.
+- `tests/test_completion_report_one_hop_0920.py`: the one-hop report path -- the flagged second-last
+  fragment with the last one missing reports the incomplete bitmap, `reported_stale` applies a
+  mid-burst report when the post-burst wait yields nothing, a lost report falls back to the QUERY
+  after exactly the one-hop report wait, and the shipped 1-hop wait (5 s) sits under the 7.5 s
+  answer budget.
+- `tests/test_linkrequest_bootstrap_backoff_0920.py`: LINKREQUESTs to an unknown destination arm the
+  bootstrap backoff like DATA (the fourth is dropped in small-mesh mode, broadcast-only past the
+  cap), a CHANNEL LRPROOF clears it through `_pending_link_requests` without learning a token, and a
+  LINKREQUEST straight after a clear is routed.
+- `ZeroHopBidirectionalPageTransfer` (`tests/test_raw_fragments.py`, `@slow`, ~75 s): both nodes send a
+  twelve-part page to each other at once at zero hop; every part delivered, no `slot_expired`, no text
+  fallback, no ANSWER / REPORT waiting more than 10 s for the lock. It replaces the unverified,
+  SMCI_RUN_UNVERIFIED-gated simmesh multi-hop `NightSessionScenarios`, which moved to
+  `tests/legacy/test_night_session_scenarios.py` (their `_bring_up` import had already broken when
+  `test_sim_scenarios.py` was archived); the one-hop and bidirectional forms are the MeshBench
+  `page_transfer` / `page_transfer_bidir` scenarios.
+
+**Field protocol**: `fieldtests/AB_PROTOCOL.md` (same route, same page, two builds back to back or
+alternated per fetch, both ends on the same build, >= 20 attempts per hop per build) and
+`testscripts/field_ab_compare.py`, which puts two capture sets side by side per hop count on the
+report's section-5 fields (attempt success and ACK latency, dead waits, completion outcomes and
+QUERYs per raw send, part time, handshakes against 15 s, backoff drops, stale-path triples, airtime).
+Run on the two existing same-build sessions (`Alpha0.1.2` vs `postAlpha0.1.1`, desktop) it shows the
+run-to-run spread the protocol has to beat: hop-1 attempt success 86 % vs 70 % on the same tree.
+
+Two things the unit work turned up in the interface, **not changed** here (the user's call):
+`_note_channel_proof` pops the `_pending_dest_proofs` / `_pending_link_requests` entry when a proof's
+CHANNEL copy arrives first, so a DIRECT copy arriving second learns no token for that destination
+(pinned as-is in `test_channel_lrproof_consumes_the_correlation_so_a_later_direct_copy_learns_no_token`);
+and the `reported_stale` capture record writes `complete: null` where the stale report's flag was
+meant (observability only).
+
+Not covered, deliberately: repeater-chain asymmetry (2 vs 4 hops each way) has no deterministic
+construction in MeshBench's symmetric link model; the one-hop raw gap, post-send listen and answer
+hold remain field-A/B decisions until MeshBench models listen-before-talk.
+
 ### Changed: speed / airtime / reliability pass (2026-09-20, later the same day)
 
 Five parallel reviews (DIRECT send path, fragmentation and raw fragments,

@@ -13,6 +13,11 @@ channel and the terrain.
     python3 testscripts/meshbench_scenarios.py list
     python3 testscripts/meshbench_scenarios.py run relay --capture-dir /tmp/mb/relay
     python3 testscripts/meshbench_scenarios.py run failover --probes 12 --fail-after 4
+    python3 testscripts/meshbench_scenarios.py run page_transfer_bidir --capture-dir /tmp/mb/ptb
+    python3 testscripts/meshbench_scenarios.py suite --scenarios zero_hop,relay,large_payload,page_transfer \
+        --seeds 7,11,13 --parallel 2 --out-dir /tmp/mb/suite-$(git rev-parse --short HEAD) \
+        --write-baseline tests/baselines/$(date +%F)-meshbench-$(git rev-parse --short HEAD).md
+    python3 testscripts/meshbench_scenarios.py report --aggregate /tmp/mb/suite-*/relay-*
 
 WHAT THIS ISOLATES, AND WHY IT IS A SEPARATE TIER
 
@@ -62,6 +67,34 @@ SCENARIOS (see SCENARIOS below, or `list`)
                     their relays collide at the endpoints (observed 2026-09-20:
                     the RNS path request never resolved in 180 s). Reports
                     time-to-path and delivery; asserts only the mechanics.
+
+  Added 2026-09-20 (evening) for the coverage gaps the day's comparison
+  work exposed -- the field workload was not represented:
+
+  page_transfer     relay topology; each probe is one real RNS.Resource of
+                    ~12 parts over an RNS Link (the NomadNet page fetch).
+  page_transfer_bidir  the same with the responder pushing its own page back
+                    on the Link at once (the 2026-09-19 night geometry).
+  duty_cycle_pages  zero_hop topology, pages back to back: the duty-cycle
+                    limiter under load.
+  link_setup        relay topology; each probe is one Link handshake, counted
+                    against MeshChat's 15 s window.
+  link_setup_two_hop  the same at two hops.
+  bring_up          two_hop topology, no probes: time-to-DIRECT-path per end.
+  three_hop         A - R1 - R2 - R3 - B.
+  many_peers        five companions, each an RNS node: >3 bound peers, so
+                    small-mesh mode is off and the CHANNEL/supplement paths run.
+  mixed_builds      responder on an older build (git:d7dcba9 by default).
+  companion_restart the sender's companion firmware rebooted mid-run (informational).
+  soak              --duration (30 min default) with health snapshots.
+
+  Hop-count scenarios (two_hop, three_hop, link_setup_two_hop, bring_up)
+  hold the sender's traffic until BOTH ends have a DIRECT path (the start
+  gate, --gate-timeout), so they measure their hops and not bring-up.
+  Every run reports late deliveries (a PROOF after the probe timeout) and
+  the RTT distribution separately, embeds meshbench_report.py's analysis in
+  result.json, and the `suite` subcommand runs scenarios x seeds and writes
+  the medians-and-ranges summary a baseline file is made of.
 
 WHAT A PASS MEANS
 
@@ -153,8 +186,9 @@ from typing import Callable, Optional
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import meshbench_report  # noqa: E402
 from rns_multiprocess_sim import NodeProcess  # noqa: E402
-from simmesh.harness import format_summary, read_capture, summarize_capture  # noqa: E402
+from simmesh.harness import INTERFACE_PATH, format_summary, read_capture, summarize_capture  # noqa: E402
 
 try:
     from meshbench import Kind, MeshbenchError, Transport, Workbench
@@ -198,7 +232,7 @@ class N:
 class After:
     """A staged action fired once the sender has reported probe `probe`."""
     probe: int
-    action: str        # "stop" | "start" | "move"
+    action: str        # "stop" | "start" | "restart" | "move"
     node: str
     args: dict = field(default_factory=dict)
     fired_at_probe: Optional[int] = None
@@ -221,6 +255,17 @@ class Scenario:
     traffic: Optional[dict] = None           # {"node": name, "every_s": float}: public-channel chatter
     informational: bool = False
     notes: str = ""
+    # --- added 2026-09-20 (coverage gaps: the field workload was not represented) ---
+    unit: str = "probe"                      # what one "probe" is: "probe" (DATA packet) | "link" (handshake) | "resource" (page)
+    resource_size: int = 5100                # unit="resource": random bytes per Resource (5100 B = 12 parts at the Link MDU)
+    respond_resource_size: int = 0           # responder pushes a Resource of this size back on every Link (bidirectional load)
+    respond_resources: int = 1
+    start_after_paths: bool = False          # hold the sender's traffic until BOTH ends have a DIRECT path (two_hop, bring_up)
+    responder_interface: Optional[str] = None   # path or "git:<rev>": the responder runs that build (mixed_builds)
+    extra_rns_nodes: list = field(default_factory=list)   # companions that also run an RNS responder (many_peers)
+    min_bound_peers: Optional[int] = None    # hard check: the sender's capture shows at least this many bound peers
+    duration_s: float = 0.0                  # unit loop runs for this long instead of a fixed count (soak)
+    health_interval_s: float = 0.0           # nodes emit health events this often (soak)
 
 
 def rep(name, east, north=0.0, mast=50.0, console=(), standby=False):
@@ -248,9 +293,29 @@ SCENARIOS = {
         "two_hop", "A - R1 - R2 - B chain; only adjacent links clear: DIRECT at two hops.",
         nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), comp("B", 30)],
         must_link=[("A", "R1"), ("R1", "R2"), ("R2", "B")], must_block=[("A", "R2"), ("R1", "B"), ("A", "B")],
-        expected_hops=2, min_delivered=0.3, probes=8,
+        expected_hops=2, min_delivered=0.3, probes=8, start_after_paths=True,
         notes="Skip links measured -4.5/-5.0 dB (marginal): the run reports any direct skip receptions from the event log. "
-              "2026-09-20: PASS 6/8 at 2 hops; firmware suggested_timeout 6.7 s for a 40 B frame at 2 hops.",
+              "2026-09-20: PASS 6/8 at 2 hops; firmware suggested_timeout 6.7 s for a 40 B frame at 2 hops. Since 2026-09-20 "
+              "the probes start only once BOTH ends have a DIRECT path (--gate-timeout), so this measures the two-hop DIRECT "
+              "path; bring-up itself is the bring_up scenario.",
+    ),
+    "bring_up": Scenario(
+        "bring_up", "two_hop topology, no probes: time from online to a DIRECT path at each end, adverts and path requests it took.",
+        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), comp("B", 30)],
+        must_link=[("A", "R1"), ("R1", "R2"), ("R2", "B")], must_block=[("A", "R2"), ("R1", "B"), ("A", "B")],
+        expected_hops=None, min_delivered=0.0, probes=0, start_after_paths=True, informational=True,
+        notes="2026-09-20: two_hop's DIRECT path resolved at 140-540 s or never in most runs, so that scenario mostly measured "
+              "the advert coin flip. This one measures it on purpose: reports time_to_direct_path per node, path_requested "
+              "count, and the sender's RNS path time; asserts only the mechanics.",
+    ),
+    "three_hop": Scenario(
+        "three_hop", "A - R1 - R2 - R3 - B chain, only adjacent links clear: DIRECT at three hops (the field sees them).",
+        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), rep("R3", 44, mast=30), comp("B", 52)],
+        must_link=[("A", "R1"), ("R1", "R2"), ("R2", "R3"), ("R3", "B")],
+        must_block=[("A", "R2"), ("R1", "R3"), ("R2", "B"), ("A", "B")],
+        expected_hops=3, min_delivered=0.2, probes=8, start_after_paths=True,
+        notes="Field 2026-09-19: hop 3 ~42% attempt success, ~5.6 s ACK. Hop-scaled values (ACK cap 5+3h = 14 s, answer hold, "
+              "raw gap) are what this exercises; expect bring-up to take several minutes (--gate-timeout).",
     ),
     "failover": Scenario(
         "failover", "A - R1 - B with R2 a cold standby; after --fail-after probes R1's firmware dies and R2's starts. "
@@ -288,6 +353,82 @@ SCENARIOS = {
         must_link=[("A", "R"), ("R", "B"), ("C", "R")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.2, probes=8,
         traffic={"node": "C", "every_s": None},
         notes="Third-party flood traffic through the same repeater; the field mesh's is <1% of channel time, this is heavier on purpose.",
+    ),
+    "page_transfer": Scenario(
+        "page_transfer", "relay topology; each probe is one RNS.Resource of ~12 parts over a Link: the NomadNet page fetch.",
+        nodes=[comp("A", -8), rep("R", 0), comp("B", 8)],
+        must_link=[("A", "R"), ("R", "B")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.5, probes=3,
+        unit="resource", resource_size=5100,
+        notes="The field's failure mode (2026-09-19): a 12-part page against RNS's AWAITING_PROOF window (12 x rtt + 40 s) "
+              "and the Resource re-request cadence; the in-flight cap, duplicate suppression and slot waits only matter here. "
+              "Reports per transfer: link handshake time (MeshChat gives it 15 s), parts, re-sent parts, complete/failed, wall "
+              "time; per part: round-0 fragments landed, reconcile rounds, first fragment -> known complete.",
+    ),
+    "page_transfer_bidir": Scenario(
+        "page_transfer_bidir", "page_transfer with the responder pushing its own 12-part Resource back on the same Link at once.",
+        nodes=[comp("A", -8), rep("R", 0), comp("B", 8)],
+        must_link=[("A", "R"), ("R", "B")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.34, probes=3,
+        unit="resource", resource_size=5100, respond_resource_size=5100, respond_resources=1,
+        notes="The 2026-09-19 night regression (answers queued 30 s behind the answerer's own bursts) needs both ends sending "
+              "Resources at the same time; the completion report is most exposed exactly there. Reports both directions.",
+    ),
+    "duty_cycle_pages": Scenario(
+        "duty_cycle_pages", "zero_hop topology, back-to-back 12-part Resources: the 30%/60 s duty-cycle limiter under load.",
+        nodes=[comp("A", -0.5), comp("B", 0.5)],
+        must_link=[("A", "B")], must_block=[], expected_hops=0, min_delivered=0.6, probes=4,
+        unit="resource", resource_size=5100,
+        notes="The duty-cycle policy is the zero-hop ceiling and nothing exercised the limiter under load before 2026-09-20. "
+              "Read duty_cycle_wait_s on raw_fragment_sent (the report's duty-cycle waits distribution) and the transfer wall times.",
+    ),
+    "link_setup": Scenario(
+        "link_setup", "relay topology; each probe is one RNS Link handshake (LINKREQUEST out, LRPROOF back) at one hop.",
+        nodes=[comp("A", -8), rep("R", 0), comp("B", 8)],
+        must_link=[("A", "R"), ("R", "B")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.5, probes=8,
+        unit="link",
+        notes="MeshChat's NomadNet downloader gives a link 15 s (--link-deadline): the run counts handshakes inside that window "
+              "and reports the distribution (field 2026-09-19: 6.8-11 s at one hop, 21.8 s with one lost frame).",
+    ),
+    "link_setup_two_hop": Scenario(
+        "link_setup_two_hop", "two_hop topology; each probe is one RNS Link handshake at two hops (probes start once both paths exist).",
+        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), comp("B", 30)],
+        must_link=[("A", "R1"), ("R1", "R2"), ("R2", "B")], must_block=[("A", "R2"), ("R1", "B"), ("A", "B")],
+        expected_hops=2, min_delivered=0.3, probes=8, unit="link", start_after_paths=True,
+        notes="Same 15 s window at two hops.",
+    ),
+    "many_peers": Scenario(
+        "many_peers", "five companions within a kilometre, each with its own RNS node: 4 bound peers, so small-mesh mode is OFF.",
+        nodes=[comp("A", -0.6), comp("B", 0.6), comp("C", 0.0, 0.5), comp("D", 0.0, -0.5), comp("E", -0.3, -0.3)],
+        must_link=[("A", "B"), ("A", "C"), ("A", "D"), ("A", "E"), ("B", "C")], must_block=[], expected_hops=0, min_delivered=0.5,
+        probes=8, extra_rns_nodes=["C", "D", "E"], min_bound_peers=4,
+        notes="Every field capture so far is small-mesh (<= 3 bound peers), so the CHANNEL / DIRECT-supplement routing "
+              "(broadcast announces, path-request supplements, bootstrap supplements) has never run against firmware. The hard "
+              "check is that the sender's capture shows >= 4 bound peers and small_mesh_mode=False on its sends.",
+    ),
+    "mixed_builds": Scenario(
+        "mixed_builds", "relay topology with the responder on an OLDER build (--responder-interface, default git:d7dcba9): protocol changes must degrade cleanly.",
+        nodes=[comp("A", -8), rep("R", 0), comp("B", 8)],
+        must_link=[("A", "R"), ("R", "B")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.34, probes=6, size=383,
+        responder_interface="git:d7dcba9",
+        notes="The completion report (f0a824a) is a protocol change: an old peer that never reports must still be reconciled by "
+              "QUERY/ANSWER, and its v3 answers must still be read. d7dcba9 is the tree as found on 2026-09-20 before the "
+              "report/trim/backoff commits. Full-size probes so raw bursts and the reconcile are exercised.",
+    ),
+    "companion_restart": Scenario(
+        "companion_restart", "relay topology; the sender's companion firmware is restarted after --fail-after probes (serial/TCP reconnect mid-run).",
+        nodes=[comp("A", -8), rep("R", 0), comp("B", 8)],
+        must_link=[("A", "R"), ("R", "B")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.0, probes=8, informational=True,
+        actions=lambda args: [After(args.fail_after, "restart", "A")],
+        notes="Informational (2026-09-20): whether the meshcore library's auto-reconnect and the interface's _on_mc_connected "
+              "re-arm (module docstring item 6) bring the interface back after its companion reboots. MeshBench's served TCP "
+              "endpoint may not survive a firmware restart at all; the run reports what happened rather than asserting it.",
+    ),
+    "soak": Scenario(
+        "soak", "relay topology, probes for --duration seconds (default 1800) with health snapshots: peer cache, maps, RSS, threads.",
+        nodes=[comp("A", -8), rep("R", 0), comp("B", 8)],
+        must_link=[("A", "R"), ("R", "B")], must_block=[("A", "B")], expected_hops=1, min_delivered=0.3, probes=0,
+        duration_s=1800.0, health_interval_s=60.0,
+        notes="Reports the first and last health snapshot per node (RSS, threads, sizes of _peers/_resolved_paths/_rns_token_peer/"
+              "reassembly/dedup maps) so unbounded growth over half an hour shows. --duration overrides.",
     ),
     "overlap_default": Scenario(
         "overlap_default", "A - {R1, R2} - B with the repeaters on their compiled default relay delays (informational).",
@@ -477,7 +618,7 @@ def events_analysis(events_path: str, companions: list, repeaters: list) -> dict
 # rns node subprocesses (rns_multiprocess_sim.py node --backend real)
 # ---------------------------------------------------------------------------
 
-def node_argv(args, name: str, endpoint: str, role: str, extra: list) -> list:
+def node_argv(args, name: str, endpoint: str, role: str, extra: list, interface_path: Optional[str] = None) -> list:
     argv = [sys.executable, os.path.join(HERE, "rns_multiprocess_sim.py"), "node",
             "--backend", "real", "--name", name, "--server", endpoint, "--role", role,
             "--loglevel", str(args.loglevel), "--advert-interval", str(args.advert_interval)]
@@ -487,7 +628,29 @@ def node_argv(args, name: str, endpoint: str, role: str, extra: list) -> list:
         argv += ["--capture-dir", args.capture_dir]
     for opt in args.iface_option:
         argv += ["--iface-option", opt]
+    if interface_path:
+        argv += ["--interface-path", interface_path]
+    if args.health_interval:
+        argv += ["--health-interval", str(args.health_interval)]
     return argv + extra
+
+
+def resolve_interface_build(spec: Optional[str], capture_dir: Optional[str]) -> Optional[str]:
+    """`--responder-interface`: a file path, or `git:<rev>` for that
+    revision's Interface/SmartMeshCoreInterface.py written next to the
+    captures (mixed_builds runs the responder on an older tree)."""
+    if not spec:
+        return None
+    if not spec.startswith("git:"):
+        return os.path.abspath(spec)
+    rev = spec[4:]
+    repo = os.path.dirname(HERE)
+    out_dir = capture_dir or tempfile.mkdtemp(prefix="smci-build-")
+    os.makedirs(out_dir, exist_ok=True)
+    dest = os.path.join(out_dir, f"SmartMeshCoreInterface_{rev.replace('/', '_')}.py")
+    with open(dest, "w") as f:
+        subprocess.run(["git", "-C", repo, "show", f"{rev}:Interface/SmartMeshCoreInterface.py"], check=True, stdout=f)
+    return dest
 
 
 def probe_events(sender: NodeProcess) -> list:
@@ -511,8 +674,12 @@ def run_scenario(scenario: Scenario, args) -> int:
     if not args.meshbench_binary and shutil.which("meshbench") is None:
         sys.exit("no `meshbench` binary on PATH; pass --meshbench-binary /path/to/meshbench")
 
-    probes = args.probes or scenario.probes
+    probes = args.probes if args.probes is not None else scenario.probes
     size = args.size or scenario.size
+    unit = args.unit or scenario.unit
+    duration = args.duration if args.duration is not None else scenario.duration_s
+    if scenario.health_interval_s and not args.health_interval:
+        args.health_interval = scenario.health_interval_s
     capture_dir = args.capture_dir
     if capture_dir:
         os.makedirs(capture_dir, exist_ok=True)
@@ -523,7 +690,13 @@ def run_scenario(scenario: Scenario, args) -> int:
 
     companions = [n.name for n in scenario.nodes if n.kind == "companion"]
     repeaters = [n.name for n in scenario.nodes if n.kind == "repeater"]
-    failures, measurements = [], {}
+    failures, measurements = [], {"unit": unit, "traffic": unit}
+    responder_build = resolve_interface_build(args.responder_interface or scenario.responder_interface, capture_dir)
+    if responder_build:
+        measurements["responder_interface"] = responder_build
+    # How long one unit of traffic may take, for the run's own deadline.
+    unit_timeout = {"probe": args.probe_timeout, "link": args.rns_link_timeout,
+                    "resource": args.rns_link_timeout + args.resource_timeout}[unit]
 
     def check(condition: bool, what: str) -> None:
         log(("ok    " if condition else "FAIL  ") + what)
@@ -586,38 +759,91 @@ def run_scenario(scenario: Scenario, args) -> int:
             log("WARNING: wall-clock clients need ~1.0; interface timeouts are off by that ratio")
 
         endpoints = {}
-        for name in (scenario.responder, scenario.sender):
+        rns_names = [scenario.responder, scenario.sender] + list(scenario.extra_rns_nodes)
+        for name in rns_names:
             endpoints[name] = nodes[name].serve(Transport.TCP)
             log(f"{name} companion served at tcp {endpoints[name]}")
         stats_before = stats_by_name(wb)
 
         try:
             host, port = endpoint_host_port(endpoints[scenario.responder])
+            responder_extra = ["--announce-interval", str(args.announce_interval)]
+            respond_size = args.respond_resource_size if args.respond_resource_size is not None else scenario.respond_resource_size
+            if respond_size:
+                responder_extra += ["--respond-resource-size", str(respond_size), "--respond-resources", str(scenario.respond_resources),
+                                    "--resource-timeout", str(args.resource_timeout)]
             responder = NodeProcess(scenario.responder, node_argv(args, scenario.responder, f"{host}:{port}", "responder",
-                                                                  ["--announce-interval", str(args.announce_interval)]),
+                                                                  responder_extra, interface_path=responder_build),
                                     echo=not args.quiet_nodes)
             procs.append(responder)
             ready = responder.wait_event("ready", timeout=args.rns_start_timeout)
             if ready is None:
                 log(f"responder never became ready (exit {responder.proc.returncode}); see its output above")
                 return 2
+            # Extra RNS peers (many_peers): more companions, each its own RNS
+            # responder that announces and binds like B, so the sender ends
+            # up with more bound peers than small-mesh mode allows.
+            extra_procs = {}
+            for name in scenario.extra_rns_nodes:
+                host, port = endpoint_host_port(endpoints[name])
+                extra_procs[name] = NodeProcess(name, node_argv(args, name, f"{host}:{port}", "responder",
+                                                                ["--announce-interval", str(args.announce_interval * 2)]),
+                                                echo=not args.quiet_nodes)
+                procs.append(extra_procs[name])
+                if extra_procs[name].wait_event("ready", timeout=args.rns_start_timeout) is None:
+                    log(f"extra RNS node {name} never became ready (exit {extra_procs[name].proc.returncode})")
+                    return 2
+                time.sleep(3.0)
             time.sleep(args.settle)
 
             host, port = endpoint_host_port(endpoints[scenario.sender])
-            sender = NodeProcess(scenario.sender, node_argv(args, scenario.sender, f"{host}:{port}", "sender", [
+            sender_extra = [
                 "--dest", ready["dest"], "--probes", str(probes), "--wait", str(args.wait),
                 "--size", str(size), "--path-timeout", str(args.path_timeout),
                 "--path-request-interval", str(args.path_request_interval),
-                "--probe-timeout", str(args.probe_timeout),
-            ]), echo=not args.quiet_nodes)
+                "--probe-timeout", str(args.probe_timeout), "--late-grace", str(args.late_grace),
+                "--traffic", unit, "--resource-size", str(args.resource_size or scenario.resource_size),
+                "--resource-timeout", str(args.resource_timeout), "--link-timeout", str(args.rns_link_timeout),
+                "--link-deadline", str(args.link_deadline),
+            ]
+            if scenario.start_after_paths or args.start_after_paths:
+                sender_extra.append("--start-gate")
+            if duration:
+                sender_extra += ["--duration", str(duration)]
+            sender = NodeProcess(scenario.sender, node_argv(args, scenario.sender, f"{host}:{port}", "sender", sender_extra),
+                                 echo=not args.quiet_nodes)
             procs.append(sender)
+
+            # Start gate (2026-09-20): hold the traffic until both ends have
+            # a DIRECT path, so a hop-count scenario measures its hops and
+            # not the advert coin flip. bring_up is this gate on its own.
+            gate = {"used": bool(scenario.start_after_paths or args.start_after_paths)}
+            if gate["used"]:
+                t_gate = time.monotonic()
+                gate_deadline = t_gate + args.gate_timeout
+                while time.monotonic() < gate_deadline:
+                    have_a = bool(sender.events_named("direct_path"))
+                    have_b = bool(responder.events_named("direct_path"))
+                    waiting = bool(sender.events_named("waiting_for_go"))
+                    if sender.proc.poll() is not None:
+                        break
+                    if have_a and have_b and waiting:
+                        break
+                    time.sleep(0.5)
+                gate.update(sender_path=bool(sender.events_named("direct_path")), responder_path=bool(responder.events_named("direct_path")),
+                            waited_s=round(time.monotonic() - t_gate, 1), timed_out=time.monotonic() >= gate_deadline)
+                log(f"start gate: sender DIRECT path {gate['sender_path']}, responder DIRECT path {gate['responder_path']}, "
+                    f"waited {gate['waited_s']} s{' (TIMED OUT)' if gate['timed_out'] else ''}; releasing the sender")
+                sender.send_line("go")
+            measurements["start_gate"] = gate
 
             actions = scenario.actions(args)
             traffic_every = args.traffic_interval if scenario.traffic else None
             traffic_node = scenario.traffic["node"] if scenario.traffic else None
             next_traffic, traffic_sent = time.monotonic() + 5.0, 0
             stats_at = {}
-            deadline = time.monotonic() + args.path_timeout + probes * (args.wait + args.probe_timeout) + 60
+            deadline = time.monotonic() + args.path_timeout + (args.gate_timeout if gate["used"] else 0) + (
+                duration + unit_timeout if duration else probes * (args.wait + unit_timeout)) + args.late_grace + 60
             done = None
             while time.monotonic() < deadline:
                 done = first_event(sender, "done")
@@ -650,6 +876,17 @@ def run_scenario(scenario: Scenario, args) -> int:
                                 if keep_down and a_running(stats_by_name(wb), other.name):
                                     other.stop()
                                     log(f"{other.name} re-stopped (node.start brings every stopped node up)")
+                        elif act.action == "restart":
+                            # companion_restart: the firmware behind a served
+                            # endpoint reboots; the interface must reconnect.
+                            node.stop()
+                            time.sleep(act.args.get("down_s", 5.0))
+                            node.start()
+                            node.wait_running(timedelta(seconds=60))
+                            for other in nodes.values():
+                                if other.name != act.node and any(n.name == other.name and n.standby for n in scenario.nodes) \
+                                        and a_running(stats_by_name(wb), other.name):
+                                    other.stop()
                         elif act.action == "move":
                             node.move(*offset(act.args["east_km"], act.args.get("north_km", 0.0)))
                 if traffic_every and time.monotonic() >= next_traffic:
@@ -688,7 +925,51 @@ def run_scenario(scenario: Scenario, args) -> int:
             if traffic_sent:
                 log(f"    background traffic: {traffic_sent} public-channel messages from {traffic_node}")
             measurements.update(sent=done.get("sent", 0), delivered=done.get("delivered", 0), rtts=rtts,
-                                resolved=done.get("resolved", {}), background_msgs=traffic_sent)
+                                resolved=done.get("resolved", {}), background_msgs=traffic_sent,
+                                late=done.get("late", 0), late_rtts=done.get("late_rtts", []),
+                                link_times_s=done.get("link_times_s", []), resources=done.get("resources", []),
+                                traffic_elapsed_s=done.get("elapsed_s"))
+            link_probes = [p for p in plist if p.get("kind") == "link"]
+            if link_probes:
+                measurements["links_within_deadline"] = sum(1 for p in link_probes if p.get("within_deadline"))
+                measurements["link_deadline_s"] = args.link_deadline
+            if done.get("late"):
+                log(f"    late deliveries (PROOF after the {args.probe_timeout:.0f} s probe timeout): {done['late']} "
+                    f"with RTT {done.get('late_rtts')}")
+            if measurements["link_times_s"]:
+                lt = measurements["link_times_s"]
+                log(f"    link handshakes: {lt} s; within {args.link_deadline:.0f} s: "
+                    f"{measurements.get('links_within_deadline', 'n/a')}/{len(link_probes) or len(lt)}")
+            for rs in measurements["resources"]:
+                log(f"    resource {rs.get('tag')}: {'complete' if rs.get('complete') else 'FAILED/timeout'} in {rs.get('elapsed_s')} s, "
+                    f"{rs.get('total_parts')} parts, {rs.get('resent_parts')} re-sent")
+            back = [e for e in responder.events_named("resource_sent")]
+            if back:
+                measurements["resources_back"] = [{k: v for k, v in e.items() if k not in ("event", "name", "_t")} for e in back]
+                for rs in measurements["resources_back"]:
+                    log(f"    return resource {rs.get('tag')}: {'complete' if rs.get('complete') else 'FAILED/timeout'} in {rs.get('elapsed_s')} s, "
+                        f"{rs.get('total_parts')} parts, {rs.get('resent_parts')} re-sent")
+            received_back = [e for e in sender.events_named("resource_received")]
+            if received_back:
+                measurements["resources_received_by_sender"] = [{k: v for k, v in e.items() if k not in ("event", "name", "_t")} for e in received_back]
+            ttp = {}
+            for proc in (sender, responder, *extra_procs.values()):
+                ev = proc.events_named("direct_path")
+                if ev:
+                    ttp[proc.name] = ev[0].get("since_online_s")
+            measurements["time_to_direct_path"] = ttp
+            measurements["path_requests"] = len(sender.events_named("path_requested"))
+            log(f"    time to first DIRECT path per node (s since online): {ttp}; sender RNS path requests: {measurements['path_requests']}")
+            health = [e for e in sender.events_named("health")] + [e for e in responder.events_named("health")]
+            if done.get("health"):
+                health.append({"name": scenario.sender, "final": True, **done["health"]})
+            if health:
+                measurements["health"] = [{k: v for k, v in e.items() if k not in ("event", "_t")} for e in health]
+                for name in (scenario.sender, scenario.responder):
+                    mine = [h for h in measurements["health"] if h.get("name") == name]
+                    if mine:
+                        log(f"    {name} health: RSS {mine[0].get('rss_kb')} -> {mine[-1].get('rss_kb')} kB, threads "
+                            f"{mine[0].get('threads')} -> {mine[-1].get('threads')}, sizes {mine[-1].get('sizes')}")
 
             # ---- checks --------------------------------------------------
             sent, delivered = done.get("sent", 0), done.get("delivered", 0)
@@ -702,6 +983,15 @@ def run_scenario(scenario: Scenario, args) -> int:
                 if scenario.expected_hops is not None:
                     check(bool(resolved_final) and all(h == scenario.expected_hops for h in resolved_final.values()),
                           f"interface's resolved DIRECT path is {scenario.expected_hops} hop(s) (firmware path discovery): {resolved_final}")
+            if scenario.min_bound_peers is not None and capture_dir:
+                recs = read_capture(capture_dir, scenario.sender)
+                bound_max = max((r.get("bound_peers") or 0 for r in recs if r.get("direction") == "out" and "event" not in r), default=0)
+                non_small = sum(1 for r in recs if r.get("direction") == "out" and "event" not in r
+                                and r.get("small_mesh_mode") is False and (r.get("bound_peers") or 0) >= scenario.min_bound_peers)
+                check(bound_max >= scenario.min_bound_peers,
+                      f"sender bound >= {scenario.min_bound_peers} peers (max seen {bound_max})")
+                check(non_small > 0, f"sender routed with small-mesh mode OFF ({non_small} sends outside small-mesh mode)")
+                measurements.update(bound_peers_max=bound_max, sends_outside_small_mesh=non_small)
             for name in repeaters:
                 stopped_forever = any(a.action == "stop" and a.node == name and not any(
                     b.action == "start" and b.node == name for b in actions) for a in actions)
@@ -715,7 +1005,7 @@ def run_scenario(scenario: Scenario, args) -> int:
                 check(act.fired_at_probe is not None, f"staged action {act.action} {act.node} after probe {act.probe} was reached")
             if actions:
                 last_stop = max((a.probe for a in actions if a.action == "stop"), default=None)
-                last_start = max((a.probe for a in actions if a.action == "start"), default=None)
+                last_start = max((a.probe for a in actions if a.action in ("start", "restart")), default=None)
                 boundary = last_start if last_start is not None else last_stop
                 if boundary is not None:
                     after = [p for p in plist if (p.get("seq") or 0) > boundary]
@@ -729,6 +1019,10 @@ def run_scenario(scenario: Scenario, args) -> int:
                             after_start = stats_after.get(act.node, {}).get("sent") or 0
                             check(after_start > before_start, f"{act.node} relayed after it was started (sent {before_start} -> {after_start})")
                             check(a_running(stats_after, act.node), f"{act.node} firmware is running at the end")
+                        if act.action == "restart" and act.fired_at_probe is not None:
+                            check(a_running(stats_after, act.node), f"{act.node} firmware is running at the end")
+                            online_again = [e for e in sender.events_named("direct_path")]
+                            log(f"info  {act.node} restarted after probe {act.probe}; sender DIRECT-path events: {len(online_again)}")
             exit_code = 0 if not failures else 2
         finally:
             for p in procs:
@@ -765,9 +1059,25 @@ def run_scenario(scenario: Scenario, args) -> int:
                 }
                 print(f"\n--- interface packet capture, node {name} ({len(records)} records) ---")
                 print(format_summary(summary))
-        with open(os.path.join(capture_dir, "result.json"), "w") as f:
-            json.dump({"scenario": scenario.name, "informational": scenario.informational, "failures": failures,
-                       "measurements": measurements, "args": {k: v for k, v in vars(args).items() if k != "func"}}, f, indent=1, default=str)
+        result_path = os.path.join(capture_dir, "result.json")
+        result = {"scenario": scenario.name, "informational": scenario.informational, "failures": failures, "exit_code": exit_code,
+                  "measurements": measurements, "args": {k: v for k, v in vars(args).items() if k != "func"},
+                  "interface_path": INTERFACE_PATH, "git_head": git_head()}
+        with open(result_path, "w") as f:
+            json.dump(result, f, indent=1, default=str)
+        # The analysis every run should carry (2026-09-20): per-hop attempt
+        # success and ACK latency, completion checks by outcome, per-part
+        # bursts, wait breakdown, on-air bytes and misses by cause from the
+        # engine events with the LBT-preventable share, the airtime ledger.
+        try:
+            analysis = meshbench_report.analyse(capture_dir)
+            result["analysis"] = meshbench_report.compact(analysis)
+            with open(result_path, "w") as f:
+                json.dump(result, f, indent=1, default=str)
+            print("\n--- analysis (meshbench_report.py) ---")
+            meshbench_report.print_block(analysis)
+        except Exception as e:  # noqa: BLE001 - the run's verdict does not depend on the summary
+            log(f"analysis failed: {e}")
         log(f"result.json written to {capture_dir}")
     if failures:
         print("\nFAILED:\n  " + "\n  ".join(failures))
@@ -776,6 +1086,14 @@ def run_scenario(scenario: Scenario, args) -> int:
 
 def a_running(stats: dict, name: str) -> bool:
     return bool(stats.get(name, {}).get("running"))
+
+
+def git_head() -> Optional[str]:
+    try:
+        return subprocess.run(["git", "-C", os.path.dirname(HERE), "rev-parse", "--short", "HEAD"],
+                              check=True, capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -825,25 +1143,165 @@ def main() -> None:
     run.add_argument("--traffic-interval", type=float, default=8.0, help="busy_repeater: seconds between C's public-channel messages")
     run.add_argument("--loglevel", type=int, default=4)
     run.add_argument("--quiet-nodes", action="store_true")
+    # traffic modes and metrics (2026-09-20)
+    run.add_argument("--unit", choices=["probe", "link", "resource"], default=None,
+                     help="Override what one probe is: a DATA packet, an RNS Link handshake, or an RNS Resource (page) over a Link")
+    run.add_argument("--resource-size", type=int, default=None, help="unit=resource: random bytes per Resource (scenario default 5100 = 12 parts)")
+    run.add_argument("--resource-timeout", type=float, default=600.0, help="unit=resource: seconds to wait for one Resource to conclude")
+    run.add_argument("--respond-resource-size", type=int, default=None,
+                     help="Responder pushes a Resource of this size back on every Link (bidirectional load); scenario default")
+    run.add_argument("--rns-link-timeout", type=float, default=90.0,
+                     help="unit=link/resource: seconds to wait for an RNS Link to establish (--link-timeout is MeshBench's link budget)")
+    run.add_argument("--link-deadline", type=float, default=15.0, help="Handshakes inside this many seconds are counted (MeshChat's window)")
+    run.add_argument("--late-grace", type=float, default=90.0,
+                     help="After the last probe, keep watching outstanding receipts this long; late PROOFs are reported, not counted as lost")
+    run.add_argument("--start-after-paths", action="store_true", help="Hold the traffic until both ends have a DIRECT path (scenario default for two_hop)")
+    run.add_argument("--gate-timeout", type=float, default=600.0, help="Longest the start gate waits for both DIRECT paths before releasing anyway")
+    run.add_argument("--responder-interface", default=None, help="Path or git:<rev>: the responder runs that interface build (mixed_builds)")
+    run.add_argument("--duration", type=float, default=None, help="soak: seconds of traffic instead of a fixed probe count")
+    run.add_argument("--health-interval", type=float, default=0.0, help="Nodes emit health snapshots this often (soak default 60)")
+
+    suite = sub.add_parser("suite", help="Run several scenarios over several seeds and summarise them (medians and ranges)")
+    suite.add_argument("--scenarios", default="zero_hop,relay,two_hop,large_payload",
+                       help="Comma-separated scenario names, or 'all'")
+    suite.add_argument("--seeds", default="7,11,13", help="Comma-separated MeshBench seeds; each scenario runs once per seed")
+    suite.add_argument("--runs-per-seed", type=int, default=1)
+    suite.add_argument("--parallel", type=int, default=2, help="Concurrent runs (each has its own node filesystem root)")
+    suite.add_argument("--out-dir", required=True, help="One subdirectory per run: <scenario>-s<seed>-<n>/ with run.log, captures, result.json")
+    suite.add_argument("--run-arg", action="append", default=[], help="Extra argument passed to every `run` (repeatable)")
+    suite.add_argument("--write-baseline", default=None, metavar="PATH",
+                       help="Also write the summary as a baseline file (e.g. tests/baselines/<date>-meshbench-<commit>.md)")
+    suite.add_argument("--label", default=None, help="Title line for the summary / baseline file")
+
+    report = sub.add_parser("report", help="Summarise finished run directories (meshbench_report.py)")
+    report.add_argument("dirs", nargs="+")
+    report.add_argument("--md", action="store_true")
+    report.add_argument("--aggregate", action="store_true")
+    report.add_argument("--bursts", action="store_true")
     args = parser.parse_args()
 
     if args.mode == "list":
         for name, sc in SCENARIOS.items():
-            print(f"{name:<18} {sc.summary}")
-            print(f"{'':<18} nodes: {', '.join(f'{n.name}({n.kind[0]},{n.east_km:+g}E,{n.north_km:+g}N,{n.height_m:g}m)' for n in sc.nodes)}")
-            print(f"{'':<18} expects {sc.expected_hops if sc.expected_hops is not None else 'n/a'} hop(s), delivery floor {sc.min_delivered:.0%}, "
-                  f"{sc.probes} probes of {sc.size} B{'; informational' if sc.informational else ''}")
+            print(f"{name:<20} {sc.summary}")
+            print(f"{'':<20} nodes: {', '.join(f'{n.name}({n.kind[0]},{n.east_km:+g}E,{n.north_km:+g}N,{n.height_m:g}m)' for n in sc.nodes)}")
+            what = {"probe": f"{sc.probes} probes of {sc.size} B", "link": f"{sc.probes} Link handshakes",
+                    "resource": f"{sc.probes} Resources of {sc.resource_size} B" + (f" + {sc.respond_resource_size} B back" if sc.respond_resource_size else "")}[sc.unit]
+            if sc.duration_s:
+                what = f"probes for {sc.duration_s:.0f} s"
+            print(f"{'':<20} expects {sc.expected_hops if sc.expected_hops is not None else 'n/a'} hop(s), delivery floor {sc.min_delivered:.0%}, "
+                  f"{what}{'; probes start once both DIRECT paths exist' if sc.start_after_paths else ''}"
+                  f"{'; extra RNS nodes ' + ','.join(sc.extra_rns_nodes) if sc.extra_rns_nodes else ''}"
+                  f"{'; responder on ' + sc.responder_interface if sc.responder_interface else ''}{'; informational' if sc.informational else ''}")
             if sc.notes:
-                print(f"{'':<18} {sc.notes}")
+                print(f"{'':<20} {sc.notes}")
         return
+    if args.mode == "report":
+        flags = [f for f, on in (("--md", args.md), ("--aggregate", args.aggregate), ("--bursts", args.bursts)) if on]
+        meshbench_report.main(flags + args.dirs)
+        return
+    if args.mode == "suite":
+        sys.exit(run_suite(args))
     scenario = SCENARIOS[args.scenario]
     if (args.size or scenario.size) > 383:
         parser.error("--size above 383 exceeds RNS.Packet.ENCRYPTED_MDU; the sender's RNS.Packet.pack() would refuse it")
-    probes = args.probes or scenario.probes
+    probes = args.probes if args.probes is not None else scenario.probes
     acts = scenario.actions(args)
     if acts and max(a.probe for a in acts) + args.recover_probes > probes:
         parser.error(f"staged actions reach probe {max(a.probe for a in acts)} and need {args.recover_probes} more; raise --probes")
     sys.exit(run_scenario(scenario, args))
+
+
+# ---------------------------------------------------------------------------
+# suite: several scenarios x several seeds, summarised
+# ---------------------------------------------------------------------------
+
+def run_suite(args) -> int:
+    """Runs each scenario once per seed (times --runs-per-seed), --parallel
+    at a time, each as its own `run` subprocess with run.log saved beside
+    its captures, then writes summary.md / summary.json (per-run rows and
+    per-scenario medians with ranges) -- the shape tests/baselines/ files
+    quote. One MeshBench run is a coin flip on bring-up and the RNS side is
+    wall-clock driven, so a baseline is several seeds, never one run."""
+    names = list(SCENARIOS) if args.scenarios.strip() == "all" else [x.strip() for x in args.scenarios.split(",") if x.strip()]
+    unknown = [n for n in names if n not in SCENARIOS]
+    if unknown:
+        sys.exit(f"unknown scenario(s): {unknown}; see `list`")
+    seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
+    os.makedirs(args.out_dir, exist_ok=True)
+    jobs = []
+    for name in names:
+        for seed in seeds:
+            for i in range(1, args.runs_per_seed + 1):
+                run_dir = os.path.join(args.out_dir, f"{name}-s{seed}-{i}")
+                jobs.append((name, seed, run_dir))
+    log(f"suite: {len(jobs)} run(s) -- {names} x seeds {seeds} x {args.runs_per_seed}, {args.parallel} at a time, under {args.out_dir}")
+    running = {}
+    pending = list(jobs)
+    finished = []
+    while pending or running:
+        while pending and len(running) < args.parallel:
+            name, seed, run_dir = pending.pop(0)
+            os.makedirs(run_dir, exist_ok=True)
+            argv = [sys.executable, os.path.abspath(__file__), "run", name, "--seed", str(seed), "--capture-dir", run_dir,
+                    "--quiet-nodes"] + args.run_arg
+            logf = open(os.path.join(run_dir, "run.log"), "w")
+            env = dict(os.environ)
+            env.pop("MESHBENCH_NODEFS", None)   # each run picks its own root under its capture dir
+            proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT, env=env)
+            running[proc.pid] = (proc, logf, name, seed, run_dir, time.monotonic())
+            log(f"started {os.path.basename(run_dir)} (pid {proc.pid})")
+            time.sleep(5.0)   # stagger MeshBench start-ups
+        for pid, (proc, logf, name, seed, run_dir, t0) in list(running.items()):
+            if proc.poll() is not None:
+                logf.close()
+                took = time.monotonic() - t0
+                finished.append((name, seed, run_dir, proc.returncode, took))
+                log(f"finished {os.path.basename(run_dir)}: exit {proc.returncode} in {took / 60:.1f} min")
+                del running[pid]
+        time.sleep(2.0)
+    results = []
+    for name, seed, run_dir, code, took in finished:
+        try:
+            results.append(meshbench_report.analyse(run_dir))
+        except Exception as e:  # noqa: BLE001
+            log(f"analysis of {run_dir} failed: {e}")
+    agg = meshbench_report.aggregate(results)
+    title = args.label or f"MeshBench suite -- {time.strftime('%Y-%m-%d')} -- commit {git_head()}"
+    lines = [f"# {title}", "",
+             f"Scenarios {names}, seeds {seeds}, {args.runs_per_seed} run(s) per seed, interface `{INTERFACE_PATH}`, "
+             f"run arguments {args.run_arg or 'defaults'}. Produced by `meshbench_scenarios.py suite`; per-run details in each "
+             f"`<scenario>-s<seed>-<n>/result.json` (\"analysis\") and `run.log`.", "",
+             "Read with the two caveats every baseline file carries: MeshBench's RF is optimistic and its airtime 1.2-1.45x "
+             "RadioLib's, its runs are wall-clock driven and not reproducible, and its virtual radio has no listen-before-talk "
+             "(the LBT-preventable column counts the half-duplex misses a real SX1262 would have deferred). Mechanics are the "
+             "hard checks; delivery and timing are measured rates -- compare medians and ranges, not single runs.", "",
+             "## Per scenario: medians [min-max] over the runs", "", meshbench_report.aggregate_md(agg), "",
+             "## Per run", "", meshbench_report.MD_HEADER, meshbench_report.MD_SEP]
+    for r in results:
+        lines.append(meshbench_report.md_row(r))
+    lines += ["", "## Verdicts", ""]
+    for name, seed, run_dir, code, took in finished:
+        lines.append(f"- {os.path.basename(run_dir)}: exit {code} ({'PASS' if code == 0 else 'FAIL' if code == 2 else 'ERROR'}), {took / 60:.1f} min")
+    bursts = [(r["name"], r["bursts"]) for r in results if r["bursts"] and any(b["sent_round0"] > 1 for b in r["bursts"])]
+    if bursts:
+        lines += ["", "## Per-part bursts (pkt: round-0 sent/landed, rounds, first fragment -> known complete s)", ""]
+        for name, rows in bursts:
+            lines.append(f"- {name}: " + "; ".join(f"{b['pkt_id']}: {b['sent_round0']}/{b['landed_round0']}, {b['rounds']}r, {b['complete_after_s']}" for b in rows))
+    summary = "\n".join(lines) + "\n"
+    with open(os.path.join(args.out_dir, "summary.md"), "w") as f:
+        f.write(summary)
+    with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
+        json.dump({"title": title, "runs": [{"scenario": n, "seed": sd, "dir": d, "exit": c, "minutes": round(t / 60, 1)}
+                                             for n, sd, d, c, t in finished],
+                   "aggregate": agg, "per_run": [meshbench_report.compact(r) for r in results]}, f, indent=1, default=str)
+    if args.write_baseline:
+        os.makedirs(os.path.dirname(os.path.abspath(args.write_baseline)), exist_ok=True)
+        with open(args.write_baseline, "w") as f:
+            f.write(summary)
+        log(f"baseline written to {args.write_baseline}")
+    print(summary)
+    log(f"summary.md / summary.json written to {args.out_dir}")
+    return 0 if all(c == 0 for _, _, _, c, _ in finished) else 2
 
 
 if __name__ == "__main__":

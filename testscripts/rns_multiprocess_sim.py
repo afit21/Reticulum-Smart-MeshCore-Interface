@@ -80,9 +80,13 @@ def status(event: str, **fields) -> None:
 # ---------------------------------------------------------------------------
 
 def write_node_config(configdir: str, name: str, server_host: str, server_port: int, fast: bool,
-                      capture_dir: str, transport_node: bool, loglevel: int, extra: dict) -> None:
+                      capture_dir: str, transport_node: bool, loglevel: int, extra: dict,
+                      interface_path: str = None) -> None:
     os.makedirs(os.path.join(configdir, "interfaces"), exist_ok=True)
-    shutil.copy(INTERFACE_PATH, os.path.join(configdir, "interfaces", "SmartMeshCoreInterface.py"))
+    # --interface-path (2026-09-20): this node runs a specific build of the
+    # interface -- the mixed_builds MeshBench scenario gives the responder an
+    # older tree so a protocol change is checked against a peer without it.
+    shutil.copy(interface_path or INTERFACE_PATH, os.path.join(configdir, "interfaces", "SmartMeshCoreInterface.py"))
     lines = [
         "[reticulum]",
         "  share_instance = No",
@@ -123,7 +127,7 @@ def run_node(args) -> None:
     configdir = args.configdir or tempfile.mkdtemp(prefix=f"smci-mp-{args.name}-")
     extra = dict(kv.split("=", 1) for kv in args.iface_option)
     write_node_config(configdir, args.name, host, port, not args.production_timing, args.capture_dir,
-                      args.transport_node, args.loglevel, extra)
+                      args.transport_node, args.loglevel, extra, interface_path=args.interface_path)
 
     def log(msg: str) -> None:
         if args.air_log:
@@ -191,6 +195,112 @@ def run_node(args) -> None:
 
         threading.Thread(target=_readvert_loop, daemon=True).start()
 
+    # ---- shared helpers for both roles (2026-09-20 traffic modes) --------
+
+    def health_snapshot() -> dict:
+        """Process and interface bookkeeping sizes for the soak scenario:
+        RSS, thread count and the interface's growable maps."""
+        rss_kb = None
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        break
+        except OSError:
+            pass
+        sizes = {}
+        for attr in ("_peers", "_resolved_paths", "_rns_token_peer", "_unknown_dest_attempts",
+                     "_unknown_dest_backoff_until", "_reassembly", "_fragmented_send_slots",
+                     "_whole_packet_dedup", "_pending_completion_reports", "_direct_recent_success"):
+            value = getattr(iface, attr, None)
+            if value is not None and hasattr(value, "__len__"):
+                sizes[attr] = len(value)
+        return {"rss_kb": rss_kb, "threads": threading.active_count(), "sizes": sizes,
+                "uptime_s": round(time.monotonic() - started_at, 1)}
+
+    started_at = time.monotonic()
+    if args.health_interval > 0:
+        def _health_loop():
+            while True:
+                time.sleep(args.health_interval)
+                try:
+                    status("health", name=args.name, **health_snapshot())
+                except Exception as e:  # noqa: BLE001
+                    print(f"[{args.name}] health snapshot failed: {e}", flush=True)
+        threading.Thread(target=_health_loop, daemon=True).start()
+
+    def resolved_now() -> dict:
+        return {k: v.out_path_len for k, v in iface._resolved_paths.items()}
+
+    def announce_direct_path_once():
+        """One `direct_path` event the first time this interface has a
+        resolved DIRECT path to anyone -- the orchestrator's start gate for
+        two_hop reads it from both ends (2026-09-20: bring-up dominated that
+        scenario, so probes now start only once both paths exist)."""
+        def _watch():
+            while not iface._resolved_paths:
+                time.sleep(0.5)
+            status("direct_path", name=args.name, resolved=resolved_now(),
+                   since_online_s=round(time.monotonic() - started_at, 1))
+        threading.Thread(target=_watch, daemon=True).start()
+
+    announce_direct_path_once()
+
+    def arm_link_for_resources(link, side: str):
+        """Accept every Resource on `link` and report each one: the responder
+        does this for the sender's page transfers, the sender for the
+        responder's return traffic in a bidirectional run."""
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        started = {}
+
+        def on_started(resource):
+            started[resource.hash] = time.monotonic()
+            status("resource_started", name=args.name, side=side, link=link.link_id.hex()[:8],
+                   size=resource.size, total_parts=getattr(resource, "total_parts", None))
+
+        def on_concluded(resource):
+            t0 = started.get(resource.hash, time.monotonic())
+            complete = resource.status == RNS.Resource.COMPLETE
+            status("resource_received", name=args.name, side=side, link=link.link_id.hex()[:8],
+                   complete=complete, status=resource.status, size=resource.size,
+                   total_parts=getattr(resource, "total_parts", None),
+                   received_count=getattr(resource, "received_count", None),
+                   retries_used=(resource.max_retries - resource.retries_left) if hasattr(resource, "retries_left") else None,
+                   elapsed_s=round(time.monotonic() - t0, 2))
+
+        link.set_resource_started_callback(on_started)
+        link.set_resource_concluded_callback(on_concluded)
+
+    def send_resource_on(link, size: int, tag: str, timeout: float) -> dict:
+        """One RNS.Resource of `size` random bytes (incompressible, so the
+        part count is size / link MDU like the field's page parts). Returns
+        its accounting: status, parts, re-sent parts, wall time."""
+        payload = os.urandom(max(1, size))
+        finished = threading.Event()
+        outcome = {}
+
+        def on_done(resource):
+            outcome["status"] = resource.status
+            finished.set()
+
+        t0 = time.monotonic()
+        resource = RNS.Resource(payload, link, callback=on_done)
+        finished.wait(timeout)
+        elapsed = time.monotonic() - t0
+        if not finished.is_set():
+            try:
+                resource.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        complete = outcome.get("status") == RNS.Resource.COMPLETE
+        total = getattr(resource, "total_parts", None)
+        sent_parts = getattr(resource, "sent_parts", None)
+        return {"complete": complete, "status": outcome.get("status"), "elapsed_s": round(elapsed, 2),
+                "size": size, "total_parts": total, "sent_parts": sent_parts,
+                "resent_parts": (sent_parts - total) if (sent_parts is not None and total is not None) else None,
+                "timed_out": not finished.is_set(), "tag": tag}
+
     if args.role == "responder":
         identity = RNS.Identity()
         destination = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, APP_NAME, ASPECT)
@@ -203,17 +313,37 @@ def run_node(args) -> None:
             status("probe_received", name=args.name, seq=seq, count=received["count"], size=len(data))
 
         destination.set_packet_callback(on_packet)
+
+        def on_link(link):
+            status("link_established", name=args.name, link=link.link_id.hex()[:8], rtt_s=round(link.rtt or 0, 3) if link.rtt else None)
+            arm_link_for_resources(link, "responder")
+            link.set_link_closed_callback(lambda l: status("link_closed", name=args.name, link=l.link_id.hex()[:8]))
+            if args.respond_resource_size > 0:
+                # Bidirectional load (2026-09-19 night regression: answers
+                # queued behind the answerer's own bursts): the responder
+                # pushes its own page back the moment the link is up, so
+                # both ends' raw bursts and completion reports contend.
+                def _push():
+                    time.sleep(args.respond_resource_delay)
+                    for i in range(args.respond_resources):
+                        if link.status != RNS.Link.ACTIVE:
+                            break
+                        result = send_resource_on(link, args.respond_resource_size, f"back-{i + 1}", args.resource_timeout)
+                        status("resource_sent", name=args.name, side="responder", link=link.link_id.hex()[:8], **result)
+                threading.Thread(target=_push, daemon=True).start()
+
+        destination.set_link_established_callback(on_link)
         status("ready", name=args.name, dest=destination.hash.hex())
         next_announce = 0.0
         while True:
             now = time.monotonic()
             if now >= next_announce:
                 destination.announce()
-                status("announced", name=args.name, peers=list(iface._peers.keys()), resolved=list(iface._resolved_paths.keys()))
+                status("announced", name=args.name, peers=list(iface._peers.keys()), resolved=resolved_now())
                 next_announce = now + args.announce_interval
             time.sleep(0.5)
 
-    # sender
+    # ---- sender ------------------------------------------------------------
     destination_hash = bytes.fromhex(args.dest)
     deadline = time.monotonic() + args.path_timeout
     requested_at = 0.0
@@ -224,40 +354,154 @@ def run_node(args) -> None:
             status("path_requested", name=args.name)
         time.sleep(0.2)
     if not RNS.Transport.has_path(destination_hash):
-        status("done", name=args.name, sent=0, delivered=0, rtts=[], reason="path request timed out")
+        status("done", name=args.name, sent=0, delivered=0, rtts=[], late=0, traffic=args.traffic, reason="path request timed out")
         sys.exit(2)
     status("path_resolved", name=args.name, hops=RNS.Transport.hops_to(destination_hash))
+
+    if args.start_gate:
+        # The orchestrator writes "go" on stdin once every end it cares
+        # about has a DIRECT path (or its own gate timeout has passed).
+        status("waiting_for_go", name=args.name, resolved=resolved_now())
+        line = sys.stdin.readline()
+        status("go", name=args.name, line=line.strip(), resolved=resolved_now())
 
     server_identity = RNS.Identity.recall(destination_hash)
     request_destination = RNS.Destination(server_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, ASPECT)
     sent = delivered = 0
-    rtts = []
-    for seq in range(1, args.probes + 1):
+    rtts, late_rtts = [], []
+    pending = {}   # seq -> (receipt, sent_at) for probes not yet delivered when their timeout passed
+    link_times = []
+    resources = []
+    traffic_started = time.monotonic()
+
+    def harvest_late():
+        """A PROOF that arrives after its probe's timeout is a late delivery,
+        not a loss: counted separately (2026-09-20 -- the 60 s probe timeout
+        was a cliff that turned a 10 s slowdown into a FAIL)."""
+        for seq in list(pending):
+            receipt, sent_at = pending[seq]
+            if receipt.status == RNS.PacketReceipt.DELIVERED:
+                rtt = receipt.get_rtt()
+                late_rtts.append(rtt)
+                del pending[seq]
+                status("probe_late", name=args.name, seq=seq, rtt_s=round(rtt, 3), resolved=resolved_now())
+            elif receipt.status == RNS.PacketReceipt.FAILED:
+                del pending[seq]
+
+    def establish_link(timeout: float):
+        established = threading.Event()
+        t0 = time.monotonic()
+        link = RNS.Link(request_destination, established_callback=lambda l: established.set())
+        established.wait(timeout)
+        took = time.monotonic() - t0
+        if not established.is_set():
+            try:
+                link.teardown()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, took
+        arm_link_for_resources(link, "sender")
+        link.set_link_closed_callback(lambda l: status("link_closed", name=args.name, link=l.link_id.hex()[:8]))
+        return link, took
+
+    link = None
+    seq = 0
+    while True:
+        seq += 1
+        if args.duration > 0:
+            if time.monotonic() - traffic_started >= args.duration:
+                break
+            if args.probes and seq > args.probes:
+                break
+        elif seq > args.probes:
+            break
         if sent:
             time.sleep(args.wait)
-        payload = PAYLOAD_HEADER.pack(seq, time.time()) + os.urandom(max(0, args.size - PAYLOAD_HEADER.size))
+        harvest_late()
+        resolved = resolved_now()
+
+        if args.traffic == "probe":
+            payload = PAYLOAD_HEADER.pack(seq, time.time()) + os.urandom(max(0, args.size - PAYLOAD_HEADER.size))
+            try:
+                receipt = RNS.Packet(request_destination, payload).send()
+            except (IOError, OSError) as e:
+                # RNS.Packet.pack() refuses a payload over ENCRYPTED_MDU (383 B for
+                # a SINGLE destination); report it as the outcome rather than
+                # dying without a "done" for the orchestrator to read.
+                status("done", name=args.name, sent=sent, delivered=delivered, rtts=[round(r, 3) for r in rtts],
+                       late=len(late_rtts), traffic=args.traffic, reason=f"packet send refused: {e}")
+                sys.exit(2)
+            sent += 1
+            sent_at = time.monotonic()
+            probe_deadline = sent_at + args.probe_timeout
+            while receipt.status == RNS.PacketReceipt.SENT and time.monotonic() < probe_deadline:
+                time.sleep(0.05)
+            if receipt.status == RNS.PacketReceipt.DELIVERED:
+                delivered += 1
+                rtts.append(receipt.get_rtt())
+                status("probe", name=args.name, seq=seq, delivered=True, rtt_s=round(receipt.get_rtt(), 3), resolved=resolved)
+            else:
+                if receipt.status == RNS.PacketReceipt.SENT:
+                    pending[seq] = (receipt, sent_at)
+                status("probe", name=args.name, seq=seq, delivered=False, resolved=resolved)
+
+        elif args.traffic == "link":
+            # One Link handshake per unit: LINKREQUEST out, LRPROOF back.
+            # MeshChat gives a NomadNet link 15 s (--link-deadline) -- that
+            # is reported per handshake, and counted, not asserted.
+            sent += 1
+            new_link, took = establish_link(args.link_timeout)
+            ok = new_link is not None
+            link_times.append(round(took, 2))
+            if ok:
+                delivered += 1
+                rtts.append(took)
+            status("probe", name=args.name, seq=seq, delivered=ok, rtt_s=round(took, 3), kind="link",
+                   within_deadline=ok and took <= args.link_deadline, link_deadline_s=args.link_deadline,
+                   link_rtt_s=round(new_link.rtt, 3) if ok and new_link.rtt else None, resolved=resolved)
+            if new_link is not None:
+                time.sleep(min(2.0, args.wait))
+                new_link.teardown()
+
+        elif args.traffic == "resource":
+            # One Resource per unit over a Link that is established once and
+            # re-established if it closed. Part count = size / link MDU; the
+            # field's NomadNet page is 12 parts of 483 B packed.
+            if link is None or link.status != RNS.Link.ACTIVE:
+                link, took = establish_link(args.link_timeout)
+                link_times.append(round(took, 2))
+                status("link_setup", name=args.name, ok=link is not None, took_s=round(took, 2),
+                       within_deadline=(link is not None and took <= args.link_deadline), resolved=resolved)
+                if link is None:
+                    sent += 1
+                    status("probe", name=args.name, seq=seq, delivered=False, kind="resource",
+                           reason="link never established", resolved=resolved)
+                    continue
+            sent += 1
+            result = send_resource_on(link, args.resource_size, f"page-{seq}", args.resource_timeout)
+            if result["complete"]:
+                delivered += 1
+                rtts.append(result["elapsed_s"])
+            resources.append(result)
+            status("probe", name=args.name, seq=seq, delivered=result["complete"], rtt_s=result["elapsed_s"],
+                   kind="resource", resolved=resolved, **{k: v for k, v in result.items() if k not in ("complete", "elapsed_s")})
+
+    # Late PROOFs: keep watching what is still outstanding for --late-grace.
+    if pending:
+        grace_end = time.monotonic() + args.late_grace
+        while pending and time.monotonic() < grace_end:
+            harvest_late()
+            time.sleep(0.2)
+        harvest_late()
+    if link is not None:
         try:
-            receipt = RNS.Packet(request_destination, payload).send()
-        except (IOError, OSError) as e:
-            # RNS.Packet.pack() refuses a payload over ENCRYPTED_MDU (383 B for
-            # a SINGLE destination); report it as the outcome rather than
-            # dying without a "done" for the orchestrator to read.
-            status("done", name=args.name, sent=sent, delivered=delivered, rtts=[round(r, 3) for r in rtts],
-                   reason=f"packet send refused: {e}")
-            sys.exit(2)
-        sent += 1
-        probe_deadline = time.monotonic() + args.probe_timeout
-        while receipt.status == RNS.PacketReceipt.SENT and time.monotonic() < probe_deadline:
-            time.sleep(0.05)
-        resolved = {k: v.out_path_len for k, v in iface._resolved_paths.items()}
-        if receipt.status == RNS.PacketReceipt.DELIVERED:
-            delivered += 1
-            rtts.append(receipt.get_rtt())
-            status("probe", name=args.name, seq=seq, delivered=True, rtt_s=round(receipt.get_rtt(), 3), resolved=resolved)
-        else:
-            status("probe", name=args.name, seq=seq, delivered=False, resolved=resolved)
+            link.teardown()
+        except Exception:  # noqa: BLE001
+            pass
     status("done", name=args.name, sent=sent, delivered=delivered, rtts=[round(r, 3) for r in rtts],
-           peers=list(iface._peers.keys()), resolved={k: v.out_path_len for k, v in iface._resolved_paths.items()})
+           late=len(late_rtts), late_rtts=[round(r, 3) for r in late_rtts], traffic=args.traffic,
+           link_times_s=link_times, resources=resources, elapsed_s=round(time.monotonic() - traffic_started, 1),
+           peers=list(iface._peers.keys()), resolved=resolved_now(), health=health_snapshot())
     sys.exit(0 if delivered == sent else 2)
 
 
@@ -268,7 +512,8 @@ def run_node(args) -> None:
 class NodeProcess:
     def __init__(self, name: str, argv: list, echo: bool):
         self.name = name
-        self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1)
         self.events = []
         self._lock = threading.Lock()
         self._echo = echo
@@ -303,6 +548,18 @@ class NodeProcess:
                 return None
             time.sleep(0.1)
         return None
+
+    def send_line(self, line: str) -> None:
+        """Write one line to the node's stdin (the sender's --start-gate)."""
+        try:
+            self.proc.stdin.write(line.rstrip("\n") + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def events_named(self, name: str) -> list:
+        with self._lock:
+            return [e for e in self.events if e.get("event") == name]
 
     def stop(self) -> None:
         if self.proc.poll() is None:
@@ -360,7 +617,7 @@ def run_orchestrator(args) -> None:
     procs = []
     exit_code = 2
     try:
-        responder = NodeProcess(args.responder, node_argv(args.responder, "responder", ["--announce-interval", str(args.announce_interval)]), echo=not args.quiet_nodes)
+        responder = NodeProcess(args.responder, node_argv(args.responder, "responder", ["--announce-interval", str(args.announce_interval)] + args.responder_arg), echo=not args.quiet_nodes)
         procs.append(responder)
         ready = responder.wait_event("ready", timeout=60)
         if ready is None:
@@ -372,7 +629,7 @@ def run_orchestrator(args) -> None:
         sender = NodeProcess(args.sender, node_argv(args.sender, "sender", [
             "--dest", ready["dest"], "--probes", str(args.probes), "--wait", str(args.wait), "--size", str(args.size),
             "--path-timeout", str(args.path_timeout), "--probe-timeout", str(args.probe_timeout),
-        ]), echo=not args.quiet_nodes)
+        ] + args.sender_arg), echo=not args.quiet_nodes)
         procs.append(sender)
         done = sender.wait_event("done", timeout=args.path_timeout + args.probes * (args.wait + args.probe_timeout) + 30)
         print("")
@@ -431,6 +688,10 @@ def main() -> None:
     run.add_argument("--quiet-air", action="store_true")
     run.add_argument("--quiet-nodes", action="store_true", help="Don't echo node RNS logs, only status events")
     run.add_argument("--air-log", action="store_true", help="Node-side radio logs")
+    # Pass-through for smoke-testing the node's traffic modes (2026-09-20)
+    # without MeshBench, e.g. --sender-arg=--traffic --sender-arg=resource.
+    run.add_argument("--sender-arg", action="append", default=[], help="Extra argument for the sender node (repeatable)")
+    run.add_argument("--responder-arg", action="append", default=[], help="Extra argument for the responder node (repeatable)")
 
     node = sub.add_parser("node", help="(internal) one RNS node")
     node.add_argument("--name", required=True)
@@ -454,6 +715,31 @@ def main() -> None:
     node.add_argument("--probe-timeout", type=float, default=60.0)
     node.add_argument("--loglevel", type=int, default=4)
     node.add_argument("--air-log", action="store_true")
+    # Traffic modes and metrics added 2026-09-20 for the MeshBench suite's
+    # coverage gaps (page transfers, link establishment, bidirectional load,
+    # late PROOFs, the two_hop start gate, soak health, mixed builds).
+    node.add_argument("--traffic", choices=["probe", "link", "resource"], default="probe",
+                      help="probe: one PROVE_ALL DATA packet per unit; link: one RNS.Link handshake per unit; "
+                           "resource: one RNS.Resource of --resource-size over a Link per unit")
+    node.add_argument("--resource-size", type=int, default=5100,
+                      help="Random (incompressible) bytes per Resource; 5100 B is ~12 parts at the Link MDU, the field's page")
+    node.add_argument("--resource-timeout", type=float, default=600.0, help="Seconds to wait for one Resource to conclude")
+    node.add_argument("--link-timeout", type=float, default=90.0, help="Seconds to wait for a Link to establish")
+    node.add_argument("--link-deadline", type=float, default=15.0,
+                      help="Reported (not asserted) per handshake: MeshChat's NomadNet downloader gives a link this long")
+    node.add_argument("--respond-resource-size", type=int, default=0,
+                      help="responder: push a Resource of this many bytes back on every established Link (bidirectional load)")
+    node.add_argument("--respond-resources", type=int, default=1, help="responder: how many Resources to push back per Link")
+    node.add_argument("--respond-resource-delay", type=float, default=1.0, help="responder: seconds after link-up before pushing")
+    node.add_argument("--late-grace", type=float, default=90.0,
+                      help="sender: after the last probe, keep watching outstanding receipts this long; a PROOF that "
+                           "arrives after its probe's timeout is reported as late, not lost")
+    node.add_argument("--start-gate", action="store_true",
+                      help="sender: after the RNS path resolves, wait for a 'go' line on stdin before the traffic phase")
+    node.add_argument("--duration", type=float, default=0.0,
+                      help="sender: keep sending units until this many seconds have passed (--probes then caps the count; 0 = no cap)")
+    node.add_argument("--health-interval", type=float, default=0.0, help="Emit a health event (RSS, threads, map sizes) this often")
+    node.add_argument("--interface-path", default=None, help="Run this node on a specific copy of the interface file")
 
     args = parser.parse_args()
     if args.mode == "run":
