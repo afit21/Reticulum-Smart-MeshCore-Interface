@@ -3169,6 +3169,32 @@ from. Milestones in order, each gated on the full suite and MeshBench
      against the firmware). Version alpha 0.1.4 (both nodes must run it:
      "Q" v4 and raw v2 are not decoded by 0.1.3); readme lists the new
      keys and the build step. Baseline: `tests/baselines/2026-09-20-
-     meshbench-<the commit this entry ships in>.md` (zero_hop, relay, two_hop, large_payload,
-     page_transfer, page_transfer_bidir, link_setup x seeds 7/11/13).
+     meshbench-6cf0876.md` (zero_hop, relay, two_hop, large_payload,
+     page_transfer, page_transfer_bidir, link_setup x seeds 7/11/17; seed
+     13 gives A a reserved identity the script refuses), against the
+     frozen alpha 0.1.3 suite (`tests/baselines/alpha-0.1.3-
+     simulatedbenchmark/`, same seeds), medians [range]: large_payload
+     delivered 17 % [0-33] -> 83 % [50-100] at 12.76 -> 5.11 B/B (the one
+     result outside the frozen spread, both ways); zero_hop 100 % at 3.39
+     -> 2.85 B/B; relay 100 % [88-100] -> 88 % [75-88] at 5.74 -> 5.45;
+     two_hop 75 % -> 88 % at 10.31 -> 9.31 but RTT median 12.2 -> 29.6 s
+     (one run 3/8 + 1 late at 15.49 B/B; re-run before reading it either
+     way); page_transfer 0 % [0-67] -> 33 % [0-67] at 8.07 -> 6.60, 12-part
+     pages in 472-596 s (1.2-1.5 parts/min: MeshBench's one-hop relay
+     regime, not a field number); page_transfer_bidir 0/3 both at 24.95 ->
+     13.51; link_setup 75 -> 88 % delivered, handshakes inside MeshChat's
+     15 s: 38 % -> 25 % (ranges 12-62 % both). One zero_hop run (seed 7,
+     under the unit suite's CPU load) never resolved a MeshCore path in
+     220 s -- B's firmware received all ten discovery requests and
+     answered none (a path discovery is a flood + telemetry request,
+     answered only after the responder's telemetry grant for the bound
+     peer, `_grant_telemetry_permission_if_needed`); delivered 8/8 over the
+     CHANNEL fallback, the unloaded re-run resolved at 87-97 s and passed
+     (both runs are in the baseline). `mixed_builds` (responder on
+     d7dcba9, an alpha-0.1.3-era build) delivered 0/6 where alpha 0.1.3
+     got 3/6, 5/6, 0/6: the raw v2 bursts and v4 QUERYs are undecodable to
+     the old node and the raw -> text fallback never fired in the run (4
+     raw sends failed, 0 text fallbacks) -- the mismatch does not degrade
+     cleanly; a protocol-version bit in the bind frame (raw v2 / "Q" v4
+     only toward peers that set it) is the follow-up, not attempted here.
 

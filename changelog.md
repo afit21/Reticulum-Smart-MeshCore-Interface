@@ -48,7 +48,12 @@ on the full suite and MeshBench `large_payload` + `relay` (two runs) against the
 - **Phase 4:** version alpha 0.1.4; full suite 288 tests OK (three `@slow` raw scenarios re-pinned
   to M2/M3: three fragments per 446-byte payload, and a REPORT under both-ways zero-hop load waits
   behind one outgoing window, 12-15 s observed, bound 20 s); baseline
-  `tests/baselines/2026-09-20-meshbench-<the commit this entry ships in>.md`.
+  `tests/baselines/2026-09-20-meshbench-6cf0876.md` (seven scenarios x seeds 7/11/17) against the
+  frozen alpha 0.1.3 suite: large_payload 17 % -> 83 % delivered at 12.76 -> 5.11 on-air B per RNS B
+  (outside the frozen spread both ways); everything else inside its spread; two_hop's RTT median
+  worse on one run (re-run before reading it). `mixed_builds` against an alpha-0.1.3-era responder
+  delivered 0/6 (alpha 0.1.3: 3/6, 5/6, 0/6): both nodes must run this build, and the mismatch does
+  not degrade cleanly -- a protocol-version bit in the bind frame is the follow-up.
 
 ### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
 
