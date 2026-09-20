@@ -22,7 +22,7 @@ As this project is under a GPL license, there is nothing stopping you from lifti
 
 In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
 
-## Features (Version alpha0.1.2)
+## Features (Version alpha0.1.3)
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
 

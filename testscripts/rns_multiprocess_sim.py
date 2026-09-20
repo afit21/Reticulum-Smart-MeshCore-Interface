@@ -298,7 +298,10 @@ def run_node(args) -> None:
         sent_parts = getattr(resource, "sent_parts", None)
         return {"complete": complete, "status": outcome.get("status"), "elapsed_s": round(elapsed, 2),
                 "size": size, "total_parts": total, "sent_parts": sent_parts,
-                "resent_parts": (sent_parts - total) if (sent_parts is not None and total is not None) else None,
+                # sent_parts counts every part put on the Link, re-sends included;
+                # it stays 0 when the advertisement was never accepted, so only a
+                # transfer that sent at least one full pass has a re-send count.
+                "resent_parts": (sent_parts - total) if (sent_parts is not None and total and sent_parts >= total) else None,
                 "timed_out": not finished.is_set(), "tag": tag}
 
     if args.role == "responder":

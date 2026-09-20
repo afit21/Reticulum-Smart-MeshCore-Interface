@@ -157,6 +157,12 @@ MESHBENCH v0.1.0 QUIRKS THIS SCRIPT WORKS AROUND (all observed 2026-09-20)
     root via MESHBENCH_NODEFS (under --capture-dir when given).
   * Miss strings say "needed at SF10" whatever the settings; the threshold
     quoted (-7.5 dB) is SF7's, so it is a label quirk.
+  * Seeded identities ignore MeshCore's reserved first bytes: seed 13 gives
+    node A a public key starting 0x00, which the firmware itself never
+    generates (path hash 0x00/0xFF is reserved) -- path discovery to that
+    node never answers and no DIRECT frame is ever exchanged. Every run now
+    checks each node's _main.id after the firmware starts and stops (exit 3)
+    on a reserved prefix, like the topology gate.
   * The engine's "ms on air" runs 1.2-1.45x RadioLib's formula for the
     configured SF7/62.5/CR8 (9 B 188 ms, 37 B 385 ms, 165 B 1270 ms; no
     standard SF/BW/CR reproduces the set), so every collision window and
@@ -171,9 +177,11 @@ Exit code 0 iff every hard check held.
 """
 import argparse
 import collections
+import glob
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -310,12 +318,15 @@ SCENARIOS = {
     ),
     "three_hop": Scenario(
         "three_hop", "A - R1 - R2 - R3 - B chain, only adjacent links clear: DIRECT at three hops (the field sees them).",
-        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), rep("R3", 44, mast=30), comp("B", 52)],
+        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), rep("R3", 26, 16, mast=15), comp("B", 20.3, 21.7)],
         must_link=[("A", "R1"), ("R1", "R2"), ("R2", "R3"), ("R3", "B")],
-        must_block=[("A", "R2"), ("R1", "R3"), ("R2", "B"), ("A", "B")],
+        must_block=[("A", "R2"), ("R1", "R3"), ("R2", "B"), ("R1", "B"), ("A", "B")],
         expected_hops=3, min_delivered=0.2, probes=8, start_after_paths=True,
         notes="Field 2026-09-19: hop 3 ~42% attempt success, ~5.6 s ACK. Hop-scaled values (ACK cap 5+3h = 14 s, answer hold, "
-              "raw gap) are what this exercises; expect bring-up to take several minutes (--gate-timeout).",
+              "raw gap) are what this exercises; expect bring-up to take several minutes (--gate-timeout). The chain bends "
+              "north after R2 because the terrain east of R2 is flat for 50 km (a straight R3 stayed clear of R1 at 44 km and "
+              "a ridge at ~51 km east blocked R3-B): found with `topology three_hop --place ...` on 2026-09-20 -- R2-R3 +16 dB, "
+              "R3-B +12 dB, R1-R3 -6.7 dB, R2-B -6.6 dB, R1-B -16 dB.",
     ),
     "failover": Scenario(
         "failover", "A - R1 - B with R2 a cold standby; after --fail-after probes R1's firmware dies and R2's starts. "
@@ -565,6 +576,31 @@ def configure_repeater(wb, node, radio: str, extra: list) -> str:
     return "?"
 
 
+def reserved_identities(nodefs_root: str, names: list) -> dict:
+    """{node: pubkey prefix} for every node whose MeshBench-generated identity
+    starts with 0x00 or 0xFF. MeshCore reserves those first bytes ("reserved
+    id hashes": companion_radio/MyMesh.cpp regenerates its identity until
+    the first byte is neither, and Identity.cpp's validatePrivateKey refuses
+    them), because the first byte is the node's path hash on air. MeshBench
+    v0.1.0's seeded identities skip that rule: seed 13 gave node A the key
+    0032090d... on 2026-09-20, and in every seed-13 run the other side held
+    A as a contact in its firmware store yet path discovery to it never
+    answered and no DIRECT frame was ever exchanged -- eleven runs of a
+    node no real radio can be. The identity lives in <nodefs>/<name>/_main.id
+    (first 32 bytes = public key) once the firmware has started."""
+    out = {}
+    for name in names:
+        path = os.path.join(nodefs_root, name, "_main.id")
+        try:
+            with open(path, "rb") as f:
+                pub = f.read(32)
+        except OSError:
+            continue
+        if len(pub) == 32 and pub[0] in (0x00, 0xFF):
+            out[name] = pub[:4].hex()
+    return out
+
+
 def radio_matches(reported: str, wanted: str) -> bool:
     try:
         r = [float(x) for x in reported.split(",")]
@@ -744,6 +780,13 @@ def run_scenario(scenario: Scenario, args) -> int:
         log("starting firmware on every node and playing the sim ...")
         wb.sim.start()
         wb.firmware.wait_started(timedelta(seconds=args.firmware_wait))
+        reserved = reserved_identities(os.environ["MESHBENCH_NODEFS"], [n.name for n in scenario.nodes])
+        check(not reserved, "no node was given a reserved MeshCore identity (public key first byte 0x00/0xFF): "
+              + (", ".join(f"{k}={v}" for k, v in reserved.items()) or "none"))
+        if reserved and not args.ignore_topology:
+            log(f"stopping: seed {args.seed} gives {sorted(reserved)} an identity real firmware never has; pick another seed "
+                "(--ignore-topology to run anyway)")
+            return 3
         for n in scenario.nodes:
             if n.kind == "repeater":
                 got = configure_repeater(wb, nodes[n.name], args.radio, n.console)
@@ -929,7 +972,7 @@ def run_scenario(scenario: Scenario, args) -> int:
                                 late=done.get("late", 0), late_rtts=done.get("late_rtts", []),
                                 link_times_s=done.get("link_times_s", []), resources=done.get("resources", []),
                                 traffic_elapsed_s=done.get("elapsed_s"))
-            link_probes = [p for p in plist if p.get("kind") == "link"]
+            link_probes = [p for p in plist if p.get("kind") == "link"] or sender.events_named("link_setup")
             if link_probes:
                 measurements["links_within_deadline"] = sum(1 for p in link_probes if p.get("within_deadline"))
                 measurements["link_deadline_s"] = args.link_deadline
@@ -1172,6 +1215,20 @@ def main() -> None:
     suite.add_argument("--write-baseline", default=None, metavar="PATH",
                        help="Also write the summary as a baseline file (e.g. tests/baselines/<date>-meshbench-<commit>.md)")
     suite.add_argument("--label", default=None, help="Title line for the summary / baseline file")
+    suite.add_argument("--summarise-existing", action="store_true",
+                       help="Run nothing: summarise every <scenario>-s<seed>-<n> directory already under --out-dir "
+                            "(after re-running a scenario into the same directory, or to rebuild summary.md)")
+
+    topo = sub.add_parser("topology", help="Measure a scenario's link budget against the terrain without running it")
+    topo.add_argument("scenario", choices=sorted(SCENARIOS))
+    topo.add_argument("--meshbench-binary", default=None)
+    topo.add_argument("--preset", default=DEFAULT_PRESET)
+    topo.add_argument("--link-timeout", type=float, default=90.0)
+    topo.add_argument("--link-margin", type=float, default=6.0)
+    topo.add_argument("--block-margin", type=float, default=-4.0)
+    topo.add_argument("--place", action="append", default=[], metavar="NAME=EAST,NORTH[,HEIGHT]",
+                      help="Override a node's placement (km east, km north, metres) to try alternatives")
+    topo.add_argument("--pair", action="append", default=[], metavar="A-B", help="Extra pairs to measure")
 
     report = sub.add_parser("report", help="Summarise finished run directories (meshbench_report.py)")
     report.add_argument("dirs", nargs="+")
@@ -1195,6 +1252,8 @@ def main() -> None:
             if sc.notes:
                 print(f"{'':<20} {sc.notes}")
         return
+    if args.mode == "topology":
+        sys.exit(measure_topology(SCENARIOS[args.scenario], args))
     if args.mode == "report":
         flags = [f for f, on in (("--md", args.md), ("--aggregate", args.aggregate), ("--bursts", args.bursts)) if on]
         meshbench_report.main(flags + args.dirs)
@@ -1209,6 +1268,51 @@ def main() -> None:
     if acts and max(a.probe for a in acts) + args.recover_probes > probes:
         parser.error(f"staged actions reach probe {max(a.probe for a in acts)} and need {args.recover_probes} more; raise --probes")
     sys.exit(run_scenario(scenario, args))
+
+
+# ---------------------------------------------------------------------------
+# topology: the link-budget gate on its own (placing a new scenario)
+# ---------------------------------------------------------------------------
+
+def measure_topology(scenario: Scenario, args) -> int:
+    """Place the scenario's nodes (with --place overrides) and run only the
+    topology gate, plus any --pair. Added 2026-09-20 after three_hop's first
+    placements failed the gate against the terrain (R3-B blocked by a hill,
+    R1-R3 clear at 44 km): a chain of hidden hops has to be found by
+    measuring, and this is far cheaper than a full run."""
+    if Workbench is None:
+        sys.exit("the meshbench Python client is not installed")
+    nodes_spec = {n.name: N(n.name, n.kind, n.east_km, n.north_km, n.height_m) for n in scenario.nodes}
+    for spec in args.place:
+        name, rest = spec.split("=", 1)
+        parts = [float(x) for x in rest.split(",")]
+        n = nodes_spec[name]
+        n.east_km, n.north_km = parts[0], parts[1]
+        if len(parts) > 2:
+            n.height_m = parts[2]
+    trial = Scenario(scenario.name, scenario.summary, list(nodes_spec.values()), scenario.must_link, scenario.must_block,
+                     scenario.expected_hops, scenario.min_delivered)
+    for pair in args.pair:
+        a, b = pair.split("-", 1)
+        trial.must_link = trial.must_link + [(a, b)]
+    os.environ.setdefault("MESHBENCH_NODEFS", tempfile.mkdtemp(prefix="meshbench-nodefs-topo-"))
+    args.firmware_version = "v1.17.1"
+    prefetch_terrain(args, trial)
+    with Workbench.headless(fixture="", binary=args.meshbench_binary) as wb:
+        wb.project.new()
+        for n in trial.nodes:
+            lat, lon = offset(n.east_km, n.north_km)
+            kind = Kind.COMPANION if n.kind == "companion" else Kind.SIMPLE_REPEATER
+            wb.nodes.place(n.name, kind, lat, lon, height_m=n.height_m)
+            log(f"placed {n.name:<2} {n.kind:<9} at ({n.east_km:+.1f} km E, {n.north_km:+.1f} km N) h={n.height_m} m")
+        if args.preset:
+            wb.call("radio.preset", {"preset": args.preset})
+        rows, ok = topology_gate(wb, trial, args)
+    log("topology gate " + ("PASSES" if ok else "FAILS") + " -- the scenario's placements are:")
+    print("    nodes=[" + ", ".join(
+        (f'comp("{n.name}", {n.east_km:g}' + (f", {n.north_km:g}" if n.north_km else "") + ")") if n.kind == "companion"
+        else f'rep("{n.name}", {n.east_km:g}, {n.north_km:g}, mast={n.height_m:g})' for n in trial.nodes) + "],")
+    return 0 if ok else 3
 
 
 # ---------------------------------------------------------------------------
@@ -1234,10 +1338,27 @@ def run_suite(args) -> int:
             for i in range(1, args.runs_per_seed + 1):
                 run_dir = os.path.join(args.out_dir, f"{name}-s{seed}-{i}")
                 jobs.append((name, seed, run_dir))
-    log(f"suite: {len(jobs)} run(s) -- {names} x seeds {seeds} x {args.runs_per_seed}, {args.parallel} at a time, under {args.out_dir}")
     running = {}
     pending = list(jobs)
     finished = []
+    if args.summarise_existing:
+        pending = []
+        for d in sorted(glob.glob(os.path.join(args.out_dir, "*-s*-*"))):
+            m = re.match(r"^(.*)-s(\d+)-(\d+)$", os.path.basename(d))
+            if not m or not os.path.isdir(d):
+                continue
+            code, took = None, 0.0
+            try:
+                with open(os.path.join(d, "result.json")) as f:
+                    code = json.load(f).get("exit_code")
+            except (OSError, json.JSONDecodeError):
+                code = 3
+            finished.append((m.group(1), int(m.group(2)), d, code if code is not None else 2, took))
+        names = sorted({f[0] for f in finished})
+        seeds = sorted({f[1] for f in finished})
+        log(f"suite: summarising {len(finished)} existing run(s) under {args.out_dir}")
+    else:
+        log(f"suite: {len(jobs)} run(s) -- {names} x seeds {seeds} x {args.runs_per_seed}, {args.parallel} at a time, under {args.out_dir}")
     while pending or running:
         while pending and len(running) < args.parallel:
             name, seed, run_dir = pending.pop(0)
@@ -1281,7 +1402,8 @@ def run_suite(args) -> int:
         lines.append(meshbench_report.md_row(r))
     lines += ["", "## Verdicts", ""]
     for name, seed, run_dir, code, took in finished:
-        lines.append(f"- {os.path.basename(run_dir)}: exit {code} ({'PASS' if code == 0 else 'FAIL' if code == 2 else 'ERROR'}), {took / 60:.1f} min")
+        lines.append(f"- {os.path.basename(run_dir)}: exit {code} ({'PASS' if code == 0 else 'FAIL' if code == 2 else 'topology gate / aborted' if code == 3 else 'ERROR'})"
+                     + (f", {took / 60:.1f} min" if took else ""))
     bursts = [(r["name"], r["bursts"]) for r in results if r["bursts"] and any(b["sent_round0"] > 1 for b in r["bursts"])]
     if bursts:
         lines += ["", "## Per-part bursts (pkt: round-0 sent/landed, rounds, first fragment -> known complete s)", ""]

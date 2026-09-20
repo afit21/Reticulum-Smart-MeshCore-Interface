@@ -42,7 +42,17 @@ pass closes the gaps that do not need a MeshBench fix upstream. Nothing in
 - `suite` subcommand: several scenarios x several seeds (default 7, 11, 13), `--parallel` runs at a
   time, `run.log` per run, then `summary.md` / `summary.json` with per-run rows and per-scenario
   medians with ranges; `--write-baseline tests/baselines/<file>.md` regenerates a baseline file in
-  one command. `report` subcommand summarises finished run directories.
+  one command, `--summarise-existing` rebuilds it from the run directories already there. `report`
+  summarises finished run directories; `topology <scenario> --place NAME=E,N[,H]` measures a
+  scenario's link budget against the terrain without running it (how `three_hop`'s placements were
+  found: the terrain east of R2 is flat for 50 km, so the chain bends north).
+- Two MeshBench v0.1.0 quirks found by the first benchmark run of the new suite, both now guarded:
+  seeded identities ignore MeshCore's reserved first bytes (seed 13 gives node A a public key
+  starting 0x00, which the firmware never generates because the first byte is the on-air path hash;
+  the other side held A in its firmware contact store yet path discovery never answered and no
+  DIRECT frame was exchanged in eleven runs) -- every run now reads each node's `_main.id` after the
+  firmware starts and stops with exit 3 on a 0x00/0xFF prefix; and `node.move()` does not re-price
+  `link.pair`, so `topology` re-creates the project per trial.
 
 **Analysis** (`testscripts/meshbench_report.py`, the summariser that produced the 2026-09-20 tables,
 moved out of the session's scratch directory): every `run` now embeds it in `result.json`

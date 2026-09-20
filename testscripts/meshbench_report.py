@@ -331,8 +331,12 @@ def analyse(run_dir: str) -> dict:
     except (OSError, json.JSONDecodeError):
         pass
     meas = result.get("measurements", {})
-    res["scenario"] = result.get("scenario") or re.sub(r"-\d+$", "", res["name"])
+    m = re.match(r"^(.*?)(?:-s(\d+))?-\d+$", res["name"])
+    res["scenario"] = result.get("scenario") or (m.group(1) if m else res["name"])
     res["seed"] = (result.get("args") or {}).get("seed")
+    if res["seed"] is None and m and m.group(2):
+        res["seed"] = int(m.group(2))
+    res["exit_code"] = result.get("exit_code")
     res["informational"] = bool(result.get("informational"))
     log_path = os.path.join(run_dir, "run.log")
     log = ""
@@ -344,11 +348,12 @@ def analyse(run_dir: str) -> dict:
     res["checks"] = [(ok.strip(), what) for ok, what in re.findall(r"^\d\d:\d\d:\d\d (ok    |FAIL  )(.*)$", log, re.M)]
     if "failures" in result:
         res["failures"] = result["failures"]
-        res["passed"] = not result["failures"] and "exit_code" not in result or result.get("exit_code", 0) == 0
         res["passed"] = not result["failures"]
     else:
-        res["failures"] = [w for ok, w in res["checks"] if ok == "FAIL"]
-        res["passed"] = ("FAILED:" not in log) and bool(res["checks"])
+        # no result.json: the run stopped before its traffic phase (topology
+        # gate, firmware, RNS bring-up) -- never a pass
+        res["failures"] = [w for ok, w in res["checks"] if ok == "FAIL"] or ["no result.json (run aborted before the traffic phase)"]
+        res["passed"] = False
     res["sent"] = meas.get("sent")
     res["delivered"] = meas.get("delivered")
     res["traffic"] = meas.get("traffic", "probe")
@@ -364,8 +369,16 @@ def analyse(run_dir: str) -> dict:
     res["links"] = dist(res["link_times_s"])
     res["links_within_deadline"] = meas.get("links_within_deadline")
     res["link_deadline_s"] = meas.get("link_deadline_s")
-    res["resources"] = meas.get("resources") or []
-    res["resources_back"] = meas.get("resources_back") or []
+    def clean_resources(items):
+        out = []
+        for x in items or []:
+            x = dict(x)
+            if x.get("resent_parts") is not None and x["resent_parts"] < 0:
+                x["resent_parts"] = None     # never got past the advertisement (sent_parts 0)
+            out.append(x)
+        return out
+    res["resources"] = clean_resources(meas.get("resources"))
+    res["resources_back"] = clean_resources(meas.get("resources_back"))
     res["health"] = meas.get("health") or []
     if not res["time_to_direct_path"] and log:
         # fallback: interface log lines `online` -> `path discovered to`
@@ -431,7 +444,9 @@ def print_block(r: dict) -> None:
     if r["time_to_direct_path"]:
         print(f"  time to first DIRECT path per node (s): {r['time_to_direct_path']}" + (f"  gate: {r['gate']}" if r.get("gate") else ""))
     if r["link_times_s"]:
-        print(f"  link handshakes: {dist_str(r['links'], 2)}; within {r.get('link_deadline_s')} s: {r.get('links_within_deadline')}/{len(r['link_times_s'])}")
+        within = (f"; within {r['link_deadline_s']:.0f} s: {r['links_within_deadline']}/{len(r['link_times_s'])}"
+                  if r.get("link_deadline_s") is not None and r.get("links_within_deadline") is not None else "")
+        print(f"  link handshakes: {dist_str(r['links'], 2)}{within}")
     for rs in r["resources"]:
         print(f"  resource {rs.get('tag')}: {'complete' if rs.get('complete') else 'FAILED/timeout'} in {rs.get('elapsed_s')} s, "
               f"{rs.get('total_parts')} parts, {rs.get('resent_parts')} re-sent")
