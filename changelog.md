@@ -7,6 +7,30 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Changed: airtime / throughput pass, phase 1 (2026-09-20 evening)
+
+Small wins on the existing code before the module split; one commit, one regression test, one
+docstring entry each. The metric is on-air bytes per delivered RNS byte, read with delivery rate and
+per-part completion time, against `fieldtests/raw/Alpha0.1.3/` and the `alpha-0.1.3` MeshBench
+baseline. Phase 0 first added `tests/test_golden_config_defaults.py` / `tests/test_golden_wire_format.py`
+(snapshots of every default and every encoded frame, generated from the frozen alpha 0.1.3 build) and
+`testscripts/check_install_load.py` (loads the file exactly as `RNS.Reticulum` does: `exec()` of the
+text, so the deliverable must stay one self-contained file).
+
+LXMF finding (phase 0, verified in `RNS/Resource.py` and LXMF 1.1.1; MeshChat v2.4.0 bundles the same
+rules): neither LXMF nor MeshChat times a transfer. The binding timer is RNS.Resource's sender proof
+wait once the last part has been sent once -- four intervals of `3 x rtt_r + 10 s` (56-112 s at
+rtt_r 1.3-6 s) with no part request cancel the resource, LXMF tears the link down and restarts the
+message from scratch (up to four times). With a 4-part window a lost tail part is only recoverable
+above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 4 s).
+
+- **A bare DIRECT send stops retrying once its reply is seen.** A LINKREQUEST whose attempt 0 lost
+  its firmware ACK was re-sent 8 s after its LRPROOF had arrived (laptop `*144922`, two hops:
+  99 B + 3.4 s ACK, LRRTT queued 3.8 s behind). The three receipt paths that correlate an LRPROOF
+  / bootstrap PROOF now signal the send (`_signal_send_answered`); the retry loop makes no further
+  attempt and an ACK wait in progress ends as `ack_timeout_source="answered"` (success, no RTT sample,
+  no backoff). Tests: `tests/test_answered_sends_0920.py`.
+
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 
 The 2026-09-20 comparison work listed what the suite could not tell us; this
