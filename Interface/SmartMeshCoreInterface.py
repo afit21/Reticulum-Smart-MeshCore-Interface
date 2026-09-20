@@ -2815,6 +2815,36 @@ part had gone out once. That is the number phase 3 is sized against.
     median ~3 s / p90 ~7 s and +4 x rttvar would settle at 8-10 s, which
     a lost report pays in full.
 
+ 2. **Stale plain PROOFs age out** (`proof_max_age`, 45 s; 0 = off;
+    `_plain_proof`, `expire_retries` on the bare send path). A delivery
+    PROOF for a non-Link packet is useful only until the sender's RNS
+    receipt deadline: `PacketReceipt.timeout` = `first_hop_timeout` (MTU
+    500 B x 8 / this interface's `bitrate` 80 bps = 50 s, + 6 s) + 6 s per
+    RNS hop = 62 s from the sender's transmit (`RNS/Packet.py` 428-431,
+    `Transport.first_hop_timeout`); LXMF's opportunistic delivery retries
+    every 10 s on top and never waits longer. The desktop's 2-hop phase
+    of the 2026-09-20 session queued 13 plain proofs while every attempt
+    missed (lock waits 8 -> 70 s, queue depth 13) and then transmitted
+    12 of them aged 45-105 s in a row once the channel cleared; 29 of
+    102 proofs failed both attempts; age at last transmit was median
+    11.5 s, p90 52.5 s, max 105.6 s. Replaying that capture with the
+    per-tier FIFO lock: a 45 s cap skips 16 attempts (~76 s of radio
+    lock) and loses 3 proofs that still reached the laptop inside its
+    deadline (all between 45 and 62 s sender-side); 60 s skips 12,
+    loses none; 30 s skips 24, loses 4. With ~5 s of transit each way at
+    two hops, 45 s is where the deadline sits. Unlike `outgoing_max_age`
+    (checked once, before the first transmission, because a retry is
+    committed air) a plain proof expires before EVERY attempt -- it is
+    one bare frame, nothing already spent -- at dequeue
+    (`proof_expired_in_queue`), before each attempt and after each lock
+    wait (`ack_timeout_source="expired"`), never as a path failure.
+    LRPROOF / RESOURCE_PRF / the Link band keep only `outgoing_max_age`.
+    Found and closed on the way: an attempt-0 expiry inside the lock
+    wait used to fall through to attempt 1, which transmitted the
+    expired packet after all (`attempt_info["expired"]`). Tests:
+    `tests/test_proof_max_age_0920.py`; shipped-default pins and golden
+    config re-pinned in the same commit.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -4921,6 +4951,26 @@ class SmartMeshCoreInterface(Interface):
         # (context RESOURCE) are exempt: RNS's Resource layer owns their
         # retransmission and re-requests what it lacks.
         self.outgoing_max_age_s = float(cfg.get("outgoing_max_age", 120.0))
+        # Phase 1 (2026-09-20): a plain delivery PROOF (packet type PROOF,
+        # context NONE -- not LRPROOF / RESOURCE_PRF / the Link band, which
+        # `_proof_is_link_class` keeps as handshake class) is useful only
+        # until the far side's receipt deadline: RNS `PacketReceipt.timeout`
+        # for a non-Link packet over this interface is `first_hop_timeout`
+        # (MTU 500 B x 8 / `bitrate` 80 bps = 50 s, + 6) + 6 s per RNS hop
+        # = 62 s, measured from the sender's transmit, after which the
+        # receipt is FAILED and the proof does nothing (`Transport.jobs`);
+        # LXMF's opportunistic delivery retries every 10 s on top and never
+        # waits longer. The desktop's 2-hop phase of the 2026-09-20 session
+        # queued 13 proofs while every attempt missed (lock waits 8 -> 70 s)
+        # and then transmitted 12 of them aged 45-105 s. Replaying that
+        # capture: a 45 s cap skips 16 attempts (~76 s of radio lock) and
+        # loses 3 proofs that still landed inside the deadline; 60 s skips
+        # 12 and loses none; 30 s skips 24 and loses 4. With ~5 s of transit
+        # each way at two hops, 45 s is where the deadline sits. Unlike
+        # outgoing_max_age this is checked before EVERY attempt, not only
+        # the first: a proof is one bare frame, so a stale retry wastes
+        # nothing already spent. 0 disables.
+        self.proof_max_age_s = float(cfg.get("proof_max_age", 45.0))
         # How many times the same bytes may be suppressed as "already in
         # flight" before the packet is forced through with a fresh in-flight
         # entry (field fix 2026-09-19: a stuck entry deadlocked a transfer for
@@ -7282,6 +7332,11 @@ class SmartMeshCoreInterface(Interface):
                 return self.PRIORITY_LOW
         return self.PRIORITY_NORMAL
 
+    def _plain_proof(self, header: Optional[_RnsHeader]) -> bool:
+        """A plain delivery PROOF: packet type PROOF and not link class
+        (`proof_max_age` applies; phase 1, 2026-09-20)."""
+        return header is not None and header.packet_type == RNS.Packet.PROOF and not self._proof_is_link_class(header)
+
     def _proof_is_link_class(self, header: _RnsHeader) -> bool:
         """Whether a PROOF packet is one a Link (or a Resource transfer)
         hangs on -- LRPROOF, RESOURCE_PRF, or any context in RNS core's own
@@ -7478,6 +7533,11 @@ class SmartMeshCoreInterface(Interface):
                     )
                 ):
                     expires_at = enqueued_at + self.outgoing_max_age_s
+                plain_proof = self._plain_proof(header)
+                if plain_proof and self.proof_max_age_s > 0:
+                    # Phase 1 (2026-09-20): see proof_max_age.
+                    proof_deadline = enqueued_at + self.proof_max_age_s
+                    expires_at = proof_deadline if expires_at is None else min(expires_at, proof_deadline)
                 if self._link_closed(header):
                     self._outgoing_dropped_total += 1
                     self._capture_outgoing(header, data, "link_closed")
@@ -7489,11 +7549,12 @@ class SmartMeshCoreInterface(Interface):
                     )
                 elif self._expired(expires_at):
                     self._outgoing_dropped_total += 1
-                    self._capture_outgoing(header, data, "expired_in_queue")
+                    self._capture_outgoing(header, data, "proof_expired_in_queue" if plain_proof else "expired_in_queue")
                     RNS.log(
-                        f"{self}: dropping outgoing packet ({len(data)} bytes) -- sat "
+                        f"{self}: dropping outgoing {'PROOF' if plain_proof else 'packet'} ({len(data)} bytes) -- sat "
                         f"{time.monotonic() - enqueued_at:.0f}s in the outgoing queue, past "
-                        f"outgoing_max_age={self.outgoing_max_age_s:.0f}s.",
+                        + (f"proof_max_age={self.proof_max_age_s:.0f}s." if plain_proof and self.proof_max_age_s > 0
+                           else f"outgoing_max_age={self.outgoing_max_age_s:.0f}s."),
                         RNS.LOG_WARNING,
                     )
                 else:
@@ -8742,10 +8803,13 @@ class SmartMeshCoreInterface(Interface):
         fastpath_budget = self._direct_payload_budget()
         if len(data) <= fastpath_budget:
             send_info["method"] = "z85_bare"
+            header = self._parse_rns_header(data)
             return await self._send_direct_with_attempts(
                 target, lambda attempt, d=data: self._encode_direct_bare(d), peer_prefix,
                 priority=priority, hop_count=hop_count, expires_at=expires_at,
-                cancel_key=self._answered_send_key(data, self._parse_rns_header(data)),
+                cancel_key=self._answered_send_key(data, header),
+                # A plain PROOF expires before every attempt (proof_max_age).
+                expire_retries=self._plain_proof(header) and self.proof_max_age_s > 0,
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -10024,6 +10088,7 @@ class SmartMeshCoreInterface(Interface):
         pass_number: Optional[int] = None,
         attempts_override: Optional[int] = None, record_result: bool = True,
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
+        expire_retries: bool = False,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -10115,28 +10180,39 @@ class SmartMeshCoreInterface(Interface):
                 if record_result and self._send_answered_by(cancel_key) == peer_prefix:
                     self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
                 return True
-            if attempt == 0 and self._expired(expires_at):
+            if (attempt == 0 or expire_retries) and self._expired(expires_at):
                 # Field fix (2026-09-18 evening): outgoing_max_age. Not a
                 # path failure (nothing was learned about the path), so no
                 # record_direct_send_result call; counted as a drop once.
                 # Attempt 0 only (page-load fix, same day): a retry is
-                # committed air, never expired mid-way.
+                # committed air, never expired mid-way -- except a plain
+                # PROOF (`expire_retries`, proof_max_age, 2026-09-20): one
+                # bare frame, nothing already spent, and past the far
+                # side's receipt deadline a retry is pure airtime.
                 self._outgoing_dropped_total += 1
                 RNS.log(
                     f"{self}: dropping DIRECT send to {peer_prefix!r}"
                     f"{f' (pkt_id={pkt_id} frag_idx={frag_idx}/{frag_total})' if pkt_id is not None else ''}"
-                    f" -- packet expired (outgoing_max_age={self.outgoing_max_age_s:.0f}s) before "
+                    f" -- packet expired ({'proof_max_age=%.0fs' % self.proof_max_age_s if expire_retries else 'outgoing_max_age=%.0fs' % self.outgoing_max_age_s}) before "
                     f"attempt {attempt} could transmit.",
                     RNS.LOG_WARNING,
                 )
+                if attempt > 0:
+                    self._capture_direct_attempt_result(
+                        peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
+                        pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                        time_critical=time_critical, pass_number=pass_number, ack_timeout_source="expired",
+                    )
                 return False
             frame = frame_builder(attempt)
+            attempt_info: dict = {}
             try:
                 ok, waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                     target, frame, attempt, peer_prefix=peer_prefix,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
+                    expire_retries=expire_retries, attempt_info=attempt_info,
                 )
             except Exception as exc:
                 RNS.log(
@@ -10157,6 +10233,15 @@ class SmartMeshCoreInterface(Interface):
             # _direct_exchange_lock, so it already happened before control
             # returned here regardless of this attempt's outcome.
             if self.detached or not self.online:
+                return False
+            if attempt_info.get("expired"):
+                # The attempt above expired while waiting for the lock and
+                # was never transmitted (the ack-wait method's own check):
+                # nothing to retry. Found while adding proof_max_age
+                # (2026-09-20) -- before this, an attempt-0 expiry inside
+                # the lock wait fell through to attempt 1, which transmitted
+                # the expired packet after all.
+                self._outgoing_dropped_total += 1
                 return False
 
         if record_result:
@@ -10582,6 +10667,8 @@ class SmartMeshCoreInterface(Interface):
         quiet_window_s: Optional[float] = None,  # seconds after this frame's own transmit (MSG_SENT) the hold may last
         quiet_info: Optional[dict] = None,  # out-param: "hold_s", "ack_done_at", "answered_at" (see the quiet-window block)
         cancel_event: "Optional[asyncio.Event]" = None,  # set when the reply to this frame has been seen (2026-09-20, _signal_send_answered)
+        expire_retries: bool = False,  # a plain PROOF: expires_at applies to every attempt, not only the first (proof_max_age, 2026-09-20)
+        attempt_info: Optional[dict] = None,  # out-param: "expired" True when the attempt aged out in the lock wait and never transmitted
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -10676,11 +10763,13 @@ class SmartMeshCoreInterface(Interface):
                         quiet_info["answered_at"] = time.monotonic()
                         quiet_info["not_sent"] = True
                     return True, False
-                if attempt == 0 and self._expired(expires_at):
+                if (attempt == 0 or expire_retries) and self._expired(expires_at):
                     # Field fix (2026-09-18 evening): the lock wait itself
                     # (225s in the drive-home capture) is where a queued
                     # packet most often ages out. Recorded, not transmitted;
                     # the caller's own pre-attempt check logs the drop.
+                    if attempt_info is not None:
+                        attempt_info["expired"] = True
                     self._capture_direct_attempt_result(
                         peer_prefix, attempt, False, queue_depth_at_acquire, lock_wait_s, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,

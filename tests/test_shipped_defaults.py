@@ -212,6 +212,7 @@ CONFIGURE_RETRY = {
     'outgoing_duplicate_suppress_limit': 3,
     'outgoing_max_age_s': 120.0,
     'path_req_retransmit_extra': 1,
+    'proof_max_age_s': 45.0,
     'retransmit_jitter_max_s': 20.0,
     'retransmit_jitter_min_s': 8.0,
 }

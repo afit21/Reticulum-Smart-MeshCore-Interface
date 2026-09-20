@@ -48,6 +48,13 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
   (`answered_before_send`, 24 of 29 hop-0 "answered" rounds) and no longer shrinks `_query_rtt`.
   Tests: `tests/test_report_window_0920.py`; `tests/test_shipped_defaults.py` and
   `tests/golden/config_defaults.json` re-pinned.
+- **Stale plain PROOFs age out** (new key `proof_max_age`, 45 s; 0 = off). The sender's RNS receipt
+  for a non-Link packet over this interface fails at 62 s (`first_hop_timeout` from `bitrate` 80 +
+  6 s/hop); the desktop's 2-hop phase transmitted 12 proofs aged 45-105 s after a 13-deep proof
+  queue. Replayed, 45 s skips 16 attempts (~76 s of lock) and loses 3 proofs that still landed in
+  time (60 s: 12 / 0; 30 s: 24 / 4). Checked before every attempt (one bare frame, nothing spent),
+  never a path failure; link-class proofs exempt. Also closed: an attempt-0 expiry during the lock
+  wait fell through to a transmitted attempt 1. Tests: `tests/test_proof_max_age_0920.py`.
 
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 
