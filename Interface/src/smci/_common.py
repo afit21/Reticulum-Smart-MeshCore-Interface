@@ -18,6 +18,17 @@ import RNS
 from RNS.Interfaces.Interface import Interface
 
 
+# The priority tiers as module-level names (2026-09-20, module split): the
+# class constants SmartMeshCoreInterface.PRIORITY_* (HANDSHAKE 0 / ANSWER 1
+# / NORMAL 2 / LOW 3, renumbered 2026-09-19) are what the code reads via
+# `self.`; these mirror them so a mixin method can use one as a default
+# argument value (a class body's names are not visible in another class
+# body). tests/test_module_split_0920.py pins the two sets equal.
+PRIORITY_HANDSHAKE = 0
+PRIORITY_ANSWER = 1
+PRIORITY_NORMAL = 2
+PRIORITY_LOW = 3
+
 _CFG_FALSY = ("no", "false", "0", "off", "n", "f", "none", "disabled", "disable")
 _CFG_TRUTHY = ("yes", "true", "1", "on", "y", "t", "enabled", "enable")
 
