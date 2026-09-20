@@ -522,8 +522,10 @@ class GoldenWireFormat(unittest.TestCase):
         """A new `_encode_*` or `*_payload_budget` method on the class must
         get golden cases."""
         cls = self.module.SmartMeshCoreInterface
-        encoders = sorted(n for n in vars(cls) if n.startswith("_encode_") and callable(getattr(cls, n)))
-        budgets = sorted(n for n in vars(cls) if n.endswith("_payload_budget") and callable(getattr(cls, n))
+        # dir() rather than vars(): since the 2026-09-20 module split the
+        # encoders live on a mixin, and a new one anywhere in the MRO counts.
+        encoders = sorted(n for n in dir(cls) if n.startswith("_encode_") and callable(getattr(cls, n)))
+        budgets = sorted(n for n in dir(cls) if n.endswith("_payload_budget") and callable(getattr(cls, n))
                          and n != "_payload_budget")
         self.assertEqual(encoders, sorted(ENCODERS))
         self.assertEqual(budgets, sorted(BUDGETS))
