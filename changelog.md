@@ -65,6 +65,15 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
   and not transmitted; the next request inside the interval goes on air to verify. Path-request
   records carry `requested_hash`. Tests: `tests/test_local_announce_cache_0920.py` (including the
   real `RNS.Transport` accept / ignore / re-accept sequence).
+- **Link handshakes pre-empt idle holds of the radio lock.** LINKREQUEST / LRPROOF / LRRTT /
+  LINKIDENTIFY / LINKPROOF (not KEEPALIVE or LINKCLOSE, which share the tier) set the lock's pre-empt
+  event; a raw burst yields during a fragment's duty-cycle throttle wait (the session's longest idle
+  hold, 26 s) and after a fragment's gap, resuming ahead of ordinary waiters; the report wait
+  releases the lock and keeps listening; a QUERY's quiet window and the post-miss listen end early;
+  a completion ANSWER/REPORT's ACK wait is cut once the expected ACK time has passed
+  (`ack_timeout_source="preempted"`, no backoff). Evidence: link-critical attempts waited ~33 s for
+  the lock over 26 attempts (median 1-3 s), a 2-hop LINKREQUEST 3.2 s behind an answer's 8 s ACK
+  miss inside a 17.4 s link. Tests: `tests/test_handshake_preemption_0920.py`.
 
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 

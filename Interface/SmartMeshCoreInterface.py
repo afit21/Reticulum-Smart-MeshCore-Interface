@@ -2890,6 +2890,53 @@ part had gone out once. That is the number phase 3 is sized against.
     restart of the RNS process (a non-transport node reloads no path
     table either, so the first request after a restart is real).
 
+ 4. **Link handshakes pre-empt idle holds of the radio lock**
+    (`_PriorityAsyncLock.acquire(preempt=True)` / `preempt_event` /
+    `yield_to_preempt` at `YIELDED_PRIORITY` 0.5; `_is_link_handshake`;
+    `_idle_hold`, `_wait_future_or_preempt`, `_PreemptedForHandshake`).
+    The 2026-09-20 session: link-critical attempts (LINKREQUEST, LRPROOF,
+    LRRTT) waited ~33 s for the lock over 26 attempts, median 1-3 s; at
+    zero hop the holder was a completion report/answer's ACK wait plus
+    its listen in 13 of the 20 waits of 0.5 s or more, a report wait in
+    4; at two hops a LINKREQUEST waited 3.2 s behind a completion
+    answer's 8 s ACK miss inside a 17.4 s link (MeshChat gives 15 s).
+    The largest tier-0 waits were not handshakes: a KEEPALIVE queued
+    20.3 s behind a raw burst's duty-cycle throttle wait -- 26.3 s, the
+    longest idle hold of the lock in the session -- which is why the
+    pre-empting class is the LINK handshake only (LINKREQUEST, LRPROOF,
+    LRRTT, LINKIDENTIFY, LINKPROOF; KEEPALIVE / LINKCLOSE / the
+    RESOURCE_PRF band keep PRIORITY_HANDSHAKE but pre-empt nothing --
+    32.6 of the laptop's 56.3 s of tier-0 lock wait was KEEPALIVE, a
+    20-byte packet nothing waits on). A pre-empting waiter sets the
+    lock's event; the idle phases watch it: (a) a raw burst yields
+    during a fragment's duty-cycle throttle wait (handshakes are exempt
+    from the cycle, the burst was going nowhere) and after -- never
+    inside -- a fragment's gap, re-acquiring at YIELDED_PRIORITY so it
+    resumes ahead of any ordinary waiter that queued meanwhile and
+    re-checking `_raw_path_reset_mid_send` afterwards; (b) the
+    post-burst report wait releases the lock and keeps listening for the
+    report radio-free (a report arriving then still completes the send);
+    (c) a QUERY's quiet window ends early (the answer budget continues
+    radio-free, as after the window); (d) the listen after a MISS yields
+    once the rx-log prediction of busy air has passed, the short success
+    listen never; (e) a completion ANSWER/REPORT's own ACK wait -- best
+    effort, never retried -- is cut once the peer's expected ACK time
+    has passed (`_ack_preempt_floor_s`: srtt + rttvar when measured,
+    else 2 s + 1 s per hop; keying the handshake into the peer's ACK
+    would lose both at a repeater), recorded as
+    `ack_timeout_source="preempted"`: not a miss (no backoff, no
+    listen, no path evidence), not a success. An ordinary frame's ACK
+    wait is never cut. This is a deliberate exception to the 2026-09-15
+    "lock held for the full send + ACK wait" contract and to the
+    2026-09-20 report entry's "the sender is silent by construction":
+    both now hold unless a Link handshake is waiting, which the field
+    numbers say is worth ~0.5-1 s per handshake at zero hop, 3-4 s at
+    two hops, and up to the whole throttle wait behind a burst. The
+    summarisers (`meshbench_report.py`, `field_ab_compare.py`) count
+    `preempted` / `answered` / `answered_before_send` / `expired`
+    attempts apart from the per-hop success rate. Tests:
+    `tests/test_handshake_preemption_0920.py`.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -3176,6 +3223,13 @@ class _PeerRecord:
         self.raw_fragments = raw_fragments
 
 
+class _PreemptedForHandshake(Exception):
+    """Raised out of an interruptible wait (the duty-cycle throttle) when a
+    link handshake is queued for the radio lock the waiter holds (phase 1,
+    2026-09-20). The holder yields (`_PriorityAsyncLock.yield_to_preempt`)
+    and retries the step afterwards."""
+
+
 class _PriorityAsyncLock:
     """User-requested architectural fix (2026-09-16, real 1-hop repeater
     field data): `_direct_exchange_lock` (see `_send_direct_frame_and_
@@ -3212,19 +3266,64 @@ class _PriorityAsyncLock:
     practice -- this interface's own steady-state code never cancels a
     task waiting on this lock)."""
 
+    # Phase 1 (2026-09-20): the tier a holder re-queues at when it yields
+    # to a pre-empting waiter -- between HANDSHAKE (0) and ANSWER (1), so
+    # the yielded exchange resumes ahead of everything but the handshakes
+    # that pre-empted it (tiers are compared numerically; a float sorts).
+    YIELDED_PRIORITY = 0.5
+
     def __init__(self):
         self._locked = False
         self._waiters: "dict[int, collections.deque]" = {}
+        # Pre-emption (phase 1, 2026-09-20): futures of waiters that asked
+        # to pre-empt an idle holder, and the event an idle holder watches.
+        self._preempt_waiters: set = set()
+        self._preempt_event: "Optional[asyncio.Event]" = None
 
     def locked(self) -> bool:
         return self._locked
 
-    async def acquire(self, priority: int) -> None:
+    def preempt_requested(self) -> bool:
+        """A waiter that may pre-empt idle holds is queued (2026-09-20)."""
+        return bool(self._preempt_waiters)
+
+    def preempt_event(self) -> "asyncio.Event":
+        """The event set while a pre-empting waiter is queued; created on
+        the running loop the first time it is asked for."""
+        if self._preempt_event is None:
+            self._preempt_event = asyncio.Event()
+            if self._preempt_waiters:
+                self._preempt_event.set()
+        return self._preempt_event
+
+    def _preempt_add(self, fut) -> None:
+        self._preempt_waiters.add(fut)
+        if self._preempt_event is not None:
+            self._preempt_event.set()
+
+    def _preempt_remove(self, fut) -> None:
+        self._preempt_waiters.discard(fut)
+        if not self._preempt_waiters and self._preempt_event is not None:
+            self._preempt_event.clear()
+
+    async def yield_to_preempt(self) -> None:
+        """Called by a holder at an idle point when `preempt_requested()`:
+        hands the lock over and re-acquires it at YIELDED_PRIORITY, so
+        the pre-empting handshake goes first and this exchange resumes
+        before any ordinary waiter that queued meanwhile (review,
+        2026-09-20: a plain release + re-acquire at NORMAL would splice a
+        whole other exchange into a raw burst)."""
+        self.release()
+        await self.acquire(self.YIELDED_PRIORITY)
+
+    async def acquire(self, priority: int, preempt: bool = False) -> None:
         if not self._locked:
             self._locked = True
             return
         fut = asyncio.get_running_loop().create_future()
         self._waiters.setdefault(priority, collections.deque()).append(fut)
+        if preempt:
+            self._preempt_add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -3250,6 +3349,9 @@ class _PriorityAsyncLock:
                 if not self._wake_next():
                     self._locked = False
             raise
+        finally:
+            if preempt:
+                self._preempt_remove(fut)
 
     def release(self) -> None:
         if not self._wake_next():
@@ -3271,8 +3373,8 @@ class _PriorityAsyncLock:
             del self._waiters[tier]
         return False
 
-    def __call__(self, priority: int) -> "_PriorityLockContext":
-        return _PriorityLockContext(self, priority)
+    def __call__(self, priority: int, preempt: bool = False) -> "_PriorityLockContext":
+        return _PriorityLockContext(self, priority, preempt)
 
 
 class _PriorityLockContext:
@@ -3283,14 +3385,15 @@ class _PriorityLockContext:
     `async with` block despite `acquire`/`release` being its own real
     methods."""
 
-    __slots__ = ("_lock", "_priority")
+    __slots__ = ("_lock", "_priority", "_preempt")
 
-    def __init__(self, lock: _PriorityAsyncLock, priority: int):
+    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False):
         self._lock = lock
         self._priority = priority
+        self._preempt = preempt
 
     async def __aenter__(self) -> None:
-        await self._lock.acquire(self._priority)
+        await self._lock.acquire(self._priority, preempt=self._preempt)
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._lock.release()
@@ -3449,7 +3552,7 @@ class _DutyCycleLimiter:
         self._prune(now)
         return sum(duration for _start, duration in self._samples)
 
-    async def wait_for_budget(self, estimated_duration_s: float) -> float:
+    async def wait_for_budget(self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None) -> float:
         """Sleeps until sending for `estimated_duration_s` would not push
         the trailing window's cumulative busy time over the cap. Returns
         the total delay actually applied (0.0 if none was needed) --
@@ -3467,6 +3570,21 @@ class _DutyCycleLimiter:
                 return total_wait
             oldest_start, _oldest_duration = self._samples[0]
             wait_s = max(0.01, (oldest_start + self._window_s) - now)
+            if interrupt is not None:
+                # Phase 1 (2026-09-20): a raw burst's throttle wait is the
+                # longest idle hold of the radio lock in the field (26 s
+                # in the zero-hop session, a KEEPALIVE queued 20 s behind
+                # it); a queued link handshake -- itself duty-cycle exempt
+                # -- ends it.
+                if interrupt.is_set():
+                    raise _PreemptedForHandshake()
+                try:
+                    await asyncio.wait_for(interrupt.wait(), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    total_wait += wait_s
+                    continue
+                total_wait += time.monotonic() - now
+                raise _PreemptedForHandshake()
             await asyncio.sleep(wait_s)
             total_wait += wait_s
 
@@ -6187,7 +6305,10 @@ class SmartMeshCoreInterface(Interface):
         (see duty_cycle_exempt_handshake). Its airtime is still recorded."""
         return self.duty_cycle_exempt_handshake and priority == self.PRIORITY_HANDSHAKE
 
-    async def _throttle_for_duty_cycle(self, frame: str, exempt: bool = False, on_air_bytes: Optional[int] = None) -> float:
+    async def _throttle_for_duty_cycle(
+        self, frame: str, exempt: bool = False, on_air_bytes: Optional[int] = None,
+        interrupt: "Optional[asyncio.Event]" = None,
+    ) -> float:
         """User-requested fix (2026-09-16): called at every actual radio-
         keying call site (`_send_channel_fastpath_frame`, one iteration
         of `_send_channel_multifragment_pass`'s per-fragment loop,
@@ -6227,7 +6348,7 @@ class SmartMeshCoreInterface(Interface):
                 f"for budget ({estimated_s:.2f}s airtime still charged to the window)."
             )
             return 0.0
-        delay = await self._duty_cycle.wait_for_budget(estimated_s)
+        delay = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt)
         self._duty_cycle.record(estimated_s)
         if delay > 0:
             self._debug(
@@ -6308,7 +6429,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _pre_transmit_gate(
         self, frame: str, skip_quiet_defer: bool = False, duty_cycle_exempt: bool = False,
-        on_air_bytes: Optional[int] = None,
+        on_air_bytes: Optional[int] = None, interrupt: "Optional[asyncio.Event]" = None,
     ) -> "tuple[float, float, float]":
         """Code-review fix: `await self._wait_for_incoming_quiet()` then
         `await self._throttle_for_duty_cycle(frame)`, in that order, used
@@ -6358,7 +6479,9 @@ class SmartMeshCoreInterface(Interface):
         quiet_defer_wait_s = 0.0
         if not skip_quiet_defer:
             quiet_defer_wait_s = await self._wait_for_incoming_quiet()
-        duty_cycle_wait_s = await self._throttle_for_duty_cycle(frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes)
+        duty_cycle_wait_s = await self._throttle_for_duty_cycle(
+            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt,
+        )
         # Step 4 (2026-09-18): last, so it reflects whatever was overheard
         # during the two waits above. A no-op unless rx_log_holds_enabled.
         medium_hold_wait_s = await self._wait_for_medium_clear()
@@ -7420,6 +7543,79 @@ class SmartMeshCoreInterface(Interface):
             if header.context == RNS.Packet.PATH_RESPONSE:
                 return self.PRIORITY_LOW
         return self.PRIORITY_NORMAL
+
+    def _is_link_handshake(self, header: Optional[_RnsHeader]) -> bool:
+        """The packets that may PRE-EMPT an idle radio-lock hold (phase 1,
+        2026-09-20): a Link's establishment and proof -- LINKREQUEST,
+        LRPROOF, LRRTT, LINKIDENTIFY, LINKPROOF -- which MeshChat's 15 s
+        window and RNS's own link timers wait on. NOT the rest of
+        PRIORITY_HANDSHAKE: KEEPALIVE (32.6 of the laptop's 56.3 s of
+        tier-0 lock wait in the 2026-09-20 session, 20 B nothing waits
+        on), LINKCLOSE and the RESOURCE_PRF/ICL/RCL band keep their tier
+        but pre-empt nothing."""
+        if header is None:
+            return False
+        if header.packet_type == RNS.Packet.LINKREQUEST:
+            return True
+        return header.context in (
+            RNS.Packet.LRPROOF, RNS.Packet.LRRTT, RNS.Packet.LINKIDENTIFY, RNS.Packet.LINKPROOF,
+        )
+
+    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":
+        """Await `fut` (shielded: it outlives this wait) for up to
+        `timeout_s`, ending early when a Link handshake queues for the
+        radio lock (phase 1, 2026-09-20). Returns `(future_done, cut_by_a
+        _handshake)`; the future's own exception is the caller's."""
+        if fut.done():
+            return True, False
+        event = self._direct_exchange_lock.preempt_event()
+        if event.is_set():
+            return False, True
+        if timeout_s <= 0:
+            return False, False
+        loop = asyncio.get_running_loop()
+        fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
+        preempt_wait = loop.create_task(event.wait())
+        try:
+            done, _pending = await asyncio.wait({fut_wait, preempt_wait}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (fut_wait, preempt_wait):
+                if not t.done():
+                    t.cancel()
+            # Retrieve the timed-out / cancelled task's exception so asyncio
+            # does not log "Task exception was never retrieved".
+            for t in (fut_wait, preempt_wait):
+                try:
+                    await t
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+        if fut.done():
+            return True, False
+        return False, preempt_wait in done
+
+    async def _idle_hold(self, seconds: float, floor_s: float = 0.0) -> bool:
+        """Sleep `seconds` with the radio lock held, but return early
+        (True) once a link handshake is queued for the lock and at least
+        `floor_s` has passed (phase 1, 2026-09-20). The lock's pre-empt
+        event is the signal; False when the whole time elapsed."""
+        if seconds <= 0:
+            return False
+        event = self._direct_exchange_lock.preempt_event()
+        started = time.monotonic()
+        if floor_s > 0:
+            await asyncio.sleep(min(seconds, floor_s))
+            if seconds <= floor_s:
+                return False
+        remaining = seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            return False
+        if event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=remaining)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def _plain_proof(self, header: Optional[_RnsHeader]) -> bool:
         """A plain delivery PROOF: packet type PROOF and not link class
@@ -8975,6 +9171,8 @@ class SmartMeshCoreInterface(Interface):
                 cancel_key=self._answered_send_key(data, header),
                 # A plain PROOF expires before every attempt (proof_max_age).
                 expire_retries=self._plain_proof(header) and self.proof_max_age_s > 0,
+                # A Link handshake pre-empts idle holds of the radio lock.
+                preempt=self._is_link_handshake(header),
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -9122,6 +9320,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _send_raw_fragment(
         self, path: bytes, frame: bytes, priority: int, telemetry: Optional[dict] = None,
+        interrupt: "Optional[asyncio.Event]" = None,
     ) -> bool:
         """One raw fragment out through the same gate every transmission
         passes (quiet defer skipped: a burst is always racing the
@@ -9130,6 +9329,7 @@ class SmartMeshCoreInterface(Interface):
         on_air = 2 + len(path) + len(frame)
         gate = await self._pre_transmit_gate(
             "", skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority), on_air_bytes=on_air,
+            interrupt=interrupt,
         )
         if telemetry is not None:
             telemetry["quiet_defer_wait_s"], telemetry["duty_cycle_wait_s"], telemetry["medium_hold_wait_s"] = gate
@@ -9223,7 +9423,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
-        last_sent_idx: Optional[int] = None, rearm=None,
+        last_sent_idx: Optional[int] = None, rearm=None, release_lock=None,
     ) -> Optional[_CompletionFrame]:
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
@@ -9253,13 +9453,29 @@ class SmartMeshCoreInterface(Interface):
         started = time.monotonic()
         provisional: Optional[_CompletionFrame] = None
         deadline_s = wait_s
+        released = release_lock is None
         while True:
             remaining = deadline_s - (time.monotonic() - started)
             if remaining <= 0:
                 got = None
             else:
                 try:
-                    got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
+                    if not released:
+                        # Phase 1 (2026-09-20): a queued Link handshake takes
+                        # the radio; the rest of this wait is radio-free (the
+                        # report future outlives the wait either way).
+                        done, cut = await self._wait_future_or_preempt(fut, remaining)
+                        if cut:
+                            release_lock()
+                            released = True
+                            self._debug(
+                                f"report wait ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) released the radio to a "
+                                f"Link handshake after {time.monotonic() - started:.2f}s; still listening for the report."
+                            )
+                            continue
+                        got = fut.result() if done else None
+                    else:
+                        got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
                 except (asyncio.TimeoutError, Exception):
                     got = None
             if got is None:
@@ -9444,7 +9660,24 @@ class SmartMeshCoreInterface(Interface):
                     self._completion_query_waiters[report_key] = (
                         report_fut, frag_total, self.COMPLETION_REPORT_NONCE_BASE | (rnd & 0x03),
                     )
-                async with self._direct_exchange_lock(priority):
+                # Phase 1 (2026-09-20): the lock is taken by hand so the
+                # burst can YIELD it to a queued Link handshake -- during a
+                # fragment's duty-cycle throttle wait, after (never inside)
+                # a fragment's gap, and for the rest of the report wait --
+                # and take it back at YIELDED_PRIORITY, ahead of ordinary
+                # waiters (see _PriorityAsyncLock.yield_to_preempt).
+                lock = self._direct_exchange_lock
+                await lock.acquire(priority)
+                lock_held = True
+                yields = 0
+
+                def release_for_handshake() -> None:
+                    nonlocal lock_held
+                    if lock_held:
+                        lock.release()
+                        lock_held = False
+
+                try:
                     for n, frag_idx in enumerate(missing):
                         if self.detached or not self.online:
                             remember()
@@ -9455,12 +9688,24 @@ class SmartMeshCoreInterface(Interface):
                             report=report_fut is not None and n >= len(missing) - 2,
                         )
                         telemetry: dict = {}
-                        try:
-                            await self._send_raw_fragment(path, frame, priority, telemetry)
-                            sent_ok = True
-                        except Exception as exc:
-                            sent_ok = False
-                            RNS.log(f"{self}: raw fragment send failed locally (pkt_id={pkt_id} frag_idx={frag_idx}): {exc}", RNS.LOG_WARNING)
+                        while True:
+                            try:
+                                await self._send_raw_fragment(path, frame, priority, telemetry, interrupt=lock.preempt_event())
+                                sent_ok = True
+                            except _PreemptedForHandshake:
+                                # Yield inside the throttle wait: the
+                                # handshake (duty-cycle exempt) goes, this
+                                # fragment re-enters the gate afterwards.
+                                yields += 1
+                                await lock.yield_to_preempt()
+                                if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
+                                    self._completion_query_waiters.pop(report_key, None)
+                                    return False
+                                continue
+                            except Exception as exc:
+                                sent_ok = False
+                                RNS.log(f"{self}: raw fragment send failed locally (pkt_id={pkt_id} frag_idx={frag_idx}): {exc}", RNS.LOG_WARNING)
+                            break
                         if self._packet_capture_file is not None:
                             self._capture_event("out", {
                                 "event": "raw_fragment_sent", "peer_prefix": peer_prefix, "pkt_id": pkt_id,
@@ -9469,6 +9714,7 @@ class SmartMeshCoreInterface(Interface):
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
+                                "handshake_yields": yields,
                             })
                         # Field fix (2026-09-19 morning): the gap follows EVERY
                         # fragment, the last one included, and is slept with
@@ -9479,6 +9725,16 @@ class SmartMeshCoreInterface(Interface):
                         gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
                         if gap_s > 0:
                             await asyncio.sleep(gap_s)
+                        if n < len(missing) - 1 and lock.preempt_requested():
+                            # After the gap (the chain is clear), before the
+                            # next fragment: let the handshake go.
+                            yields += 1
+                            await lock.yield_to_preempt()
+                            if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
+                                self._completion_query_waiters.pop(report_key, None)
+                                return False
+                    if yields:
+                        self._debug(f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
                     if report_fut is not None:
                         stale_report = None
 
@@ -9497,10 +9753,7 @@ class SmartMeshCoreInterface(Interface):
                             # and wait the transit time for the last
                             # fragment's own report first.
                             stale_report = report_fut.result()
-                            report_fut = asyncio.get_running_loop().create_future()
-                            self._completion_query_waiters[report_key] = (
-                                report_fut, frag_total, self.COMPLETION_REPORT_NONCE_BASE | (rnd & 0x03),
-                            )
+                            report_fut = rearm()
                         # Radio kept quiet, lock still held: the receiver's
                         # report (and, right behind it, whatever RNS sends
                         # back) is crossing the chain now, and this node's
@@ -9511,6 +9764,7 @@ class SmartMeshCoreInterface(Interface):
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, pkt_id, frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=missing[-1] if missing else None, rearm=rearm,
+                            release_lock=release_for_handshake,
                         )
                         if report is None and stale_report is not None:
                             # The last fragment (or its report) was lost: the
@@ -9524,6 +9778,8 @@ class SmartMeshCoreInterface(Interface):
                                 stage=f"raw{rnd}", answer_version=stale_report.version,
                                 held=sorted(stale_report.held) if stale_report.held is not None else None,
                             )
+                finally:
+                    release_for_handshake()
                 self._completion_query_waiters.pop(report_key, None)
             held_before = sum(acked)
             answer = report
@@ -10253,7 +10509,7 @@ class SmartMeshCoreInterface(Interface):
         pass_number: Optional[int] = None,
         attempts_override: Optional[int] = None, record_result: bool = True,
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
-        expire_retries: bool = False,
+        expire_retries: bool = False, preempt: bool = False,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -10377,7 +10633,7 @@ class SmartMeshCoreInterface(Interface):
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
-                    expire_retries=expire_retries, attempt_info=attempt_info,
+                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=preempt,
                 )
             except Exception as exc:
                 RNS.log(
@@ -10670,9 +10926,21 @@ class SmartMeshCoreInterface(Interface):
             pass
         return None, True
 
+    def _ack_preempt_floor_s(self, peer_prefix: Optional[str], hop_count: Optional[int]) -> float:
+        """How long a best-effort ANSWER/REPORT's ACK wait runs before a
+        queued handshake may cut it (phase 1, 2026-09-20): the peer's
+        expected ACK time (srtt + rttvar when measured; ACKs at hop 0 were
+        median 0.65 s / p90 1.65 s, at hop 2 median 2.7 s / p90 3.5 s in
+        the 2026-09-20 session), else 2 s + 1 s per hop. Keying the
+        handshake into the peer's ACK would lose both at a repeater."""
+        st = self._ack_rtt.get(peer_prefix) if peer_prefix else None
+        if st is not None:
+            return max(0.5, st["srtt"] + st["rttvar"])
+        return 2.0 + 1.0 * max(0, hop_count or 0)
+
     async def _await_direct_ack(
         self, sent, peer_prefix: Optional[str], hop_count: Optional[int], rx_window: dict, ack_wait_start: float,
-        cancel_event: "Optional[asyncio.Event]" = None,
+        cancel_event: "Optional[asyncio.Event]" = None, preemptible: bool = False,
     ) -> "tuple[bool, bool, Optional[float], str, Optional[float], Optional[float]]":
         """The ACK wait for one transmitted DIRECT frame (refactor,
         2026-09-19: lifted verbatim out of `_send_direct_frame_and_wait_
@@ -10722,6 +10990,30 @@ class SmartMeshCoreInterface(Interface):
             # in the mesh: keep waiting the remainder as before.
             hop1_abort_deadline_s = self._hop1_abort_deadline_s(peer_prefix, hop_count, timeout_s)
             ack_filters = {"code": expected_ack.hex()}
+            if preemptible:
+                # Phase 1 (2026-09-20): a completion ANSWER/REPORT is best
+                # effort and never retried; once the peer's expected ACK
+                # time has passed, a queued Link handshake may take the
+                # radio. "preempted": not a miss (no backoff, no listen,
+                # no path evidence), not a success.
+                floor_s = min(timeout_s, self._ack_preempt_floor_s(peer_prefix, hop_count))
+                ack_event, answered = await self._wait_for_ack_event(ack_filters, floor_s, cancel_event)
+                if ack_event is None and not answered and timeout_s > floor_s:
+                    preempt_event = self._direct_exchange_lock.preempt_event()
+                    if preempt_event.is_set():
+                        return False, False, timeout_s, "preempted", None, None
+                    ack_event, answered = await self._wait_for_ack_event(
+                        ack_filters, timeout_s - floor_s, preempt_event,
+                    )
+                    if answered:
+                        return False, False, timeout_s, "preempted", None, None
+                ok = ack_event is not None
+                if ok:
+                    ack_latency_s = time.monotonic() - ack_wait_start
+                    self._record_ack_rtt(peer_prefix, ack_latency_s)
+                elif ack_timeout_source == "measured":
+                    self._backoff_ack_rtt(peer_prefix, "missed ACK under measured timeout")
+                return ok, ok or ack_timeout_source != "measured", timeout_s, ack_timeout_source, ack_latency_s, None
             first_wait_s = hop1_abort_deadline_s if hop1_abort_deadline_s is not None else timeout_s
             ack_event, answered = await self._wait_for_ack_event(ack_filters, first_wait_s, cancel_event)
             aborted = False
@@ -10834,6 +11126,8 @@ class SmartMeshCoreInterface(Interface):
         cancel_event: "Optional[asyncio.Event]" = None,  # set when the reply to this frame has been seen (2026-09-20, _signal_send_answered)
         expire_retries: bool = False,  # a plain PROOF: expires_at applies to every attempt, not only the first (proof_max_age, 2026-09-20)
         attempt_info: Optional[dict] = None,  # out-param: "expired" True when the attempt aged out in the lock wait and never transmitted
+        preempt: bool = False,  # a Link handshake: may pre-empt an idle hold of the lock (phase 1, 2026-09-20)
+        preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -10909,8 +11203,9 @@ class SmartMeshCoreInterface(Interface):
         `_capture_direct_attempt_result`'s own docstring."""
         self._direct_exchange_queue_depth += 1
         wait_start = time.monotonic()
+        preempted = False
         try:
-            async with self._direct_exchange_lock(priority):
+            async with self._direct_exchange_lock(priority, preempt=preempt):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 if quiet_wait is not None and quiet_wait.done():
@@ -10981,7 +11276,9 @@ class SmartMeshCoreInterface(Interface):
                     (ok, waited_full_timeout, ack_timeout_s, ack_timeout_source,
                      ack_latency_s, hop1_abort_deadline_s) = await self._await_direct_ack(
                         sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=cancel_event,
+                        preemptible=preemptible,
                     )
+                    preempted = ack_timeout_source == "preempted"
                     ack_done_at = time.monotonic()
                 except Exception as exc:
                     send_exc = exc
@@ -11022,8 +11319,19 @@ class SmartMeshCoreInterface(Interface):
                 miss_diagnosis = None if ok else self._diagnose_missed_ack(rx_window, hop_count)
                 medium_busy_remaining_s = self._medium_busy_remaining_s()
                 listen_delay_s = self._post_attempt_listen_s(ok, miss_diagnosis)
-                if listen_delay_s > 0:
-                    await asyncio.sleep(listen_delay_s)
+                if preempted:
+                    # The handshake that cut this wait takes the radio now;
+                    # the listen it would have had is theirs.
+                    listen_delay_s = 0.0
+                elif listen_delay_s > 0:
+                    # Phase 1 (2026-09-20): the listen after a MISS yields to
+                    # a queued handshake once the rx-log prediction of busy
+                    # air (0 unless holds are on) has passed; the short
+                    # success listen runs in full.
+                    if ok:
+                        await asyncio.sleep(listen_delay_s)
+                    elif await self._idle_hold(listen_delay_s, floor_s=medium_busy_remaining_s):
+                        listen_delay_s = time.monotonic() - (ack_done_at or time.monotonic())
 
                 # Field fix (2026-09-19 night, `fieldtests/raw/Alpha0.1.2/
                 # *nighttest*` vs `fieldtests/raw/binaryfieldtest/`): an
@@ -11080,16 +11388,18 @@ class SmartMeshCoreInterface(Interface):
                     quiet_remaining_s = ack_done_at + quiet_window_s - time.monotonic()
                     if quiet_remaining_s > 0:
                         quiet_started = time.monotonic()
-                        try:
-                            await asyncio.wait_for(asyncio.shield(quiet_wait), timeout=quiet_remaining_s)
-                            if quiet_info is not None:
-                                quiet_info["answered_at"] = time.monotonic()
-                        except asyncio.TimeoutError:
-                            pass
-                        except Exception:
-                            # The awaited future failing is the caller's
-                            # business, not this radio hold's.
-                            pass
+                        # Phase 1 (2026-09-20): a queued Link handshake ends
+                        # the hold early; the caller keeps waiting for the
+                        # answer with the radio free, as it does after the
+                        # window.
+                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s)
+                        if answered and quiet_info is not None:
+                            quiet_info["answered_at"] = time.monotonic()
+                        if cut:
+                            self._debug(
+                                f"quiet window for {peer_prefix!r} cut at {time.monotonic() - quiet_started:.2f}s "
+                                f"of {quiet_remaining_s:.2f}s -- a Link handshake is waiting for the radio."
+                            )
                         quiet_hold_s = time.monotonic() - quiet_started
                     if quiet_info is not None:
                         quiet_info["hold_s"] = quiet_hold_s or 0.0
@@ -12480,6 +12790,10 @@ class SmartMeshCoreInterface(Interface):
                 # used to run with hop_count=None, i.e. the flat firmware
                 # suggestion, so neither the hop cap nor the abort applied).
                 hop_count=hops,
+                # Phase 1 (2026-09-20): best effort, never retried -- a
+                # queued Link handshake may cut this ACK wait once the
+                # peer's expected ACK time has passed.
+                preemptible=True,
             )
             if not ok:
                 self._debug(

@@ -138,7 +138,9 @@ def collect(paths: list, node_filter: str = None) -> list:
 def analyse_set(recs: list, hop_filter=None) -> dict:
     out = {"records": len(recs), "nodes": sorted({r["_node"] for r in recs}),
            "span_s": (recs[-1]["ts"] - recs[0]["ts"]) if len(recs) > 1 else 0.0}
-    att = [r for r in recs if r.get("event") == "direct_attempt_result"]
+    att = [r for r in recs if r.get("event") == "direct_attempt_result"
+           # neither a success nor a failure of the path (phase 1, 2026-09-20)
+           and r.get("ack_timeout_source") not in ("expired", "answered", "answered_before_send", "preempted")]
     if hop_filter is not None:
         att = [r for r in att if r.get("hop_count") == hop_filter]
     by_hop = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -246,7 +248,7 @@ def analyse_set(recs: list, hop_filter=None) -> dict:
     for r in recs:
         ev = r.get("event")
         if ev == "direct_attempt_result":
-            if r.get("ack_timeout_source") in ("expired", "answered"):
+            if r.get("ack_timeout_source") in ("expired", "answered", "answered_before_send"):
                 continue   # never keyed the radio
             b = r.get("on_air_bytes")
             if b is None:

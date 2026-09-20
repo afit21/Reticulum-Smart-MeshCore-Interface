@@ -296,7 +296,7 @@ class NightSessionFixes(SingleNodeCase):
         async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False):
             return {}
 
-        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=None):
+        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=None, preemptible=False):
             await asyncio.sleep(0.05)      # a (short) ACK latency, so the window is measured from MSG_SENT
             return True, False, 1.0, "test", 0.05, None
 
@@ -476,7 +476,7 @@ class NightSessionFixes(SingleNodeCase):
         iface, M = self.iface, self.module
         rounds = iter(held_per_round)
 
-        async def fake_raw(path, frame, priority, telemetry=None):
+        async def fake_raw(path, frame, priority, telemetry=None, interrupt=None):
             return True
 
         async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=2, hop_count=None, send_info=None):

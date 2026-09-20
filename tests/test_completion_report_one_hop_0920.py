@@ -188,7 +188,7 @@ class _OneHopRawSend(SingleNodeCase):
         saved_path = iface._resolved_paths.get(PEER)
         sent = []
 
-        async def fake_send_raw_fragment(path, frame, priority, telemetry=None):
+        async def fake_send_raw_fragment(path, frame, priority, telemetry=None, interrupt=None):
             header, payload, src, dst = iface._decode_raw_fragment(frame)
             flagged = iface._raw_fragment_report_requested(frame)
             sent.append({"t": time.monotonic(), "frag_idx": header.frag_idx, "round": header.attempt,
