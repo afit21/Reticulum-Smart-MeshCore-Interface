@@ -2742,24 +2742,27 @@ part had gone out once. That is the number phase 3 is sized against.
     `_send_direct_with_attempts`, `cancel_event` down to
     `_await_direct_ack`). Laptop capture `*144922` at two hops, relative
     to its first record: LINKREQUEST out at 2213.5 s; attempt 0 lost its
-    firmware ACK and its 11 s wait ended at 2227.9 s, 0.5 s AFTER the
-    LRPROOF had arrived; attempt 1 re-sent the request at 2235.4 s -- a
+    firmware ACK (the ACK itself was heard on air 0.6 s after the 11 s
+    wait ended) and the LRPROOF arrived at 2227.4 s, during attempt 0's
+    post-miss listen; attempt 1 re-sent the request at 2235.4 s -- a
     99-byte frame plus a 3.4 s ACK at two hops, eight seconds after the
-    Link was proven, with the LRRTT queued 3.8 s behind it. The three
-    places that pop `_pending_link_requests` / `_pending_dest_proofs`
-    (the DIRECT PROOF branch of `_observe_incoming_rns_packet`, both
-    tables, and `_note_channel_proof`) now signal the key; the retry
-    loop makes no further attempt (recorded success -- the far side
-    provably got the frame -- and one `direct_attempt_result` with
-    `ack_timeout_source="answered"` for the attempt that did not
+    Link was proven, with the LRRTT queued 3.8 s behind it. The DIRECT
+    PROOF branch of `_observe_incoming_rns_packet` (every proof, before
+    the `_pending_*` pops) and `_note_channel_proof` now signal the key;
+    the retry loop makes no further attempt (one `direct_attempt_result`
+    with `ack_timeout_source="answered"` for the attempt that did not
     happen), and an ACK wait already running ends at once, as
-    "answered", with no RTT sample and no backoff. The key is derived
-    in `_send_direct_payload`, the one place bare sends are dispatched,
-    so a supplement copy of the same LINKREQUEST shares it: a
-    LINKREQUEST's link_id, or a bootstrap DATA's truncated hash while
-    `_pending_dest_proofs` remembers it. Ordinary resolved-destination
-    DATA has no key and is unchanged. Tests:
-    `tests/test_answered_sends_0920.py`.
+    "answered", with no RTT sample and no backoff. Path evidence
+    (`record_direct_send_result` success) is recorded only when the
+    reply came DIRECT from the peer the send was addressed to -- a
+    DIRECT-to-all copy cancelled by another peer's relay, or a CHANNEL
+    copy, learns nothing about this peer's path. The key is derived in
+    `_send_direct_payload`, the one place bare sends are dispatched, so
+    a supplement copy shares it: a LINKREQUEST's link_id, or a plain
+    SINGLE-destination DATA's truncated hash (its PROOF's destination
+    field; a Link packet's proof carries the link_id, so Link DATA has
+    no key). Events and answered keys are swept on the proof-correlation
+    TTL. Tests: `tests/test_answered_sends_0920.py`.
 
  5. **The completion-report window is sized from the measured report
     latency** (`_report_rtt`, `_record_report_latency`, `_expect_report`;
@@ -7730,9 +7733,14 @@ class SmartMeshCoreInterface(Interface):
         unknown-destination backoff, the one decision a matched proof is
         entitled to change. The worst a forged CHANNEL proof can do is keep
         this node trying a destination it would otherwise have given up on
-        for a while -- the pre-backoff behaviour."""
+        for a while -- the pre-backoff behaviour. Phase 1 (2026-09-20)
+        added a second, equally bounded decision: the bare send the proof
+        answers stops retrying (`_signal_send_answered`), with NO path
+        evidence recorded for any peer -- a forged CHANNEL proof can at
+        most cost one retry the application's own retry then covers."""
         if header is None or header.packet_type != RNS.Packet.PROOF or header.destination_hash is None:
             return
+        self._signal_send_answered(header.destination_hash, f"PROOF over {transport}", None)
         delivered = self._pending_dest_proofs.pop(header.destination_hash, None)
         if delivered is None:
             # The same for an LRPROOF answering a LINKREQUEST this node sent
@@ -7741,7 +7749,6 @@ class SmartMeshCoreInterface(Interface):
             delivered = self._pending_link_requests.pop(header.destination_hash, None)
         if delivered is None:
             return
-        self._signal_send_answered(header.destination_hash, f"PROOF over {transport}")
         proved_dest, _expiry = delivered
         had_backoff = proved_dest in self._unknown_dest_attempts or proved_dest in self._unknown_dest_backoff_until
         self._clear_unknown_dest_backoff(proved_dest)
@@ -7854,25 +7861,39 @@ class SmartMeshCoreInterface(Interface):
             return None
         if header.packet_type == RNS.Packet.LINKREQUEST:
             return self._compute_link_id(data)
-        if header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE:
-            truncated_hash = self._compute_truncated_hash(data, header.header_type)
-            if truncated_hash is not None and truncated_hash in self._pending_dest_proofs:
-                return truncated_hash
+        if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
+                and header.destination_type == RNS.Destination.SINGLE):
+            # Review (2026-09-20): every plain DATA to a SINGLE destination,
+            # not only a bootstrap send -- its PROOF's destination field is
+            # this truncated hash whether the token was known or not (a
+            # Link packet's proof carries the link_id instead, so those are
+            # left out). In the 2026-09-20 laptop captures 2 of 47 and 4 of
+            # 15 bare retries followed the packet's own PROOF.
+            return self._compute_truncated_hash(data, header.header_type)
         return None
 
     def _answered_send_event(self, key: bytes) -> "asyncio.Event":
         """The event an in-flight send with this key waits on; already set
         if the reply was seen before the send got this far (a proof that
-        beat the retry loop to the key)."""
-        event = self._send_answered_events.get(key)
-        if event is None:
+        beat the retry loop to the key). Timestamped so an event whose
+        send was never answered is swept too (review, 2026-09-20)."""
+        entry = self._send_answered_events.get(key)
+        if entry is None:
             event = asyncio.Event()
             if key in self._send_answered_at:
                 event.set()
-            self._send_answered_events[key] = event
-        return event
+            self._send_answered_events[key] = (event, time.monotonic())
+            return event
+        return entry[0]
 
-    def _signal_send_answered(self, key: Optional[bytes], how: str) -> None:
+    def _send_answered_by(self, key: bytes) -> Optional[str]:
+        """Which bound peer delivered the reply (None: a CHANNEL copy, or
+        an unbound sender) -- only a reply from the peer the send was
+        addressed to is evidence about THAT peer's path."""
+        entry = self._send_answered_at.get(key)
+        return entry[1] if entry is not None else None
+
+    def _signal_send_answered(self, key: Optional[bytes], how: str, sender_peer_prefix: Optional[str] = None) -> None:
         """Phase 1 (2026-09-20, `fieldtests/raw/Alpha0.1.3/capture_*144922`
         at 2 hops): a LINKREQUEST's attempt 0 lost its firmware ACK, its
         11 s ACK wait ended 0.5 s AFTER the LRPROOF had arrived, and attempt
@@ -7884,17 +7905,18 @@ class SmartMeshCoreInterface(Interface):
         (`_await_direct_ack`) observe it."""
         if key is None:
             return
-        self._send_answered_at[key] = time.monotonic()
-        event = self._send_answered_events.get(key)
-        if event is not None and not event.is_set():
-            event.set()
+        self._send_answered_at[key] = (time.monotonic(), sender_peer_prefix)
+        entry = self._send_answered_events.get(key)
+        if entry is not None and not entry[0].is_set():
+            entry[0].set()
             self._debug(f"send {key.hex()} answered ({how}) while its retry loop was live -- no further attempts.")
 
     def _send_answered_sweep(self, now: float) -> None:
-        stale = [k for k, t in self._send_answered_at.items() if now - t > self.proof_correlation_ttl_s]
-        for k in stale:
+        ttl = self.proof_correlation_ttl_s
+        for k in [k for k, (t, _by) in self._send_answered_at.items() if now - t > ttl]:
             del self._send_answered_at[k]
-            self._send_answered_events.pop(k, None)
+        for k in [k for k, (_ev, t) in self._send_answered_events.items() if now - t > ttl]:
+            del self._send_answered_events[k]
 
     def _path_response_rate_limited(self, destination_hash: Optional[bytes]) -> bool:
         """True if an outgoing PATH_RESPONSE for `destination_hash` was
@@ -8260,6 +8282,12 @@ class SmartMeshCoreInterface(Interface):
                 )
                 return
             bootstrap_targets = [] if backed_off else self._select_bootstrap_supplement_targets()
+            if bootstrap_targets:
+                # Registered BEFORE the supplement tasks are spawned (review,
+                # 2026-09-20): the proof correlation and the answered-send
+                # key are read by the send path, so their order must not
+                # rest on the tasks not running until the dispatcher yields.
+                self._remember_bootstrap_send(data, header)
             for bootstrap_peer_prefix in bootstrap_targets:
                 task = self._spawn_background_task(
                     self._send_direct_supplement(
@@ -8286,7 +8314,6 @@ class SmartMeshCoreInterface(Interface):
                     # adv_name). Excluding proofs removes the harm without
                     # inventing trust.
                     self._record_unknown_dest_attempt(header.destination_hash)
-                self._remember_bootstrap_send(data, header)
             self._debug(
                 f"routing decision: no known peer for this destination -- "
                 f"CHANNEL broadcast"
@@ -10080,7 +10107,12 @@ class SmartMeshCoreInterface(Interface):
                     time_critical=time_critical, pass_number=pass_number,
                     ack_timeout_source="answered",
                 )
-                if record_result:
+                # Path evidence only when THIS peer delivered the reply
+                # (review, 2026-09-20): a DIRECT-to-all copy cancelled by a
+                # proof relayed through another peer, or a CHANNEL copy,
+                # says nothing about this peer's path -- like an expiry,
+                # nothing is recorded.
+                if record_result and self._send_answered_by(cancel_key) == peer_prefix:
                     self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
                 return True
             if attempt == 0 and self._expired(expires_at):
@@ -10114,7 +10146,9 @@ class SmartMeshCoreInterface(Interface):
                 )
                 ok, waited_full_timeout = False, False
             if ok:
-                if record_result:
+                if record_result and not (
+                        cancel_event is not None and cancel_event.is_set()
+                        and self._send_answered_by(cancel_key) != peer_prefix):
                     self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
                 return True
             # No per-attempt delay here anymore -- the post-send listen
@@ -12419,6 +12453,10 @@ class SmartMeshCoreInterface(Interface):
         self._touch_peer_seen(sender_peer_prefix)
 
         if header.packet_type == RNS.Packet.PROOF:
+            # Phase 1 (2026-09-20): whatever else this proof means, a bare
+            # send keyed by its destination field (a link_id, or a plain
+            # DATA's truncated hash) has been answered by this peer.
+            self._signal_send_answered(header.destination_hash, "DIRECT PROOF", sender_peer_prefix)
             # Code review (2026-09-18): the one PROOF whose destination
             # field IS worth learning from -- an LRPROOF answering a
             # LINKREQUEST this node sent carries the link_id, a stable
@@ -12431,7 +12469,6 @@ class SmartMeshCoreInterface(Interface):
             delivered = self._pending_dest_proofs.pop(header.destination_hash, None)
             if delivered is not None:
                 proved_dest, _expiry = delivered
-                self._signal_send_answered(header.destination_hash, "DIRECT PROOF")
                 self._learn_rns_token(proved_dest, sender_peer_prefix)
                 self._clear_unknown_dest_backoff(proved_dest)
                 self._debug(
@@ -12444,7 +12481,6 @@ class SmartMeshCoreInterface(Interface):
             pending = self._pending_link_requests.pop(header.destination_hash, None)
             if pending is not None:
                 requested_dest, _expiry = pending
-                self._signal_send_answered(header.destination_hash, "DIRECT LRPROOF")
                 self._learn_rns_token(header.destination_hash, sender_peer_prefix)
                 self._learn_rns_token(requested_dest, sender_peer_prefix)
                 self._clear_unknown_dest_backoff(requested_dest)

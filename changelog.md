@@ -31,9 +31,11 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
 - **A bare DIRECT send stops retrying once its reply is seen.** A LINKREQUEST whose attempt 0 lost
   its firmware ACK was re-sent 8 s after its LRPROOF had arrived (laptop `*144922`, two hops:
   99 B + 3.4 s ACK, LRRTT queued 3.8 s behind). The three receipt paths that correlate an LRPROOF
-  / bootstrap PROOF now signal the send (`_signal_send_answered`); the retry loop makes no further
-  attempt and an ACK wait in progress ends as `ack_timeout_source="answered"` (success, no RTT sample,
-  no backoff). Tests: `tests/test_answered_sends_0920.py`.
+  / plain-DATA PROOF now signal the send (`_signal_send_answered`; the key is a LINKREQUEST's link_id
+  or a SINGLE-destination DATA's truncated hash); the retry loop makes no further attempt and an ACK
+  wait in progress ends as `ack_timeout_source="answered"` (no RTT sample, no backoff). Path evidence
+  is recorded only when the reply came DIRECT from the addressed peer. Tests:
+  `tests/test_answered_sends_0920.py`.
 - **Completion-report window sized from measured report latency** (default change:
   `direct_raw_report_wait_base` 2.0 -> 4.0 s, `direct_raw_report_wait_per_hop` 3.0 -> 2.5 s). Zero
   hop: the receiver's report waited p90 4-5 s for its own radio lock, so a 2 s window sent 29 of the

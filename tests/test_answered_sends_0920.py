@@ -57,20 +57,19 @@ class AnsweredSendKey(SingleNodeCase):
         header = self.iface._parse_rns_header(raw)
         self.assertEqual(self.iface._answered_send_key(raw, header), _link_id_the_rns_way(raw))
 
-    def test_data_key_only_while_a_bootstrap_proof_is_pending(self):
+    def test_plain_single_data_key_is_its_truncated_hash(self):
+        """Every plain DATA to a SINGLE destination (review 2026-09-20: not
+        only a bootstrap send) -- its PROOF's destination field is exactly
+        this value (RNS `ProofDestination`)."""
         iface = self.iface
         raw = build_rns_packet("data", dest_hash=DEST, payload=b"probe")
         header = iface._parse_rns_header(raw)
-        self.assertIsNone(iface._answered_send_key(raw, header), "no pending proof -> no key")
-        iface._remember_bootstrap_send(raw, header)
-        try:
-            key = iface._answered_send_key(raw, header)
-            self.assertEqual(key, iface._compute_truncated_hash(raw, header.header_type))
-            self.assertIn(key, iface._pending_dest_proofs)
-        finally:
-            iface._pending_dest_proofs.clear()
+        self.assertEqual(iface._answered_send_key(raw, header), iface._compute_truncated_hash(raw, header.header_type))
 
     def test_other_packets_have_no_key(self):
+        """A Link packet's proof carries the link_id, not the packet hash,
+        so Link DATA / Resource parts have no key; nor do announces, path
+        requests or proofs themselves."""
         iface = self.iface
         for kind in ("announce", "path_request", "proof", "link_data", "resource"):
             raw = build_rns_packet(kind, dest_hash=DEST, payload=b"x" * 8)
@@ -107,7 +106,60 @@ class RetryLoopStopsWhenAnswered(SingleNodeCase):
             iface._send_answered_at.pop(key, None)
         self.assertTrue(ok)
         self.assertEqual(calls, [0], f"attempts transmitted: {calls}")
-        self.assertEqual(recorded, [True], "an answered send records success, never a failure")
+        self.assertEqual(recorded, [], "answered by nobody in particular (a CHANNEL copy): no path evidence either way")
+
+    def test_reply_from_the_addressed_peer_credits_its_path_and_from_another_peer_does_not(self):
+        """A DIRECT-to-all LINKREQUEST: peer A relays the LRPROOF, so B's
+        copy is cancelled too -- B's path learned nothing (review
+        2026-09-20); A's copy records a success."""
+        iface = self.iface
+        recorded = []
+
+        async def fake_send(target, frame, attempt=0, **kwargs):
+            return False, True
+
+        original_send = iface._send_direct_frame_and_wait_for_ack
+        original_record = iface.record_direct_send_result
+        iface._send_direct_frame_and_wait_for_ack = fake_send
+        iface.record_direct_send_result = lambda peer, succeeded, waited_full_timeout: recorded.append((peer, succeeded))
+        try:
+            for answered_by, want in (("111111111111", [("111111111111", True)]), ("222222222222", [])):
+                key = os.urandom(16)
+                recorded.clear()
+                iface._signal_send_answered(key, "test", answered_by)
+                ok = self.node.run_on_loop(iface._send_direct_with_attempts(
+                    "ab" * 32, lambda attempt: "Rframe", "111111111111", priority=iface.PRIORITY_HANDSHAKE, cancel_key=key,
+                ), timeout=20.0)
+                self.assertTrue(ok)
+                self.assertEqual(recorded, want, f"answered by {answered_by}")
+                iface._send_answered_events.pop(key, None)
+                iface._send_answered_at.pop(key, None)
+        finally:
+            iface._send_direct_frame_and_wait_for_ack = original_send
+            iface.record_direct_send_result = original_record
+
+    def test_unanswered_events_are_swept_and_a_fresh_key_transmits(self):
+        iface = self.iface
+        key = os.urandom(16)
+        self.on_loop(iface._answered_send_event, key)
+        self.assertIn(key, iface._send_answered_events)
+        iface._send_answered_sweep(time.monotonic() + iface.proof_correlation_ttl_s + 1.0)
+        self.assertNotIn(key, iface._send_answered_events, "an event whose send was never answered is swept")
+        calls = []
+
+        async def fake_send(target, frame, attempt=0, **kwargs):
+            calls.append(attempt)
+            return True, True
+
+        original_send = iface._send_direct_frame_and_wait_for_ack
+        iface._send_direct_frame_and_wait_for_ack = fake_send
+        try:
+            self.node.run_on_loop(iface._send_direct_with_attempts(
+                "ab" * 32, lambda attempt: "Rframe", PEER, cancel_key=os.urandom(16), record_result=False,
+            ), timeout=20.0)
+        finally:
+            iface._send_direct_frame_and_wait_for_ack = original_send
+        self.assertEqual(calls, [0], "a send with a fresh (unanswered) key transmits")
 
     def test_already_answered_key_skips_attempt_zero(self):
         iface = self.iface
@@ -188,6 +240,20 @@ class AckWaitEndsWhenAnswered(SingleNodeCase):
 
 
 class ReceiptPathsSignal(SingleNodeCase):
+    def test_channel_proof_for_plain_data_signals_with_no_peer(self):
+        iface = self.iface
+        raw = build_rns_packet("data", dest_hash=DEST, payload=b"probe")
+        key = iface._answered_send_key(raw, iface._parse_rns_header(raw))
+        event = self.on_loop(iface._answered_send_event, key)
+        try:
+            proof = build_rns_packet("proof", dest_hash=key, payload=b"s" * 64)
+            self.on_loop(iface._note_channel_proof, iface._parse_rns_header(proof), "channel_bare")
+            self.assertTrue(event.is_set())
+            self.assertIsNone(iface._send_answered_by(key), "a CHANNEL proof names no peer -> no path credit")
+        finally:
+            iface._send_answered_events.pop(key, None)
+            iface._send_answered_at.pop(key, None)
+
     def test_channel_lrproof_signals_the_link_id(self):
         iface = self.iface
         raw = build_rns_packet("link_request", dest_hash=DEST, payload=os.urandom(RNS.Link.ECPUBSIZE))
@@ -218,6 +284,7 @@ class ReceiptPathsSignal(SingleNodeCase):
             proof = build_rns_packet("proof", dest_hash=key, payload=b"s" * 64)
             self.on_loop(iface._observe_incoming_rns_packet, proof, PEER)
             self.assertTrue(event.is_set())
+            self.assertEqual(iface._send_answered_by(key), PEER)
         finally:
             iface._peers.pop(PEER, None)
             iface._pending_dest_proofs.clear()
