@@ -31,8 +31,9 @@ change regenerates it in the same commit):
   Text frames ride MeshCore text messages -- `send_msg` (TXT_MSG) for
   DIRECT, `send_chan_msg` (GRP_TXT) for CHANNEL -- as one ASCII marker
   character followed by the Z85 encoding of a binary body. Payload
-  budgets per frame come from FIRMWARE_TEXT_LIMIT (160) less the marker,
-  Z85's 5/4 expansion, the header and PAYLOAD_MARGIN (4); CHANNEL also
+  budgets per frame come from FIRMWARE_TEXT_LIMIT (160) less the marker
+  and one Z85 padding character, divided by Z85's 5/4 expansion, less
+  the header and PAYLOAD_MARGIN (4) (`_payload_budget`); CHANNEL also
   loses the firmware's own "<name>: " prefix.
 
   "R" (MARKER) -- an RNS packet, or one fragment of it. Byte 0 is

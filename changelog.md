@@ -16,6 +16,18 @@ DIRECT fragments" entries carry the packet-level detail.
   `tests/golden/wire_format.json`). New entries go at the end of `docs/history.md`. CLAUDE.md's
   "Missing design docs" note lists the documents the history cites that never existed; none was
   created.
+- **The interface is assembled from a source package.** RNS `exec()`s a custom interface as one text
+  file (no `__file__`, no package machinery -- `RNS/Reticulum.py`, checked by
+  `testscripts/check_install_load.py`), so the split lives in `Interface/src/smci/` (`_common`,
+  `_locks`, `_config`, `_observability`, `_wire`, `_peers`, `_paths`, `_direct`, `_reconcile`,
+  `_routing` as mixins, `interface.py` the class) and `python3 Interface/build_interface.py`
+  concatenates it into `Interface/SmartMeshCoreInterface.py`, which is still the file that is
+  installed. Ten pure-move commits, one module each, each audited function by function against the
+  previous deliverable (`testscripts/audit_split.py`: same bodies, same constants; the only addition
+  is the module-level `PRIORITY_*` mirrors of the class constants that mixin methods use as default
+  arguments) and pinned by `tests/test_module_split_0920.py`. Edit the sources, rebuild, commit both;
+  the pre-commit hook refuses a stale deliverable. The install method and `update-interface.sh` are
+  unchanged.
 
 ### Changed: airtime / throughput pass, phase 1 (2026-09-20 evening)
 

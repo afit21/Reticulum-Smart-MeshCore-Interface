@@ -2943,3 +2943,47 @@ part had gone out once. That is the number phase 3 is sized against.
     `preempted` / `answered` / `answered_before_send` / `expired`
     attempts apart from the per-hop success rate. Tests:
     `tests/test_handshake_preemption_0920.py`.
+
+**Airtime / throughput pass, phase 2 (2026-09-20 evening): the module
+split, no behaviour change.** Two steps, ten pure-move commits.
+
+1. This history left the module docstring (540c1a1). The docstring keeps
+   the rationale paragraph, the DESIGN INVARIANTS and a WIRE FORMAT section
+   written from the code (`"R"` / `"P"` / `"Q"` text frames, the completion
+   versions and nonce ranges, the 13-byte raw header and its payload
+   budget), each pinned byte for byte by `tests/golden/wire_format.json`.
+   New entries go at the end of this file.
+2. The deliverable is assembled (b91d4a9 .. 38e7f2f). RNS loads a custom
+   interface by `exec()`ing `<interfaces>/<type>.py` as text into a globals
+   dict holding only `Interface` and `RNS` -- no `__file__`, no package
+   machinery (`RNS/Reticulum.py`; `testscripts/check_install_load.py`
+   does exactly that) -- so a package cannot be installed as such. The
+   source is now the package `Interface/src/smci/` along the seams that
+   already existed: `_common` (imports, `_cfg_bool`, Z85, the record
+   types), `_locks` (the priority lock / semaphore, the duty-cycle
+   limiter, `_PreemptedForHandshake`), then one mixin per concern --
+   `_config` (`_configure_*`), `_observability` (capture, [STATS], the
+   RX-log tap and airtime model), `_wire` (budgets, encoders/decoders,
+   header parse and packet classes), `_peers` (bind protocol, peer cache,
+   `_register_peer`, tokens, `_resolve_routing_peer`), `_paths`
+   (discovery, stale-path detector, the per-peer estimators), `_direct`
+   (the gate, bare/text sends, the attempt loop and ACK wait, the lock's
+   idle-hold helpers), `_reconcile` (raw bursts, reports, QUERY/ANSWER,
+   reassembly), `_routing` (the outgoing worker and dispatcher, CHANNEL,
+   supplements, receive demux, `process_incoming`) -- and `interface.py`
+   (constants, `__init__`, properties, lifecycle). `Interface/build_
+   interface.py` concatenates them in dependency order, drops relative
+   imports and hoists absolute ones into one block; `--check` refuses a
+   stale deliverable and runs in the pre-commit hook. Each commit was
+   audited with `testscripts/audit_split.py` (every function by name with
+   its `ast.unparse`d body, every class constant by value, across any
+   class): PURE MOVE, the only addition being the module-level
+   `PRIORITY_*` mirrors in `_common` that mixin methods use as default
+   argument values (`tests/test_module_split_0920.py` pins them equal to
+   the class constants, the deliverable equal to what the sources build,
+   and the package's class equal to the assembled one in methods).
+   Method bodies, class constants, `__init__` and the `_configure_*`
+   order are byte-identical to the phase-1 build (e7ba341). Gate: the
+   full unit suite, and MeshBench `zero_hop` and `relay` twice each on
+   this build and on the frozen alpha 0.1.3 build, recorded in
+   `changelog.md` and the session report.

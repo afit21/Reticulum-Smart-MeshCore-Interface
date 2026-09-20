@@ -31,8 +31,9 @@ change regenerates it in the same commit):
   Text frames ride MeshCore text messages -- `send_msg` (TXT_MSG) for
   DIRECT, `send_chan_msg` (GRP_TXT) for CHANNEL -- as one ASCII marker
   character followed by the Z85 encoding of a binary body. Payload
-  budgets per frame come from FIRMWARE_TEXT_LIMIT (160) less the marker,
-  Z85's 5/4 expansion, the header and PAYLOAD_MARGIN (4); CHANNEL also
+  budgets per frame come from FIRMWARE_TEXT_LIMIT (160) less the marker
+  and one Z85 padding character, divided by Z85's 5/4 expansion, less
+  the header and PAYLOAD_MARGIN (4) (`_payload_budget`); CHANNEL also
   loses the firmware's own "<name>: " prefix.
 
   "R" (MARKER) -- an RNS packet, or one fragment of it. Byte 0 is
@@ -3048,7 +3049,7 @@ class _WireFormatMixin:
         held: "Optional[set]" = None, version: Optional[int] = None,
         nonce: Optional[int] = None,
     ) -> str:
-        """`version` defaults to this build's own (v2). Passing
+        """`version` defaults to this build's own (v3 since 2026-09-19). Passing
         `COMPLETION_PROTOCOL_VERSION_V1` produces the pre-step-3 fixed-body
         frame -- used to answer a v1 QUERY in kind. `held` is only encoded
         on a v2 ANSWER; `complete` is carried by both versions (redundant
@@ -3139,7 +3140,7 @@ class _WireFormatMixin:
 
     def _raw_fragment_report_requested(self, raw: bytes) -> bool:
         """Whether byte 0 of a raw fragment carries RAW_FLAG_REPORT (the
-        burst's last fragment, 2026-09-20). Read separately from
+        burst's last two fragments, 2026-09-20). Read separately from
         `_decode_raw_fragment` so the decoder's 4-tuple contract, and the
         tests pinning it, stay unchanged."""
         return bool(raw) and bool(raw[0] & self.RAW_FLAG_REPORT)
