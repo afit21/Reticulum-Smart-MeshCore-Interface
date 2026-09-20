@@ -133,7 +133,12 @@ class LastTwoFragmentsCarryTheFlag(SingleNodeCase):
             self.on_loop(lambda: iface._handle_direct_multifragment_frame(h0, b"a" * 10, PEER, raw=True, report_requested=False))
             self.assertEqual(sent, [], "an unflagged fragment must not report")
             self.on_loop(lambda: iface._handle_direct_multifragment_frame(h1, b"b" * 10, PEER, raw=True, report_requested=True))
-            self.assertEqual(len(sent), 1)
+            # Phase 3 M1 (2026-09-20): the gaps report is HELD for one fragment
+            # airtime (the last fragment is usually right behind) and sent
+            # only if the bucket is still incomplete when the hold ends.
+            self.assertEqual(sent, [], "the gaps report is not sent at once (M1 debounce)")
+            hold = iface._report_hold_s(10 + iface.RAW_HEADER_SIZE, 0)
+            self.assertTrue(wait_until(lambda: len(sent) == 1, hold + 2.0), "the gaps report goes out after the hold")
             args, kwargs = sent[-1]
             self.assertEqual(args[0], PEER)
             self.assertFalse(kwargs.get("complete"))

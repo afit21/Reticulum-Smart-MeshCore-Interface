@@ -501,6 +501,29 @@ class _ConfigMixin:
         # relays) per delivered part, and removes the QUERY-vs-PROOF
         # collision from the common path. `no` restores burst-then-QUERY.
         self.direct_raw_report_enabled = _cfg_bool(cfg.get("direct_raw_report_enabled", "yes"))
+        # Phase 3 M1 (2026-09-20, docs/reconcile_redesign.md): the REPORT
+        # and the QUERY's ANSWER go out as MeshCore TXT_TYPE_CLI_DATA --
+        # encrypted and MAC'd like any text message, relayed identically,
+        # delivered to the host as CONTACT_MSG_RECV with txt_type 1, and
+        # NEVER acknowledged by the firmware (`BaseChatMesh::onPeerDataRecv`:
+        # "no ack expected for CLI_DATA replies"; `CMD_SEND_TXT_MSG` sets
+        # expected_ack 0 for it). The sender's next action confirms a
+        # report; a lost one falls through to the QUERY as before. Saves
+        # the ACK frame (and its relays) per report and, on the reporting
+        # side, the 1-3 s ACK wait that made reports queue behind each
+        # other (23 of the 31 report lock waits over 1 s in the 2026-09-20
+        # zero-hop session were the previous report's ACK wait). `no`
+        # restores ACKed reports and answers.
+        self.direct_report_noack = _cfg_bool(cfg.get("direct_report_noack", "yes"))
+        # Phase 3 M1: a flagged fragment that leaves gaps no longer reports
+        # at once -- the second-last fragment is flagged too, so at zero hop
+        # the receiver sent a gaps report and, 0.2-0.4 s later, the complete
+        # one (146 reports for ~105 bursts in the 2026-09-20 session, and the
+        # sender re-drove the last fragment as a duplicate 20 times). The
+        # gaps report is held for one fragment's airtime plus its relay gap
+        # (`_report_hold_s`) and dropped if the bucket completes first. `no`
+        # reports immediately as before.
+        self.direct_report_debounce = _cfg_bool(cfg.get("direct_report_debounce", "yes"))
         # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
         # answer budget's own slope, so the floor stays under the budget at
         # every depth: 4 / 6.5 / 9 / 11.5 s against 5 / 7.5 / 10 / 12.5 s),

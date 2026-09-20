@@ -1539,6 +1539,86 @@ class _DirectSendMixin:
         finally:
             self._direct_exchange_queue_depth -= 1
 
+    # -- No-ACK text frames (phase 3 M1, 2026-09-20) ------------------------
+
+    TXT_TYPE_PLAIN = 0
+    TXT_TYPE_CLI_DATA = 1
+
+    def _noack_frame_hold_s(self, on_air_bytes: int, hops: int) -> float:
+        """How long the radio lock stays held after a no-ACK frame leaves
+        (pure function, docs/reconcile_redesign.md): `send_msg` returns
+        when the frame is QUEUED (MeshBench finding 2), so at least its own
+        airtime; through repeaters the same hop-scaled relay gap a raw
+        fragment gets (`_raw_fragment_gap_s`, which includes the airtime);
+        at zero hop the airtime plus `direct_raw_zero_hop_gap`."""
+        if hops > 0:
+            return self._raw_fragment_gap_s(hops, on_air_bytes)
+        return self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes) + max(0.0, self.direct_raw_zero_hop_gap_s)
+
+    async def _send_direct_noack_frame(
+        self, target: str, frame: str, attempt: int, peer_prefix: Optional[str], hop_count: int,
+        kind: str, priority: int = PRIORITY_NORMAL,
+    ) -> bool:
+        """One text frame as TXT_TYPE_CLI_DATA: the firmware delivers it
+        (CONTACT_MSG_RECV, txt_type 1) and never ACKs it, so the lock is
+        held only through the gate, the send command and the frame's
+        hold (`_noack_frame_hold_s`), never through an ACK wait. The
+        command frame is the one the library's own `send_msg` builds
+        (`meshcore/commands/messaging.py`) with the type byte set:
+        `[0x02][txt_type][attempt][timestamp:4 LE][dst_prefix:6][text]`
+        (`MyMesh::onSerialFrame`, CMD_SEND_TXT_MSG). Returns whether the
+        firmware accepted it. Captured as a `direct_attempt_result` of
+        `kind` with `ack_timeout_source="noack"`."""
+        self._direct_exchange_queue_depth += 1
+        wait_start = time.monotonic()
+        try:
+            async with self._direct_exchange_lock(priority):
+                lock_wait_s = time.monotonic() - wait_start
+                queue_depth_at_acquire = self._direct_exchange_queue_depth
+                gate_telemetry: dict = {}
+                on_air_bytes = self._text_frame_on_air_bytes(frame, hop_count)
+                ok = False
+                send_exc = None
+                hold_s = 0.0
+                try:
+                    await self._pre_transmit_gate(
+                        frame, skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                    )
+                    gate_telemetry["duty_cycle_exempt"] = self._duty_cycle_exempt(priority)
+                    dst = bytes.fromhex(str(target)[:12])
+                    data = (
+                        bytes([0x02, self.TXT_TYPE_CLI_DATA, attempt & 0xFF])
+                        + int(time.time()).to_bytes(4, "little") + dst + frame.encode("utf-8")
+                    )
+                    await self._run_command(
+                        self._mc_ready.commands.send(data, [self._EventType.MSG_SENT, self._EventType.ERROR]),
+                        "send_txt_msg(cli_data)", self._EventType.MSG_SENT,
+                    )
+                    self.txb += len(frame)
+                    ok = True
+                    hold_s = self._noack_frame_hold_s(on_air_bytes, hop_count)
+                    # The frame is on air / in the chain: keep the radio
+                    # quiet for its hold, yielding to a Link handshake only
+                    # once the frame itself is off the air.
+                    airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
+                    await self._idle_hold(hold_s, floor_s=airtime_s)
+                except Exception as exc:
+                    send_exc = exc
+                self._debug(
+                    f"no-ACK {kind} to {peer_prefix!r}: sent={ok} lock_wait={lock_wait_s:.2f}s "
+                    f"hold={hold_s:.2f}s hop={hop_count}" + (f" (local send exception: {send_exc})" if send_exc else "") + "."
+                )
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, None,
+                    hop_count=hop_count, time_critical=True, listen_delay_s=hold_s,
+                    ack_timeout_source="noack", kind=kind,
+                    duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
+                    on_air_bytes=on_air_bytes if ok else None,
+                )
+                return ok
+        finally:
+            self._direct_exchange_queue_depth -= 1
+
     async def _send_direct(self, target, payload: bytes):
         """A bare (fits-in-one-message) DIRECT send making exactly one
         attempt. Note this method itself is NOT on the real send path as

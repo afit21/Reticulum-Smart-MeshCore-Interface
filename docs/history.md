@@ -2987,3 +2987,45 @@ split, no behaviour change.** Two steps, ten pure-move commits.
    full unit suite, and MeshBench `zero_hop` and `relay` twice each on
    this build and on the frozen alpha 0.1.3 build, recorded in
    `changelog.md` and the session report.
+
+**Airtime / throughput pass, phase 3 (2026-09-20 night): the reconcile
+redesign, `docs/reconcile_redesign.md`.** One module (`_reconcile.py`)
+owns the burst-and-report state machine; every timing decision is a pure
+function with a deterministic test pinned to the field number it came
+from. Milestones in order, each gated on the full suite and MeshBench
+`large_payload` + `relay` twice against the previous milestone's runs.
+
+ M1. **Reports without a firmware ACK, debounced** (`direct_report_noack`,
+     `direct_report_debounce`, both default yes; `_send_direct_noack_frame`,
+     `_noack_frame_hold_s`, `_report_hold_s`, `_schedule_gaps_report`).
+     Verified in the firmware: `TXT_TYPE_CLI_DATA` (1) is the same
+     encrypted, MAC'd TXT_MSG datagram as a plain message
+     (`BaseChatMesh::sendCommandData` -> `createDatagram`), relayed the
+     same way, delivered to the host as CONTACT_MSG_RECV with `txt_type`
+     1 (`MyMesh::onCommandDataRecv`), and never ACKed
+     (`BaseChatMesh::onPeerDataRecv`: "no ack expected for CLI_DATA
+     replies"; the companion's CMD_SEND_TXT_MSG handler sets expected_ack
+     0). The library's `send_msg` hard-codes type 0, so the frame is
+     built as it builds it -- `[0x02][txt_type][attempt][ts:4][dst:6]
+     [text]` -- and sent through `commands.send()`. Every REPORT and
+     every QUERY ANSWER now goes that way: the "Q" bytes are unchanged
+     (the golden wire snapshot did not move), the receiver's lock is held
+     only through the gate, the send and the frame's hold (its airtime
+     plus the raw relay gap through repeaters; airtime plus the zero-hop
+     gap at hop 0) -- never through the 1-3 s ACK wait that made reports
+     queue behind each other (23 of the 31 report lock waits over 1 s in
+     the 2026-09-20 zero-hop session). The QUERY stays ACKed (path
+     evidence, the quiet window's anchor). Debounce: a flagged fragment
+     that leaves gaps arms a hold of one fragment airtime (plus the relay
+     gap through repeaters) instead of reporting at once; a completion
+     inside the hold cancels it and only the complete report goes (the
+     complete report followed the gaps report by 0.22-0.43 s at the
+     receiver at zero hop; 146 reports for ~105 bursts, and the sender
+     re-drove the last fragment as a duplicate 20 times on those). The
+     sender's rules are unchanged: a lost report falls through to the
+     QUERY. The fake `meshcore` gained the CLI_DATA semantics (`commands.
+     send` of a SEND_TXT_MSG frame, delivered with txt_type 1, no ACK).
+     Tests: `tests/test_reconcile_m1_noack_reports_0920.py`; the two
+     receiver tests that expected an immediate gaps report now wait out
+     the hold. Shipped-default pins and golden config re-pinned (two new
+     keys). Gate results are in `changelog.md`.

@@ -792,6 +792,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # _answer_path_request_locally.
         self._announce_cache = collections.OrderedDict()
         self._path_request_local_answer_at = {}
+        # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
+        # report (M1 debounce); cancelled when the bucket completes.
+        self._pending_gap_reports = {}
 
         self._contact_refresh_task = None
 

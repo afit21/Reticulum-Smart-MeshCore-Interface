@@ -107,7 +107,13 @@ class ReceiverReportsOnTheFlaggedSecondLastFragment(SingleNodeCase):
                 )
                 for _ in range(3):
                     await asyncio.sleep(0)   # let the spawned answer task run
-            self.node.run_on_loop(scenario(), timeout=10.0)
+                # Phase 3 M1 (2026-09-20): the gaps report is held for one
+                # fragment airtime plus the one-hop relay gap first.
+                assert answers == [], "the gaps report is not sent at once (M1 debounce)"
+                await asyncio.sleep(iface._report_hold_s(10 + iface.RAW_HEADER_SIZE, 1) + 0.5)
+                for _ in range(3):
+                    await asyncio.sleep(0)
+            self.node.run_on_loop(scenario(), timeout=15.0)
 
             self.assertEqual(len(answers), 1, "exactly one report for the flagged second-last fragment")
             sender_token, got_pkt_id, got_total, complete, kwargs = answers[0]

@@ -1229,7 +1229,58 @@ class _ReconcileMixin:
         if not fut.done():
             fut.set_result(frame)
 
-    def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set) -> None:
+    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int) -> float:
+        """How long a receiver holds a gaps report after a flagged fragment
+        that left gaps (pure function, phase 3 M1): the time the burst's
+        LAST fragment needs to arrive -- one fragment's airtime plus, through
+        repeaters, the hop-scaled relay gap the sender itself observes
+        between fragments (`_raw_fragment_gap_s`). Field: the complete
+        report followed the gaps report by 0.22-0.43 s at the receiver at
+        zero hop, one fragment airtime (~0.9 s at SF7/BW62.5) covers it."""
+        if hops > 0:
+            return self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
+        return self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
+
+    def _schedule_gaps_report(self, key, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
+        """Hold the gaps report for `_report_hold_s` (M1 debounce); if the
+        bucket completes first the complete report supersedes it
+        (`_cancel_gaps_report`). A second flagged fragment while one is
+        held re-arms the hold (the bitmap is read when it fires). With
+        `direct_report_debounce = no` the report goes at once."""
+        def held_now() -> set:
+            bucket = self._reassembly.get(key)
+            return set(bucket.fragments.keys()) if bucket is not None else set()
+
+        if not self.direct_report_debounce or not self.direct_raw_report_enabled:
+            self._send_completion_report(sender_token, header, complete=False, held=held_now())
+            return
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        hops = max(0, resolved.out_path_len) if resolved is not None else 0
+        hold_s = self._report_hold_s(fragment_on_air_bytes, hops)
+        self._cancel_gaps_report(key)
+
+        async def fire():
+            try:
+                await asyncio.sleep(hold_s)
+                if self._pending_gap_reports.get(key) is not asyncio.current_task():
+                    return
+                self._pending_gap_reports.pop(key, None)
+                if key not in self._reassembly or self._dedup_contains(key):
+                    return   # completed (its report went) or gone meanwhile
+                self._send_completion_report(sender_token, header, complete=False, held=held_now(), held_s=hold_s)
+            except asyncio.CancelledError:
+                pass
+
+        self._pending_gap_reports[key] = self._spawn_background_task(fire())
+
+    def _cancel_gaps_report(self, key) -> None:
+        task = self._pending_gap_reports.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set,
+                                held_s: Optional[float] = None) -> None:
         """Receiver-initiated completion report (2026-09-20): one unsolicited
         v3 ANSWER for a raw burst, nonce `COMPLETION_REPORT_NONCE_BASE |
         round` (the raw header's attempt bits), spawned from the raw receive
@@ -1249,6 +1300,8 @@ class _ReconcileMixin:
                 "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
                 "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
                 "round": (header.attempt or 0) & 0x03,
+                "held_s": round(held_s, 3) if held_s is not None else None,   # M1 debounce hold, gaps reports only
+                "noack": self.direct_report_noack,
             })
         self._spawn_background_task(
             self._send_completion_answer(
@@ -1315,6 +1368,18 @@ class _ReconcileMixin:
         gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
         if gap_s > 0:
             await asyncio.sleep(gap_s)
+        if self.direct_report_noack:
+            # Phase 3 M1 (2026-09-20): TXT_TYPE_CLI_DATA -- delivered, never
+            # ACKed; the querier's / sender's next action confirms it.
+            try:
+                await self._send_direct_noack_frame(
+                    target, frame, (nonce or 0) & 0x03, peer_prefix, hops,
+                    kind="completion_report" if report else "completion_answer",
+                    priority=self.PRIORITY_ANSWER,
+                )
+            except Exception as exc:
+                self._debug(f"no-ACK completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) failed locally: {exc}.")
+            return
         try:
             ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                 target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
@@ -1407,16 +1472,20 @@ class _ReconcileMixin:
             if raw and report_requested:
                 # One of the burst's last two fragments landed but the bucket
                 # has gaps: report the bitmap unasked, so the sender re-drives
-                # exactly the missing fragments without a QUERY first.
-                bucket = self._reassembly.get(key)
-                held = set(bucket.fragments.keys()) if bucket is not None else set()
-                self._send_completion_report(sender_token, header, complete=False, held=held)
+                # exactly the missing fragments without a QUERY first --
+                # after a hold, since the flagged second-last fragment is
+                # usually followed by the last one within a fragment airtime
+                # (phase 3 M1, 2026-09-20; docs/reconcile_redesign.md).
+                self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
         else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
             if raw:
                 # Report BEFORE RNS sees the packet, so the report enters the
                 # radio lock ahead of whatever RNS sends back (a PROOF, the
-                # next Resource request) and the sender learns first.
+                # next Resource request) and the sender learns first. A gaps
+                # report still held for this bucket is dropped: complete
+                # supersedes it (M1 debounce).
+                self._cancel_gaps_report(key)
                 self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)

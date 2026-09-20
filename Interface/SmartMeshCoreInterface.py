@@ -1263,6 +1263,29 @@ class _ConfigMixin:
         # relays) per delivered part, and removes the QUERY-vs-PROOF
         # collision from the common path. `no` restores burst-then-QUERY.
         self.direct_raw_report_enabled = _cfg_bool(cfg.get("direct_raw_report_enabled", "yes"))
+        # Phase 3 M1 (2026-09-20, docs/reconcile_redesign.md): the REPORT
+        # and the QUERY's ANSWER go out as MeshCore TXT_TYPE_CLI_DATA --
+        # encrypted and MAC'd like any text message, relayed identically,
+        # delivered to the host as CONTACT_MSG_RECV with txt_type 1, and
+        # NEVER acknowledged by the firmware (`BaseChatMesh::onPeerDataRecv`:
+        # "no ack expected for CLI_DATA replies"; `CMD_SEND_TXT_MSG` sets
+        # expected_ack 0 for it). The sender's next action confirms a
+        # report; a lost one falls through to the QUERY as before. Saves
+        # the ACK frame (and its relays) per report and, on the reporting
+        # side, the 1-3 s ACK wait that made reports queue behind each
+        # other (23 of the 31 report lock waits over 1 s in the 2026-09-20
+        # zero-hop session were the previous report's ACK wait). `no`
+        # restores ACKed reports and answers.
+        self.direct_report_noack = _cfg_bool(cfg.get("direct_report_noack", "yes"))
+        # Phase 3 M1: a flagged fragment that leaves gaps no longer reports
+        # at once -- the second-last fragment is flagged too, so at zero hop
+        # the receiver sent a gaps report and, 0.2-0.4 s later, the complete
+        # one (146 reports for ~105 bursts in the 2026-09-20 session, and the
+        # sender re-drove the last fragment as a duplicate 20 times). The
+        # gaps report is held for one fragment's airtime plus its relay gap
+        # (`_report_hold_s`) and dropped if the bucket completes first. `no`
+        # reports immediately as before.
+        self.direct_report_debounce = _cfg_bool(cfg.get("direct_report_debounce", "yes"))
         # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
         # answer budget's own slope, so the floor stays under the budget at
         # every depth: 4 / 6.5 / 9 / 11.5 s against 5 / 7.5 / 10 / 12.5 s),
@@ -6373,6 +6396,86 @@ class _DirectSendMixin:
         finally:
             self._direct_exchange_queue_depth -= 1
 
+    # -- No-ACK text frames (phase 3 M1, 2026-09-20) ------------------------
+
+    TXT_TYPE_PLAIN = 0
+    TXT_TYPE_CLI_DATA = 1
+
+    def _noack_frame_hold_s(self, on_air_bytes: int, hops: int) -> float:
+        """How long the radio lock stays held after a no-ACK frame leaves
+        (pure function, docs/reconcile_redesign.md): `send_msg` returns
+        when the frame is QUEUED (MeshBench finding 2), so at least its own
+        airtime; through repeaters the same hop-scaled relay gap a raw
+        fragment gets (`_raw_fragment_gap_s`, which includes the airtime);
+        at zero hop the airtime plus `direct_raw_zero_hop_gap`."""
+        if hops > 0:
+            return self._raw_fragment_gap_s(hops, on_air_bytes)
+        return self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes) + max(0.0, self.direct_raw_zero_hop_gap_s)
+
+    async def _send_direct_noack_frame(
+        self, target: str, frame: str, attempt: int, peer_prefix: Optional[str], hop_count: int,
+        kind: str, priority: int = PRIORITY_NORMAL,
+    ) -> bool:
+        """One text frame as TXT_TYPE_CLI_DATA: the firmware delivers it
+        (CONTACT_MSG_RECV, txt_type 1) and never ACKs it, so the lock is
+        held only through the gate, the send command and the frame's
+        hold (`_noack_frame_hold_s`), never through an ACK wait. The
+        command frame is the one the library's own `send_msg` builds
+        (`meshcore/commands/messaging.py`) with the type byte set:
+        `[0x02][txt_type][attempt][timestamp:4 LE][dst_prefix:6][text]`
+        (`MyMesh::onSerialFrame`, CMD_SEND_TXT_MSG). Returns whether the
+        firmware accepted it. Captured as a `direct_attempt_result` of
+        `kind` with `ack_timeout_source="noack"`."""
+        self._direct_exchange_queue_depth += 1
+        wait_start = time.monotonic()
+        try:
+            async with self._direct_exchange_lock(priority):
+                lock_wait_s = time.monotonic() - wait_start
+                queue_depth_at_acquire = self._direct_exchange_queue_depth
+                gate_telemetry: dict = {}
+                on_air_bytes = self._text_frame_on_air_bytes(frame, hop_count)
+                ok = False
+                send_exc = None
+                hold_s = 0.0
+                try:
+                    await self._pre_transmit_gate(
+                        frame, skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                    )
+                    gate_telemetry["duty_cycle_exempt"] = self._duty_cycle_exempt(priority)
+                    dst = bytes.fromhex(str(target)[:12])
+                    data = (
+                        bytes([0x02, self.TXT_TYPE_CLI_DATA, attempt & 0xFF])
+                        + int(time.time()).to_bytes(4, "little") + dst + frame.encode("utf-8")
+                    )
+                    await self._run_command(
+                        self._mc_ready.commands.send(data, [self._EventType.MSG_SENT, self._EventType.ERROR]),
+                        "send_txt_msg(cli_data)", self._EventType.MSG_SENT,
+                    )
+                    self.txb += len(frame)
+                    ok = True
+                    hold_s = self._noack_frame_hold_s(on_air_bytes, hop_count)
+                    # The frame is on air / in the chain: keep the radio
+                    # quiet for its hold, yielding to a Link handshake only
+                    # once the frame itself is off the air.
+                    airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
+                    await self._idle_hold(hold_s, floor_s=airtime_s)
+                except Exception as exc:
+                    send_exc = exc
+                self._debug(
+                    f"no-ACK {kind} to {peer_prefix!r}: sent={ok} lock_wait={lock_wait_s:.2f}s "
+                    f"hold={hold_s:.2f}s hop={hop_count}" + (f" (local send exception: {send_exc})" if send_exc else "") + "."
+                )
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, None,
+                    hop_count=hop_count, time_critical=True, listen_delay_s=hold_s,
+                    ack_timeout_source="noack", kind=kind,
+                    duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
+                    on_air_bytes=on_air_bytes if ok else None,
+                )
+                return ok
+        finally:
+            self._direct_exchange_queue_depth -= 1
+
     async def _send_direct(self, target, payload: bytes):
         """A bare (fits-in-one-message) DIRECT send making exactly one
         attempt. Note this method itself is NOT on the real send path as
@@ -7673,7 +7776,58 @@ class _ReconcileMixin:
         if not fut.done():
             fut.set_result(frame)
 
-    def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set) -> None:
+    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int) -> float:
+        """How long a receiver holds a gaps report after a flagged fragment
+        that left gaps (pure function, phase 3 M1): the time the burst's
+        LAST fragment needs to arrive -- one fragment's airtime plus, through
+        repeaters, the hop-scaled relay gap the sender itself observes
+        between fragments (`_raw_fragment_gap_s`). Field: the complete
+        report followed the gaps report by 0.22-0.43 s at the receiver at
+        zero hop, one fragment airtime (~0.9 s at SF7/BW62.5) covers it."""
+        if hops > 0:
+            return self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
+        return self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
+
+    def _schedule_gaps_report(self, key, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
+        """Hold the gaps report for `_report_hold_s` (M1 debounce); if the
+        bucket completes first the complete report supersedes it
+        (`_cancel_gaps_report`). A second flagged fragment while one is
+        held re-arms the hold (the bitmap is read when it fires). With
+        `direct_report_debounce = no` the report goes at once."""
+        def held_now() -> set:
+            bucket = self._reassembly.get(key)
+            return set(bucket.fragments.keys()) if bucket is not None else set()
+
+        if not self.direct_report_debounce or not self.direct_raw_report_enabled:
+            self._send_completion_report(sender_token, header, complete=False, held=held_now())
+            return
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        hops = max(0, resolved.out_path_len) if resolved is not None else 0
+        hold_s = self._report_hold_s(fragment_on_air_bytes, hops)
+        self._cancel_gaps_report(key)
+
+        async def fire():
+            try:
+                await asyncio.sleep(hold_s)
+                if self._pending_gap_reports.get(key) is not asyncio.current_task():
+                    return
+                self._pending_gap_reports.pop(key, None)
+                if key not in self._reassembly or self._dedup_contains(key):
+                    return   # completed (its report went) or gone meanwhile
+                self._send_completion_report(sender_token, header, complete=False, held=held_now(), held_s=hold_s)
+            except asyncio.CancelledError:
+                pass
+
+        self._pending_gap_reports[key] = self._spawn_background_task(fire())
+
+    def _cancel_gaps_report(self, key) -> None:
+        task = self._pending_gap_reports.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set,
+                                held_s: Optional[float] = None) -> None:
         """Receiver-initiated completion report (2026-09-20): one unsolicited
         v3 ANSWER for a raw burst, nonce `COMPLETION_REPORT_NONCE_BASE |
         round` (the raw header's attempt bits), spawned from the raw receive
@@ -7693,6 +7847,8 @@ class _ReconcileMixin:
                 "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
                 "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
                 "round": (header.attempt or 0) & 0x03,
+                "held_s": round(held_s, 3) if held_s is not None else None,   # M1 debounce hold, gaps reports only
+                "noack": self.direct_report_noack,
             })
         self._spawn_background_task(
             self._send_completion_answer(
@@ -7759,6 +7915,18 @@ class _ReconcileMixin:
         gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
         if gap_s > 0:
             await asyncio.sleep(gap_s)
+        if self.direct_report_noack:
+            # Phase 3 M1 (2026-09-20): TXT_TYPE_CLI_DATA -- delivered, never
+            # ACKed; the querier's / sender's next action confirms it.
+            try:
+                await self._send_direct_noack_frame(
+                    target, frame, (nonce or 0) & 0x03, peer_prefix, hops,
+                    kind="completion_report" if report else "completion_answer",
+                    priority=self.PRIORITY_ANSWER,
+                )
+            except Exception as exc:
+                self._debug(f"no-ACK completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) failed locally: {exc}.")
+            return
         try:
             ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                 target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
@@ -7851,16 +8019,20 @@ class _ReconcileMixin:
             if raw and report_requested:
                 # One of the burst's last two fragments landed but the bucket
                 # has gaps: report the bitmap unasked, so the sender re-drives
-                # exactly the missing fragments without a QUERY first.
-                bucket = self._reassembly.get(key)
-                held = set(bucket.fragments.keys()) if bucket is not None else set()
-                self._send_completion_report(sender_token, header, complete=False, held=held)
+                # exactly the missing fragments without a QUERY first --
+                # after a hold, since the flagged second-last fragment is
+                # usually followed by the last one within a fragment airtime
+                # (phase 3 M1, 2026-09-20; docs/reconcile_redesign.md).
+                self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
         else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
             if raw:
                 # Report BEFORE RNS sees the packet, so the report enters the
                 # radio lock ahead of whatever RNS sends back (a PROOF, the
-                # next Resource request) and the sender learns first.
+                # next Resource request) and the sender learns first. A gaps
+                # report still held for this bucket is dropped: complete
+                # supersedes it (M1 debounce).
+                self._cancel_gaps_report(key)
                 self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
@@ -10593,6 +10765,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # _answer_path_request_locally.
         self._announce_cache = collections.OrderedDict()
         self._path_request_local_answer_at = {}
+        # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
+        # report (M1 debounce); cancelled when the bucket completes.
+        self._pending_gap_reports = {}
 
         self._contact_refresh_task = None
 

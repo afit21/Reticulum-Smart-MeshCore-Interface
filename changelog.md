@@ -7,6 +7,21 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Changed: airtime / throughput pass, phase 3 -- the reconcile redesign (2026-09-20 night)
+
+Design: `docs/reconcile_redesign.md`. One module owns the burst-and-report state machine; each
+timing decision is a pure function with a test pinned to its field number. Each milestone is gated
+on the full suite and MeshBench `large_payload` + `relay` (two runs) against the previous milestone.
+
+- **M1: reports without a firmware ACK, debounced** (new keys `direct_report_noack`,
+  `direct_report_debounce`, both yes). REPORTs and QUERY ANSWERs go out as MeshCore
+  `TXT_TYPE_CLI_DATA`: encrypted and relayed like any text message, delivered as CONTACT_MSG_RECV
+  with txt_type 1, never ACKed by the firmware (`BaseChatMesh::onPeerDataRecv`). The "Q" bytes are
+  unchanged; the reporting node's lock is held for the frame's airtime and relay gap instead of an
+  ACK wait. A gaps report is held one fragment airtime (plus the relay gap) and dropped if the
+  bucket completes first -- the second-last fragment's report and the duplicate last fragment it
+  caused (20 of 43 zero-hop rounds) are gone. Tests: `tests/test_reconcile_m1_noack_reports_0920.py`.
+
 ### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
 
 - **The dated design history moved out of the module docstring into `docs/history.md`**, verbatim

@@ -207,6 +207,8 @@ CONFIGURE_RETRY = {
     'direct_raw_report_wait_base_s': 4.0,
     'direct_raw_report_wait_per_hop_s': 2.5,
     'direct_raw_zero_hop_gap_s': 0.15,
+    'direct_report_debounce': True,
+    'direct_report_noack': True,
     'ordinary_data_bare_retransmit_extra': 1,
     'ordinary_data_link_retransmit_extra': 0,
     'outgoing_duplicate_suppress_limit': 3,
