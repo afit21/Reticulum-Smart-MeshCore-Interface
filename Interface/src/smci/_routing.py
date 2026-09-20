@@ -1473,6 +1473,7 @@ class _RoutingMixin:
         self._handle_direct_multifragment_frame(
             header, rns_payload, sender_token, raw=True,
             report_requested=self._raw_fragment_report_requested(data),
+            parity=self._raw_fragment_is_parity(data),
         )
 
     def _on_channel_msg_recv(self, event):

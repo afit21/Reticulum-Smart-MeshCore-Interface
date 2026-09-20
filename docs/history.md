@@ -3100,3 +3100,37 @@ from. Milestones in order, each gated on the full suite and MeshBench
      `tests/test_reconcile_m3_short_header_0920.py`; the codec, budget
      and strike tests updated to the 9-byte header (the strike scenario's
      payload is now sized to four fragments explicitly).
+
+ M4. **Hop-adaptive XOR parity** (`RAW_FLAG_PARITY` 0x08; new keys
+     `direct_raw_parity_enabled` yes, `direct_raw_parity_min_hops` 1;
+     `_encode_raw_parity`, `_raw_parity_fits`, `_raw_parity_fragments`,
+     `_reconstruct_from_parity`). From one hop up, every part's burst of
+     two or more data fragments ends with one parity fragment: the raw
+     header with the parity flag, frag_idx carrying the coverage mask,
+     the payload the length of the highest covered fragment followed by
+     the XOR of the covered fragments padded to the longest (at most 1 +
+     161 bytes, which fits the firmware's 172 / 174 - path_len limits up
+     to three hops; `_raw_parity_fits` withholds it where it would not).
+     A round-1 re-drive of two or more fragments gets a parity over
+     exactly those. The receiver keeps parities in the bucket
+     (`_ReassemblyBucket.parity`, keyed by mask) and, after every data
+     or parity fragment, reconstructs any covered fragment that is the
+     only one missing -- the short last fragment's length comes from the
+     parity's first byte -- then completes the bucket through the
+     ordinary path, so the packet reaches RNS once and the have-bitmap
+     reports data fragments only. Motivation (the 2026-09-19 field
+     numbers): at one hop ~18 % of raw fragments are lost, so a three-
+     fragment part loses exactly one 41 % of the time it loses any; each
+     such part now completes in the burst instead of a report + re-drive
+     round (one 170-byte frame instead of a report, a re-driven fragment
+     and a second report, and a full report window sooner). At zero hop
+     (~5 % loss) the parity's 25 % airtime is not worth it, so the
+     shipped floor is one hop. Parity frames carry the burst's report
+     flag (they are the burst's last frame) and appear in the capture as
+     `raw_fragment_sent` with `parity_mask` and `raw_fragment_received`
+     with `parity`. Golden wire snapshot: `_encode_raw_parity` cases
+     added, nothing else changed. Tests:
+     `tests/test_reconcile_m4_parity_0920.py` (the pure functions, the
+     codec, reconstruction of each single loss with the parity before or
+     after the loss is visible, two losses left to the report path, the
+     burst and re-drive shapes at one hop, none at zero hop).

@@ -103,6 +103,7 @@ ENCODERS = (
     "_encode_completion_frame",
     "_encode_completion_frame_v4",
     "_encode_raw_fragment",
+    "_encode_raw_parity",
 )
 BUDGETS = (
     "_channel_payload_budget",
@@ -237,6 +238,21 @@ def build_cases(module):
                        frame_type=cls.COMPLETION_TYPE_QUERY, pkt_id=0xFFFF, frag_total=2, complete=False,
                        held=[], version=None, nonce=cls.COMPLETION_QUERY_NONCE_MAX))
 
+    # -- raw parity fragments (phase 3 M4, 2026-09-20) -----------------------
+    # `fragments` = [[frag_idx, payload_hex]]: the XOR over the covered
+    # fragments padded to the longest, prefixed by the last covered one's length.
+    parity_sets = {
+        "three_of_three": [[0, bytes(range(0, 40)).hex()], [1, bytes(range(40, 80)).hex()], [2, bytes(range(80, 100)).hex()]],
+        "two_redrive": [[0, bytes(range(0, 40)).hex()], [2, bytes(range(80, 95)).hex()]],
+        "eight": [[k, bytes([k] * (30 if k < 7 else 7)).hex()] for k in range(8)],
+    }
+    for set_name, frags in parity_sets.items():
+        for attempt in (0, 3):
+            for report in (False, True):
+                cases.append(_case(f"raw_parity_{set_name}_attempt{attempt}_report{int(report)}", "_encode_raw_parity",
+                                   fragments=frags, dst_pubkey_hex=DST_PUBKEY_HEX, src_prefix_hex=OWN_PUBKEY_HEX[:12],
+                                   pkt_id=PKT_ID, frag_total=8 if set_name == "eight" else 3, attempt=attempt, report=report))
+
     # -- raw binary DIRECT fragments -----------------------------------------
     for idx, total in ((0, 1), (3, 4), (254, 255)):
         for attempt in range(4):
@@ -282,6 +298,10 @@ def _invoke(iface, call, a):
     if call == "_encode_completion_frame_v4":
         return iface._encode_completion_frame_v4(
             a["frame_type"], [(p, t, c, set(h)) for p, t, c, h in a["entries"]], nonce=a["nonce"])
+    if call == "_encode_raw_parity":
+        return iface._encode_raw_parity(
+            [(i, bytes.fromhex(h)) for i, h in a["fragments"]], a["dst_pubkey_hex"], a["src_prefix_hex"],
+            a["pkt_id"], a["frag_total"], a["attempt"], report=a["report"])
     if call == "_encode_raw_fragment":
         return iface._encode_raw_fragment(
             bytes.fromhex(a["payload_hex"]), a["dst_pubkey_hex"], a["src_prefix_hex"],
@@ -382,6 +402,24 @@ def check_decodes(module, case, kind, encoded):
             eq("entry held", (set(got[3]) if got[3] is not None else None),
                ({i for i in h if 0 <= i < t} if is_answer else None))
         eq("first mirrored", (cf.pkt_id, cf.frag_total, cf.complete), (a["entries"][0][0], a["entries"][0][1] & 0xFF, a["entries"][0][2]))
+    elif call == "_encode_raw_parity":
+        raw = bytes.fromhex(encoded)
+        header, payload, src_prefix_hex, dst = iface._decode_raw_fragment(raw)
+        frags = [(i, bytes.fromhex(h)) for i, h in a["fragments"]]
+        eq("parity flag", iface._raw_fragment_is_parity(raw), True)
+        eq("report", iface._raw_fragment_report_requested(raw), a["report"])
+        eq("mask", header.frag_idx, sum(1 << i for i, _p in frags))
+        eq("frag_total", header.frag_total, a["frag_total"])
+        eq("attempt", header.attempt, a["attempt"] & 0x03)
+        top = max(i for i, _p in frags)
+        eq("last_len", payload[0], len(dict(frags)[top]))
+        width = max(len(p) for _i, p in frags)
+        eq("width", len(payload) - 1, width)
+        acc = bytearray(width)
+        for _i, p in frags:
+            for k, b in enumerate(p):
+                acc[k] ^= b
+        eq("xor", payload[1:], bytes(acc))
     elif call == "_encode_raw_fragment":
         raw = bytes.fromhex(encoded)
         header, payload, src_prefix_hex, dst = iface._decode_raw_fragment(raw)

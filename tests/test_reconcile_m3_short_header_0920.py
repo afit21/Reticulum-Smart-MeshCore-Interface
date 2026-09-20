@@ -79,7 +79,7 @@ class ShortSourcePrefix(SingleNodeCase):
         own = iface._own_pubkey_hex
         handled = []
         original = iface._handle_direct_multifragment_frame
-        iface._handle_direct_multifragment_frame = lambda header, payload, sender_token, raw=False, report_requested=False: handled.append(
+        iface._handle_direct_multifragment_frame = lambda header, payload, sender_token, raw=False, report_requested=False, parity=False: handled.append(
             (sender_token, header.pkt_id, header.frag_idx, raw, report_requested))
         try:
             frame = iface._encode_raw_fragment(b"y" * 20, own, PEER, 9, 1, 3, attempt=0, report=True)

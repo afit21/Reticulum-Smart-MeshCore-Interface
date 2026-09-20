@@ -191,7 +191,7 @@ class _ObservabilityMixin:
 
     def _capture_fragment_received(
         self, mode: str, sender_token: str, pkt_id: int, frag_idx: int, frag_total: int, progress: int,
-        raw: bool = False,
+        raw: bool = False, parity: bool = False,
     ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per individual
         fragment actually added to a reassembly bucket, not just the
@@ -216,6 +216,7 @@ class _ObservabilityMixin:
             "pkt_id": pkt_id,
             "frag_idx": frag_idx,
             "frag_total": frag_total,
+            "parity": parity,   # M4 (2026-09-20): a parity fragment; frag_idx is then its coverage mask
             "progress": progress,
             # User-requested (2026-09-19): raw binary fragment (True) or a
             # Z85 text one (False); both share the same reassembly bucket.

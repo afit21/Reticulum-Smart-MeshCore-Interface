@@ -328,7 +328,8 @@ class _WireFormatMixin:
         """RNS payload bytes per raw fragment for a path of `path_len`
         bytes: the smaller of the configured cap, the firmware's receive
         push limit and its send-frame limit less the path, minus our
-        13-byte header. 157 at zero hop with the defaults."""
+        9-byte header (M3, 2026-09-20). 161 up to four hops with the
+        defaults."""
         cap = min(self.direct_raw_payload_cap, self.FIRMWARE_RAW_RX_PAYLOAD_LIMIT,
                   self.FIRMWARE_RAW_TX_FRAME_LIMIT - max(0, path_len))
         return max(0, cap - self.RAW_HEADER_SIZE)
@@ -345,6 +346,51 @@ class _WireFormatMixin:
             + bytes([frag_idx & 0xFF, frag_total & 0xFF])
         )
         return header + payload
+
+    def _encode_raw_parity(
+        self, fragments: "list[tuple[int, bytes]]", dst_pubkey_hex: str, src_prefix_hex: str,
+        pkt_id: int, frag_total: int, attempt: int, report: bool = False,
+    ) -> bytes:
+        """One XOR parity fragment over `fragments` = [(frag_idx, payload)]
+        (phase 3 M4): RAW_FLAG_PARITY set, frag_idx = the coverage mask,
+        payload = [len of the highest-index covered fragment:1] + XOR of the
+        payloads padded with zeros to the longest one."""
+        mask = 0
+        width = max(len(p) for _i, p in fragments)
+        acc = bytearray(width)
+        last_len = 0
+        for idx, payload in fragments:
+            mask |= 1 << idx
+            for k, b in enumerate(payload):
+                acc[k] ^= b
+        top = max(i for i, _p in fragments)
+        last_len = len(dict(fragments)[top])
+        header = (
+            bytes([(self.RAW_PROTOCOL_VERSION << 4) | (attempt & 0x03) | self.RAW_FLAG_PARITY | (self.RAW_FLAG_REPORT if report else 0)])
+            + bytes.fromhex(dst_pubkey_hex[: self.RAW_DST_PREFIX_BYTES * 2])
+            + bytes.fromhex(src_prefix_hex[: self.RAW_SRC_PREFIX_BYTES * 2])
+            + pkt_id.to_bytes(2, "big")
+            + bytes([mask & 0xFF, frag_total & 0xFF])
+        )
+        return header + bytes([last_len & 0xFF]) + bytes(acc)
+
+    def _raw_fragment_is_parity(self, raw: bytes) -> bool:
+        return bool(raw) and bool(raw[0] & self.RAW_FLAG_PARITY)
+
+    def _raw_parity_fits(self, budget: int, path_len: int) -> bool:
+        """Whether a parity frame over fragments of `budget` bytes fits the
+        firmware's limits at this path length (pure function, M4):
+        header + 1 + budget within the receive push limit and within
+        cmd + path_len + path + payload."""
+        frame = self.RAW_HEADER_SIZE + 1 + budget
+        return frame <= min(self.FIRMWARE_RAW_RX_PAYLOAD_LIMIT, self.FIRMWARE_RAW_TX_FRAME_LIMIT - max(0, path_len))
+
+    def _raw_parity_fragments(self, hops: int) -> int:
+        """How many parity fragments a burst of one part gets at `hops`
+        (pure function, M4): 0 below `direct_raw_parity_min_hops`, else 1."""
+        if not self.direct_raw_parity_enabled or hops < max(0, self.direct_raw_parity_min_hops):
+            return 0
+        return 1
 
     def _raw_fragment_report_requested(self, raw: bytes) -> bool:
         """Whether byte 0 of a raw fragment carries RAW_FLAG_REPORT (the
@@ -373,8 +419,12 @@ class _WireFormatMixin:
         i += self.RAW_SRC_PREFIX_BYTES
         pkt_id = int.from_bytes(raw[i:i + 2], "big")
         frag_idx, frag_total = raw[i + 2], raw[i + 3]
-        if frag_total < 1 or frag_idx >= frag_total:
+        parity = bool(raw[0] & self.RAW_FLAG_PARITY)
+        if frag_total < 1 or (not parity and frag_idx >= frag_total):
             raise ValueError(f"invalid frag_idx/frag_total: {frag_idx}/{frag_total}")
+        if parity and (frag_idx == 0 or frag_idx >> frag_total or len(raw) < self.RAW_HEADER_SIZE + 2):
+            raise ValueError(f"invalid parity mask {frag_idx:#x} for frag_total {frag_total}")
+        # For a parity fragment frag_idx is the coverage mask (M4).
         header = _FrameHeader(self.PROTOCOL_VERSION, True, False, pkt_id, frag_idx, frag_total, attempt)
         return header, bytes(raw[self.RAW_HEADER_SIZE:]), src_prefix_hex, bytes(dst)
 

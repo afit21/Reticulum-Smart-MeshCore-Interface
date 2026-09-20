@@ -639,16 +639,35 @@ class _ReconcileMixin:
                         lock.release()
                         lock_held = False
 
+                # M4: the burst as a list of (part, frag_idx-or-None, frame
+                # builder); a parity frame follows each part's data
+                # fragments when parity applies to this hop count, the
+                # frame fits, and the part sends two or more fragments.
+                burst = []
+                n_parity = self._raw_parity_fragments(gap_hops) if self._raw_parity_fits(
+                    self._direct_raw_payload_budget(len(path)), len(path)) else 0
+                for part in parts:
+                    idxs = [i for p, i in missing if p is part]
+                    for i in idxs:
+                        burst.append((part, i, None))
+                    if n_parity and len(idxs) >= 2:
+                        burst.append((part, None, [(i, part.chunks[i]) for i in idxs]))
                 try:
-                    for n, (part, frag_idx) in enumerate(missing):
+                    for n, (part, frag_idx, parity_over) in enumerate(burst):
                         if self.detached or not self.online:
                             remember_all()
                             fail_rest(False)
                             return
-                        frame = self._encode_raw_fragment(
-                            part.chunks[frag_idx], target, own_prefix, part.pkt_id, frag_idx, part.frag_total, attempt=rnd,
-                            report=report_fut is not None and n >= len(missing) - 2,
-                        )
+                        flagged = report_fut is not None and n >= len(burst) - 2
+                        if parity_over is None:
+                            frame = self._encode_raw_fragment(
+                                part.chunks[frag_idx], target, own_prefix, part.pkt_id, frag_idx, part.frag_total, attempt=rnd,
+                                report=flagged,
+                            )
+                        else:
+                            frame = self._encode_raw_parity(
+                                parity_over, target, own_prefix, part.pkt_id, part.frag_total, attempt=rnd, report=flagged,
+                            )
                         telemetry: dict = {}
                         while True:
                             try:
@@ -674,11 +693,12 @@ class _ReconcileMixin:
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
                                 "handshake_yields": yields, "window_parts": len(parts),
+                                "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
                         gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
                         if gap_s > 0:
                             await asyncio.sleep(gap_s)
-                        if n < len(missing) - 1 and lock.preempt_requested():
+                        if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()
                             if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
@@ -1570,9 +1590,36 @@ class _ReconcileMixin:
         ack_airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=12)
         return max(0.0, ack_airtime_s * (1.0 + 2.5 * hops))
 
+    def _reconstruct_from_parity(self, key, bucket) -> "Optional[tuple[int, bytes]]":
+        """M4: if any held parity covers exactly one missing data fragment,
+        return (frag_idx, payload) for it -- XOR of the parity and the
+        other covered fragments padded to the parity's width, the last
+        covered fragment trimmed to its recorded length."""
+        for mask, (last_len, xor) in list(bucket.parity.items()):
+            covered = [i for i in range(bucket.frag_total) if mask & (1 << i)]
+            missing = [i for i in covered if i not in bucket.fragments]
+            if len(missing) != 1:
+                continue
+            idx = missing[0]
+            acc = bytearray(xor)
+            for i in covered:
+                if i == idx:
+                    continue
+                for k, b in enumerate(bucket.fragments[i]):
+                    if k < len(acc):
+                        acc[k] ^= b
+            data = bytes(acc[:last_len]) if idx == max(covered) else bytes(acc)
+            self._debug(f"reassembly {key}: fragment {idx} reconstructed from parity mask {mask:#x}.")
+            if self._packet_capture_file is not None:
+                self._capture_event("in", {"event": "raw_parity_reconstructed", "sender_token": key[1],
+                                           "pkt_id": key[2], "frag_total": key[3], "frag_idx": idx, "mask": mask})
+            bucket.parity.pop(mask, None)
+            return idx, data
+        return None
+
     def _handle_direct_multifragment_frame(
         self, header: _FrameHeader, payload: bytes, sender_token: str, raw: bool = False,
-        report_requested: bool = False,
+        report_requested: bool = False, parity: bool = False,
     ) -> None:
         """docs/wire_format_design.md's DIRECT-needs-fragmenting receive
         side (Milestone 6) -- reuses the exact same reassembly/dedup
@@ -1607,6 +1654,37 @@ class _ReconcileMixin:
         if raw and header.pkt_id is not None:
             self._note_recent_raw_pkt(sender_token, header.pkt_id, header.frag_total)
 
+        if raw and parity:
+            # M4: a parity fragment. Keep it on the bucket (opening one if
+            # needed), then reconstruct if exactly one covered fragment is
+            # missing; the reconstructed fragment re-enters this method as
+            # an ordinary fragment, so completion, reports and RNS delivery
+            # take the one path.
+            if self._dedup_contains(key):
+                self._incoming_dropped_total += 1
+                if report_requested:
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                return
+            bucket = self._reassembly.get(key)
+            if bucket is None:
+                bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+            if len(payload) >= 2:
+                bucket.parity[header.frag_idx] = (payload[0], bytes(payload[1:]))
+                bucket.last_progress = time.monotonic()
+                self._capture_fragment_received(key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total,
+                                                len(bucket.fragments), raw=True, parity=True)
+            reconstructed = self._reconstruct_from_parity(key, bucket)
+            if reconstructed is not None:
+                idx, data = reconstructed
+                self._handle_direct_multifragment_frame(
+                    _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
+                    data, sender_token, raw=True, report_requested=report_requested,
+                )
+                return
+            if report_requested and key in self._reassembly:
+                self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
+            return
+
         if self._dedup_contains(key):
             self._incoming_dropped_total += 1
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
@@ -1619,6 +1697,18 @@ class _ReconcileMixin:
             return
 
         complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
+        if complete_data is None and raw:
+            # M4: a parity that arrived earlier may now cover exactly one gap.
+            bucket = self._reassembly.get(key)
+            if bucket is not None and bucket.parity:
+                reconstructed = self._reconstruct_from_parity(key, bucket)
+                if reconstructed is not None:
+                    idx, data = reconstructed
+                    self._handle_direct_multifragment_frame(
+                        _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
+                        data, sender_token, raw=True, report_requested=report_requested,
+                    )
+                    return
         if complete_data is None:
             self._last_incoming_direct_at = time.monotonic()
             if raw and report_requested:

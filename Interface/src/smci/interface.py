@@ -374,6 +374,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # the bit). Bits 0-1 stay the round, the high nibble the version; an
     # older build masks the bit away and simply never reports.
     RAW_FLAG_REPORT = 0x04
+    # Bit 3 of byte 0 (2026-09-20, phase 3 M4): a PARITY fragment. Its
+    # frag_idx byte is a coverage MASK (bit i = data fragment i covered, so
+    # at most 8 data fragments per part) and its payload is
+    # [last_covered_len:1] + XOR of the covered fragments padded to the
+    # fragment budget. A receiver missing exactly one covered fragment
+    # reconstructs it; the have-bitmap reports data fragments only.
+    RAW_FLAG_PARITY = 0x08
     # Companion firmware limits (MAX_FRAME_SIZE 176 on the serial link):
     # onRawDataRecv pushes payload + 4 bytes, CMD_SEND_RAW_DATA carries
     # cmd + path_len + path + payload -- both confirmed in

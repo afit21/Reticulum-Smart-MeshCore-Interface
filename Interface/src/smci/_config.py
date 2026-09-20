@@ -538,6 +538,18 @@ class _ConfigMixin:
         self.direct_raw_window_enabled = _cfg_bool(cfg.get("direct_raw_window_enabled", "yes"))
         self.direct_raw_window_collect_s = float(cfg.get("direct_raw_window_collect", 0.75))
         self.direct_raw_window_max_parts = int(cfg.get("direct_raw_window_max_parts", 6))
+        # Phase 3 M4 (2026-09-20): one XOR parity fragment per part per burst
+        # from `direct_raw_parity_min_hops` (1) hops up -- none at zero hop,
+        # where per-fragment loss is a few percent. With ~18 % per-fragment
+        # loss at one hop a 3-fragment part loses exactly one fragment 41 %
+        # of the time (none 55 %): parity turns most of that into a first-
+        # round completion for one extra fragment on the burst instead of a
+        # report + re-burst + report. A re-drive of two or more fragments
+        # gets its own parity over the re-driven set. Sent only where the
+        # 171-byte parity frame fits the firmware's limits (up to three
+        # hops). `no` disables.
+        self.direct_raw_parity_enabled = _cfg_bool(cfg.get("direct_raw_parity_enabled", "yes"))
+        self.direct_raw_parity_min_hops = int(cfg.get("direct_raw_parity_min_hops", 1))
         # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
         # answer budget's own slope, so the floor stays under the budget at
         # every depth: 4 / 6.5 / 9 / 11.5 s against 5 / 7.5 / 10 / 12.5 s),

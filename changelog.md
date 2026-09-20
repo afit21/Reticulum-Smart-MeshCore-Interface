@@ -35,6 +35,13 @@ on the full suite and MeshBench `large_payload` + `relay` (two runs) against the
   part is three raw fragments (510 B on air) instead of four (688 B). Raw is not used where the
   short prefix would be ambiguous. Golden wire snapshot regenerated (31 raw/budget cases). Tests:
   `tests/test_reconcile_m3_short_header_0920.py`.
+- **M4: hop-adaptive XOR parity** (`RAW_FLAG_PARITY` 0x08; new keys `direct_raw_parity_enabled` yes,
+  `direct_raw_parity_min_hops` 1). From one hop up a part's burst of two or more fragments ends with
+  one parity fragment (coverage mask in frag_idx, payload = last covered length + XOR of the covered
+  fragments); a receiver missing exactly one covered fragment reconstructs it and completes without
+  a report round. At ~18 % one-hop fragment loss a three-fragment part loses exactly one 41 % of the
+  time it loses any. None at zero hop. Golden wire snapshot: parity cases added. Tests:
+  `tests/test_reconcile_m4_parity_0920.py`.
 
 ### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
 

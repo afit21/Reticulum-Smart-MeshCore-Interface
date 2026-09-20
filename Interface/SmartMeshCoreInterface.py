@@ -74,8 +74,15 @@ change regenerates it in the same commit):
   no text framing, no firmware encryption, no firmware ACK), RAW_HEADER_SIZE
   9 bytes (version 2, 2026-09-20; version 1 was 13 with a 6-byte source
   prefix and is no longer decoded) then the RNS payload chunk:
-    [RAW_PROTOCOL_VERSION 2 << 4 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
+    [RAW_PROTOCOL_VERSION 2 << 4 | RAW_FLAG_PARITY 0x08 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
     [dst_pubkey_prefix:2][src_pubkey_prefix:2][pkt_id:2 BE][frag_idx][frag_total]
+  With RAW_FLAG_PARITY set (M4, 2026-09-20) the frame is a parity
+  fragment: frag_idx is the coverage mask (bit i = data fragment i is
+  covered, 1..0xFF, within frag_total) and the payload is [length of the
+  highest covered fragment:1] + the XOR of the covered fragments padded
+  to the longest (`_encode_raw_parity`); a receiver missing exactly one
+  covered fragment reconstructs it. One parity per part's burst from
+  `direct_raw_parity_min_hops` (1) hops; none at zero hop.
   The 2-byte source prefix names the unique bound peer whose 6-byte
   prefix starts with it (`_resolve_raw_src`; a sender never uses raw
   where that would be ambiguous). RAW_FLAG_REPORT marks the last two
@@ -286,13 +293,16 @@ class _ReassemblyBucket:
     staleness metric, and also the sort key §5.3's oldest-by-last-progress
     capacity eviction uses."""
 
-    __slots__ = ("frag_total", "coop", "fragments", "last_progress")
+    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity")
 
     def __init__(self, frag_total: int, coop: bool):
         self.frag_total = frag_total
         self.coop = coop
         self.fragments: dict = {}
         self.last_progress = time.monotonic()
+        # Phase 3 M4 (2026-09-20): coverage mask -> (last_covered_len, xor
+        # bytes) of the raw parity fragments held for this bucket.
+        self.parity: dict = {}
 
 
 class _RnsHeader(NamedTuple):
@@ -1314,6 +1324,18 @@ class _ConfigMixin:
         self.direct_raw_window_enabled = _cfg_bool(cfg.get("direct_raw_window_enabled", "yes"))
         self.direct_raw_window_collect_s = float(cfg.get("direct_raw_window_collect", 0.75))
         self.direct_raw_window_max_parts = int(cfg.get("direct_raw_window_max_parts", 6))
+        # Phase 3 M4 (2026-09-20): one XOR parity fragment per part per burst
+        # from `direct_raw_parity_min_hops` (1) hops up -- none at zero hop,
+        # where per-fragment loss is a few percent. With ~18 % per-fragment
+        # loss at one hop a 3-fragment part loses exactly one fragment 41 %
+        # of the time (none 55 %): parity turns most of that into a first-
+        # round completion for one extra fragment on the burst instead of a
+        # report + re-burst + report. A re-drive of two or more fragments
+        # gets its own parity over the re-driven set. Sent only where the
+        # 171-byte parity frame fits the firmware's limits (up to three
+        # hops). `no` disables.
+        self.direct_raw_parity_enabled = _cfg_bool(cfg.get("direct_raw_parity_enabled", "yes"))
+        self.direct_raw_parity_min_hops = int(cfg.get("direct_raw_parity_min_hops", 1))
         # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
         # answer budget's own slope, so the floor stays under the budget at
         # every depth: 4 / 6.5 / 9 / 11.5 s against 5 / 7.5 / 10 / 12.5 s),
@@ -2203,7 +2225,7 @@ class _ObservabilityMixin:
 
     def _capture_fragment_received(
         self, mode: str, sender_token: str, pkt_id: int, frag_idx: int, frag_total: int, progress: int,
-        raw: bool = False,
+        raw: bool = False, parity: bool = False,
     ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per individual
         fragment actually added to a reassembly bucket, not just the
@@ -2228,6 +2250,7 @@ class _ObservabilityMixin:
             "pkt_id": pkt_id,
             "frag_idx": frag_idx,
             "frag_total": frag_total,
+            "parity": parity,   # M4 (2026-09-20): a parity fragment; frag_idx is then its coverage mask
             "progress": progress,
             # User-requested (2026-09-19): raw binary fragment (True) or a
             # Z85 text one (False); both share the same reassembly bucket.
@@ -3232,7 +3255,8 @@ class _WireFormatMixin:
         """RNS payload bytes per raw fragment for a path of `path_len`
         bytes: the smaller of the configured cap, the firmware's receive
         push limit and its send-frame limit less the path, minus our
-        13-byte header. 157 at zero hop with the defaults."""
+        9-byte header (M3, 2026-09-20). 161 up to four hops with the
+        defaults."""
         cap = min(self.direct_raw_payload_cap, self.FIRMWARE_RAW_RX_PAYLOAD_LIMIT,
                   self.FIRMWARE_RAW_TX_FRAME_LIMIT - max(0, path_len))
         return max(0, cap - self.RAW_HEADER_SIZE)
@@ -3249,6 +3273,51 @@ class _WireFormatMixin:
             + bytes([frag_idx & 0xFF, frag_total & 0xFF])
         )
         return header + payload
+
+    def _encode_raw_parity(
+        self, fragments: "list[tuple[int, bytes]]", dst_pubkey_hex: str, src_prefix_hex: str,
+        pkt_id: int, frag_total: int, attempt: int, report: bool = False,
+    ) -> bytes:
+        """One XOR parity fragment over `fragments` = [(frag_idx, payload)]
+        (phase 3 M4): RAW_FLAG_PARITY set, frag_idx = the coverage mask,
+        payload = [len of the highest-index covered fragment:1] + XOR of the
+        payloads padded with zeros to the longest one."""
+        mask = 0
+        width = max(len(p) for _i, p in fragments)
+        acc = bytearray(width)
+        last_len = 0
+        for idx, payload in fragments:
+            mask |= 1 << idx
+            for k, b in enumerate(payload):
+                acc[k] ^= b
+        top = max(i for i, _p in fragments)
+        last_len = len(dict(fragments)[top])
+        header = (
+            bytes([(self.RAW_PROTOCOL_VERSION << 4) | (attempt & 0x03) | self.RAW_FLAG_PARITY | (self.RAW_FLAG_REPORT if report else 0)])
+            + bytes.fromhex(dst_pubkey_hex[: self.RAW_DST_PREFIX_BYTES * 2])
+            + bytes.fromhex(src_prefix_hex[: self.RAW_SRC_PREFIX_BYTES * 2])
+            + pkt_id.to_bytes(2, "big")
+            + bytes([mask & 0xFF, frag_total & 0xFF])
+        )
+        return header + bytes([last_len & 0xFF]) + bytes(acc)
+
+    def _raw_fragment_is_parity(self, raw: bytes) -> bool:
+        return bool(raw) and bool(raw[0] & self.RAW_FLAG_PARITY)
+
+    def _raw_parity_fits(self, budget: int, path_len: int) -> bool:
+        """Whether a parity frame over fragments of `budget` bytes fits the
+        firmware's limits at this path length (pure function, M4):
+        header + 1 + budget within the receive push limit and within
+        cmd + path_len + path + payload."""
+        frame = self.RAW_HEADER_SIZE + 1 + budget
+        return frame <= min(self.FIRMWARE_RAW_RX_PAYLOAD_LIMIT, self.FIRMWARE_RAW_TX_FRAME_LIMIT - max(0, path_len))
+
+    def _raw_parity_fragments(self, hops: int) -> int:
+        """How many parity fragments a burst of one part gets at `hops`
+        (pure function, M4): 0 below `direct_raw_parity_min_hops`, else 1."""
+        if not self.direct_raw_parity_enabled or hops < max(0, self.direct_raw_parity_min_hops):
+            return 0
+        return 1
 
     def _raw_fragment_report_requested(self, raw: bytes) -> bool:
         """Whether byte 0 of a raw fragment carries RAW_FLAG_REPORT (the
@@ -3277,8 +3346,12 @@ class _WireFormatMixin:
         i += self.RAW_SRC_PREFIX_BYTES
         pkt_id = int.from_bytes(raw[i:i + 2], "big")
         frag_idx, frag_total = raw[i + 2], raw[i + 3]
-        if frag_total < 1 or frag_idx >= frag_total:
+        parity = bool(raw[0] & self.RAW_FLAG_PARITY)
+        if frag_total < 1 or (not parity and frag_idx >= frag_total):
             raise ValueError(f"invalid frag_idx/frag_total: {frag_idx}/{frag_total}")
+        if parity and (frag_idx == 0 or frag_idx >> frag_total or len(raw) < self.RAW_HEADER_SIZE + 2):
+            raise ValueError(f"invalid parity mask {frag_idx:#x} for frag_total {frag_total}")
+        # For a parity fragment frag_idx is the coverage mask (M4).
         header = _FrameHeader(self.PROTOCOL_VERSION, True, False, pkt_id, frag_idx, frag_total, attempt)
         return header, bytes(raw[self.RAW_HEADER_SIZE:]), src_prefix_hex, bytes(dst)
 
@@ -7314,16 +7387,35 @@ class _ReconcileMixin:
                         lock.release()
                         lock_held = False
 
+                # M4: the burst as a list of (part, frag_idx-or-None, frame
+                # builder); a parity frame follows each part's data
+                # fragments when parity applies to this hop count, the
+                # frame fits, and the part sends two or more fragments.
+                burst = []
+                n_parity = self._raw_parity_fragments(gap_hops) if self._raw_parity_fits(
+                    self._direct_raw_payload_budget(len(path)), len(path)) else 0
+                for part in parts:
+                    idxs = [i for p, i in missing if p is part]
+                    for i in idxs:
+                        burst.append((part, i, None))
+                    if n_parity and len(idxs) >= 2:
+                        burst.append((part, None, [(i, part.chunks[i]) for i in idxs]))
                 try:
-                    for n, (part, frag_idx) in enumerate(missing):
+                    for n, (part, frag_idx, parity_over) in enumerate(burst):
                         if self.detached or not self.online:
                             remember_all()
                             fail_rest(False)
                             return
-                        frame = self._encode_raw_fragment(
-                            part.chunks[frag_idx], target, own_prefix, part.pkt_id, frag_idx, part.frag_total, attempt=rnd,
-                            report=report_fut is not None and n >= len(missing) - 2,
-                        )
+                        flagged = report_fut is not None and n >= len(burst) - 2
+                        if parity_over is None:
+                            frame = self._encode_raw_fragment(
+                                part.chunks[frag_idx], target, own_prefix, part.pkt_id, frag_idx, part.frag_total, attempt=rnd,
+                                report=flagged,
+                            )
+                        else:
+                            frame = self._encode_raw_parity(
+                                parity_over, target, own_prefix, part.pkt_id, part.frag_total, attempt=rnd, report=flagged,
+                            )
                         telemetry: dict = {}
                         while True:
                             try:
@@ -7349,11 +7441,12 @@ class _ReconcileMixin:
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
                                 "handshake_yields": yields, "window_parts": len(parts),
+                                "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
                         gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
                         if gap_s > 0:
                             await asyncio.sleep(gap_s)
-                        if n < len(missing) - 1 and lock.preempt_requested():
+                        if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()
                             if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
@@ -8245,9 +8338,36 @@ class _ReconcileMixin:
         ack_airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=12)
         return max(0.0, ack_airtime_s * (1.0 + 2.5 * hops))
 
+    def _reconstruct_from_parity(self, key, bucket) -> "Optional[tuple[int, bytes]]":
+        """M4: if any held parity covers exactly one missing data fragment,
+        return (frag_idx, payload) for it -- XOR of the parity and the
+        other covered fragments padded to the parity's width, the last
+        covered fragment trimmed to its recorded length."""
+        for mask, (last_len, xor) in list(bucket.parity.items()):
+            covered = [i for i in range(bucket.frag_total) if mask & (1 << i)]
+            missing = [i for i in covered if i not in bucket.fragments]
+            if len(missing) != 1:
+                continue
+            idx = missing[0]
+            acc = bytearray(xor)
+            for i in covered:
+                if i == idx:
+                    continue
+                for k, b in enumerate(bucket.fragments[i]):
+                    if k < len(acc):
+                        acc[k] ^= b
+            data = bytes(acc[:last_len]) if idx == max(covered) else bytes(acc)
+            self._debug(f"reassembly {key}: fragment {idx} reconstructed from parity mask {mask:#x}.")
+            if self._packet_capture_file is not None:
+                self._capture_event("in", {"event": "raw_parity_reconstructed", "sender_token": key[1],
+                                           "pkt_id": key[2], "frag_total": key[3], "frag_idx": idx, "mask": mask})
+            bucket.parity.pop(mask, None)
+            return idx, data
+        return None
+
     def _handle_direct_multifragment_frame(
         self, header: _FrameHeader, payload: bytes, sender_token: str, raw: bool = False,
-        report_requested: bool = False,
+        report_requested: bool = False, parity: bool = False,
     ) -> None:
         """docs/wire_format_design.md's DIRECT-needs-fragmenting receive
         side (Milestone 6) -- reuses the exact same reassembly/dedup
@@ -8282,6 +8402,37 @@ class _ReconcileMixin:
         if raw and header.pkt_id is not None:
             self._note_recent_raw_pkt(sender_token, header.pkt_id, header.frag_total)
 
+        if raw and parity:
+            # M4: a parity fragment. Keep it on the bucket (opening one if
+            # needed), then reconstruct if exactly one covered fragment is
+            # missing; the reconstructed fragment re-enters this method as
+            # an ordinary fragment, so completion, reports and RNS delivery
+            # take the one path.
+            if self._dedup_contains(key):
+                self._incoming_dropped_total += 1
+                if report_requested:
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                return
+            bucket = self._reassembly.get(key)
+            if bucket is None:
+                bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+            if len(payload) >= 2:
+                bucket.parity[header.frag_idx] = (payload[0], bytes(payload[1:]))
+                bucket.last_progress = time.monotonic()
+                self._capture_fragment_received(key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total,
+                                                len(bucket.fragments), raw=True, parity=True)
+            reconstructed = self._reconstruct_from_parity(key, bucket)
+            if reconstructed is not None:
+                idx, data = reconstructed
+                self._handle_direct_multifragment_frame(
+                    _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
+                    data, sender_token, raw=True, report_requested=report_requested,
+                )
+                return
+            if report_requested and key in self._reassembly:
+                self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
+            return
+
         if self._dedup_contains(key):
             self._incoming_dropped_total += 1
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
@@ -8294,6 +8445,18 @@ class _ReconcileMixin:
             return
 
         complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
+        if complete_data is None and raw:
+            # M4: a parity that arrived earlier may now cover exactly one gap.
+            bucket = self._reassembly.get(key)
+            if bucket is not None and bucket.parity:
+                reconstructed = self._reconstruct_from_parity(key, bucket)
+                if reconstructed is not None:
+                    idx, data = reconstructed
+                    self._handle_direct_multifragment_frame(
+                        _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
+                        data, sender_token, raw=True, report_requested=report_requested,
+                    )
+                    return
         if complete_data is None:
             self._last_incoming_direct_at = time.monotonic()
             if raw and report_requested:
@@ -10013,6 +10176,7 @@ class _RoutingMixin:
         self._handle_direct_multifragment_frame(
             header, rns_payload, sender_token, raw=True,
             report_requested=self._raw_fragment_report_requested(data),
+            parity=self._raw_fragment_is_parity(data),
         )
 
     def _on_channel_msg_recv(self, event):
@@ -10636,6 +10800,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # the bit). Bits 0-1 stay the round, the high nibble the version; an
     # older build masks the bit away and simply never reports.
     RAW_FLAG_REPORT = 0x04
+    # Bit 3 of byte 0 (2026-09-20, phase 3 M4): a PARITY fragment. Its
+    # frag_idx byte is a coverage MASK (bit i = data fragment i covered, so
+    # at most 8 data fragments per part) and its payload is
+    # [last_covered_len:1] + XOR of the covered fragments padded to the
+    # fragment budget. A receiver missing exactly one covered fragment
+    # reconstructs it; the have-bitmap reports data fragments only.
+    RAW_FLAG_PARITY = 0x08
     # Companion firmware limits (MAX_FRAME_SIZE 176 on the serial link):
     # onRawDataRecv pushes payload + 4 bytes, CMD_SEND_RAW_DATA carries
     # cmd + path_len + path + payload -- both confirmed in

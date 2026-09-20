@@ -190,6 +190,7 @@ class _OneHopRawSend(SingleNodeCase):
             "_send_raw_fragment", "_query_remote_fragments", "_canonical_peer_prefix",
             "direct_raw_report_wait_base_s", "direct_raw_report_wait_per_hop_s",
             "direct_raw_hop_gap_factor", "direct_raw_report_enabled", "direct_raw_reconcile_rounds",
+            "direct_raw_parity_enabled",
         )}
         saved_path = iface._resolved_paths.get(PEER)
         sent = []
@@ -214,6 +215,10 @@ class _OneHopRawSend(SingleNodeCase):
         iface.direct_raw_hop_gap_factor = 0.0
         iface.direct_raw_report_enabled = True
         iface.direct_raw_reconcile_rounds = 3
+        # These scenarios pin the data-fragment burst shape (which fragments
+        # carry the flag, how many go out); M4's parity fragment (2026-09-20)
+        # has its own tests and is off here.
+        iface.direct_raw_parity_enabled = False
         iface._resolved_paths[PEER] = self.module._ResolvedPath(ONE_HOP_PATH_HEX, 1, 1, time.monotonic())
         iface._query_rtt.pop(PEER, None)
         iface._last_firmware_ack_timeout_s.pop(PEER, None)

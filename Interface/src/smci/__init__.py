@@ -74,8 +74,15 @@ change regenerates it in the same commit):
   no text framing, no firmware encryption, no firmware ACK), RAW_HEADER_SIZE
   9 bytes (version 2, 2026-09-20; version 1 was 13 with a 6-byte source
   prefix and is no longer decoded) then the RNS payload chunk:
-    [RAW_PROTOCOL_VERSION 2 << 4 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
+    [RAW_PROTOCOL_VERSION 2 << 4 | RAW_FLAG_PARITY 0x08 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
     [dst_pubkey_prefix:2][src_pubkey_prefix:2][pkt_id:2 BE][frag_idx][frag_total]
+  With RAW_FLAG_PARITY set (M4, 2026-09-20) the frame is a parity
+  fragment: frag_idx is the coverage mask (bit i = data fragment i is
+  covered, 1..0xFF, within frag_total) and the payload is [length of the
+  highest covered fragment:1] + the XOR of the covered fragments padded
+  to the longest (`_encode_raw_parity`); a receiver missing exactly one
+  covered fragment reconstructs it. One parity per part's burst from
+  `direct_raw_parity_min_hops` (1) hops; none at zero hop.
   The 2-byte source prefix names the unique bound peer whose 6-byte
   prefix starts with it (`_resolve_raw_src`; a sender never uses raw
   where that would be ambiguous). RAW_FLAG_REPORT marks the last two
