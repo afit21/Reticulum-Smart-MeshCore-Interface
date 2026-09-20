@@ -39,7 +39,16 @@ at a repeater are real. Its numbers below are read with that split.
   burst-then-QUERY. Two earlier cuts (flag on the last fragment only; a
   receiver-side idle timer) regressed `large_payload` to 0/6 and were
   replaced -- the docstring entry has the mechanism. MeshBench: zero_hop 7/8, 8/8 (baseline 7/8, 6/8 FAIL) with probe RTT avg 5-8 s (12-15) and 100% zero-hop attempt success (25-46%); relay 8/8, 7/8 (5/8, 4/8) with the repeater relaying 63-67 frames (118-133); large_payload 3/6, 3/6 (1/6 FAIL, 4/6) with a third of the QUERYs; two_hop bring-up-dominated (see the docstring entry).
-Tests: `tests/test_completion_report_0920.py`. Field test proposed in the
+- **Dead-wait trims** (no wire change): `direct_completion_unacked_grace`
+  6 s (`_multihop` 10 s) caps the answer wait after a QUERY whose own
+  firmware ACK was missed (answered 14% of the time in the field, never
+  later than 5.6 s at hop <= 1); `direct_ack_timeout_base`/`_per_hop`
+  8 + 4h -> 5 + 3h s (largest field ACK ever seen 3.82 / 6.06 / 8.15 /
+  7.25 s at 0-3 hops over 2670 ACKs: none cut); `direct_post_send_listen_min`
+  /`_max` 0.3-3 -> 0.2-1 s (1.7 s mean on 598 misses against 8.6%-vs-6.9%
+  contention); a completion ANSWER's own ACK wait is hop-aware. MeshBench:
+  relay 8/8, 8/8; large_payload 6/6, 1/6 (+5/6 and one run with no DIRECT path at all); two_hop bring-up-dominated; longest one-hop missed-ACK wait 12 -> 8 s, post-miss listen 1.6 -> 0.6 s mean, completion-check timeouts 97 -> 8 across the run sets.
+Tests: `tests/test_completion_report_0920.py`, `tests/test_dead_wait_trims_0920.py`. Field test proposed in the
 session report; none of this is field-tested yet.
 
 ### Fixed: night-session fixes revised against the simulators and the MeshBench findings (2026-09-20)

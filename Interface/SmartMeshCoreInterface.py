@@ -2625,6 +2625,36 @@ virtual radio has no listen-before-talk, so it over-counts self-collisions
 between nodes that can hear each other while hidden-node collisions at a
 repeater are real): `zero_hop` 7/8 and 8/8 delivered (baseline 7/8 and 6/8, the latter a FAIL), probe RTT avg 5.0 / 8.2 s (12.3 / 14.6), zero-hop DIRECT attempt success 100% (25-46%), half-duplex misses 4-16 per run (23-25), QUERY attempts on air 0-2 (9-13); `relay` 8/8 and 7/8 (5/8, 4/8), the repeater relayed 67 / 63 frames (118 / 133), endpoint transmissions 42+42 / 40+39 (81+79 / 103+95); `large_payload` 3/6 and 3/6 (1/6 FAIL, 4/6), delivered-probe RTT avg 34.9 / 40.3 s (40.9 / 39.6), QUERY attempts 7 / 12 (24 / 22), R relayed 125 / 135 (184 / 138), per-part first-fragment-to-known-complete 18.6-64.6 s (34.4-83.0 s); `two_hop` 2/8, 3/8, 3/8, 2/8 over four runs (3/8, 5/8) -- in three of the four the DIRECT path resolved after 450 s or never (0-1 raw sends, no report code ran), and two runs lost 2-4 probes to the unknown-destination backoff that the third change below removes; the one run with a live 2-hop path (2/8) lost single raw fragments in the chain twice in a row and fell to the existing raw-pause strikes, with the report working where it applied.
 
+**Dead-wait trims (2026-09-20, same pass, no wire change):** three
+timing defaults whose evidence is the same 3693 `direct_attempt_result`
+and 539 `completion_check_result` records of the 2026-09-19 sessions.
+
+1. `direct_completion_unacked_grace` (6.0 s; `_multihop` 10.0 s from 2
+   hops). The answer wait after a QUERY whose OWN firmware ACK was missed
+   used to run the full 15-18 s budget. Across the three sessions such
+   queries were answered 6/19, 9/65, 4/31 and 0/5 times at 0-3 hops, every
+   hop<=1 answer inside 5.6 s, and with `miss_diagnosis=hop1_loss` 0 of 26
+   ever: the missing ACK is the signal that the QUERY never reached the
+   peer (48% of unanswered reconciles, second audit), and ~1300 s were
+   waited for nothing. The re-query now goes out 9-12 s sooner.
+2. `direct_ack_timeout_base`/`_per_hop` 8 + 4h -> 5 + 3h. Re-derived over
+   2670 field ACKs, the largest that ever arrived was 3.82 / 6.06 / 8.15 /
+   7.25 s at 0 / 1 / 2 / 3 hops; 5 / 8 / 11 / 14 s cuts off zero of them
+   (31-93% margin) and, in replay, saves 824 + 635 + 171 s of dead lock
+   time at 1-3 hops beyond what 8 + 4h saved. `direct_ack_min_timeout`
+   (5 s) still floors hop 0. `_send_completion_answer` now passes
+   `hop_count`, so an ANSWER's own ACK wait is hop-aware (it ran on the
+   flat firmware suggestion before, capture records show `hop=None`).
+3. `direct_post_send_listen_min/max` 0.3-3.0 -> 0.2-1.0 s. The post-miss
+   listen averaged 1.7 s on 598 misses (~1000 s of lock time), while the
+   evening audit measured frame overlap between the nodes at 8.6% against
+   6.9% by chance, and the firmware's own listen-before-talk keeps a retry
+   out of an audible frame anyway. Still a random draw, per the standing
+   instruction.
+
+MeshBench (two runs each, on top of the completion report, against that
+change's runs): `relay` 8/8 and 8/8 (P1: 8/8, 7/8), probe RTT avg 10.4 / 13.6 s; `large_payload` 6/6 and 1/6 (P1: 3/6, 3/6) plus two more runs: 5/6, and one with no DIRECT path ever resolved (0 raw sends, uninformative), delivered-probe RTT avg 31.1 / 41.9 s, per-part first-fragment-to-known-complete 14.5-37.8 s; `two_hop` 2/8 and 2/8, both with the DIRECT path resolving after 497 / 543 s and 4 probes each dropped by the unknown-destination backoff (no trimmed wait was on the critical path). The mechanics are unambiguous across the captures: the longest missed-ACK wait at one hop 12.0 -> 8.0 s, post-miss listen mean 1.55-1.65 -> 0.59 s, completion-check timeouts 97 (baseline set) / 19 (P1 set) -> 8.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -4435,9 +4465,9 @@ class SmartMeshCoreInterface(Interface):
         # capped at this grace (from 2 hops the multihop value, where two
         # late answers arrived at 9.0 and 24.3 s), so the re-query goes out
         # 9-12 s sooner. 0 disables the cap.
-        self.direct_completion_unacked_grace_s = float(cfg.get("direct_completion_unacked_grace", 0.0))
+        self.direct_completion_unacked_grace_s = float(cfg.get("direct_completion_unacked_grace", 6.0))
         self.direct_completion_unacked_grace_multihop_s = float(
-            cfg.get("direct_completion_unacked_grace_multihop", 0.0)
+            cfg.get("direct_completion_unacked_grace_multihop", 10.0)
         )
         # Per-hop addition to the FLOOR (not the ceiling): a first query, before
         # any RTT sample exists, needs longer at depth. Measured query->answer
@@ -4981,8 +5011,8 @@ class SmartMeshCoreInterface(Interface):
         # defers while the radio reports a frame in progress) already keeps
         # the retry out of an audible frame. Still random, per the user's
         # standing instruction; just a smaller range.
-        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.3))
-        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 3))
+        self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.2))
+        self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 1.0))
         self.direct_post_send_listen_success_min_s = float(cfg.get("direct_post_send_listen_success_min", 0.0))
         self.direct_post_send_listen_success_max_s = float(cfg.get("direct_post_send_listen_success_max", 0.4))
 
@@ -5027,8 +5057,8 @@ class SmartMeshCoreInterface(Interface):
         # 1-3 hops over 8 + 4h. `direct_ack_min_timeout` (5 s) is the hop-0
         # floor, so hop 0 is unchanged. Tuned for SF7/BW62.5/CR8 like every
         # absolute second in this file.
-        self.direct_ack_timeout_base_s = float(cfg.get("direct_ack_timeout_base", 8.0))
-        self.direct_ack_timeout_per_hop_s = float(cfg.get("direct_ack_timeout_per_hop", 4.0))
+        self.direct_ack_timeout_base_s = float(cfg.get("direct_ack_timeout_base", 5.0))
+        self.direct_ack_timeout_per_hop_s = float(cfg.get("direct_ack_timeout_per_hop", 3.0))
 
         # Step 2 of "lessen our reliance on arbitrary wait times"
         # (2026-09-18, see module docstring): measured ACK round-trip
@@ -11710,6 +11740,10 @@ class SmartMeshCoreInterface(Interface):
                 target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
                 priority=self.PRIORITY_ANSWER, time_critical=True,
                 kind="completion_report" if report else "completion_answer",
+                # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
+                # used to run with hop_count=None, i.e. the flat firmware
+                # suggestion, so neither the hop cap nor the abort applied).
+                hop_count=hops,
             )
             if not ok:
                 self._debug(
