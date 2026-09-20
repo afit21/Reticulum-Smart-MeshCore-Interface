@@ -7,6 +7,16 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
+
+- **The dated design history moved out of the module docstring into `docs/history.md`**, verbatim
+  (the alpha 0.1.0 STATUS snapshot, M0-M6 and every dated entry since, ~2900 lines). The docstring
+  keeps the rationale, the design invariants and a new WIRE FORMAT section written from the code
+  ("R" / "P" / "Q" text frames and the 13-byte raw header, byte for byte, pinned by
+  `tests/golden/wire_format.json`). New entries go at the end of `docs/history.md`. CLAUDE.md's
+  "Missing design docs" note lists the documents the history cites that never existed; none was
+  created.
+
 ### Changed: airtime / throughput pass, phase 1 (2026-09-20 evening)
 
 Small wins on the existing code before the module split; one commit, one regression test, one
