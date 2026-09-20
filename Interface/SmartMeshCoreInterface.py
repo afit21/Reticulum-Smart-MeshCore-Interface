@@ -82,9 +82,10 @@ change regenerates it in the same commit):
   covered, 1..0xFF, within frag_total) and the payload is [length of the
   highest covered fragment:1] + the XOR of the covered fragments padded
   to the longest (`_encode_raw_parity`); a receiver missing exactly one
-  covered fragment reconstructs it. When enabled (`direct_raw_parity_
-  enabled`, shipped off pending a field A/B), one parity per part's burst
-  from `direct_raw_parity_min_hops` (1) hops; none at zero hop.
+  covered fragment reconstructs it. One parity per part's burst from
+  `direct_raw_parity_min_hops` (1) hops, none at zero hop; on by default
+  (`direct_raw_parity_enabled`, the owner's decision of 2026-09-21 after
+  the M4 gate had shipped it off -- see docs/history.md).
   The 2-byte source prefix names the unique bound peer whose 6-byte
   prefix starts with it (`_resolve_raw_src`; a sender never uses raw
   where that would be ambiguous). RAW_FLAG_REPORT marks the last two
@@ -1335,16 +1336,19 @@ class _ConfigMixin:
         # report + re-burst + report. A re-drive of two or more fragments
         # gets its own parity over the re-driven set. Sent only where the
         # 171-byte parity frame fits the firmware's limits (up to three
-        # hops). SHIPPED OFF (M4 gate, 2026-09-20 night): under MeshBench the
-        # repeater's loss alternates (its relay of fragment N overlaps N+1,
-        # the interface's gap being sized to the real ~0.9 s airtime where
-        # MeshBench's frames take ~1.3 s), so a four-frame burst leaves two
-        # data fragments or the parity itself missing -- three runs 4/6,
-        # 5/6, 1/6 against M3's 2/6, 6/6, 6/6, at 25 % more raw bytes per
-        # part. The field's random loss is the case it is for; a field A/B
-        # with `yes` on both nodes decides (fieldtests/AB_PROTOCOL.md,
-        # `raw_parity_reconstructed` per single-loss burst).
-        self.direct_raw_parity_enabled = _cfg_bool(cfg.get("direct_raw_parity_enabled", "no"))
+        # hops). ON BY DEFAULT at the owner's decision (2026-09-21). The M4
+        # gate had shipped it off: under MeshBench the repeater's loss
+        # alternates (its relay of fragment N overlaps N+1, the interface's
+        # gap being sized to the real ~0.9 s airtime where MeshBench's
+        # frames take ~1.3 s), so a four-frame burst leaves two data
+        # fragments or the parity itself missing -- three runs 4/6, 5/6,
+        # 1/6 against M3's 2/6, 6/6, 6/6, at 25 % more raw bytes per part,
+        # while reconstruction itself worked (1, 3, 4 per run). The field's
+        # random loss is the case it is for, and the field A/B
+        # (fieldtests/AB_PROTOCOL.md, `raw_parity_reconstructed` per
+        # single-loss burst) is what confirms or reverses this default;
+        # `no` is the other arm.
+        self.direct_raw_parity_enabled = _cfg_bool(cfg.get("direct_raw_parity_enabled", "yes"))
         self.direct_raw_parity_min_hops = int(cfg.get("direct_raw_parity_min_hops", 1))
         # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
         # answer budget's own slope, so the floor stays under the budget at

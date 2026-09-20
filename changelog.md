@@ -35,16 +35,17 @@ on the full suite and MeshBench `large_payload` + `relay` (two runs) against the
   part is three raw fragments (510 B on air) instead of four (688 B). Raw is not used where the
   short prefix would be ambiguous. Golden wire snapshot regenerated (31 raw/budget cases). Tests:
   `tests/test_reconcile_m3_short_header_0920.py`.
-- **M4: hop-adaptive XOR parity, shipped off** (`RAW_FLAG_PARITY` 0x08; new keys
-  `direct_raw_parity_enabled` **no**, `direct_raw_parity_min_hops` 1). When enabled, from one hop up
+- **M4: hop-adaptive XOR parity** (`RAW_FLAG_PARITY` 0x08; new keys `direct_raw_parity_enabled`
+  **yes** -- shipped off by the M4 gate on 2026-09-20, switched on by the owner's decision on
+  2026-09-21; the baseline below was taken with it off -- `direct_raw_parity_min_hops` 1). From one hop up
   a part's burst of two or more fragments ends with one parity fragment (coverage mask in frag_idx,
   payload = last covered length + XOR of the covered fragments); a receiver missing exactly one
   covered fragment reconstructs it and completes without a report round. Its gate (large_payload x3:
   4/6, 5/6, 1/6 against M3's 2/6, 6/6, 6/6) showed no benefit and a cost, because MeshBench's
   repeater loses fragments in an alternating pattern (its ~1.3 s frames against a gap sized for the
   real ~0.9 s) that no single parity repairs; reconstruction itself worked (1, 3 and 4 per run). The
-  field's random loss is the case it is for: set `direct_raw_parity_enabled = yes` on both nodes for
-  the field A/B. Golden wire snapshot: parity cases added. Tests: `tests/test_reconcile_m4_parity_0920.py`.
+  field's random loss is the case it is for; `direct_raw_parity_enabled = no` is the field A/B's
+  other arm. Golden wire snapshot: parity cases added. Tests: `tests/test_reconcile_m4_parity_0920.py`.
 - **Phase 4:** version alpha 0.1.4; full suite 288 tests OK (three `@slow` raw scenarios re-pinned
   to M2/M3: three fragments per 446-byte payload, and a REPORT under both-ways zero-hop load waits
   behind one outgoing window, 12-15 s observed, bound 20 s); baseline
@@ -52,8 +53,8 @@ on the full suite and MeshBench `large_payload` + `relay` (two runs) against the
   frozen alpha 0.1.3 suite: large_payload 17 % -> 83 % delivered at 12.76 -> 5.11 on-air B per RNS B
   (outside the frozen spread both ways); everything else inside its spread; two_hop's RTT median
   worse on one run (re-run before reading it). `mixed_builds` against an alpha-0.1.3-era responder
-  delivered 0/6 (alpha 0.1.3: 3/6, 5/6, 0/6): both nodes must run this build, and the mismatch does
-  not degrade cleanly -- a protocol-version bit in the bind frame is the follow-up.
+  delivered 0/6 (alpha 0.1.3: 3/6, 5/6, 0/6): both nodes must run this build. By the owner's
+  decision (2026-09-21) compatibility with earlier builds is not a goal during alpha.
 
 ### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
 

@@ -53,7 +53,7 @@ class PureAndCodec(SingleNodeCase):
         self.assertTrue(iface._raw_parity_fits(157, 4))
         bare = self.module.SmartMeshCoreInterface.__new__(self.module.SmartMeshCoreInterface)
         bare._configure_retry({})
-        self.assertFalse(bare.direct_raw_parity_enabled, "shipped off pending a field A/B (M4 gate, 2026-09-20)")
+        self.assertTrue(bare.direct_raw_parity_enabled, "on by default (owner's decision, 2026-09-21)")
         self.assertEqual(bare.direct_raw_parity_min_hops, 1)
 
     def test_encode_decode(self):

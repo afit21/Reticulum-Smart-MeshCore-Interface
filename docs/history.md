@@ -3195,6 +3195,25 @@ from. Milestones in order, each gated on the full suite and MeshBench
      got 3/6, 5/6, 0/6: the raw v2 bursts and v4 QUERYs are undecodable to
      the old node and the raw -> text fallback never fired in the run (4
      raw sends failed, 0 text fallbacks) -- the mismatch does not degrade
-     cleanly; a protocol-version bit in the bind frame (raw v2 / "Q" v4
-     only toward peers that set it) is the follow-up, not attempted here.
+     cleanly. Not a follow-up: on 2026-09-21 the owner ruled that
+     compatibility with earlier builds is not wanted while the project is
+     in alpha -- both nodes run the same build, and that is the whole
+     rule.
+
+ 2026-09-21. **Parity on by default** (`direct_raw_parity_enabled` no ->
+     yes, the owner's decision on reading the pass report). The M4 gate's
+     reading stands as written above -- under MeshBench's alternating
+     relay loss the parity cannot pay for itself and the three-run
+     comparison against M3 showed a cost -- and the owner chose the
+     field's random-loss case over MeshBench's regime for the shipped
+     default. Consequences on record: the alpha 0.1.4 baseline
+     (`tests/baselines/2026-09-20-meshbench-6cf0876.md`) was taken with
+     parity OFF; the parity-on MeshBench reference is the M4 gate
+     (`large_payload` 4/6 @ 5.00, 5/6 @ 5.49, 1/6 @ 7.52 B/B; `relay` 6/8
+     + 1 late @ 6.52, 8/8 @ 5.54; build 3ec8d7f, otherwise this code).
+     A parity-on baseline suite is the next MeshBench run to make when a
+     reference point is needed; the field A/B's `no` arm is the way to
+     reverse this. Shipped-default pin and config golden re-pinned; the
+     one-hop raw-send fixture (`tests/test_completion_report_one_hop_
+     0920.py`) still turns parity off for its burst-shape pins.
 
