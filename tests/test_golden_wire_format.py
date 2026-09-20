@@ -386,7 +386,10 @@ def check_decodes(module, case, kind, encoded):
         raw = bytes.fromhex(encoded)
         header, payload, src_prefix_hex, dst = iface._decode_raw_fragment(raw)
         eq("payload", payload, bytes.fromhex(a["payload_hex"]))
-        eq("src_prefix", src_prefix_hex, a["src_prefix_hex"][:cls.BIND_PUBKEY_PREFIX_BYTES * 2])
+        # The source prefix on the wire is RAW_SRC_PREFIX_BYTES (2 since M3,
+        # 2026-09-20; the v1 header carried the full 6-byte prefix).
+        src_bytes = getattr(cls, "RAW_SRC_PREFIX_BYTES", cls.BIND_PUBKEY_PREFIX_BYTES)
+        eq("src_prefix", src_prefix_hex, a["src_prefix_hex"][:src_bytes * 2])
         eq("dst_prefix", dst, bytes.fromhex(a["dst_pubkey_hex"][:cls.RAW_DST_PREFIX_BYTES * 2]))
         eq("pkt_id", header.pkt_id, a["pkt_id"])
         eq("frag", (header.frag_idx, header.frag_total), (a["frag_idx"], a["frag_total"]))

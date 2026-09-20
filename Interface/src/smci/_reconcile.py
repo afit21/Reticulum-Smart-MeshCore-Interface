@@ -27,6 +27,8 @@ class _ReconcileMixin:
             return False
         if self._own_pubkey_prefix() is None:
             return False
+        if self._raw_src_ambiguous(peer_prefix):
+            return False   # M3: a 2-byte source prefix must name one bound peer
         path_hex = self._resolved_paths[peer_prefix].out_path_hex or ""
         if path_hex and self._raw_path_unsupported(path_hex):
             return False

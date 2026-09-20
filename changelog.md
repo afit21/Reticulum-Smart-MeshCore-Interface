@@ -29,6 +29,12 @@ on the full suite and MeshBench `large_payload` + `relay` (two runs) against the
   QUERY asks about the whole window. The window takes the in-flight slot. Golden wire snapshot
   regenerated: v1-v3 bytes unchanged (pinned under `v3` names), 96 v4 cases added. Tests:
   `tests/test_reconcile_m2_window_0920.py`.
+- **M3: three fragments per 483-byte part** (raw header version 2, 9 bytes: a 2-byte source prefix
+  resolved to the unique bound peer, `RAW_HEADER_SIZE` 13 -> 9; both nodes must run this build). The
+  per-fragment payload at the shipped cap is 161 up to four hops and 3 x 161 = 483, so a Link MDU
+  part is three raw fragments (510 B on air) instead of four (688 B). Raw is not used where the
+  short prefix would be ambiguous. Golden wire snapshot regenerated (31 raw/budget cases). Tests:
+  `tests/test_reconcile_m3_short_header_0920.py`.
 
 ### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
 

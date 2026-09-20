@@ -340,7 +340,7 @@ class _WireFormatMixin:
         header = (
             bytes([(self.RAW_PROTOCOL_VERSION << 4) | (attempt & 0x03) | (self.RAW_FLAG_REPORT if report else 0)])
             + bytes.fromhex(dst_pubkey_hex[: self.RAW_DST_PREFIX_BYTES * 2])
-            + bytes.fromhex(src_prefix_hex[: self.BIND_PUBKEY_PREFIX_BYTES * 2])
+            + bytes.fromhex(src_prefix_hex[: self.RAW_SRC_PREFIX_BYTES * 2])
             + pkt_id.to_bytes(2, "big")
             + bytes([frag_idx & 0xFF, frag_total & 0xFF])
         )
@@ -354,11 +354,14 @@ class _WireFormatMixin:
         return bool(raw) and bool(raw[0] & self.RAW_FLAG_REPORT)
 
     def _decode_raw_fragment(self, raw: bytes) -> "tuple[_FrameHeader, bytes, str, bytes]":
-        """Returns (header, payload, src_prefix_hex, dst_prefix_bytes).
-        Raises ValueError for anything that isn't one of ours -- callers
-        drop those silently, since other applications' raw packets share
-        this payload type. Bit 2 of byte 0 (RAW_FLAG_REPORT) is ignored
-        here; see `_raw_fragment_report_requested`."""
+        """Returns (header, payload, src_prefix_hex, dst_prefix_bytes);
+        `src_prefix_hex` is the sender's RAW_SRC_PREFIX_BYTES-byte prefix
+        (4 hex chars since version 2), which `_resolve_raw_src` maps to
+        the bound peer's full 6-byte prefix. Raises ValueError for
+        anything that isn't one of ours -- callers drop those silently,
+        since other applications' raw packets share this payload type.
+        Bit 2 of byte 0 (RAW_FLAG_REPORT) is ignored here; see
+        `_raw_fragment_report_requested`."""
         if len(raw) < self.RAW_HEADER_SIZE:
             raise ValueError("too short for a raw fragment header")
         if (raw[0] >> 4) != self.RAW_PROTOCOL_VERSION:
@@ -366,8 +369,8 @@ class _WireFormatMixin:
         attempt = raw[0] & 0x03
         dst = raw[1:1 + self.RAW_DST_PREFIX_BYTES]
         i = 1 + self.RAW_DST_PREFIX_BYTES
-        src_prefix_hex = raw[i:i + self.BIND_PUBKEY_PREFIX_BYTES].hex()
-        i += self.BIND_PUBKEY_PREFIX_BYTES
+        src_prefix_hex = raw[i:i + self.RAW_SRC_PREFIX_BYTES].hex()
+        i += self.RAW_SRC_PREFIX_BYTES
         pkt_id = int.from_bytes(raw[i:i + 2], "big")
         frag_idx, frag_total = raw[i + 2], raw[i + 3]
         if frag_total < 1 or frag_idx >= frag_total:

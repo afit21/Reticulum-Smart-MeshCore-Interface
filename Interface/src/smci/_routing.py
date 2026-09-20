@@ -1460,9 +1460,18 @@ class _RoutingMixin:
         if not own or bytes.fromhex(own[: self.RAW_DST_PREFIX_BYTES * 2]) != dst_prefix:
             self._raw_frames_ignored += 1
             return
+        # M3 (2026-09-20): the 2-byte source prefix names a bound peer (the
+        # 6-byte token every text frame from that peer carries, so raw and
+        # text fragments share one reassembly bucket); no or two matches ->
+        # dropped, counted.
+        sender_token = self._resolve_raw_src(src_prefix)
+        if sender_token is None:
+            self._raw_frames_ignored += 1
+            self._debug(f"raw fragment from unresolvable source prefix {src_prefix!r} dropped (no unique bound peer).")
+            return
         self._raw_fragments_received += 1
         self._handle_direct_multifragment_frame(
-            header, rns_payload, src_prefix, raw=True,
+            header, rns_payload, sender_token, raw=True,
             report_requested=self._raw_fragment_report_requested(data),
         )
 

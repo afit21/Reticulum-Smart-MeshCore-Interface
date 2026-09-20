@@ -3072,3 +3072,31 @@ from. Milestones in order, each gated on the full suite and MeshBench
      (`COMPLETION_PROTOCOL_VERSION` 3 -> 4). Both nodes must run this
      build. Tests: `tests/test_reconcile_m2_window_0920.py`; the golden
      wire and config snapshots and the shipped-default pins re-pinned.
+
+ M3. **Three fragments per 483-byte part** (raw header version 2, 9
+     bytes: `RAW_PROTOCOL_VERSION` 2, `RAW_HEADER_SIZE` 13 -> 9,
+     `RAW_SRC_PREFIX_BYTES` 2; `_resolve_raw_src`, `_raw_src_ambiguous`).
+     The version-1 header carried the sender's full 6-byte prefix so raw
+     fragments would land in the same reassembly bucket as text
+     fragments; bound peers are few (small-mesh mode caps at 3), so the
+     receiver now resolves a 2-byte source prefix to the unique bound
+     peer whose prefix starts with it -- and hands
+     `_handle_direct_multifragment_frame` that peer's full prefix, so the
+     bucket key is unchanged -- dropping a fragment whose prefix matches
+     no bound peer or two (logged once per prefix), while a sender never
+     uses raw to a peer whose short prefix another bound peer shares, or
+     while a bound peer shares this node's own short prefix
+     (`_raw_fragments_eligible`). Firmware limits re-read for this
+     change: `onRawDataRecv` pushes payload + 4 bytes inside
+     MAX_FRAME_SIZE 176 (172 received, the 2026-09-19 audit's number) and
+     CMD_SEND_RAW_DATA is cmd + path_len + path + payload (174 -
+     path_len). Per-fragment payload at the shipped cap of 170 is 161 up
+     to four hops, and 3 x 161 = 483: the Link MDU part in three raw
+     fragments instead of four (3 x 170 = 510 B on air instead of 4 x
+     172 = 688, one fewer loss opportunity and gap per part). A v1 header
+     is no longer decoded (both nodes are updated together). Golden wire
+     snapshot regenerated in the same commit: the 31 raw-fragment and
+     budget cases changed, nothing else. Tests:
+     `tests/test_reconcile_m3_short_header_0920.py`; the codec, budget
+     and strike tests updated to the 9-byte header (the strike scenario's
+     payload is now sized to four fragments explicitly).

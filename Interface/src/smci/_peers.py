@@ -493,6 +493,38 @@ class _PeerStateMixin:
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 
+    def _resolve_raw_src(self, src_prefix_hex: str) -> Optional[str]:
+        """The bound peer a raw fragment's RAW_SRC_PREFIX_BYTES-byte source
+        prefix names (phase 3 M3, 2026-09-20): exactly one bound peer whose
+        6-byte prefix starts with it, else None (no match, or two bound
+        peers sharing the short prefix -- both dropped by the caller, the
+        ambiguous case logged once per prefix)."""
+        short = (src_prefix_hex or "").lower()
+        if len(short) < self.RAW_SRC_PREFIX_BYTES * 2:
+            return None
+        short = short[: self.RAW_SRC_PREFIX_BYTES * 2]
+        matches = [p for p in self._peers if p.startswith(short)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1 and short not in self._raw_src_ambiguous_logged:
+            self._raw_src_ambiguous_logged.add(short)
+            RNS.log(f"{self}: raw fragments from source prefix {short} are ambiguous between bound peers {matches} -- dropped.", RNS.LOG_WARNING)
+        return None
+
+    def _raw_src_ambiguous(self, peer_prefix: str) -> bool:
+        """Whether another bound peer shares `peer_prefix`'s short raw
+        source prefix -- then raw fragments from this node would be
+        ambiguous at the far end, so the sender uses text (M3)."""
+        short = peer_prefix[: self.RAW_SRC_PREFIX_BYTES * 2]
+        own = (self._own_pubkey_prefix() or "")[: self.RAW_SRC_PREFIX_BYTES * 2]
+        # The far end resolves OUR prefix against ITS bound peers; the best
+        # this side can check is that no other bound peer of ours shares
+        # our short prefix (the two nodes' peer sets coincide in a small
+        # mesh) -- and that the target's own short prefix is unique here.
+        others = [p for p in self._peers if p != peer_prefix and p.startswith(short)]
+        own_clash = [p for p in self._peers if own and p.startswith(own)]
+        return bool(others) or bool(own_clash)
+
     def _canonical_peer_prefix(self, raw_prefix: str) -> Optional[str]:
         """Resolves a MeshCore-native pubkey prefix (e.g. `pubkey_prefix`
         off a CONTACT_MSG_RECV event) to this interface's own canonical

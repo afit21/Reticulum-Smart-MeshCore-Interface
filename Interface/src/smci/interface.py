@@ -348,13 +348,25 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     COMPLETION_QUERY_NONCE_MAX = 0xEF
 
     # --- Raw binary DIRECT fragments (2026-09-18 night, module docstring) ---
-    # [ver<<4 | attempt&3 : 1][dst_prefix : 2][src_prefix : 6][pkt_id : 2]
-    # [frag_idx : 1][frag_total : 1] then payload. No marker character: a
-    # raw packet is its own MeshCore payload type; the version nibble and
-    # dst prefix are the filter against other applications' raw packets.
-    RAW_PROTOCOL_VERSION = 1
-    RAW_HEADER_SIZE = 13
+    # Version 2 (2026-09-20, phase 3 M3, docs/reconcile_redesign.md):
+    # [2<<4 | flags | attempt&3 : 1][dst_prefix : 2][src_prefix : 2]
+    # [pkt_id : 2][frag_idx : 1][frag_total : 1] then payload -- 9 bytes.
+    # The version-1 header carried the sender's full 6-byte prefix (13
+    # bytes); bound peers are few (small-mesh mode caps at 3), so a 2-byte
+    # source prefix resolves to a bound peer uniquely in practice, the
+    # receiver checks that (`_resolve_raw_src`: no match or two matches ->
+    # dropped, logged) and a sender never uses raw to a peer whose 2-byte
+    # prefix another bound peer shares (`_raw_src_ambiguous`). The gain:
+    # the per-fragment payload is min(cap 170, 172, 174 - path_len) - 9 =
+    # 161 up to four hops, and 3 x 161 = 483 -- a Link MDU part in three
+    # fragments instead of four. A v1 header is no longer decoded (both
+    # nodes are updated together). No marker character: a raw packet is
+    # its own MeshCore payload type; the version nibble and dst prefix are
+    # the filter against other applications' raw packets.
+    RAW_PROTOCOL_VERSION = 2
+    RAW_HEADER_SIZE = 9
     RAW_DST_PREFIX_BYTES = 2
+    RAW_SRC_PREFIX_BYTES = 2
     # Bit 2 of byte 0 (2026-09-20, completion report): "report what you hold
     # when this lands" -- set on the LAST fragment of every raw burst, so a
     # receiver whose bucket is still incomplete after the burst reports its
@@ -815,6 +827,8 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # v4 report's entries.
         self._raw_windows = {}
         self._recent_raw_pkts = {}
+        # M3: short raw source prefixes already logged as ambiguous.
+        self._raw_src_ambiguous_logged = set()
 
         self._contact_refresh_task = None
 

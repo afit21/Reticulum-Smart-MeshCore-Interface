@@ -53,32 +53,41 @@ change regenerates it in the same commit):
   BIND_CAP_RAW_FRAGMENTS 0x02.
 
   "Q" (COMPLETION_MARKER) -- the DIRECT-only completion QUERY / ANSWER /
-  REPORT (the have-bitmap reconcile):
+  REPORT (the have-bitmap reconcile). Versions 1-3, single part:
     [version][type: 0 QUERY / 1 ANSWER][complete: 0/1][pkt_id:2 BE][frag_total]
     v3 adds  [nonce]                                        (after frag_total)
     v2+ ANSWER adds the have-bitmap, ceil(frag_total / 8) bytes, bit i = fragment i held
-  COMPLETION_PROTOCOL_VERSION is 3; v1 and v2 frames still decode and a
-  v1 QUERY is answered in v1. A QUERY's nonce cycles 1..0xEF
+  Version 4 (2026-09-20, one report per window), multi-part:
+    [4][type][n: 1..8][nonce] then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
+  COMPLETION_PROTOCOL_VERSION is 4; v1-v3 frames still decode and a
+  v1 / v3 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
   (COMPLETION_QUERY_NONCE_MAX) and its ANSWER echoes it; a receiver-
   initiated REPORT is an ANSWER with nonce 0xF0 | round
   (COMPLETION_REPORT_NONCE_BASE), round being the raw header's attempt
-  bits. A pre-v3 peer drops a v3 QUERY, so both nodes must run a v3
-  build for reconciliation to work.
+  bits. A pre-v3 peer drops a v3 QUERY and a pre-v4 peer a v4 frame, so
+  both nodes must run the same build for reconciliation to work. Reports
+  and answers are sent as MeshCore TXT_TYPE_CLI_DATA (encrypted, never
+  ACKed by the firmware) since 2026-09-20; the QUERY is a plain ACKed
+  text message.
 
   Raw binary DIRECT fragments -- `send_raw_data` (PAYLOAD_TYPE_RAW_CUSTOM,
   no text framing, no firmware encryption, no firmware ACK), RAW_HEADER_SIZE
-  13 bytes then the RNS payload chunk:
-    [RAW_PROTOCOL_VERSION 1 << 4 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
-    [dst_pubkey_prefix:2][src_pubkey_prefix:6][pkt_id:2 BE][frag_idx][frag_total]
-  RAW_FLAG_REPORT marks the last two fragments of a burst (the receiver
-  reports when one lands). Per-fragment payload is
-  min(direct_raw_payload_cap, FIRMWARE_RAW_RX_PAYLOAD_LIMIT 172,
-  FIRMWARE_RAW_TX_FRAME_LIMIT 174 - path_len) - 13: 157 bytes at the
-  shipped cap of 170. The firmware dedups raw packets by content, so no
-  two transmissions of a fragment may be byte-identical -- the attempt
-  bits change per round (at most 4 rounds). Raw fragments land in the
-  same reassembly bucket as text fragments from that sender and are
-  reconciled by the same "Q" frames.
+  9 bytes (version 2, 2026-09-20; version 1 was 13 with a 6-byte source
+  prefix and is no longer decoded) then the RNS payload chunk:
+    [RAW_PROTOCOL_VERSION 2 << 4 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
+    [dst_pubkey_prefix:2][src_pubkey_prefix:2][pkt_id:2 BE][frag_idx][frag_total]
+  The 2-byte source prefix names the unique bound peer whose 6-byte
+  prefix starts with it (`_resolve_raw_src`; a sender never uses raw
+  where that would be ambiguous). RAW_FLAG_REPORT marks the last two
+  fragments of a burst (the receiver reports when one lands). Per-
+  fragment payload is min(direct_raw_payload_cap, FIRMWARE_RAW_RX_
+  PAYLOAD_LIMIT 172, FIRMWARE_RAW_TX_FRAME_LIMIT 174 - path_len) - 9:
+  161 bytes at the shipped cap of 170 up to four hops, so a 483-byte Link
+  MDU part is exactly three fragments. The firmware dedups raw packets
+  by content, so no two transmissions of a fragment may be byte-identical
+  -- the attempt bits change per round (at most 4 rounds). Raw fragments
+  land in the same reassembly bucket as text fragments from that sender
+  and are reconciled by the same "Q" frames.
 
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification

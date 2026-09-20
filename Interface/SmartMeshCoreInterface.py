@@ -53,32 +53,41 @@ change regenerates it in the same commit):
   BIND_CAP_RAW_FRAGMENTS 0x02.
 
   "Q" (COMPLETION_MARKER) -- the DIRECT-only completion QUERY / ANSWER /
-  REPORT (the have-bitmap reconcile):
+  REPORT (the have-bitmap reconcile). Versions 1-3, single part:
     [version][type: 0 QUERY / 1 ANSWER][complete: 0/1][pkt_id:2 BE][frag_total]
     v3 adds  [nonce]                                        (after frag_total)
     v2+ ANSWER adds the have-bitmap, ceil(frag_total / 8) bytes, bit i = fragment i held
-  COMPLETION_PROTOCOL_VERSION is 3; v1 and v2 frames still decode and a
-  v1 QUERY is answered in v1. A QUERY's nonce cycles 1..0xEF
+  Version 4 (2026-09-20, one report per window), multi-part:
+    [4][type][n: 1..8][nonce] then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
+  COMPLETION_PROTOCOL_VERSION is 4; v1-v3 frames still decode and a
+  v1 / v3 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
   (COMPLETION_QUERY_NONCE_MAX) and its ANSWER echoes it; a receiver-
   initiated REPORT is an ANSWER with nonce 0xF0 | round
   (COMPLETION_REPORT_NONCE_BASE), round being the raw header's attempt
-  bits. A pre-v3 peer drops a v3 QUERY, so both nodes must run a v3
-  build for reconciliation to work.
+  bits. A pre-v3 peer drops a v3 QUERY and a pre-v4 peer a v4 frame, so
+  both nodes must run the same build for reconciliation to work. Reports
+  and answers are sent as MeshCore TXT_TYPE_CLI_DATA (encrypted, never
+  ACKed by the firmware) since 2026-09-20; the QUERY is a plain ACKed
+  text message.
 
   Raw binary DIRECT fragments -- `send_raw_data` (PAYLOAD_TYPE_RAW_CUSTOM,
   no text framing, no firmware encryption, no firmware ACK), RAW_HEADER_SIZE
-  13 bytes then the RNS payload chunk:
-    [RAW_PROTOCOL_VERSION 1 << 4 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
-    [dst_pubkey_prefix:2][src_pubkey_prefix:6][pkt_id:2 BE][frag_idx][frag_total]
-  RAW_FLAG_REPORT marks the last two fragments of a burst (the receiver
-  reports when one lands). Per-fragment payload is
-  min(direct_raw_payload_cap, FIRMWARE_RAW_RX_PAYLOAD_LIMIT 172,
-  FIRMWARE_RAW_TX_FRAME_LIMIT 174 - path_len) - 13: 157 bytes at the
-  shipped cap of 170. The firmware dedups raw packets by content, so no
-  two transmissions of a fragment may be byte-identical -- the attempt
-  bits change per round (at most 4 rounds). Raw fragments land in the
-  same reassembly bucket as text fragments from that sender and are
-  reconciled by the same "Q" frames.
+  9 bytes (version 2, 2026-09-20; version 1 was 13 with a 6-byte source
+  prefix and is no longer decoded) then the RNS payload chunk:
+    [RAW_PROTOCOL_VERSION 2 << 4 | RAW_FLAG_REPORT 0x04 | attempt & 0x03]
+    [dst_pubkey_prefix:2][src_pubkey_prefix:2][pkt_id:2 BE][frag_idx][frag_total]
+  The 2-byte source prefix names the unique bound peer whose 6-byte
+  prefix starts with it (`_resolve_raw_src`; a sender never uses raw
+  where that would be ambiguous). RAW_FLAG_REPORT marks the last two
+  fragments of a burst (the receiver reports when one lands). Per-
+  fragment payload is min(direct_raw_payload_cap, FIRMWARE_RAW_RX_
+  PAYLOAD_LIMIT 172, FIRMWARE_RAW_TX_FRAME_LIMIT 174 - path_len) - 9:
+  161 bytes at the shipped cap of 170 up to four hops, so a 483-byte Link
+  MDU part is exactly three fragments. The firmware dedups raw packets
+  by content, so no two transmissions of a fragment may be byte-identical
+  -- the attempt bits change per round (at most 4 rounds). Raw fragments
+  land in the same reassembly bucket as text fragments from that sender
+  and are reconciled by the same "Q" frames.
 
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
@@ -3235,7 +3244,7 @@ class _WireFormatMixin:
         header = (
             bytes([(self.RAW_PROTOCOL_VERSION << 4) | (attempt & 0x03) | (self.RAW_FLAG_REPORT if report else 0)])
             + bytes.fromhex(dst_pubkey_hex[: self.RAW_DST_PREFIX_BYTES * 2])
-            + bytes.fromhex(src_prefix_hex[: self.BIND_PUBKEY_PREFIX_BYTES * 2])
+            + bytes.fromhex(src_prefix_hex[: self.RAW_SRC_PREFIX_BYTES * 2])
             + pkt_id.to_bytes(2, "big")
             + bytes([frag_idx & 0xFF, frag_total & 0xFF])
         )
@@ -3249,11 +3258,14 @@ class _WireFormatMixin:
         return bool(raw) and bool(raw[0] & self.RAW_FLAG_REPORT)
 
     def _decode_raw_fragment(self, raw: bytes) -> "tuple[_FrameHeader, bytes, str, bytes]":
-        """Returns (header, payload, src_prefix_hex, dst_prefix_bytes).
-        Raises ValueError for anything that isn't one of ours -- callers
-        drop those silently, since other applications' raw packets share
-        this payload type. Bit 2 of byte 0 (RAW_FLAG_REPORT) is ignored
-        here; see `_raw_fragment_report_requested`."""
+        """Returns (header, payload, src_prefix_hex, dst_prefix_bytes);
+        `src_prefix_hex` is the sender's RAW_SRC_PREFIX_BYTES-byte prefix
+        (4 hex chars since version 2), which `_resolve_raw_src` maps to
+        the bound peer's full 6-byte prefix. Raises ValueError for
+        anything that isn't one of ours -- callers drop those silently,
+        since other applications' raw packets share this payload type.
+        Bit 2 of byte 0 (RAW_FLAG_REPORT) is ignored here; see
+        `_raw_fragment_report_requested`."""
         if len(raw) < self.RAW_HEADER_SIZE:
             raise ValueError("too short for a raw fragment header")
         if (raw[0] >> 4) != self.RAW_PROTOCOL_VERSION:
@@ -3261,8 +3273,8 @@ class _WireFormatMixin:
         attempt = raw[0] & 0x03
         dst = raw[1:1 + self.RAW_DST_PREFIX_BYTES]
         i = 1 + self.RAW_DST_PREFIX_BYTES
-        src_prefix_hex = raw[i:i + self.BIND_PUBKEY_PREFIX_BYTES].hex()
-        i += self.BIND_PUBKEY_PREFIX_BYTES
+        src_prefix_hex = raw[i:i + self.RAW_SRC_PREFIX_BYTES].hex()
+        i += self.RAW_SRC_PREFIX_BYTES
         pkt_id = int.from_bytes(raw[i:i + 2], "big")
         frag_idx, frag_total = raw[i + 2], raw[i + 3]
         if frag_total < 1 or frag_idx >= frag_total:
@@ -4013,6 +4025,38 @@ class _PeerStateMixin:
         self._pending_path_discoveries.pop(pubkey_prefix, None)
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
+
+    def _resolve_raw_src(self, src_prefix_hex: str) -> Optional[str]:
+        """The bound peer a raw fragment's RAW_SRC_PREFIX_BYTES-byte source
+        prefix names (phase 3 M3, 2026-09-20): exactly one bound peer whose
+        6-byte prefix starts with it, else None (no match, or two bound
+        peers sharing the short prefix -- both dropped by the caller, the
+        ambiguous case logged once per prefix)."""
+        short = (src_prefix_hex or "").lower()
+        if len(short) < self.RAW_SRC_PREFIX_BYTES * 2:
+            return None
+        short = short[: self.RAW_SRC_PREFIX_BYTES * 2]
+        matches = [p for p in self._peers if p.startswith(short)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1 and short not in self._raw_src_ambiguous_logged:
+            self._raw_src_ambiguous_logged.add(short)
+            RNS.log(f"{self}: raw fragments from source prefix {short} are ambiguous between bound peers {matches} -- dropped.", RNS.LOG_WARNING)
+        return None
+
+    def _raw_src_ambiguous(self, peer_prefix: str) -> bool:
+        """Whether another bound peer shares `peer_prefix`'s short raw
+        source prefix -- then raw fragments from this node would be
+        ambiguous at the far end, so the sender uses text (M3)."""
+        short = peer_prefix[: self.RAW_SRC_PREFIX_BYTES * 2]
+        own = (self._own_pubkey_prefix() or "")[: self.RAW_SRC_PREFIX_BYTES * 2]
+        # The far end resolves OUR prefix against ITS bound peers; the best
+        # this side can check is that no other bound peer of ours shares
+        # our short prefix (the two nodes' peer sets coincide in a small
+        # mesh) -- and that the target's own short prefix is unique here.
+        others = [p for p in self._peers if p != peer_prefix and p.startswith(short)]
+        own_clash = [p for p in self._peers if own and p.startswith(own)]
+        return bool(others) or bool(own_clash)
 
     def _canonical_peer_prefix(self, raw_prefix: str) -> Optional[str]:
         """Resolves a MeshCore-native pubkey prefix (e.g. `pubkey_prefix`
@@ -6658,6 +6702,8 @@ class _ReconcileMixin:
             return False
         if self._own_pubkey_prefix() is None:
             return False
+        if self._raw_src_ambiguous(peer_prefix):
+            return False   # M3: a 2-byte source prefix must name one bound peer
         path_hex = self._resolved_paths[peer_prefix].out_path_hex or ""
         if path_hex and self._raw_path_unsupported(path_hex):
             return False
@@ -9954,9 +10000,18 @@ class _RoutingMixin:
         if not own or bytes.fromhex(own[: self.RAW_DST_PREFIX_BYTES * 2]) != dst_prefix:
             self._raw_frames_ignored += 1
             return
+        # M3 (2026-09-20): the 2-byte source prefix names a bound peer (the
+        # 6-byte token every text frame from that peer carries, so raw and
+        # text fragments share one reassembly bucket); no or two matches ->
+        # dropped, counted.
+        sender_token = self._resolve_raw_src(src_prefix)
+        if sender_token is None:
+            self._raw_frames_ignored += 1
+            self._debug(f"raw fragment from unresolvable source prefix {src_prefix!r} dropped (no unique bound peer).")
+            return
         self._raw_fragments_received += 1
         self._handle_direct_multifragment_frame(
-            header, rns_payload, src_prefix, raw=True,
+            header, rns_payload, sender_token, raw=True,
             report_requested=self._raw_fragment_report_requested(data),
         )
 
@@ -10555,13 +10610,25 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     COMPLETION_QUERY_NONCE_MAX = 0xEF
 
     # --- Raw binary DIRECT fragments (2026-09-18 night, module docstring) ---
-    # [ver<<4 | attempt&3 : 1][dst_prefix : 2][src_prefix : 6][pkt_id : 2]
-    # [frag_idx : 1][frag_total : 1] then payload. No marker character: a
-    # raw packet is its own MeshCore payload type; the version nibble and
-    # dst prefix are the filter against other applications' raw packets.
-    RAW_PROTOCOL_VERSION = 1
-    RAW_HEADER_SIZE = 13
+    # Version 2 (2026-09-20, phase 3 M3, docs/reconcile_redesign.md):
+    # [2<<4 | flags | attempt&3 : 1][dst_prefix : 2][src_prefix : 2]
+    # [pkt_id : 2][frag_idx : 1][frag_total : 1] then payload -- 9 bytes.
+    # The version-1 header carried the sender's full 6-byte prefix (13
+    # bytes); bound peers are few (small-mesh mode caps at 3), so a 2-byte
+    # source prefix resolves to a bound peer uniquely in practice, the
+    # receiver checks that (`_resolve_raw_src`: no match or two matches ->
+    # dropped, logged) and a sender never uses raw to a peer whose 2-byte
+    # prefix another bound peer shares (`_raw_src_ambiguous`). The gain:
+    # the per-fragment payload is min(cap 170, 172, 174 - path_len) - 9 =
+    # 161 up to four hops, and 3 x 161 = 483 -- a Link MDU part in three
+    # fragments instead of four. A v1 header is no longer decoded (both
+    # nodes are updated together). No marker character: a raw packet is
+    # its own MeshCore payload type; the version nibble and dst prefix are
+    # the filter against other applications' raw packets.
+    RAW_PROTOCOL_VERSION = 2
+    RAW_HEADER_SIZE = 9
     RAW_DST_PREFIX_BYTES = 2
+    RAW_SRC_PREFIX_BYTES = 2
     # Bit 2 of byte 0 (2026-09-20, completion report): "report what you hold
     # when this lands" -- set on the LAST fragment of every raw burst, so a
     # receiver whose bucket is still incomplete after the burst reports its
@@ -11022,6 +11089,8 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # v4 report's entries.
         self._raw_windows = {}
         self._recent_raw_pkts = {}
+        # M3: short raw source prefixes already logged as ambiguous.
+        self._raw_src_ambiguous_logged = set()
 
         self._contact_refresh_task = None
 
