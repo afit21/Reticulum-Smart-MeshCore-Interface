@@ -48,7 +48,15 @@ at a repeater are real. Its numbers below are read with that split.
   /`_max` 0.3-3 -> 0.2-1 s (1.7 s mean on 598 misses against 8.6%-vs-6.9%
   contention); a completion ANSWER's own ACK wait is hop-aware. MeshBench:
   relay 8/8, 8/8; large_payload 6/6, 1/6 (+5/6 and one run with no DIRECT path at all); two_hop bring-up-dominated; longest one-hop missed-ACK wait 12 -> 8 s, post-miss listen 1.6 -> 0.6 s mean, completion-check timeouts 97 -> 8 across the run sets.
-Tests: `tests/test_completion_report_0920.py`, `tests/test_dead_wait_trims_0920.py`. Field test proposed in the
+- **A CHANNEL-carried PROOF clears the unknown-destination backoff.** Baseline
+  `two_hop-1`: probes 2 and 3 delivered over CHANNEL and proved, three
+  bootstrap attempts counted as "no token learned", probes 4-7 dropped by the
+  interface for 300 s (`unknown_dest_backoff_drop`). `_note_channel_proof`
+  matches a CHANNEL PROOF against the remembered bootstrap send (or pending
+  LINKREQUEST) and clears the backoff, learning no token. MeshBench: two_hop 4/8 and 5/8 (the latter with no DIRECT path ever resolved) with zero backoff drops, where every earlier late-path run dropped 2-4 of 8; relay 8/8, 8/8.
+
+Tests: `tests/test_completion_report_0920.py`, `tests/test_dead_wait_trims_0920.py`,
+`tests/test_channel_proof_backoff_0920.py`. Field test proposed in the
 session report; none of this is field-tested yet.
 
 ### Fixed: night-session fixes revised against the simulators and the MeshBench findings (2026-09-20)

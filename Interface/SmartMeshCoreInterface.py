@@ -2655,6 +2655,48 @@ and 539 `completion_check_result` records of the 2026-09-19 sessions.
 MeshBench (two runs each, on top of the completion report, against that
 change's runs): `relay` 8/8 and 8/8 (P1: 8/8, 7/8), probe RTT avg 10.4 / 13.6 s; `large_payload` 6/6 and 1/6 (P1: 3/6, 3/6) plus two more runs: 5/6, and one with no DIRECT path ever resolved (0 raw sends, uninformative), delivered-probe RTT avg 31.1 / 41.9 s, per-part first-fragment-to-known-complete 14.5-37.8 s; `two_hop` 2/8 and 2/8, both with the DIRECT path resolving after 497 / 543 s and 4 probes each dropped by the unknown-destination backoff (no trimmed wait was on the critical path). The mechanics are unambiguous across the captures: the longest missed-ACK wait at one hop 12.0 -> 8.0 s, post-miss listen mean 1.55-1.65 -> 0.59 s, completion-check timeouts 97 (baseline set) / 19 (P1 set) -> 8.
 
+**A CHANNEL-carried PROOF clears the unknown-destination backoff
+(2026-09-20, same pass):** baseline `two_hop-1` delivered probes 2 and 3
+over CHANNEL (no DIRECT path yet) and their PROOFs came back over CHANNEL
+(`channel_bare`), yet the interface counted three bootstrap attempts "with
+no token learned" and dropped probes 4-7 outright for 300 s
+(`unknown_dest_backoff_drop`) while the destination was provably
+answering. The 2026-09-19 afternoon fix only clears the backoff for a
+PROOF that arrives DIRECT (`_observe_incoming_rns_packet`), and the
+CHANNEL receive path -- deliberately, its sender is unauthenticated --
+observes nothing. `_note_channel_proof`, called from `process_incoming`
+for every `channel_*` transport, matches the PROOF's destination field
+against `_pending_dest_proofs` (a remembered bootstrap DATA send) or
+`_pending_link_requests` (an LRPROOF's link_id) and clears that
+destination's backoff. It learns NO token: a forged CHANNEL proof can at
+most keep this node trying a destination it would otherwise have paused
+on, which is the pre-backoff behaviour. A LINKREQUEST to an unresolved
+destination takes the same path, so this is also what keeps a link
+attempt inside MeshChat's 15 s window from being dropped by this
+interface during a discovery backoff.
+
+MeshBench (`two_hop`, `relay`, two runs each, on top of the two changes
+above): `two_hop` 4/8 PASS and 5/8 (a mechanics FAIL only because no DIRECT path ever resolved -- the bring-up coin flip of finding 7; all five probes were delivered over CHANNEL), with ZERO `unknown_dest_backoff_drop` records, where every earlier late-path two_hop run (baseline, P1, P2: six runs) had dropped 2-4 of 8 probes itself and delivered 2-3; `relay` 8/8 and 8/8, probe RTT avg 12.1 / 8.6 s, unchanged from P1+P2 as expected.
+
+Still open from the same pass, in the merged ranking (evidence in the
+session report, `/tmp/mb/report-2026-09-20.md` at the time): bind frames
+carrying the full 32-byte pubkey so `add_contact` + the telemetry grant
+happen at bind and discovery no longer waits on an advert crossing the
+repeaters (the `two_hop` bring-up coin flip); answering an RNS path
+re-request from the cached announce locally; no reconcile quiet hold at
+zero hop and a longer one from two hops; the one-hop raw gap giving the
+sender's own listen-before-talk credit for the first repeater (field-only
+check: MeshBench has no LBT); a 9-10-byte raw header so a 483 B part is
+three fragments; HANDSHAKE-tier waiters pre-empting idle lock holds and
+raw bursts yielding between fragments (MeshChat's 15 s link window);
+duplicate suppression counting only copies that have started
+transmitting; PATH_UPDATE adoption; shorter bind jitter and re-request
+cadence; a peer-silence gate on the stale-path reset; a 3 s startup
+stagger; the completion ANSWER as no-ACK CLI_DATA; one-AES-block "Q"
+frames; small packets as ACKed text rather than raw; a third bare
+attempt at >= 2 hops; the TXT_MSG airtime overhead 6 -> 5 B; resumed raw
+sends not reusing round numbers.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -12964,6 +13006,8 @@ class SmartMeshCoreInterface(Interface):
         self.rxb += len(data)
         header = self._parse_rns_header(data)
         self._note_link_closed(header)
+        if transport.startswith("channel"):
+            self._note_channel_proof(header, transport)
         if self._packet_capture_file is not None:
             self._capture_incoming(
                 data, transport=transport, sender_peer_prefix=sender_peer_prefix,
