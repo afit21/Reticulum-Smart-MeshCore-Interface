@@ -2529,6 +2529,102 @@ and the updated gap, cap-default and quiet-window cases. Still open from the
 MeshBench report: the startup burst (finding 5), stale-path resets under
 pure congestion (6), and the bring-up odds through repeaters (7).
 
+**Receiver-initiated completion REPORT for raw bursts (2026-09-20, the
+speed/airtime/reliability pass: five parallel reviews of the send path,
+fragmentation, discovery, timing defaults and airtime, merged and ranked,
+then evaluated one at a time against a two-run MeshBench baseline of
+`zero_hop`, `relay`, `two_hop` and `large_payload` on the unmodified
+tree).** The single mechanism three of the five reviews converged on, and
+the one every baseline run showed directly: after a raw burst the sender
+keyed its reconcile QUERY the instant the last fragment's gap ended --
+exactly when the receiver, having just handed the packet to RNS, transmits
+its own reaction (the delivery PROOF, or the next Resource request). At
+zero hop the two frames collided outright (baseline `zero_hop`: 25-46%
+DIRECT attempt success, 23-25 half-duplex misses per run, probe RTT 9-27 s
+for a 147-byte packet); through a repeater they collided at the repeater as
+hidden nodes (baseline `relay`: the receiver held probe 4 at t=187.9 s and
+the sender learned it at t=223.8 s, after four QUERY attempts and four
+PROOF attempts had taken turns colliding at R). The field captures say the
+same thing from the other side: `answering_complete=True` on 49/82, 45/74
+and 51/68 of the QUERYs the three 2026-09-19 sessions answered (the
+receiver already held the whole packet when asked), 3.3 QUERY attempts per
+raw send, receiver-complete p50 7.7 s versus sender-known p50 34 s at one
+hop.
+
+The change (`direct_raw_report_enabled`, default yes; `direct_raw_report_
+wait_base` 2.0 s + `direct_raw_report_wait_per_hop` 3.0 s x hops, never
+more than the QUERY answer budget):
+
+- *Receiver.* `_handle_direct_multifragment_frame(raw=True)` sends the
+  existing v3 ANSWER frame UNSOLICITED -- `_send_completion_report` -- when
+  a raw bucket completes (spawned before `process_incoming`, so it enters
+  the radio lock ahead of whatever RNS sends back), when the burst's
+  flagged last fragment arrives and the bucket still has gaps (carrying
+  the bitmap, so the sender re-drives exactly the missing fragments), and
+  when a flagged fragment arrives for a packet already delivered (the
+  sender re-burst because it never got the report). No
+  `_completion_answer_hold_s`: a report follows a raw fragment, which the
+  firmware does not ACK, so there is no ACK relay to wait out.
+- *Wire.* Bit 2 of the raw header's byte 0 (`RAW_FLAG_REPORT`, 0x04; bits
+  0-1 stay the round, the high nibble the version) marks the last fragment
+  of every burst. Reports carry nonce `COMPLETION_REPORT_NONCE_BASE |
+  round` (0xF0..0xF3); QUERY nonces now cycle 1..0xEF
+  (`COMPLETION_QUERY_NONCE_MAX`) so the two ranges never meet. Both field
+  nodes are updated together; an older peer masks the bit away and never
+  reports, and the sender then pays the report wait before its QUERY.
+- *Sender.* `_send_direct_raw_fragmented` registers the
+  `(peer, pkt_id)` waiter under the round's report nonce BEFORE the burst
+  (a multi-fragment burst completes at the receiver while the sender is
+  still in the last fragment's gap), keeps the lock with the radio quiet
+  for `_completion_report_wait_s` after the burst (`_await_completion_
+  report`), and only if nothing arrives runs the QUERY path exactly as
+  before. A matching-round report resolves the waiter; a `complete=True`
+  report of any round is accepted by the handler's existing monotone rule;
+  a stale round's incomplete bitmap is discarded. A report counts as path
+  evidence (`record_direct_send_result` success), as an answered QUERY did.
+  Captured as `completion_check_result` with `outcome="reported"` and
+  `report_wait_s`; the receiver writes `completion_report_sent`, and the
+  report's own DIRECT attempt is `kind="completion_report"`.
+- *A lost last fragment (second and third cuts, same day).* The first
+  cut flagged only the last fragment, so a LOST last fragment (uniform
+  ~18% per fragment at one hop in the field; systematic in MeshBench's
+  LBT-less radio, where the tail chases the repeater's relay of the
+  fragment before it) meant no report, the whole report wait AND a
+  QUERY: MeshBench `large_payload` went 0/6 and 0/6 against a 1/6-4/6
+  baseline. The second cut added a receiver-side idle timer (report the
+  bitmap once fragments stop arriving for two sender gaps + an airtime
+  + 1 s) and a matching longer sender wait, and went 0/6 again: in that
+  lossy, bidirectional scenario the timer's report queued behind the
+  receiver's own sends, landed after the sender's wait had expired, and
+  both sides then transmitted into each other at the repeater -- while
+  the scenario's 60 s per-probe deadline sits exactly where the
+  baseline's 34-48 s part times were, so any slowdown of the lossy case
+  flips delivery. The third cut has no timer: the flag rides the LAST
+  TWO fragments of a burst, the sender waits only the transit time
+  (2 + 3 x hops s) for a report, and if the last fragment's report never
+  comes it acts on the second-last fragment's report (kept when it
+  arrived mid-burst, captured as `outcome="reported_stale"`; the
+  fragments sent after it are re-driven, at worst one duplicate
+  fragment) and only otherwise falls back to the QUERY. Bytes per part
+  when both flagged fragments land: two reports + two ACKs, the same as
+  a QUERY exchange -- the win is the missing round trip and the
+  sender's silence, not bytes.
+
+Airtime: the QUERY frame and its firmware ACK (and their relays) are gone
+from every part that lands; a report is the ANSWER that was going to be
+sent anyway. Speed: the sender learns of delivery one report airtime after
+the burst instead of after gap + QUERY + ACK + answer. Reliability: the
+sender is silent by construction while the receiver reacts, so the
+QUERY-vs-PROOF collision leaves the common path.
+
+MeshBench (two runs each, working tree with this change only, against the
+two-run baseline of the unmodified tree; MeshBench's RF is optimistic, its
+airtime ~30% pessimistic, its runs not reproducible, and -- established
+this pass against `relay-1`'s event log and `Dispatcher::checkSend` -- its
+virtual radio has no listen-before-talk, so it over-counts self-collisions
+between nodes that can hear each other while hidden-node collisions at a
+repeater are real): `zero_hop` 7/8 and 8/8 delivered (baseline 7/8 and 6/8, the latter a FAIL), probe RTT avg 5.0 / 8.2 s (12.3 / 14.6), zero-hop DIRECT attempt success 100% (25-46%), half-duplex misses 4-16 per run (23-25), QUERY attempts on air 0-2 (9-13); `relay` 8/8 and 7/8 (5/8, 4/8), the repeater relayed 67 / 63 frames (118 / 133), endpoint transmissions 42+42 / 40+39 (81+79 / 103+95); `large_payload` 3/6 and 3/6 (1/6 FAIL, 4/6), delivered-probe RTT avg 34.9 / 40.3 s (40.9 / 39.6), QUERY attempts 7 / 12 (24 / 22), R relayed 125 / 135 (184 / 138), per-part first-fragment-to-known-complete 18.6-64.6 s (34.4-83.0 s); `two_hop` 2/8, 3/8, 3/8, 2/8 over four runs (3/8, 5/8) -- in three of the four the DIRECT path resolved after 450 s or never (0-1 raw sends, no report code ran), and two runs lost 2-4 probes to the unknown-destination backoff that the third change below removes; the one run with a live 2-hop path (2/8) lost single raw fragments in the chain twice in a row and fell to the existing raw-pause strikes, with the report working where it applied.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -3413,6 +3509,17 @@ class SmartMeshCoreInterface(Interface):
     COMPLETION_TYPE_QUERY = 0
     COMPLETION_TYPE_ANSWER = 1
     COMPLETION_FRAME_RAW_SIZE = 6  # ver+type+complete+pkt_id(2)+frag_total -- the fixed body
+    # Receiver-initiated completion REPORT (2026-09-20, see the module
+    # docstring's entry of that date): an ANSWER the receiver sends
+    # UNSOLICITED when a raw burst lands, so the sender does not have to
+    # ask. Same v3 frame; the nonce byte distinguishes a report from an
+    # echoed QUERY nonce: reports carry `COMPLETION_REPORT_NONCE_BASE |
+    # round` (0xF0..0xF3, the raw header's 2-bit round), and QUERY nonces
+    # cycle through 1..COMPLETION_QUERY_NONCE_MAX so the two ranges can never
+    # meet. A sender that pre-registers a waiter for its burst round accepts
+    # the matching report exactly as it would a QUERY's answer.
+    COMPLETION_REPORT_NONCE_BASE = 0xF0
+    COMPLETION_QUERY_NONCE_MAX = 0xEF
 
     # --- Raw binary DIRECT fragments (2026-09-18 night, module docstring) ---
     # [ver<<4 | attempt&3 : 1][dst_prefix : 2][src_prefix : 6][pkt_id : 2]
@@ -3422,6 +3529,13 @@ class SmartMeshCoreInterface(Interface):
     RAW_PROTOCOL_VERSION = 1
     RAW_HEADER_SIZE = 13
     RAW_DST_PREFIX_BYTES = 2
+    # Bit 2 of byte 0 (2026-09-20, completion report): "report what you hold
+    # when this lands" -- set on the LAST fragment of every raw burst, so a
+    # receiver whose bucket is still incomplete after the burst reports its
+    # bitmap without being asked (a complete bucket reports regardless of
+    # the bit). Bits 0-1 stay the round, the high nibble the version; an
+    # older build masks the bit away and simply never reports.
+    RAW_FLAG_REPORT = 0x04
     # Companion firmware limits (MAX_FRAME_SIZE 176 on the serial link):
     # onRawDataRecv pushes payload + 4 bytes, CMD_SEND_RAW_DATA carries
     # cmd + path_len + path + payload -- both confirmed in
@@ -4310,6 +4424,21 @@ class SmartMeshCoreInterface(Interface):
         self.direct_completion_check_timeout_max_multihop_s = float(
             cfg.get("direct_completion_check_timeout_max_multihop", 18.0)
         )
+        # Dead-wait trims (2026-09-20): when the QUERY's own firmware ACK was
+        # MISSED, the full answer budget above still applied -- yet across
+        # the three 2026-09-19 sessions an un-ACKed QUERY was answered only
+        # 6/19, 9/65, 4/31 and 0/5 times at 0-3 hops, every hop<=1 answer
+        # arrived within 5.6 s, and with `miss_diagnosis=hop1_loss` 0 of 26
+        # were ever answered: the missing ACK is the signal that the QUERY
+        # never reached the peer (48% of unanswered reconciles, second
+        # audit). The answer wait after an un-ACKed QUERY is therefore
+        # capped at this grace (from 2 hops the multihop value, where two
+        # late answers arrived at 9.0 and 24.3 s), so the re-query goes out
+        # 9-12 s sooner. 0 disables the cap.
+        self.direct_completion_unacked_grace_s = float(cfg.get("direct_completion_unacked_grace", 0.0))
+        self.direct_completion_unacked_grace_multihop_s = float(
+            cfg.get("direct_completion_unacked_grace_multihop", 0.0)
+        )
         # Per-hop addition to the FLOOR (not the ceiling): a first query, before
         # any RTT sample exists, needs longer at depth. Measured query->answer
         # round trips that session: median 3.2s / 5.7s, p90 11.7s / 16.1s.
@@ -4458,6 +4587,36 @@ class SmartMeshCoreInterface(Interface):
         # burst of airtime for nothing.
         self.direct_raw_reconcile_rounds = max(1, min(4, int(cfg.get("direct_raw_reconcile_rounds", 3))))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
+        # Receiver-initiated completion report (2026-09-20, module docstring
+        # entry of that date). After a raw burst the sender used to key its
+        # reconcile QUERY the instant the last fragment's gap ended -- which
+        # is exactly when the receiver, having just handed the packet to
+        # RNS, transmits its own reaction (a delivery PROOF, the next
+        # Resource request): at zero hop the two frames collided outright,
+        # through a repeater they collided at the repeater as hidden nodes
+        # (every baseline MeshBench run, 2026-09-20; field: `answering_
+        # complete=True` on 49/82, 45/74 and 51/68 of QUERYs, 3.3 QUERY
+        # attempts per raw send, receiver-complete p50 7.7 s vs sender-known
+        # p50 34 s at one hop). With the report on, the receiver sends the
+        # ANSWER unsolicited the moment the burst lands (complete, or its
+        # bitmap when the flagged last fragment arrived with gaps), and the
+        # sender keeps its radio quiet for `direct_raw_report_wait_base` +
+        # `..._per_hop` x hops seconds after the burst (never longer than
+        # the answer budget) before falling back to the QUERY path exactly
+        # as before. Saves the QUERY frame and its firmware ACK (and their
+        # relays) per delivered part, and removes the QUERY-vs-PROOF
+        # collision from the common path. `no` restores burst-then-QUERY.
+        self.direct_raw_report_enabled = _cfg_bool(cfg.get("direct_raw_report_enabled", "yes"))
+        self.direct_raw_report_wait_base_s = float(cfg.get("direct_raw_report_wait_base", 2.0))
+        self.direct_raw_report_wait_per_hop_s = float(cfg.get("direct_raw_report_wait_per_hop", 3.0))
+        # The flag rides the LAST TWO fragments of a burst: when the last
+        # one is lost (uniform ~18% per fragment at one hop in the field,
+        # systematic in MeshBench's LBT-less radio) the report the second-
+        # last fragment triggered still tells the sender what to re-drive --
+        # it may have arrived while the burst was still going, in which case
+        # the sender keeps it as the fallback and waits the transit time for
+        # a newer one first. Two cuts before this one used a receiver-side
+        # idle timer instead; see the module docstring entry for why not.
         # Field fix (2026-09-19, bidirectional image transfer): an unanswered
         # reconcile round used to re-burst every un-ACKed fragment. In that
         # capture 3 data sends went to a peer that already held the packet
@@ -4812,6 +4971,16 @@ class SmartMeshCoreInterface(Interface):
         # ranges for now -- "we can tune this later" still applies. See
         # _send_direct_frame_and_wait_for_ack's own docstring for exactly
         # where each fires.
+        #
+        # 0.3-3 s -> 0.2-1 s (2026-09-20, dead-wait trims): the post-miss
+        # listen averaged 1.7 s on 598 field misses -- ~1000 s of lock time
+        # across the three 2026-09-19 sessions -- while the evening audit
+        # measured frame overlap between the two nodes at 8.6% against 6.9%
+        # expected by chance (loss, not contention, explains 53% of misses),
+        # and the firmware's own listen-before-talk (Dispatcher::checkSend
+        # defers while the radio reports a frame in progress) already keeps
+        # the retry out of an audible frame. Still random, per the user's
+        # standing instruction; just a smaller range.
         self.direct_post_send_listen_min_s = float(cfg.get("direct_post_send_listen_min", 0.3))
         self.direct_post_send_listen_max_s = float(cfg.get("direct_post_send_listen_max", 3))
         self.direct_post_send_listen_success_min_s = float(cfg.get("direct_post_send_listen_success_min", 0.0))
@@ -4848,6 +5017,16 @@ class SmartMeshCoreInterface(Interface):
         # to 2121s (-15%) while cutting off ZERO of the 559 ACKs that did
         # arrive. Kept proportional to path length rather than flat so a
         # deeper path still gets the time it genuinely needs.
+        #
+        # Tightened 2026-09-20 (dead-wait trims, module docstring entry of that
+        # date) to 5 + 3h: re-derived over all three 2026-09-19 sessions
+        # (2670 ACKs), the largest ACK that ever arrived was 3.82 / 6.06 /
+        # 8.15 / 7.25 s at 0 / 1 / 2 / 3 hops, so 5 / 8 / 11 / 14 s still
+        # cuts off ZERO of them (31-93% above the per-hop maximum) and, in
+        # replay, saves a further 824 + 635 + 171 s of dead lock time at
+        # 1-3 hops over 8 + 4h. `direct_ack_min_timeout` (5 s) is the hop-0
+        # floor, so hop 0 is unchanged. Tuned for SF7/BW62.5/CR8 like every
+        # absolute second in this file.
         self.direct_ack_timeout_base_s = float(cfg.get("direct_ack_timeout_base", 8.0))
         self.direct_ack_timeout_per_hop_s = float(cfg.get("direct_ack_timeout_per_hop", 4.0))
 
@@ -6496,10 +6675,10 @@ class SmartMeshCoreInterface(Interface):
 
     def _encode_raw_fragment(
         self, payload: bytes, dst_pubkey_hex: str, src_prefix_hex: str,
-        pkt_id: int, frag_idx: int, frag_total: int, attempt: int,
+        pkt_id: int, frag_idx: int, frag_total: int, attempt: int, report: bool = False,
     ) -> bytes:
         header = (
-            bytes([(self.RAW_PROTOCOL_VERSION << 4) | (attempt & 0x03)])
+            bytes([(self.RAW_PROTOCOL_VERSION << 4) | (attempt & 0x03) | (self.RAW_FLAG_REPORT if report else 0)])
             + bytes.fromhex(dst_pubkey_hex[: self.RAW_DST_PREFIX_BYTES * 2])
             + bytes.fromhex(src_prefix_hex[: self.BIND_PUBKEY_PREFIX_BYTES * 2])
             + pkt_id.to_bytes(2, "big")
@@ -6507,11 +6686,19 @@ class SmartMeshCoreInterface(Interface):
         )
         return header + payload
 
+    def _raw_fragment_report_requested(self, raw: bytes) -> bool:
+        """Whether byte 0 of a raw fragment carries RAW_FLAG_REPORT (the
+        burst's last fragment, 2026-09-20). Read separately from
+        `_decode_raw_fragment` so the decoder's 4-tuple contract, and the
+        tests pinning it, stay unchanged."""
+        return bool(raw) and bool(raw[0] & self.RAW_FLAG_REPORT)
+
     def _decode_raw_fragment(self, raw: bytes) -> "tuple[_FrameHeader, bytes, str, bytes]":
         """Returns (header, payload, src_prefix_hex, dst_prefix_bytes).
         Raises ValueError for anything that isn't one of ours -- callers
         drop those silently, since other applications' raw packets share
-        this payload type."""
+        this payload type. Bit 2 of byte 0 (RAW_FLAG_REPORT) is ignored
+        here; see `_raw_fragment_report_requested`."""
         if len(raw) < self.RAW_HEADER_SIZE:
             raise ValueError("too short for a raw fragment header")
         if (raw[0] >> 4) != self.RAW_PROTOCOL_VERSION:
@@ -7309,6 +7496,39 @@ class SmartMeshCoreInterface(Interface):
             return
         self._pending_dest_proofs[truncated_hash] = (
             header.destination_hash, time.monotonic() + self.proof_correlation_ttl_s,
+        )
+
+    def _note_channel_proof(self, header: Optional[_RnsHeader], transport: str) -> None:
+        """A delivery PROOF that arrived over CHANNEL for a bootstrap DATA
+        send this node remembered (2026-09-20, MeshBench `two_hop` baseline:
+        probes 2 and 3 were delivered over CHANNEL and PROVED, the interface
+        still counted them as bootstrap attempts "with no token learned",
+        and after the third it dropped probes 4-7 outright for 300 s --
+        `unknown_dest_backoff_drop` -- while the destination was provably
+        answering). The CHANNEL receive path deliberately learns no routing
+        token (its sender is unauthenticated, see `_handle_channel_frame`),
+        and that stays so: this only clears the destination's
+        unknown-destination backoff, the one decision a matched proof is
+        entitled to change. The worst a forged CHANNEL proof can do is keep
+        this node trying a destination it would otherwise have given up on
+        for a while -- the pre-backoff behaviour."""
+        if header is None or header.packet_type != RNS.Packet.PROOF or header.destination_hash is None:
+            return
+        delivered = self._pending_dest_proofs.pop(header.destination_hash, None)
+        if delivered is None:
+            # The same for an LRPROOF answering a LINKREQUEST this node sent
+            # to an unresolved destination (link_id -> requested destination,
+            # the shape `_observe_incoming_rns_packet` uses for DIRECT).
+            delivered = self._pending_link_requests.pop(header.destination_hash, None)
+        if delivered is None:
+            return
+        proved_dest, _expiry = delivered
+        had_backoff = proved_dest in self._unknown_dest_attempts or proved_dest in self._unknown_dest_backoff_until
+        self._clear_unknown_dest_backoff(proved_dest)
+        self._debug(
+            f"PROOF over {transport} for a bootstrap DATA send to {proved_dest.hex()} -- destination is "
+            f"reachable; unknown-destination backoff {'cleared' if had_backoff else 'not armed'} "
+            f"(no token learned: CHANNEL senders are unauthenticated)."
         )
 
     def _pending_dest_proofs_sweep(self, now: float) -> None:
@@ -8416,6 +8636,60 @@ class SmartMeshCoreInterface(Interface):
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
         return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
 
+    def _completion_report_wait_s(self, hops: int, peer_prefix: str) -> float:
+        """How long a raw sender keeps its radio quiet after a burst for the
+        receiver's unsolicited completion report (2026-09-20): `direct_raw_
+        report_wait_base` + `..._per_hop` x hops -- the report's own airtime
+        plus one relay per repeater with the firmware's random forward
+        delay, the same physics `_completion_quiet_window_s` sizes for a
+        QUERY's answer -- never longer than the answer budget a QUERY would
+        get. A report that does not arrive in that time was lost or is
+        queued behind the receiver's own sends, and waiting longer only
+        delays the QUERY fallback (third cut: the first two waited for a
+        receiver-side idle timer as well and MeshBench `large_payload`, a
+        lossy bidirectional one-hop case with a 60 s per-probe deadline,
+        went 0/6 against a 1/6-4/6 baseline)."""
+        window_s = self.direct_raw_report_wait_base_s + self.direct_raw_report_wait_per_hop_s * max(0, hops)
+        budget_s = self._completion_query_timeout_s(peer_prefix, hops)
+        return max(0.0, min(window_s, budget_s))
+
+    async def _await_completion_report(
+        self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
+    ) -> Optional[_CompletionFrame]:
+        """Wait (lock held, radio quiet) for the receiver's completion
+        report after a raw burst; None if none arrived inside
+        `_completion_report_wait_s`, in which case the caller falls back to
+        the QUERY path. A report is captured as a `completion_check_result`
+        with outcome "reported" so the reconcile accounting stays in one
+        record type; no record is written when nothing arrives (the QUERY
+        that follows writes its own)."""
+        wait_s = self._completion_report_wait_s(hops, peer_prefix)
+        started = time.monotonic()
+        try:
+            got: _CompletionFrame = await asyncio.wait_for(asyncio.shield(fut), timeout=wait_s)
+        except (asyncio.TimeoutError, Exception):
+            self._debug(
+                f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
+                f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
+            )
+            return None
+        waited_s = time.monotonic() - started
+        self._debug(
+            f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
+            f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
+            f"{waited_s:.1f}s after the burst's last gap."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", {
+                "event": "completion_check_result",
+                "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
+                "outcome": "reported", "complete": got.complete, "stage": stage,
+                "timeout_s": round(wait_s, 3), "answer_version": got.version,
+                "held": sorted(got.held) if got.held is not None else None,
+                "report_wait_s": round(waited_s, 3),
+            })
+        return got
+
     def _record_query_path_evidence(self, peer_prefix: str, infos: "list[dict]", answered: bool = False) -> None:
         """One raw reconcile round's QUERY sends, as stale-path evidence
         (2026-09-19 morning field test). Each QUERY is an ACKed DIRECT
@@ -8540,14 +8814,31 @@ class SmartMeshCoreInterface(Interface):
                     f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} -- last reconcile "
                     f"unanswered, re-querying instead of re-bursting {len(missing)} fragment(s)."
                 )
+            report: Optional[_CompletionFrame] = None
             if burst_this_round:
+                # Completion report (2026-09-20): the waiter is registered
+                # BEFORE the burst -- for a multi-fragment burst the receiver
+                # completes on the last fragment while this side is still
+                # in that fragment's gap -- under the report nonce for this
+                # round, so a stale round's incomplete bitmap can never be
+                # applied (a `complete=True` report of any round is accepted
+                # by the handler's monotone rule, as a late QUERY answer is).
+                report_key = (peer_prefix, pkt_id)
+                report_fut = None
+                if self.direct_raw_report_enabled:
+                    report_fut = asyncio.get_running_loop().create_future()
+                    self._completion_query_waiters[report_key] = (
+                        report_fut, frag_total, self.COMPLETION_REPORT_NONCE_BASE | (rnd & 0x03),
+                    )
                 async with self._direct_exchange_lock(priority):
                     for n, frag_idx in enumerate(missing):
                         if self.detached or not self.online:
                             remember()
+                            self._completion_query_waiters.pop(report_key, None)
                             return False
                         frame = self._encode_raw_fragment(
                             chunks[frag_idx], target, own_prefix, pkt_id, frag_idx, frag_total, attempt=rnd,
+                            report=report_fut is not None and n >= len(missing) - 2,
                         )
                         telemetry: dict = {}
                         try:
@@ -8573,10 +8864,48 @@ class SmartMeshCoreInterface(Interface):
                         gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
                         if gap_s > 0:
                             await asyncio.sleep(gap_s)
+                    if report_fut is not None:
+                        stale_report = None
+                        if report_fut.done() and not report_fut.result().complete:
+                            # An INCOMPLETE report that arrived while this
+                            # burst was still going (the second-last fragment
+                            # is flagged too) describes a state the fragments
+                            # sent since have changed. Keep it as the fallback
+                            # and wait the transit time for the last
+                            # fragment's own report first.
+                            stale_report = report_fut.result()
+                            report_fut = asyncio.get_running_loop().create_future()
+                            self._completion_query_waiters[report_key] = (
+                                report_fut, frag_total, self.COMPLETION_REPORT_NONCE_BASE | (rnd & 0x03),
+                            )
+                        # Radio kept quiet, lock still held: the receiver's
+                        # report (and, right behind it, whatever RNS sends
+                        # back) is crossing the chain now, and this node's
+                        # next burst or QUERY is what used to collide with it.
+                        report = await self._await_completion_report(
+                            report_fut, peer_prefix, pkt_id, frag_total, gap_hops, stage=f"raw{rnd}",
+                        )
+                        if report is None and stale_report is not None:
+                            # The last fragment (or its report) was lost: the
+                            # earlier report is authoritative for everything
+                            # but the fragments sent after it, which are
+                            # re-driven -- at worst one duplicate fragment,
+                            # never a QUERY round trip.
+                            report = stale_report
+                            self._capture_completion_check_result(
+                                peer_prefix, pkt_id, frag_total, "reported_stale", stale_report.complete,
+                                stage=f"raw{rnd}", answer_version=stale_report.version,
+                                held=sorted(stale_report.held) if stale_report.held is not None else None,
+                            )
+                self._completion_query_waiters.pop(report_key, None)
             held_before = sum(acked)
-            answer = None
+            answer = report
             query_infos: list = []
-            for q in range(max(1, self.direct_raw_query_attempts)):
+            if report is not None:
+                # The report is the ANSWER; the path evidence a QUERY's ACK
+                # would have given is the report itself (it crossed the path).
+                self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+            for q in range(max(1, self.direct_raw_query_attempts) if report is None else 0):
                 info: dict = {}
                 answer = await self._query_remote_fragments(
                     target, peer_prefix, pkt_id, frag_total, stage=f"raw{rnd}", priority=priority, hop_count=hop_count,
@@ -8998,6 +9327,17 @@ class SmartMeshCoreInterface(Interface):
         2026-09-18 night). Same estimator shape as `_record_ack_rtt`."""
         self._rtt_sample(self._query_rtt, peer_prefix, rtt_s)
 
+    def _completion_unacked_grace_s(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> float:
+        """Answer wait after a QUERY whose own firmware ACK was missed
+        (2026-09-20, see `direct_completion_unacked_grace_s`): the multihop
+        value from 2 hops, else the base; 0 = no cap."""
+        if hop_count is None:
+            resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+            hop_count = resolved.out_path_len if resolved is not None else 0
+        if hop_count is not None and hop_count >= 2:
+            return max(0.0, self.direct_completion_unacked_grace_multihop_s)
+        return max(0.0, self.direct_completion_unacked_grace_s)
+
     def _completion_query_timeout_cap_s(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> float:
         """The ceiling on a completion-ANSWER wait (field fix, 2026-09-19 --
         see `direct_completion_check_timeout_max_s` for the evidence). With
@@ -9131,7 +9471,9 @@ class SmartMeshCoreInterface(Interface):
         # EARLIER query for this same pkt_id cannot resolve this one (the
         # frag_total guard alone could not -- five such stale resolutions
         # happened in the evening session, one applying held=[]).
-        self._completion_query_nonce = (self._completion_query_nonce + 1) & 0xFF
+        # 2026-09-20: cycles 1..COMPLETION_QUERY_NONCE_MAX, leaving 0 and the
+        # 0xF0.. range to receiver-initiated reports (see the constant).
+        self._completion_query_nonce = (self._completion_query_nonce % self.COMPLETION_QUERY_NONCE_MAX) + 1
         query_nonce = self._completion_query_nonce
         self._completion_query_waiters[key] = (fut, frag_total, query_nonce)
         outcome = "send_failed"
@@ -9225,6 +9567,13 @@ class SmartMeshCoreInterface(Interface):
             # is the same point, since the hold ended before this line).
             quiet_hold_s = float(quiet_info.get("hold_s", 0.0) or 0.0)
             remaining = max(0.0, timeout_s - quiet_hold_s)
+            if not q_ok:
+                # Dead-wait trims (2026-09-20): no firmware ACK for the QUERY
+                # -> it most likely never reached the peer; a short grace
+                # covers the answers that do arrive (see the config comment).
+                grace_s = self._completion_unacked_grace_s(hop_count, peer_prefix)
+                if grace_s > 0:
+                    remaining = min(remaining, grace_s)
             rtt_origin = quiet_info.get("ack_done_at", answer_wait_start)
             try:
                 got: _CompletionFrame = await asyncio.wait_for(fut, timeout=remaining)
@@ -11270,10 +11619,38 @@ class SmartMeshCoreInterface(Interface):
         if not fut.done():
             fut.set_result(frame)
 
+    def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set) -> None:
+        """Receiver-initiated completion report (2026-09-20): one unsolicited
+        v3 ANSWER for a raw burst, nonce `COMPLETION_REPORT_NONCE_BASE |
+        round` (the raw header's attempt bits), spawned from the raw receive
+        path -- on completion, on a flagged last fragment that left gaps, and
+        on a flagged duplicate of a packet already delivered. Best effort
+        like the QUERY's answer; the sender's QUERY fallback is the recovery
+        path if it is lost. Off when `direct_raw_report_enabled` is no."""
+        if not self.direct_raw_report_enabled or header.pkt_id is None:
+            return
+        nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
+        self._debug(
+            f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
+            f"complete={complete} held={sorted(held)} (round {(header.attempt or 0) & 0x03})."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", {
+                "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
+                "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
+                "round": (header.attempt or 0) & 0x03,
+            })
+        self._spawn_background_task(
+            self._send_completion_answer(
+                sender_token, header.pkt_id, header.frag_total, complete,
+                held=held, version=self.COMPLETION_PROTOCOL_VERSION, nonce=nonce, report=True,
+            )
+        )
+
     async def _send_completion_answer(
         self, sender_token: str, pkt_id: int, frag_total: int, complete: bool,
         held: "Optional[set]" = None, version: Optional[int] = None,
-        nonce: Optional[int] = None,
+        nonce: Optional[int] = None, report: bool = False,
     ) -> None:
         """Best-effort ANSWER send for `_handle_incoming_completion_frame`'s
         QUERY branch. Deliberately no retry loop: this is already the
@@ -11323,13 +11700,16 @@ class SmartMeshCoreInterface(Interface):
         else:
             out_path_len = contact.get("out_path_len", 0) if isinstance(contact, dict) else 0
             hops = 1 if out_path_len is None or out_path_len < 0 else int(out_path_len)
-        gap_s = self._completion_answer_hold_s(hops)
+        # A report (2026-09-20) follows a raw fragment, which the firmware
+        # does not ACK, so there is no ACK relay to wait out: no hold.
+        gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
         if gap_s > 0:
             await asyncio.sleep(gap_s)
         try:
             ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
                 target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
-                priority=self.PRIORITY_ANSWER, time_critical=True, kind="completion_answer",
+                priority=self.PRIORITY_ANSWER, time_critical=True,
+                kind="completion_report" if report else "completion_answer",
             )
             if not ok:
                 self._debug(
@@ -11671,7 +12051,10 @@ class SmartMeshCoreInterface(Interface):
             self._raw_frames_ignored += 1
             return
         self._raw_fragments_received += 1
-        self._handle_direct_multifragment_frame(header, rns_payload, src_prefix, raw=True)
+        self._handle_direct_multifragment_frame(
+            header, rns_payload, src_prefix, raw=True,
+            report_requested=self._raw_fragment_report_requested(data),
+        )
 
     def _subscribe_rx_log_events(self) -> None:
         """Observe-only tap on the firmware's raw-RX log feed (2026-09-18,
@@ -12176,6 +12559,7 @@ class SmartMeshCoreInterface(Interface):
 
     def _handle_direct_multifragment_frame(
         self, header: _FrameHeader, payload: bytes, sender_token: str, raw: bool = False,
+        report_requested: bool = False,
     ) -> None:
         """docs/wire_format_design.md's DIRECT-needs-fragmenting receive
         side (Milestone 6) -- reuses the exact same reassembly/dedup
@@ -12211,13 +12595,31 @@ class SmartMeshCoreInterface(Interface):
         if self._dedup_contains(key):
             self._incoming_dropped_total += 1
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
+            if raw and report_requested:
+                # Completion report (2026-09-20): a flagged fragment for a
+                # packet already delivered means the sender never got the
+                # report (or a QUERY's answer) and re-burst -- tell it again,
+                # so it stops without a QUERY round trip.
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
             return
 
         complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
         if complete_data is None:
             self._last_incoming_direct_at = time.monotonic()
+            if raw and report_requested:
+                # One of the burst's last two fragments landed but the bucket
+                # has gaps: report the bitmap unasked, so the sender re-drives
+                # exactly the missing fragments without a QUERY first.
+                bucket = self._reassembly.get(key)
+                held = set(bucket.fragments.keys()) if bucket is not None else set()
+                self._send_completion_report(sender_token, header, complete=False, held=held)
         else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
+            if raw:
+                # Report BEFORE RNS sees the packet, so the report enters the
+                # radio lock ahead of whatever RNS sends back (a PROOF, the
+                # next Resource request) and the sender learns first.
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
             else:
@@ -12526,7 +12928,8 @@ class SmartMeshCoreInterface(Interface):
         if not self.online or self.detached:
             return
         self.rxb += len(data)
-        self._note_link_closed(self._parse_rns_header(data))
+        header = self._parse_rns_header(data)
+        self._note_link_closed(header)
         if self._packet_capture_file is not None:
             self._capture_incoming(
                 data, transport=transport, sender_peer_prefix=sender_peer_prefix,

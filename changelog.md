@@ -7,6 +7,41 @@ session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
 
+### Changed: speed / airtime / reliability pass (2026-09-20, later the same day)
+
+Five parallel reviews (DIRECT send path, fragmentation and raw fragments,
+discovery and binding, timing defaults, airtime) over the 2026-09-19 field
+captures and the firmware/library/RNS source, merged into a ranked list of 23
+proposals (`/tmp/mb/proposals-ranked.md` in the session; the top of the
+remaining list is reproduced in the module docstring entries), then the top
+three evaluated one at a time against a two-run MeshBench baseline
+(`zero_hop`, `relay`, `two_hop`, `large_payload`) of the unmodified tree.
+One methodological finding first: MeshBench v0.1.0's virtual radio has no
+listen-before-talk (23 of `relay-1`'s 52 half-duplex misses were a node
+keying 20-980 ms into a frame it was already receiving, which the real
+firmware's `Dispatcher::checkSend` defers), so it over-counts
+self-collisions between nodes that can hear each other -- zero hop, and a
+sender against its own repeater at one hop -- while hidden-node collisions
+at a repeater are real. Its numbers below are read with that split.
+
+- **Receiver-initiated completion REPORT for raw bursts** (protocol change:
+  `RAW_FLAG_REPORT` bit 2 of the raw header's byte 0 on a burst's last two
+  fragments; ANSWER nonces 0xF0-0xF3 reserved for reports, QUERY nonces cycle
+  1-0xEF; both nodes must run this build). The receiver of a raw burst sends
+  the existing v3 ANSWER unsolicited when the packet completes, or its bitmap
+  when a flagged fragment lands with gaps; the sender registers its waiter
+  before the burst, keeps the radio quiet for `direct_raw_report_wait_base`
+  (2 s) + `direct_raw_report_wait_per_hop` (3 s) x hops, falls back to the
+  second-last fragment's report if the last one's never comes, and only then
+  to the QUERY path as before. Every baseline run showed the QUERY keyed at
+  the instant the receiver transmitted its own reaction (a PROOF): zero-hop
+  attempt success 25-46%. `direct_raw_report_enabled = no` restores
+  burst-then-QUERY. Two earlier cuts (flag on the last fragment only; a
+  receiver-side idle timer) regressed `large_payload` to 0/6 and were
+  replaced -- the docstring entry has the mechanism. MeshBench: zero_hop 7/8, 8/8 (baseline 7/8, 6/8 FAIL) with probe RTT avg 5-8 s (12-15) and 100% zero-hop attempt success (25-46%); relay 8/8, 7/8 (5/8, 4/8) with the repeater relaying 63-67 frames (118-133); large_payload 3/6, 3/6 (1/6 FAIL, 4/6) with a third of the QUERYs; two_hop bring-up-dominated (see the docstring entry).
+Tests: `tests/test_completion_report_0920.py`. Field test proposed in the
+session report; none of this is field-tested yet.
+
 ### Fixed: night-session fixes revised against the simulators and the MeshBench findings (2026-09-20)
 
 Six interface changes, no wire-format change (module docstring entry
