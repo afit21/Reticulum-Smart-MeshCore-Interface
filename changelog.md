@@ -146,6 +146,24 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
   the lock over 26 attempts (median 1-3 s), a 2-hop LINKREQUEST 3.2 s behind an answer's 8 s ACK
   miss inside a 17.4 s link. Tests: `tests/test_handshake_preemption_0920.py`.
 
+### Added: alpha-0.1.3 simulated benchmark (2026-09-20, evening)
+
+`tests/baselines/alpha-0.1.3-simulatedbenchmark/` -- the development branch (interface at 1b69fa7, the
+build the day's field session ran on) through all twelve MeshBench scenarios over seeds 7, 11 and 17,
+36 runs, produced by `meshbench_scenarios.py suite` in one command (`summary.md` generated,
+`README.md` the commentary, `runs/*/result.json` the evidence). It supersedes
+`2026-09-20-meshbench-1b69fa7.md`. Headlines: zero_hop and relay unchanged (100 % [88-100 %]
+delivered, 86 % / 73 % of completion checks ending on a report); two_hop now measures the two-hop
+DIRECT path behind the start gate (75 % [62-88 %], attempts 67 / 76 %); three_hop reached three hops
+in two of three runs (attempts 39-47 %, ACK 3.7-4.0 s -- the field's 42 % / 5.6 s); one-hop pages,
+bidirectional pages and one-hop handshakes are dominated by MeshBench's missing listen-before-talk
+(pages 464 s or timed out, handshakes median 22 s vs 3-9 s zero-hop / 14-17 s two-hop in the field),
+so their floors are unreachable here and are read relatively. Two findings: `many_peers` never bound
+more than 3 of 4 peers in 7-12 minutes (five zero-hop nodes' bind/announce traffic colliding; the
+>3-peer routing has still never run against firmware), and seed 13 gives node A a reserved 0x00
+identity (eleven runs discarded, guarded since). Timing mechanics held in every run (missed-attempt
+timeouts 5 / 8 / 11 / 14 s at 0-3 hops, post-miss listen <= 1 s, no backoff drops).
+
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 
 The 2026-09-20 comparison work listed what the suite could not tell us; this

@@ -1206,7 +1206,7 @@ def main() -> None:
 
     suite = sub.add_parser("suite", help="Run several scenarios over several seeds and summarise them (medians and ranges)")
     suite.add_argument("--scenarios", default="zero_hop,relay,two_hop,large_payload",
-                       help="Comma-separated scenario names, or 'all'")
+                       help="Comma-separated scenario names, 'all', or 'quick' (zero_hop, relay, large_payload: the ~15 min regression check)")
     suite.add_argument("--seeds", default="7,11,13", help="Comma-separated MeshBench seeds; each scenario runs once per seed")
     suite.add_argument("--runs-per-seed", type=int, default=1)
     suite.add_argument("--parallel", type=int, default=2, help="Concurrent runs (each has its own node filesystem root)")
@@ -1326,7 +1326,14 @@ def run_suite(args) -> int:
     per-scenario medians with ranges) -- the shape tests/baselines/ files
     quote. One MeshBench run is a coin flip on bring-up and the RNS side is
     wall-clock driven, so a baseline is several seeds, never one run."""
-    names = list(SCENARIOS) if args.scenarios.strip() == "all" else [x.strip() for x in args.scenarios.split(",") if x.strip()]
+    # `quick`: the under-20-minute regression check (2026-09-20) -- the DIRECT
+    # fast path and report mechanism (zero_hop), one-hop timing (relay) and
+    # fragmentation/reconcile (large_payload), one seed, three at a time.
+    # two_hop is left out (its start gate can wait 10 min for bring-up), as is
+    # anything with pages (25-45 min a run) and soak.
+    QUICK = ["zero_hop", "relay", "large_payload"]
+    names = (list(SCENARIOS) if args.scenarios.strip() == "all" else QUICK if args.scenarios.strip() == "quick"
+             else [x.strip() for x in args.scenarios.split(",") if x.strip()])
     unknown = [n for n in names if n not in SCENARIOS]
     if unknown:
         sys.exit(f"unknown scenario(s): {unknown}; see `list`")
