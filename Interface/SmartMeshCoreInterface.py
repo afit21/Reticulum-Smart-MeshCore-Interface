@@ -2725,6 +2725,18 @@ at rtt 2 s, 5.5/min at 4 s) for one lost tail fragment to be recoverable;
 the 39-part transfer at ~5 parts/min was cancelled exactly when its last
 part had gone out once. That is the number phase 3 is sized against.
 
+ 0. *The metric is now in the capture.* Every transmit record --
+    `direct_attempt_result` (text frames, via `_text_frame_on_air_bytes`,
+    the framing the duty-cycle limiter already prices), `raw_fragment_
+    sent` (2 + path + frame) and `channel_fragment_sent` (which the
+    single-frame CHANNEL send now writes too, frag 0/1) -- carries
+    `on_air_bytes`, and `testscripts/field_ab_compare.py` reports on-air
+    bytes per delivered RNS byte (own transmissions over the RNS bytes of
+    the DIRECT sends that completed). On the 2026-09-20 session, with the
+    pre-field-values estimated from frame sizes: desktop 2.59 B/B
+    (serving, zero then two hops), laptop 1.43 B/B (zero hop). Capture
+    only; nothing decides on it.
+
  1. **A bare DIRECT send stops retrying once its reply is seen**
     (`_answered_send_key`, `_signal_send_answered`; `cancel_key` on
     `_send_direct_with_attempts`, `cancel_event` down to
@@ -5609,7 +5621,7 @@ class SmartMeshCoreInterface(Interface):
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
-        quiet_hold_s: Optional[float] = None,
+        quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -5730,11 +5742,14 @@ class SmartMeshCoreInterface(Interface):
             # asked for -- the hidden-node quiet window, non-null only on a
             # reconcile QUERY. See _send_direct_frame_and_wait_for_ack.
             "quiet_hold_s": round(quiet_hold_s, 3) if quiet_hold_s is not None else None,
+            # 2026-09-20 (airtime pass): the frame's estimated on-air size,
+            # None for an attempt that never keyed the radio.
+            "on_air_bytes": on_air_bytes,
         })
 
     def _capture_channel_fragment_sent(
         self, pkt_id: int, attempt: int, frag_idx: int, frag_total: int, position: int,
-        ok: bool, size_bytes: int,
+        ok: bool, size_bytes: int, on_air_bytes: Optional[int] = None,
     ) -> None:
         """Observability addition (2026-09-18, user-requested field-tuning
         data): one record per individual CHANNEL fragment transmit
@@ -5768,6 +5783,7 @@ class SmartMeshCoreInterface(Interface):
             "position": position,
             "ok": ok,
             "size_bytes": size_bytes,
+            "on_air_bytes": on_air_bytes,
         })
 
     def _capture_direct_send_result(
@@ -9043,6 +9059,7 @@ class SmartMeshCoreInterface(Interface):
                                 "event": "raw_fragment_sent", "peer_prefix": peer_prefix, "pkt_id": pkt_id,
                                 "frag_idx": frag_idx, "frag_total": frag_total, "round": rnd, "ok": sent_ok,
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
+                                "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
                             })
@@ -10630,6 +10647,8 @@ class SmartMeshCoreInterface(Interface):
                     kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
+                    on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)
+                                  if send_exc is None else None),
                 )
                 if send_exc is not None:
                     # Listened out the quiet window above first, same as any
@@ -10768,6 +10787,13 @@ class SmartMeshCoreInterface(Interface):
             )
             return
         self.txb += len(frame)
+        # 2026-09-20 (airtime pass): the single-frame CHANNEL send wrote no
+        # transmit record at all, so a capture could not total this node's
+        # air. One `channel_fragment_sent` with frag 0/1, like the others.
+        self._capture_channel_fragment_sent(
+            pkt_id, attempt, 0, 1, 0, ok=True, size_bytes=len(frame),
+            on_air_bytes=self._text_frame_on_air_bytes(self._own_node_name + ": " + frame),
+        )
         self._debug(
             f"CHANNEL send OK: pkt_id={pkt_id} attempt={attempt} "
             f"{len(payload)}-byte payload ({len(frame)} chars on wire)."
@@ -10817,6 +10843,7 @@ class SmartMeshCoreInterface(Interface):
                 self.txb += len(frame)
                 self._capture_channel_fragment_sent(
                     pkt_id, attempt, frag_idx, frag_total, position, ok=True, size_bytes=len(frame),
+                    on_air_bytes=self._text_frame_on_air_bytes(self._own_node_name + ": " + frame),
                 )
             except Exception as exc:
                 # CHANNEL is blind/unacknowledged (§0) -- a failure here
@@ -12392,9 +12419,20 @@ class SmartMeshCoreInterface(Interface):
             return self._estimate_airtime_s(on_air_bytes)
         if self._radio_params is None:
             return (len(frame) * 8) / max(1, self.duty_cycle_estimate_bitrate)
+        return self._estimate_airtime_s(self._text_frame_on_air_bytes(frame, path_len))
+
+    def _text_frame_on_air_bytes(self, frame: str, path_len: int = 0) -> int:
+        """Bytes one of this node's own TXT_MSG frames occupies on air, per
+        the framing above (2026-09-20: also written to every transmit
+        record as `on_air_bytes`, so a field capture can report on-air
+        bytes per delivered RNS byte -- the metric of the airtime pass --
+        the way `meshbench_report.py`'s ledger does from MeshBench's own
+        event log). A CHANNEL frame's firmware framing differs slightly
+        (channel hash instead of dest/src hashes); the same formula is
+        used as an estimate."""
         plaintext = len(frame.encode("utf-8")) + self._TXT_MSG_PLAINTEXT_OVERHEAD_BYTES
         ciphertext = -(-plaintext // 16) * 16
-        return self._estimate_airtime_s(self._TXT_MSG_FIXED_OVERHEAD_BYTES + max(0, path_len) + ciphertext)
+        return self._TXT_MSG_FIXED_OVERHEAD_BYTES + max(0, path_len) + ciphertext
 
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT

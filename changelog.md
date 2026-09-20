@@ -24,6 +24,10 @@ rtt_r 1.3-6 s) with no part request cancel the resource, LXMF tears the link dow
 message from scratch (up to four times). With a 4-part window a lost tail part is only recoverable
 above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 4 s).
 
+- **The metric is in the capture.** `on_air_bytes` on every `direct_attempt_result`,
+  `raw_fragment_sent` and `channel_fragment_sent` record (the single-frame CHANNEL send now writes
+  one too), and `testscripts/field_ab_compare.py` reports on-air bytes per delivered RNS byte. The
+  2026-09-20 session, estimated from frame sizes: desktop 2.59 B/B, laptop 1.43 B/B at zero hop.
 - **A bare DIRECT send stops retrying once its reply is seen.** A LINKREQUEST whose attempt 0 lost
   its firmware ACK was re-sent 8 s after its LRPROOF had arrived (laptop `*144922`, two hops:
   99 B + 3.4 s ACK, LRRTT queued 3.8 s behind). The three receipt paths that correlate an LRPROOF

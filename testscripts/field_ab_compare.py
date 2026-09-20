@@ -44,7 +44,14 @@ WHAT IS COMPARED (per set, per hop, with n)
   handshakes     LINKREQUEST out -> the next LRPROOF in (median / p90 / max, count within 15 s)
   backoff        `unknown_dest_backoff_drop` records, and how many while PROOFs were arriving
   airtime        RNS bytes out / in, raw fragment bytes, `channel_fragment_sent`, `rx_log` TEXT_MSG frames
-                 of 36-44 B (QUERY / ANSWER / REPORT class) per delivered raw send
+                 of 36-44 B (QUERY / ANSWER / REPORT class) per delivered raw send; and, since the
+                 2026-09-20 airtime pass, ON-AIR BYTES PER DELIVERED RNS BYTE -- this node's own
+                 transmissions (`on_air_bytes` on every `direct_attempt_result`, `raw_fragment_sent`
+                 and `channel_fragment_sent` record; records from builds before that field are
+                 counted at their frame size) divided by the RNS bytes of its DIRECT sends that
+                 completed (`direct_send_result ok=true`, `size_bytes`). The headline metric of that
+                 pass, lower is better; the MeshBench ledger (`meshbench_report.py`) is the
+                 all-nodes equivalent. Captures without `on_air_bytes` print the ratio with a '~'.
   stale paths    `direct_send_result` failures and consecutive-failure triples (the stale-path reset trigger)
 
 Nothing here decides; it puts the two columns next to each other with their
@@ -232,6 +239,37 @@ def analyse_set(recs: list, hop_filter=None) -> dict:
     out["raw_bytes"] = sum(r.get("size_bytes") or 0 for r in recs if r.get("event") == "raw_fragment_sent")
     out["raw_fragments"] = sum(1 for r in recs if r.get("event") == "raw_fragment_sent")
     out["channel_fragments"] = sum(1 for r in recs if r.get("event") == "channel_fragment_sent")
+    # On-air bytes per delivered RNS byte (2026-09-20): own transmissions
+    # over the RNS bytes of the DIRECT sends that completed.
+    on_air = 0
+    estimated = False
+    for r in recs:
+        ev = r.get("event")
+        if ev == "direct_attempt_result":
+            if r.get("ack_timeout_source") in ("expired", "answered"):
+                continue   # never keyed the radio
+            b = r.get("on_air_bytes")
+            if b is None:
+                estimated = True
+                b = 40 if r.get("kind") in ("completion_query", "completion_answer", "completion_report") else 120
+            on_air += b
+        elif ev == "raw_fragment_sent" and r.get("ok", True):
+            b = r.get("on_air_bytes")
+            if b is None:
+                estimated = True
+                b = 2 + (r.get("path_len") or 0) + (r.get("size_bytes") or 0)
+            on_air += b
+        elif ev == "channel_fragment_sent" and r.get("ok", True):
+            b = r.get("on_air_bytes")
+            if b is None:
+                estimated = True
+                b = (r.get("size_bytes") or 0) + 16
+            on_air += b
+    delivered = sum(r.get("size_bytes") or 0 for r in dsr if r.get("ok"))
+    out["on_air_bytes"] = on_air
+    out["rns_bytes_delivered"] = delivered
+    out["on_air_per_delivered_rns_byte"] = (on_air / delivered) if delivered else None
+    out["on_air_ratio_estimated"] = estimated
     rx = [r for r in recs if r.get("event") == "rx_log"]
     out["rx_log_frames"] = len(rx)
     control = sum(1 for r in rx if (r.get("payload_typename") or "") == "TEXT_MSG" and (r.get("payload_length") or 0) in CONTROL_FRAME_BYTES)
@@ -298,6 +336,9 @@ def print_comparison(sets: dict, min_n: int) -> None:
     row("channel fragments sent", [s["channel_fragments"] for s in sets.values()])
     row("rx_log frames / control-size TEXT frames", [f"{s['rx_log_frames']} / {s['control_frames_overheard']}" for s in sets.values()])
     row("control frames per raw send", [fmt(s["control_frames_per_raw_send"], 2) for s in sets.values()])
+    row("on-air B per delivered RNS B (own tx / ok sends)", [
+        f"{'~' if s['on_air_ratio_estimated'] else ''}{fmt(s['on_air_per_delivered_rns_byte'], 2)} "
+        f"({s['on_air_bytes']} / {s['rns_bytes_delivered']})" for s in sets.values()])
     row("routing decisions", [s["routing"] for s in sets.values()])
     row("incoming transports", [s["in_transport"] for s in sets.values()])
 
