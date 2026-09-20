@@ -82,8 +82,9 @@ change regenerates it in the same commit):
   covered, 1..0xFF, within frag_total) and the payload is [length of the
   highest covered fragment:1] + the XOR of the covered fragments padded
   to the longest (`_encode_raw_parity`); a receiver missing exactly one
-  covered fragment reconstructs it. One parity per part's burst from
-  `direct_raw_parity_min_hops` (1) hops; none at zero hop.
+  covered fragment reconstructs it. When enabled (`direct_raw_parity_
+  enabled`, shipped off pending a field A/B), one parity per part's burst
+  from `direct_raw_parity_min_hops` (1) hops; none at zero hop.
   The 2-byte source prefix names the unique bound peer whose 6-byte
   prefix starts with it (`_resolve_raw_src`; a sender never uses raw
   where that would be ambiguous). RAW_FLAG_REPORT marks the last two

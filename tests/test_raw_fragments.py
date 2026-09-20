@@ -636,7 +636,7 @@ class RawFragmentScenarios(unittest.TestCase):
         a.send(big)
         self.assertTrue(wait_until(lambda: big in b.owner.received, 40.0), "raw transfer never delivered")
         sent = _events(a, "raw_fragment_sent")
-        self.assertGreaterEqual(len(sent), 4)
+        self.assertGreaterEqual(len(sent), 3)   # 9-byte raw header (M3, 2026-09-20): 161 B per fragment, three for this payload
         self.assertEqual(sum(1 for r in _events(a, "direct_attempt_result") if r.get("frag_total")), 0, "no text fragments should have been sent")
         self.assertTrue(any(r.get("transport") == "direct_raw_multifragment" for r in b.capture_records() if r["direction"] == "in"))
 
@@ -661,8 +661,8 @@ class RawFragmentScenarios(unittest.TestCase):
         big = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"raw-hop-" + os.urandom(440))
         a.send(big)
         self.assertTrue(wait_until(lambda: big in b.owner.received, 60.0), "raw transfer through a repeater never delivered")
-        self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 4)
-        self.assertGreaterEqual(len(_events(a, "raw_fragment_sent")), 4)
+        self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 3)   # three fragments since M3
+        self.assertGreaterEqual(len(_events(a, "raw_fragment_sent")), 3)
 
         # Phase 2's premise is "raw is enabled for this peer and the chain
         # drops it", so establish that premise rather than inheriting phase
@@ -827,7 +827,12 @@ class ZeroHopBidirectionalPageTransfer(unittest.TestCase):
         self.assertEqual(sa["text_fallbacks"] + sb["text_fallbacks"], 0, (sa, sb))
         waits = [w for w in sa["answer_lock_waits"] + sb["answer_lock_waits"] if w is not None]
         if waits:
-            self.assertLessEqual(max(waits), 10.0, f"an ANSWER/REPORT waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
+            # Phase 3 M2 (2026-09-20): a node's REPORT waits behind its own
+            # outgoing raw window (up to 6 parts x 3 fragments at zero hop,
+            # 12-15 s observed under both-ways load) -- one window, bounded,
+            # not starvation. MeshBench page_transfer_bidir measures the
+            # cost against the real firmware.
+            self.assertLessEqual(max(waits), 20.0, f"an ANSWER/REPORT waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
         checks = sa["checks"] + sb["checks"]
         self.assertGreater(checks, 0, "no completion checks recorded")
 

@@ -208,7 +208,7 @@ CONFIGURE_RETRY = {
     'direct_raw_report_wait_per_hop_s': 2.5,
     'direct_raw_window_collect_s': 0.75,
     'direct_raw_window_enabled': True,
-    'direct_raw_parity_enabled': True,
+    'direct_raw_parity_enabled': False,
     'direct_raw_parity_min_hops': 1,
     'direct_raw_window_max_parts': 6,
     'direct_raw_zero_hop_gap_s': 0.15,

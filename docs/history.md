@@ -3134,3 +3134,41 @@ from. Milestones in order, each gated on the full suite and MeshBench
      codec, reconstruction of each single loss with the parity before or
      after the loss is visible, two losses left to the report path, the
      burst and re-drive shapes at one hop, none at zero hop).
+
+     Gate (M4 against M3, `large_payload` x3 + `relay` x2 each): M4
+     4/6 @ 5.00, 5/6 @ 5.49, 1/6 @ 7.52 B/B; relay 6/8 + 1 late @ 6.52,
+     8/8 @ 5.54 -- M3 2/6 @ 8.51, 6/6 @ 4.50, 6/6 @ 4.36; relay 7/8 @
+     5.21, 7/8 @ 5.14. Mechanics PASS on every run (the 1/6 is a delivery-
+     floor miss, not a mechanics FAIL), so by the milestone rule M4 is not
+     reverted; but it showed no benefit and a cost, and MeshBench's own
+     miss reasons say why: on every build of the pass, the frozen alpha
+     0.1.3 included, R misses 30-40 % of A's raw fragments with "half-
+     duplex: its own transmitter was keyed", in an alternating pattern
+     (`XrX`, `XrXr`, `rXrX` per burst) -- the one-hop gap is (1 + 2 x 1) x
+     airtime = 2.7 s from the real radio's ~0.9 s frame, and MeshBench's
+     frames take ~1.3 s, so R is still relaying fragment N when N+1
+     arrives. Under a strictly alternating loss a four-frame burst leaves
+     two data fragments missing or the parity itself, the burst is a third
+     longer, and B logged more half-duplex misses of its own (5 in run 3
+     against 0-2 on M3). Reconstruction did work in the real stack (B
+     logged `raw_parity_reconstructed` 1, 3 and 4 times in the three runs)
+     -- the mechanism is sound, the regime is wrong. **Shipped off**
+     (`direct_raw_parity_enabled` no; the code, tests and knob stay): the
+     field's random one-hop loss is the case it was built for, and the
+     field A/B (`fieldtests/AB_PROTOCOL.md`, both nodes `yes`) with
+     `raw_parity_reconstructed` per single-loss burst as the field is what
+     decides. The same MeshBench timing artefact is why `large_payload`
+     swings 1/6-6/6 between runs of one build; `direct_raw_hop_gap_factor`
+     is a spacing decision the field A/B owns, not MeshBench.
+
+ Phase 4 (2026-09-20 night). Full suite 288 tests OK (the three `@slow`
+     raw scenarios re-pinned: a 446-byte payload is three fragments since
+     M3, and under both-ways zero-hop load a node's REPORT waits behind its
+     own outgoing window -- one window of up to 6 parts, 12-15 s observed,
+     bounded, pinned at 20 s; `page_transfer_bidir` measures that cost
+     against the firmware). Version alpha 0.1.4 (both nodes must run it:
+     "Q" v4 and raw v2 are not decoded by 0.1.3); readme lists the new
+     keys and the build step. Baseline: `tests/baselines/2026-09-20-
+     meshbench-<the commit this entry ships in>.md` (zero_hop, relay, two_hop, large_payload,
+     page_transfer, page_transfer_bidir, link_setup x seeds 7/11/13).
+

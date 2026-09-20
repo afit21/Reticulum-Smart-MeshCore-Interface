@@ -109,7 +109,7 @@
     "direct_raw_fragments_enabled": true,
     "direct_raw_hop_gap_factor": 2.0,
     "direct_raw_incomplete_strikes": 2,
-    "direct_raw_parity_enabled": true,
+    "direct_raw_parity_enabled": false,
     "direct_raw_parity_min_hops": 1,
     "direct_raw_path_unsupported_ttl_s": 86400.0,
     "direct_raw_payload_cap": 170,
