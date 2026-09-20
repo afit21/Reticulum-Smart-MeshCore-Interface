@@ -301,7 +301,13 @@ class DelayedAnswerScenario(unittest.TestCase):
         big = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"late-answer-" + os.urandom(440))
         a.send(big)
         self.assertTrue(wait_until(lambda: big in b.owner.received, 30.0), "fragments never arrived")
-        self.assertTrue(wait_until(lambda: any(r.get("outcome") == "answered" for r in _events(a, "completion_check_result")), 90.0),
+        # The late frame that finishes the send may be the QUERY's ANSWER
+        # (outcome "answered") or, since phase 1.5 of 2026-09-20 widened the
+        # report window to 4 s, the receiver's delayed REPORT landing inside
+        # a later round's report wait (outcome "reported"): both are the
+        # late answer getting through.
+        self.assertTrue(wait_until(lambda: any(r.get("outcome") in ("answered", "reported") and r.get("complete")
+                                               for r in _events(a, "completion_check_result")), 90.0),
                         "the late answer never got through")
         time.sleep(2.0)
         checks = _events(a, "completion_check_result")
