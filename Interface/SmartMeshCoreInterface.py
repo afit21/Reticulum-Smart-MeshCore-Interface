@@ -2761,6 +2761,32 @@ part had gone out once. That is the number phase 3 is sized against.
     DATA has no key and is unchanged. Tests:
     `tests/test_answered_sends_0920.py`.
 
+ 5. **The completion-report window is sized from the measured report
+    latency** (`_report_rtt`, `_record_report_latency`, `_expect_report`;
+    default change `direct_raw_report_wait_base` 2.0 -> 4.0 s and
+    `direct_raw_report_wait_per_hop` 3.0 -> 2.5 s). Zero hop, 2026-09-20
+    session: the receiver's report attempt waited a median 1.1-1.4 s and
+    p90 4-5 s for its own radio lock (behind its previous report's ACK
+    wait and its own sends) on top of ~2.3 s of serial delivery latency,
+    so with a 2 s window the desktop saw only 43 of its 77 hop-0 rounds
+    `reported` while 29 fell back to a QUERY that was then `answered` --
+    two frames, two ACKs and ~5 s for a report that was merely late --
+    and the on-time reports' `report_wait_s` (median 1.18 s, max 1.97 s)
+    were truncated by the window itself. Now: floor `base + per_hop x
+    hops` (4 / 6.5 / 9 / 11.5 s, the answer budget's own slope so the
+    floor sits under the budget at every depth); a per-peer
+    Jacobson/Karels estimator of burst-end -> report-arrival, sampled in
+    `_handle_incoming_completion_frame` for every report whose
+    `(peer, pkt_id)` expectation the sender registered at the burst's
+    end -- on time or LATE (the estimator must see the reports the window
+    missed, or it can never grow past the window) -- withdrawn when the
+    round ends; window = max(floor, srtt + 4 x rttvar), never above the
+    QUERY answer budget; dropped with the peer's other path stats. The
+    cost of a lost report at zero hop rises 2 -> 4 s of quiet radio (5 of
+    77 rounds); the saving is a QUERY round trip on the late ones (29 of
+    77). Tests: `tests/test_report_window_0920.py`; the shipped-default
+    pins and the golden config snapshot re-pinned in the same commit.
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -3921,6 +3947,12 @@ class SmartMeshCoreInterface(Interface):
         # trip per peer, measured directly -- raw bursts produce no ACK
         # samples, so this is what sizes the reconcile wait.
         self._query_rtt = {}
+        # Phase 1 (2026-09-20): burst end -> completion REPORT arrival per
+        # peer, on-time and late reports alike, which sizes the report
+        # window (`_completion_report_wait_s`); (peer, pkt_id) -> the
+        # burst's end time while a report for it may still be measured.
+        self._report_rtt = {}
+        self._report_expected = {}
         self._last_firmware_ack_timeout_s = {}
         # Rolling one-byte nonce for completion QUERYs (field fix 2026-09-19).
         self._completion_query_nonce = 0
@@ -4751,8 +4783,21 @@ class SmartMeshCoreInterface(Interface):
         # relays) per delivered part, and removes the QUERY-vs-PROOF
         # collision from the common path. `no` restores burst-then-QUERY.
         self.direct_raw_report_enabled = _cfg_bool(cfg.get("direct_raw_report_enabled", "yes"))
-        self.direct_raw_report_wait_base_s = float(cfg.get("direct_raw_report_wait_base", 2.0))
-        self.direct_raw_report_wait_per_hop_s = float(cfg.get("direct_raw_report_wait_per_hop", 3.0))
+        # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
+        # answer budget's own slope, so the floor stays under the budget at
+        # every depth: 4 / 6.5 / 9 / 11.5 s against 5 / 7.5 / 10 / 12.5 s),
+        # and the window grows to the MEASURED report latency
+        # (`_report_rtt`: srtt + 4 x rttvar, on-time and late reports both
+        # sampled) above that floor, still capped by the answer budget. The
+        # 2026-09-20 field session, zero hop: the receiver's report waited a
+        # median 1.1-1.4 s and p90 4-5 s for its own radio lock (behind its
+        # previous report's ACK wait and its own sends) on top of ~2.3 s of
+        # serial delivery latency, so with a 2 s window only 43 of the
+        # desktop's 77 hop-0 rounds were `reported` and 29 paid a QUERY
+        # round trip (two frames, two ACKs, ~5 s) for a report that was
+        # merely late. The base is what a lost report costs at zero hop.
+        self.direct_raw_report_wait_base_s = float(cfg.get("direct_raw_report_wait_base", 4.0))
+        self.direct_raw_report_wait_per_hop_s = float(cfg.get("direct_raw_report_wait_per_hop", 2.5))
         # The flag rides the LAST TWO fragments of a burst: when the last
         # one is lost (uniform ~18% per fragment at one hop in the field,
         # systematic in MeshBench's LBT-less radio) the report the second-
@@ -7017,6 +7062,7 @@ class SmartMeshCoreInterface(Interface):
         self._echo_stats.pop(peer_prefix, None)
         self._last_firmware_ack_timeout_s.pop(peer_prefix, None)
         self._query_rtt.pop(peer_prefix, None)
+        self._report_rtt.pop(peer_prefix, None)
         self._raw_disabled_until.pop(peer_prefix, None)
         self._raw_incomplete_strikes.pop(peer_prefix, None)
         self._direct_path_recent_success.pop(peer_prefix, None)
@@ -8857,8 +8903,38 @@ class SmartMeshCoreInterface(Interface):
         lossy bidirectional one-hop case with a 60 s per-probe deadline,
         went 0/6 against a 1/6-4/6 baseline)."""
         window_s = self.direct_raw_report_wait_base_s + self.direct_raw_report_wait_per_hop_s * max(0, hops)
+        # Phase 1 (2026-09-20): the measured report latency (burst end ->
+        # report arrival, late reports included so the estimate is not
+        # truncated by the window it sizes) widens the window above the
+        # hop-scaled floor; the QUERY answer budget still caps it.
+        rs = self._report_rtt.get(peer_prefix)
+        if rs is not None:
+            window_s = max(window_s, rs["srtt"] + 4.0 * rs["rttvar"])
         budget_s = self._completion_query_timeout_s(peer_prefix, hops)
         return max(0.0, min(window_s, budget_s))
+
+    def _record_report_latency(self, peer_prefix: Optional[str], pkt_id: int) -> Optional[float]:
+        """One burst-end -> REPORT-arrival sample for the window estimator
+        (2026-09-20), taken in `_handle_incoming_completion_frame` for every
+        report that matches an expectation `_send_direct_raw_fragmented`
+        registered -- whether the report arrives inside the window or after
+        it (the sender may already be in its QUERY fallback). Returns the
+        latency, or None when nothing was expected."""
+        burst_end = self._report_expected.get((peer_prefix, pkt_id))
+        if burst_end is None:
+            return None
+        latency_s = time.monotonic() - burst_end
+        self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
+        return latency_s
+
+    def _expect_report(self, peer_prefix: str, pkt_id: int, burst_end: Optional[float]) -> None:
+        """Register (or, with None, withdraw) the burst end time a report
+        for (peer, pkt_id) is measured against."""
+        key = (peer_prefix, pkt_id)
+        if burst_end is None:
+            self._report_expected.pop(key, None)
+        else:
+            self._report_expected[key] = burst_end
 
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
@@ -9090,6 +9166,9 @@ class SmartMeshCoreInterface(Interface):
                         # report (and, right behind it, whatever RNS sends
                         # back) is crossing the chain now, and this node's
                         # next burst or QUERY is what used to collide with it.
+                        # A report arriving from here until the round ends is
+                        # measured for the window estimator (2026-09-20).
+                        self._expect_report(peer_prefix, pkt_id, time.monotonic())
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, pkt_id, frag_total, gap_hops, stage=f"raw{rnd}",
                         )
@@ -9122,6 +9201,7 @@ class SmartMeshCoreInterface(Interface):
                 query_infos.append(info)
                 if answer is not None or self.detached or not self.online:
                     break
+            self._expect_report(peer_prefix, pkt_id, None)
             if self.detached or not self.online:
                 remember()
                 return False
@@ -11833,6 +11913,17 @@ class SmartMeshCoreInterface(Interface):
         peer_prefix = self._canonical_peer_prefix(sender_token)
         if peer_prefix is None:
             return
+        if frame.nonce is not None and (frame.nonce & 0xF0) == self.COMPLETION_REPORT_NONCE_BASE:
+            # A receiver-initiated REPORT: sample its latency whether or
+            # not a waiter still exists (a late report is the case the
+            # estimator most needs to see) -- phase 1, 2026-09-20.
+            latency_s = self._record_report_latency(peer_prefix, frame.pkt_id)
+            if latency_s is not None:
+                self._debug(
+                    f"completion REPORT from {sender_token!r} for pkt_id={frame.pkt_id} arrived "
+                    f"{latency_s:.2f}s after the burst ended (window estimator "
+                    f"srtt={self._report_rtt[peer_prefix]['srtt']:.2f}s)."
+                )
         waiter = self._completion_query_waiters.get((peer_prefix, frame.pkt_id))
         if waiter is None:
             return

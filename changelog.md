@@ -34,6 +34,13 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
   / bootstrap PROOF now signal the send (`_signal_send_answered`); the retry loop makes no further
   attempt and an ACK wait in progress ends as `ack_timeout_source="answered"` (success, no RTT sample,
   no backoff). Tests: `tests/test_answered_sends_0920.py`.
+- **Completion-report window sized from measured report latency** (default change:
+  `direct_raw_report_wait_base` 2.0 -> 4.0 s, `direct_raw_report_wait_per_hop` 3.0 -> 2.5 s). Zero
+  hop: the receiver's report waited p90 4-5 s for its own radio lock, so a 2 s window sent 29 of the
+  desktop's 77 hop-0 rounds to a QUERY round trip for a report that was merely late. The window is
+  now max(floor 4 + 2.5 x hops, per-peer srtt + 4 x rttvar of burst-end -> report arrival, late
+  reports included), capped by the answer budget. Tests: `tests/test_report_window_0920.py`;
+  `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json` re-pinned.
 
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 

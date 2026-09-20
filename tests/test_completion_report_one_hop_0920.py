@@ -394,20 +394,24 @@ class ReportLostFallsBackToTheQueryAfterTheHopScaledWait(_OneHopRawSend):
 
 
 class OneHopReportWaitFromShippedDefaults(SingleNodeCase):
-    def test_shipped_one_hop_wait_is_five_seconds_under_a_seven_and_a_half_second_budget(self):
+    def test_shipped_one_hop_wait_is_under_the_answer_budget_at_every_depth(self):
         """The values the interface ships (an empty config block): report
-        wait 2.0 s + 3.0 s x hops, completion budget floor 5.0 s + 2.5 s x
-        hops capped at 15 s. So a lost report costs 2.0 s at zero hop,
-        5.0 s at one hop (the `relay` case) and 8.0 s at two -- every one
-        under the QUERY budget of the same depth -- and the first depth at
-        which the budget clamps the window is three hops (11.0 s vs 12.5 s
-        floor, still under the 15 s cap)."""
+        wait 4.0 s + 2.5 s x hops (phase 1, 2026-09-20: was 2.0 + 3.0 x
+        hops; the zero-hop receiver's report waited p90 4-5 s for its own
+        lock, so a 2 s window sent 29 of 77 hop-0 rounds to a QUERY),
+        completion budget floor 5.0 s + 2.5 s x hops capped at 15 s. So a
+        lost report costs 4.0 s at zero hop, 6.5 s at one hop (the `relay`
+        case), 9.0 s at two and 11.5 s at three -- every one strictly under
+        the QUERY budget of the same depth, which the window's per-hop slope
+        now matches. With no report ever measured the window IS the floor;
+        `ReportWindowGrowsWithMeasuredLatency` (tests/test_report_window_
+        0920.py) covers the estimator."""
         module = self.module
         bare = module.SmartMeshCoreInterface.__new__(module.SmartMeshCoreInterface)
         bare._configure_retry({})
         self.assertTrue(bare.direct_raw_report_enabled)
-        self.assertEqual(bare.direct_raw_report_wait_base_s, 2.0)
-        self.assertEqual(bare.direct_raw_report_wait_per_hop_s, 3.0)
+        self.assertEqual(bare.direct_raw_report_wait_base_s, 4.0)
+        self.assertEqual(bare.direct_raw_report_wait_per_hop_s, 2.5)
         self.assertEqual(bare.direct_completion_check_timeout_s, 5.0)
         self.assertEqual(bare.direct_completion_check_timeout_per_hop_s, 2.5)
         self.assertEqual(bare.direct_completion_check_timeout_max_s, 15.0)
@@ -420,9 +424,10 @@ class OneHopReportWaitFromShippedDefaults(SingleNodeCase):
         for k in keys:
             setattr(iface, k, getattr(bare, k))
         iface._query_rtt.pop(PEER, None)
+        iface._report_rtt.pop(PEER, None)
         iface._last_firmware_ack_timeout_s.pop(PEER, None)
         try:
-            for hops, want_wait, want_budget in ((0, 2.0, 5.0), (1, 5.0, 7.5), (2, 8.0, 10.0), (3, 11.0, 12.5)):
+            for hops, want_wait, want_budget in ((0, 4.0, 5.0), (1, 6.5, 7.5), (2, 9.0, 10.0), (3, 11.5, 12.5)):
                 self.assertAlmostEqual(iface._completion_query_timeout_s(PEER, hops), want_budget, msg=f"hops={hops}")
                 self.assertAlmostEqual(iface._completion_report_wait_s(hops, PEER), want_wait, msg=f"hops={hops}")
                 self.assertLess(iface._completion_report_wait_s(hops, PEER), iface._completion_query_timeout_s(PEER, hops))
