@@ -1,0 +1,1648 @@
+"""Raw fragmentation and the reconcile: the raw burst-then-report/QUERY sender with its resume and text-fallback verdicts, the report window and QUERY answer budgets, the completion QUERY / ANSWER / REPORT handling on both sides, and the per-sender reassembly buckets, dedup cache and their sweeps. Phase 3 of the 2026-09-20 pass redesigns this module around one burst-and-report state machine."""
+import asyncio
+import time
+from typing import Optional
+
+import RNS
+
+from ._common import _FrameHeader, _ReassemblyBucket, _CompletionFrame, PRIORITY_NORMAL
+from ._locks import _PreemptedForHandshake
+
+
+class _ReconcileMixin:
+    def _raw_fragments_eligible(self, peer_prefix: str, priority: int) -> bool:
+        """Whether a too-big-for-one-text-frame packet to `peer_prefix` may
+        go as raw fragments: flag on, library support present, the peer
+        advertised BIND_CAP_RAW_FRAGMENTS, a resolved path (the raw send
+        is source-routed), our own prefix known (it is the src field),
+        not handshake priority, and not inside a fallback cooldown."""
+        if not self.direct_raw_fragments_enabled or priority == self.PRIORITY_HANDSHAKE:
+            return False
+        if not (self.direct_fragment_reconcile_enabled and self.direct_completion_check_enabled):
+            return False
+        if self._mc is None or not hasattr(self._EventType, "RAW_DATA") or not hasattr(self._mc.commands, "send_raw_data"):
+            return False
+        peer = self._peers.get(peer_prefix)
+        if peer is None or not peer.raw_fragments or peer_prefix not in self._resolved_paths:
+            return False
+        if self._own_pubkey_prefix() is None:
+            return False
+        path_hex = self._resolved_paths[peer_prefix].out_path_hex or ""
+        if path_hex and self._raw_path_unsupported(path_hex):
+            return False
+        until = self._raw_disabled_until.get(peer_prefix)
+        return not (until is not None and time.monotonic() < until)
+
+    def _raw_path_unsupported(self, path_hex: str) -> bool:
+        note = self._raw_unsupported_paths.get(path_hex)
+        if note is None:
+            return False
+        if time.monotonic() - note["since"] >= self.direct_raw_path_unsupported_ttl_s:
+            del self._raw_unsupported_paths[path_hex]
+            return False
+        return True
+
+    def _note_raw_fallback_outcome(self, peer_prefix: str, path_hex: str, text_ok: bool) -> None:
+        """Called after the Z85 text send that followed a raw fallback on
+        `path_hex`. Text succeeded -> the chain drops raw packets: note the
+        path and lift the peer's pause. Text failed too -> the path is
+        sick; nothing is concluded about raw."""
+        if not text_ok:
+            self._debug(
+                f"raw fallback to {peer_prefix!r} on path {path_hex or '<zero-hop>'}: the Z85 text send failed as "
+                f"well -- a path problem, not a raw one; raw stays paused for the cooldown only."
+            )
+            return
+        if not path_hex:
+            # Zero hop: no repeater to blame -- the peer's own radio did not
+            # deliver raw frames. The per-peer pause already covers it.
+            RNS.log(
+                f"{self}: Z85 text to {peer_prefix!r} succeeded at zero hop where raw fragments did not -- "
+                f"raw paused for this peer for {self.direct_raw_fallback_cooldown_s:.0f}s.",
+                RNS.LOG_WARNING,
+            )
+            return
+        self._raw_unsupported_paths[path_hex] = {"since": time.monotonic(), "peer": peer_prefix}
+        self._raw_disabled_until.pop(peer_prefix, None)
+        RNS.log(
+            f"{self}: Z85 text to {peer_prefix!r} over path {path_hex} succeeded where raw fragments did not -- "
+            f"a repeater in that chain does not carry raw packets; noted for "
+            f"{self.direct_raw_path_unsupported_ttl_s / 3600:.0f}h (raw resumes on a different path).",
+            RNS.LOG_WARNING,
+        )
+
+    # --- Shared fragmented-send helpers (refactor, 2026-09-19) ---------------
+    # The text and raw fragmented senders used to carry byte-identical
+    # copies of these four pieces; the review that day found three logic
+    # gaps in exactly that duplicated region. One copy each, now.
+
+    def _resume_state(self, resume: Optional[dict], frag_total: int, pkt_id: int, peer_prefix: str,
+                      raw: bool) -> "tuple[list, bool]":
+        """(acked, resumed) to start a fragmented send from: everything
+        False for a fresh send, or the remembered per-fragment state when
+        `resume` matches this send's fragment count. Logs and captures a
+        `direct_resume` record when resuming."""
+        if resume is None or resume.get("frag_total") != frag_total or len(resume.get("acked", ())) != frag_total:
+            return [False] * frag_total, False
+        acked = list(resume["acked"])
+        held_before = [i for i, a in enumerate(acked) if a]
+        self._debug(
+            f"{'RAW' if raw else 'DIRECT'} fragmented send pkt_id={pkt_id} to {peer_prefix!r}: RESUMING a failed "
+            f"send -- receiver believed to hold {held_before} of {frag_total}."
+        )
+        if self._packet_capture_file is not None:
+            record = {"event": "direct_resume", "peer_prefix": peer_prefix, "pkt_id": pkt_id,
+                      "frag_total": frag_total, "held_before": held_before}
+            if raw:
+                record["raw"] = True
+            self._capture_event("out", record)
+        return acked, True
+
+    def _remember_resumable(self, resume_key, pkt_id: int, frag_total: int, acked: list,
+                            last_progress_at: Optional[float]) -> None:
+        """A failed fragmented send with something delivered is worth
+        resuming if RNS re-issues these bytes while the receiver's bucket
+        is still alive (its idle clock restarted at our last confirmed
+        delivery; keep a 25% margin under its timeout)."""
+        if resume_key is None or not any(acked) or last_progress_at is None:
+            return
+        self._resumable_sends[resume_key] = {
+            "pkt_id": pkt_id, "frag_total": frag_total, "acked": list(acked),
+            "expires_at": last_progress_at + 0.75 * self.reassembly_idle_timeout_s,
+        }
+
+    def _held_from_answer(self, answer: "_CompletionFrame", frag_total: int) -> "Optional[set]":
+        """The fragments a completion ANSWER says the receiver holds, or
+        None when the answer carries no per-fragment information (a v1
+        ANSWER without a bitmap -- audit fix 2026-09-19: never read that
+        as "holds nothing")."""
+        if answer.complete:
+            return set(range(frag_total))
+        if answer.held is None:
+            return None
+        return set(answer.held)
+
+    def _resumable_sends_sweep(self, now: float) -> None:
+        """Alpha 0.1.1: a failed fragmented send is only worth resuming
+        while the receiver's bucket can still be alive."""
+        expired = [k for k, v in self._resumable_sends.items() if now >= v["expires_at"]]
+        for k in expired:
+            del self._resumable_sends[k]
+
+    async def _send_raw_fragment(
+        self, path: bytes, frame: bytes, priority: int, telemetry: Optional[dict] = None,
+        interrupt: "Optional[asyncio.Event]" = None,
+    ) -> bool:
+        """One raw fragment out through the same gate every transmission
+        passes (quiet defer skipped: a burst is always racing the
+        receiver's reassembly clock), then CMD_SEND_RAW_DATA. Returns
+        whether the firmware accepted it; never waits for anything after."""
+        on_air = 2 + len(path) + len(frame)
+        gate = await self._pre_transmit_gate(
+            "", skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority), on_air_bytes=on_air,
+            interrupt=interrupt,
+        )
+        if telemetry is not None:
+            telemetry["quiet_defer_wait_s"], telemetry["duty_cycle_wait_s"], telemetry["medium_hold_wait_s"] = gate
+        await self._run_command(
+            self._mc_ready.commands.send_raw_data(frame, path), "send_raw_data", self._EventType.OK,
+        )
+        self.txb += len(frame)
+        return True
+
+    def _raw_fragment_gap_s(self, hops: int, on_air_bytes: int) -> float:
+        """Quiet time after one raw fragment before this node transmits
+        anything else (2026-09-19 morning field test, both captures).
+
+        Zero hop: `direct_raw_zero_hop_gap` flat -- the receiver sends no
+        ACK, only its own processing needs covering. Through repeaters:
+        `direct_raw_hop_gap_factor` x `hops` x the fragment's own airtime.
+        The chain is a half-duplex pipeline: each repeater re-transmits the
+        fragment after a random delay (simple_repeater `getDirectRetransmit
+        Delay`: rand(0..5) x `direct_tx_delay_factor` 0.3 x airtime, so 0 to
+        1.5 airtimes per hop) and cannot hear the next fragment while it
+        does. The pre-fix gap was 2 airtimes regardless of hop count; at 2
+        and 4 hops every 2-fragment raw send in both directions lost
+        exactly one fragment (laptop pkt 0/1/2, desktop pkt 19/20), and
+        solo re-sends of the missing one arrived. `hops` x airtime is the
+        chain's collision-free floor with no repeater delay at all; the
+        factor of 2 sits between the firmware's mean (1.75x per hop) and
+        worst case (2.5x). At one hop this equals the pre-fix gap the first
+        raw field test passed with."""
+        if hops <= 0:
+            return max(0.0, self.direct_raw_zero_hop_gap_s)
+        # MeshBench finding 2 (2026-09-20, real firmware): the gap starts when
+        # send_raw_data returns OK, which the firmware gives when the frame is
+        # QUEUED, so the fragment's own airtime was eaten out of the gap and
+        # the next fragment (or the QUERY) left ~0.9s after the frame ended,
+        # inside the repeater's relay of it -- 7/7 second fragments lost at R
+        # in large_payload, 7/9 QUERYs in relay. The frame's own airtime is
+        # now added on top of the hop-scaled term.
+        airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
+        return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
+
+    def _completion_report_wait_s(self, hops: int, peer_prefix: str) -> float:
+        """How long a raw sender keeps its radio quiet after a burst for the
+        receiver's unsolicited completion report (2026-09-20): `direct_raw_
+        report_wait_base` + `..._per_hop` x hops -- the report's own airtime
+        plus one relay per repeater with the firmware's random forward
+        delay, the same physics `_completion_quiet_window_s` sizes for a
+        QUERY's answer -- never longer than the answer budget a QUERY would
+        get. A report that does not arrive in that time was lost or is
+        queued behind the receiver's own sends, and waiting longer only
+        delays the QUERY fallback (third cut: the first two waited for a
+        receiver-side idle timer as well and MeshBench `large_payload`, a
+        lossy bidirectional one-hop case with a 60 s per-probe deadline,
+        went 0/6 against a 1/6-4/6 baseline)."""
+        window_s = self.direct_raw_report_wait_base_s + self.direct_raw_report_wait_per_hop_s * max(0, hops)
+        # Phase 1 (2026-09-20): the measured report latency (burst end ->
+        # report arrival, late reports included so the estimate is not
+        # truncated by the window it sizes) widens the window above the
+        # hop-scaled floor; the QUERY answer budget still caps it.
+        rs = self._report_rtt.get(peer_prefix)
+        if rs is not None:
+            # srtt + 2 x rttvar (the factor `_completion_quiet_window_s`
+            # uses), not RFC 6298's 4: a lost report at zero hop costs the
+            # whole window and the true distribution there is median ~3 s,
+            # p90 ~7 s (2026-09-20 review), which +4 x rttvar overshoots.
+            window_s = max(window_s, rs["srtt"] + 2.0 * rs["rttvar"])
+        budget_s = self._completion_query_timeout_s(peer_prefix, hops)
+        return max(0.0, min(window_s, budget_s))
+
+    def _record_report_latency(self, peer_prefix: Optional[str], pkt_id: int) -> Optional[float]:
+        """One burst-end -> REPORT-arrival sample for the window estimator
+        (2026-09-20), taken in `_handle_incoming_completion_frame` for every
+        report that matches an expectation `_send_direct_raw_fragmented`
+        registered -- whether the report arrives inside the window or after
+        it (the sender may already be in its QUERY fallback). Returns the
+        latency, or None when nothing was expected."""
+        burst_end = self._report_expected.get((peer_prefix, pkt_id))
+        if burst_end is None:
+            return None
+        latency_s = time.monotonic() - burst_end
+        self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
+        return latency_s
+
+    def _expect_report(self, peer_prefix: str, pkt_id: int, burst_end: Optional[float]) -> None:
+        """Register (or, with None, withdraw) the burst end time a report
+        for (peer, pkt_id) is measured against."""
+        key = (peer_prefix, pkt_id)
+        if burst_end is None:
+            self._report_expected.pop(key, None)
+        else:
+            self._report_expected[key] = burst_end
+
+    async def _await_completion_report(
+        self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
+        last_sent_idx: Optional[int] = None, rearm=None, release_lock=None,
+    ) -> Optional[_CompletionFrame]:
+        """Wait (lock held, radio quiet) for the receiver's completion
+        report after a raw burst; None if none arrived inside
+        `_completion_report_wait_s`, in which case the caller falls back to
+        the QUERY path. A report is captured as a `completion_check_result`
+        with outcome "reported" so the reconcile accounting stays in one
+        record type; no record is written when nothing arrives (the QUERY
+        that follows writes its own).
+
+        Phase 1 (2026-09-20): an INCOMPLETE report whose only gap is
+        `last_sent_idx` -- the burst's last fragment -- is the second-last
+        fragment's report (both are flagged), sent by the receiver moments
+        before the last fragment landed. Taken as final it re-drives that
+        fragment as a duplicate: 20 of the desktop's 43 "reported" hop-0
+        rounds in the 2026-09-20 session did exactly that (each followed by
+        a one-fragment round and a second report). It is now provisional:
+        `rearm()` puts a fresh future under the same key so the complete
+        report can still land, the wait continues for up to half the window
+        more (the complete report follows the incomplete one by a median
+        1.5-1.9 s at zero hop -- its ACK wait -- and the receiver-side
+        debounce of phase 3 removes the pair at the source), and the
+        provisional report is acted on only if nothing better arrives
+        (captured with `provisional: true`). When the last fragment really
+        was lost this costs at most that extra half window; today's
+        behaviour (re-drive it at once) is the fallback either way."""
+        wait_s = self._completion_report_wait_s(hops, peer_prefix)
+        started = time.monotonic()
+        provisional: Optional[_CompletionFrame] = None
+        deadline_s = wait_s
+        released = release_lock is None
+        while True:
+            remaining = deadline_s - (time.monotonic() - started)
+            if remaining <= 0:
+                got = None
+            else:
+                try:
+                    if not released:
+                        # Phase 1 (2026-09-20): a queued Link handshake takes
+                        # the radio; the rest of this wait is radio-free (the
+                        # report future outlives the wait either way).
+                        done, cut = await self._wait_future_or_preempt(fut, remaining)
+                        if cut:
+                            release_lock()
+                            released = True
+                            self._debug(
+                                f"report wait ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) released the radio to a "
+                                f"Link handshake after {time.monotonic() - started:.2f}s; still listening for the report."
+                            )
+                            continue
+                        got = fut.result() if done else None
+                    else:
+                        got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
+                except (asyncio.TimeoutError, Exception):
+                    got = None
+            if got is None:
+                if provisional is not None:
+                    got = provisional
+                    break
+                self._debug(
+                    f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
+                    f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
+                )
+                return None
+            missing_only_last = (
+                not got.complete and got.held is not None and last_sent_idx is not None and rearm is not None
+                and set(range(frag_total)) - set(got.held) == {last_sent_idx}
+            )
+            if missing_only_last and provisional is None:
+                provisional = got
+                fut = rearm()
+                deadline_s = min(wait_s, (time.monotonic() - started) + wait_s / 2.0)
+                self._debug(
+                    f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) misses only the "
+                    f"last fragment sent ({last_sent_idx}) -- the second-last fragment's report; provisional, "
+                    f"waiting the rest of the window for the last fragment's own."
+                )
+                continue
+            break
+        waited_s = time.monotonic() - started
+        is_provisional = got is provisional
+        self._debug(
+            f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
+            f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
+            f"{waited_s:.1f}s after the burst's last gap."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", {
+                "event": "completion_check_result",
+                "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
+                "outcome": "reported", "complete": got.complete, "stage": stage,
+                "timeout_s": round(wait_s, 3), "answer_version": got.version,
+                "held": sorted(got.held) if got.held is not None else None,
+                "report_wait_s": round(waited_s, 3), "provisional": is_provisional,
+            })
+        return got
+
+    def _record_query_path_evidence(self, peer_prefix: str, infos: "list[dict]", answered: bool = False) -> None:
+        """One raw reconcile round's QUERY sends, as stale-path evidence
+        (2026-09-19 morning field test). Each QUERY is an ACKed DIRECT
+        exchange over the cached path, so its firmware ACK proves the
+        path, and `direct_raw_query_attempts` consecutive full-timeout
+        misses disprove it as strongly as one text send's exhausted
+        `direct_send_attempts` budget does. Before this, a raw send
+        recorded one failure only after all its rounds were exhausted and
+        the QUERYs recorded nothing: the desktop sat on a dead zero-hop
+        path through 17 consecutive full-timeout QUERY misses and three
+        whole 70s sends (09:58:23-10:01:05) before `record_direct_send_
+        result` reached its threshold of 3. Counted per round, not per
+        attempt, so a single lost ACK still is not a path failure."""
+        if not infos:
+            return
+        if answered or any(i.get("acked") for i in infos):
+            # An ANSWER proves the path even if the QUERY's own ACK was lost.
+            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+        elif all(i.get("waited_full_timeout") for i in infos):
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+
+    async def _raw_path_reset_mid_send(
+        self, peer_prefix: str, path: bytes, pkt_id: int, rnd: int, acked: list, frag_total: int, remember,
+    ) -> bool:
+        """True when the path this raw send was started on is no longer
+        the peer's resolved path (reset by `_reset_stale_path`, possibly
+        from this send's own QUERY evidence, or re-resolved elsewhere):
+        the remaining rounds would burst fragments source-routed down a
+        path already known to be dead. The send is remembered for resume
+        and abandoned; the next packet for this peer goes through
+        discovery. `asyncio.sleep(0)` first lets the background reset
+        task spawned a moment ago run before the check."""
+        await asyncio.sleep(0)
+        resolved = self._resolved_paths.get(peer_prefix)
+        if resolved is not None and (resolved.out_path_hex or "") == path.hex():
+            return False
+        remember()
+        self._outgoing_dropped_total += 1
+        RNS.log(
+            f"{self}: RAW send pkt_id={pkt_id} to {peer_prefix!r}: path {path.hex() or '<zero-hop>'} was reset "
+            f"after round {rnd} -- abandoning the remaining rounds rather than bursting down a dead path; "
+            f"receiver holds {sum(acked)}/{frag_total}.",
+            RNS.LOG_WARNING,
+        )
+        return True
+
+    async def _send_direct_raw_fragmented(
+        self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+        expires_at: Optional[float] = None, resume: Optional[dict] = None, resume_key=None,
+    ) -> Optional[bool]:
+        """Raw binary fragments (2026-09-18 night, module docstring): burst
+        every missing fragment, ask the receiver what it holds, repeat.
+        Returns True (delivered), False (failed, recorded), or None (raw
+        declined or disabled for this peer mid-way -- the caller re-sends
+        as text fragments)."""
+        resolved = self._resolved_paths.get(peer_prefix)
+        own_prefix = self._own_pubkey_prefix()
+        if resolved is None or own_prefix is None:
+            return None
+        try:
+            path = bytes.fromhex(resolved.out_path_hex or "")
+        except ValueError:
+            return None
+        budget = self._direct_raw_payload_budget(len(path))
+        if budget <= 0:
+            return None
+        chunks = self._chunk_payload(payload, budget)
+        frag_total = len(chunks)
+        if frag_total > 255:
+            return None
+        if self._expired(expires_at):
+            self._outgoing_dropped_total += 1
+            RNS.log(f"{self}: dropping raw DIRECT send to {peer_prefix!r} -- packet expired before its first transmission.", RNS.LOG_WARNING)
+            return False
+
+        acked, resumed = self._resume_state(resume, frag_total, pkt_id, peer_prefix, raw=True)
+        self._last_fragmented_pkt_id = pkt_id
+        self._last_fragmented_frag_total = frag_total
+        self._debug(
+            f"RAW fragmented send starting: pkt_id={pkt_id} to {peer_prefix!r} frag_total={frag_total} "
+            f"budget={budget}B path_len={len(path)} hop_count={hop_count}{' (resumed)' if resumed else ''}."
+        )
+        # Field fix (2026-09-19 morning): the gap is per fragment, scaled by
+        # the number of repeaters that must each forward it before the
+        # chain is clear -- see _raw_fragment_gap_s.
+        gap_hops = max(0, hop_count if hop_count is not None else len(path))
+        last_progress_at = time.monotonic() if resumed else None
+        empty_answered_bursts = 0
+
+        def remember() -> None:
+            self._remember_resumable(resume_key, pkt_id, frag_total, acked, last_progress_at)
+
+        rounds = max(1, self.direct_raw_reconcile_rounds)
+        query_unanswered_rounds = 0
+        # Field fix (2026-09-19, bidirectional image transfer): an unanswered
+        # reconcile is "no information", and re-bursting every un-ACKed
+        # fragment on it is a guess that lengthens the peer's queue -- the
+        # very thing delaying its ANSWER. Bursts now only follow an answered
+        # reconcile (or start the send); an unanswered round re-queries,
+        # until `direct_raw_reburst_after_unanswered` consecutive silent
+        # rounds allow one more burst as a safety valve.
+        burst_allowed = True
+        consecutive_unanswered = 0
+        for rnd in range(rounds):
+            # Audit fix (2026-09-19): expiry was checked once, before the
+            # first burst. Three rounds of bursts plus their query waits far
+            # exceed outgoing_max_age (120s), so a raw send could never
+            # expire mid-flight the way the text path can.
+            if rnd > 0 and self._expired(expires_at):
+                self._outgoing_dropped_total += 1
+                remember()
+                self._debug(
+                    f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: giving up before round {rnd} -- "
+                    f"packet expired (outgoing_max_age); receiver holds {sum(acked)}/{frag_total}."
+                )
+                return False
+            missing = [i for i in range(frag_total) if not acked[i]]
+            burst_this_round = bool(missing) and burst_allowed
+            if missing and not burst_this_round:
+                self._debug(
+                    f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} -- last reconcile "
+                    f"unanswered, re-querying instead of re-bursting {len(missing)} fragment(s)."
+                )
+            report: Optional[_CompletionFrame] = None
+            if burst_this_round:
+                # Completion report (2026-09-20): the waiter is registered
+                # BEFORE the burst -- for a multi-fragment burst the receiver
+                # completes on the last fragment while this side is still
+                # in that fragment's gap -- under the report nonce for this
+                # round, so a stale round's incomplete bitmap can never be
+                # applied (a `complete=True` report of any round is accepted
+                # by the handler's monotone rule, as a late QUERY answer is).
+                report_key = (peer_prefix, pkt_id)
+                report_fut = None
+                if self.direct_raw_report_enabled:
+                    report_fut = asyncio.get_running_loop().create_future()
+                    self._completion_query_waiters[report_key] = (
+                        report_fut, frag_total, self.COMPLETION_REPORT_NONCE_BASE | (rnd & 0x03),
+                    )
+                # Phase 1 (2026-09-20): the lock is taken by hand so the
+                # burst can YIELD it to a queued Link handshake -- during a
+                # fragment's duty-cycle throttle wait, after (never inside)
+                # a fragment's gap, and for the rest of the report wait --
+                # and take it back at YIELDED_PRIORITY, ahead of ordinary
+                # waiters (see _PriorityAsyncLock.yield_to_preempt).
+                lock = self._direct_exchange_lock
+                await lock.acquire(priority)
+                lock_held = True
+                yields = 0
+
+                def release_for_handshake() -> None:
+                    nonlocal lock_held
+                    if lock_held:
+                        lock.release()
+                        lock_held = False
+
+                try:
+                    for n, frag_idx in enumerate(missing):
+                        if self.detached or not self.online:
+                            remember()
+                            self._completion_query_waiters.pop(report_key, None)
+                            return False
+                        frame = self._encode_raw_fragment(
+                            chunks[frag_idx], target, own_prefix, pkt_id, frag_idx, frag_total, attempt=rnd,
+                            report=report_fut is not None and n >= len(missing) - 2,
+                        )
+                        telemetry: dict = {}
+                        while True:
+                            try:
+                                await self._send_raw_fragment(path, frame, priority, telemetry, interrupt=lock.preempt_event())
+                                sent_ok = True
+                            except _PreemptedForHandshake:
+                                # Yield inside the throttle wait: the
+                                # handshake (duty-cycle exempt) goes, this
+                                # fragment re-enters the gate afterwards.
+                                yields += 1
+                                await lock.yield_to_preempt()
+                                if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
+                                    self._completion_query_waiters.pop(report_key, None)
+                                    return False
+                                continue
+                            except Exception as exc:
+                                sent_ok = False
+                                RNS.log(f"{self}: raw fragment send failed locally (pkt_id={pkt_id} frag_idx={frag_idx}): {exc}", RNS.LOG_WARNING)
+                            break
+                        if self._packet_capture_file is not None:
+                            self._capture_event("out", {
+                                "event": "raw_fragment_sent", "peer_prefix": peer_prefix, "pkt_id": pkt_id,
+                                "frag_idx": frag_idx, "frag_total": frag_total, "round": rnd, "ok": sent_ok,
+                                "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
+                                "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
+                                "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
+                                "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
+                                "handshake_yields": yields,
+                            })
+                        # Field fix (2026-09-19 morning): the gap follows EVERY
+                        # fragment, the last one included, and is slept with
+                        # the lock still held -- so the QUERY below (and any
+                        # other send waiting on the lock) cannot enter the
+                        # repeater chain while this fragment is still
+                        # working its way down it.
+                        gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
+                        if gap_s > 0:
+                            await asyncio.sleep(gap_s)
+                        if n < len(missing) - 1 and lock.preempt_requested():
+                            # After the gap (the chain is clear), before the
+                            # next fragment: let the handshake go.
+                            yields += 1
+                            await lock.yield_to_preempt()
+                            if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
+                                self._completion_query_waiters.pop(report_key, None)
+                                return False
+                    if yields:
+                        self._debug(f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
+                    if report_fut is not None:
+                        stale_report = None
+
+                        def rearm(_key=report_key, _ft=frag_total, _rnd=rnd):
+                            fresh = asyncio.get_running_loop().create_future()
+                            self._completion_query_waiters[_key] = (
+                                fresh, _ft, self.COMPLETION_REPORT_NONCE_BASE | (_rnd & 0x03),
+                            )
+                            return fresh
+
+                        if report_fut.done() and not report_fut.result().complete:
+                            # An INCOMPLETE report that arrived while this
+                            # burst was still going (the second-last fragment
+                            # is flagged too) describes a state the fragments
+                            # sent since have changed. Keep it as the fallback
+                            # and wait the transit time for the last
+                            # fragment's own report first.
+                            stale_report = report_fut.result()
+                            report_fut = rearm()
+                        # Radio kept quiet, lock still held: the receiver's
+                        # report (and, right behind it, whatever RNS sends
+                        # back) is crossing the chain now, and this node's
+                        # next burst or QUERY is what used to collide with it.
+                        # A report arriving from here until the round ends is
+                        # measured for the window estimator (2026-09-20).
+                        self._expect_report(peer_prefix, pkt_id, time.monotonic())
+                        report = await self._await_completion_report(
+                            report_fut, peer_prefix, pkt_id, frag_total, gap_hops, stage=f"raw{rnd}",
+                            last_sent_idx=missing[-1] if missing else None, rearm=rearm,
+                            release_lock=release_for_handshake,
+                        )
+                        if report is None and stale_report is not None:
+                            # The last fragment (or its report) was lost: the
+                            # earlier report is authoritative for everything
+                            # but the fragments sent after it, which are
+                            # re-driven -- at worst one duplicate fragment,
+                            # never a QUERY round trip.
+                            report = stale_report
+                            self._capture_completion_check_result(
+                                peer_prefix, pkt_id, frag_total, "reported_stale", stale_report.complete,
+                                stage=f"raw{rnd}", answer_version=stale_report.version,
+                                held=sorted(stale_report.held) if stale_report.held is not None else None,
+                            )
+                finally:
+                    release_for_handshake()
+                self._completion_query_waiters.pop(report_key, None)
+            held_before = sum(acked)
+            answer = report
+            query_infos: list = []
+            if report is not None:
+                # The report is the ANSWER; the path evidence a QUERY's ACK
+                # would have given is the report itself (it crossed the path).
+                self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+            for q in range(max(1, self.direct_raw_query_attempts) if report is None else 0):
+                info: dict = {}
+                answer = await self._query_remote_fragments(
+                    target, peer_prefix, pkt_id, frag_total, stage=f"raw{rnd}", priority=priority, hop_count=hop_count,
+                    send_info=info,
+                )
+                query_infos.append(info)
+                if answer is not None or self.detached or not self.online:
+                    break
+            self._expect_report(peer_prefix, pkt_id, None)
+            if self.detached or not self.online:
+                remember()
+                return False
+            # Field fix (2026-09-19 morning): the QUERYs are ACKed DIRECT
+            # exchanges over the cached path -- their firmware ACKs are the
+            # same stale-path evidence the text path's sends feed.
+            self._record_query_path_evidence(peer_prefix, query_infos, answered=answer is not None)
+            if answer is None:
+                query_unanswered_rounds += 1
+                consecutive_unanswered += 1
+                burst_allowed = 0 < self.direct_raw_reburst_after_unanswered <= consecutive_unanswered
+                self._debug(f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} reconcile unanswered.")
+                if await self._raw_path_reset_mid_send(peer_prefix, path, pkt_id, rnd, acked, frag_total, remember):
+                    return False
+                continue
+            held = self._held_from_answer(answer, frag_total)
+            if held is None:
+                # Audit fix (2026-09-19): a v1 ANSWER carries no bitmap at
+                # all, which is "no per-fragment information" -- NOT "holds
+                # nothing" (reading it as an empty set once blacklisted a v1
+                # peer's whole repeater chain for a day). Unanswered round.
+                query_unanswered_rounds += 1
+                consecutive_unanswered += 1
+                burst_allowed = 0 < self.direct_raw_reburst_after_unanswered <= consecutive_unanswered
+                self._debug(
+                    f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} answered v1 "
+                    f"(no bitmap) -- no per-fragment information, treating as unanswered."
+                )
+                continue
+            acked = [i in held for i in range(frag_total)]
+            burst_allowed = True
+            consecutive_unanswered = 0
+            if held:
+                last_progress_at = time.monotonic()
+            self._debug(
+                f"RAW send pkt_id={pkt_id} to {peer_prefix!r}: round {rnd} -- receiver holds "
+                f"{sorted(held)} of {frag_total}."
+            )
+            if all(acked):
+                self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                self._resumable_sends.pop(resume_key, None)
+                # Field fix (2026-09-19 night): a completed raw send is the
+                # evidence that clears the soft incomplete-strike count.
+                self._raw_incomplete_strikes.pop(peer_prefix, None)
+                return True
+            if sum(acked) <= held_before and burst_this_round:
+                # A strike needs a burst that provably delivered nothing; a
+                # re-query round sent no data and says nothing about raw.
+                empty_answered_bursts += 1
+                if empty_answered_bursts >= max(1, self.direct_raw_fallback_strikes):
+                    # The text path works (the ANSWER came back) but raw
+                    # frames are not arriving. Pause raw for this peer and
+                    # fall back to Z85 on the same path; the caller records
+                    # the verdict per PATH once the text send's outcome is
+                    # known (_note_raw_fallback_outcome).
+                    self._raw_disabled_until[peer_prefix] = time.monotonic() + self.direct_raw_fallback_cooldown_s
+                    # A verdict on the chain is only possible if raw delivered
+                    # NOTHING on it (review, 2026-09-19): a chain that carried
+                    # fragments 0 and 1 and then stalled is lossy, not
+                    # raw-incapable, and must not be noted.
+                    nothing_ever_held = not any(acked)
+                    if nothing_ever_held:
+                        # Audit fix (2026-09-19): keyed (peer, path) rather
+                        # than peer alone -- two concurrent sends to the same
+                        # peer could otherwise cross wires and attribute one
+                        # send's text success to the other's raw failure,
+                        # blacklisting a chain for 24h on someone else's
+                        # evidence.
+                        self._raw_fallback_pending[(peer_prefix, path.hex())] = time.monotonic()
+                    RNS.log(
+                        f"{self}: raw fragments to {peer_prefix!r} are not arriving over path "
+                        f"{path.hex() or '<zero-hop>'} ({empty_answered_bursts} answered reconciles, nothing new "
+                        f"held; receiver holds {sum(acked)}/{frag_total}) -- re-sending as Z85 text"
+                        + ("; if that succeeds the path is noted as not carrying raw." if nothing_ever_held
+                           else " (raw did deliver part of it, so no verdict on the chain)."),
+                        RNS.LOG_WARNING,
+                    )
+                    return None
+            else:
+                empty_answered_bursts = 0
+
+        remember()
+        if query_unanswered_rounds == rounds:
+            # Unanswered throughout: nothing is known about the path -> a
+            # real failure, recorded like any other.
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+            RNS.log(
+                f"{self}: RAW fragmented send pkt_id={pkt_id} to {peer_prefix!r} gave up after {rounds} round(s) "
+                f"with no reconcile ever answered: receiver holds {sum(acked)}/{frag_total}.",
+                RNS.LOG_WARNING,
+            )
+            return False
+        # Answered but still incomplete after every round: the path is alive
+        # and raw made progress, it just did not finish under this loss.
+        # Not a path failure and not a verdict on the chain -- hand the packet
+        # to the Z85 text path (per-fragment ACKs, finishing budget) rather
+        # than drop it. The receiver's raw bucket is remembered for resume.
+        #
+        # Field fix (2026-09-19 night): this used to pause raw for the peer
+        # unconditionally, so the next packets under the same loss would go
+        # straight to text instead of each spending three raw rounds first
+        # (review, 2026-09-19). The night capture (`fieldtests/raw/Alpha0.1.2/
+        # desktop_afipc_20260919T212602_nighttest.jsonl`) shows the cost: at
+        # 21:45:14 one part lost the same fragment three rounds running,
+        # and the 600s pause that followed carried the next 46 page parts as
+        # five text fragments plus five ACKs each -- on a path where 16 of
+        # the session's 20 raw sends had completed. One incomplete send is
+        # one unlucky fragment, not evidence about the chain: the e87cca8
+        # build (8 of 8 raw sends complete at one hop) only ever paused on
+        # the two-strike "delivered nothing" rule above. So this is now a
+        # SOFT strike, and raw pauses only when `direct_raw_incomplete_
+        # strikes` (2) consecutive raw sends to this peer end this way; a
+        # completed raw send clears the count (a path change clears it too,
+        # via _clear_peer_path_stats).
+        strikes = self._raw_incomplete_strikes.get(peer_prefix, 0) + 1
+        self._raw_incomplete_strikes[peer_prefix] = strikes
+        pause_raw = 0 < self.direct_raw_incomplete_strikes <= strikes
+        if pause_raw:
+            self._raw_disabled_until[peer_prefix] = time.monotonic() + self.direct_raw_fallback_cooldown_s
+            self._raw_incomplete_strikes.pop(peer_prefix, None)
+        # Review (2026-09-19): the chain verdict is about the whole send, not
+        # the strike sequence -- if raw delivered nothing in any round while
+        # the text-path reconcile was answered at least once, this is the
+        # same "Z85 works, binary doesn't" evidence the strike rule looks
+        # for, and an unanswered round in between must not hide it.
+        if not any(acked):
+            self._raw_fallback_pending[(peer_prefix, path.hex())] = time.monotonic()
+        RNS.log(
+            f"{self}: RAW fragmented send pkt_id={pkt_id} to {peer_prefix!r} incomplete after {rounds} round(s) "
+            f"(receiver holds {sum(acked)}/{frag_total}) -- re-sending as Z85 text"
+            + ("; nothing arrived raw, so a successful text send notes the path." if not any(acked) else ".")
+            + (f" Raw paused for this peer for {self.direct_raw_fallback_cooldown_s:.0f}s "
+               f"({strikes} consecutive incomplete raw send(s))." if pause_raw
+               else f" Incomplete-send strike {strikes} of {self.direct_raw_incomplete_strikes} -- "
+                    f"the next packet still goes raw-first."),
+            RNS.LOG_WARNING,
+        )
+        return None
+
+    async def _check_remote_completion(
+        self, target: str, peer_prefix: str, pkt_id: int, frag_total: int,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+    ) -> bool:
+        """Field-data-driven fix (2026-09-16): real capture from a 5-node
+        field test found a concrete case (`pkt_id=3`, router -> a client)
+        where 2 of 3 fragments were logged as "never acknowledged" by the
+        sender after exhausting both retry passes -- roughly 4+ minutes
+        and 8 fragment-attempts total -- yet the receiver's own capture
+        showed a completed reassembly of *all three* fragments about a
+        second *before* the sender's own final successful ACK for the
+        third fragment even landed. That's direct proof the first two
+        fragments physically arrived; only their ACKs failed to make it
+        back, an asymmetric/return-path loss this design previously had
+        no way to distinguish from genuine non-delivery -- so it just
+        kept blindly retrying data the receiver already had, burning
+        airtime and `_direct_exchange_lock` time other queued sends were
+        waiting on, and risking a false `direct_path_reset_threshold`
+        trip (`record_direct_send_result`) over a link that was actually
+        fine.
+
+        Called from `_send_direct_fragmented` only once both retry passes
+        are exhausted and fragments still appear missing -- never a
+        substitute for the real firmware ACK, only a last resort before
+        giving up on data that might have already arrived. Sends one
+        lightweight `"Q"`-marker QUERY frame and waits up to
+        `direct_completion_check_timeout_s` for a matching ANSWER,
+        correlated via `_completion_query_waiters` keyed by `(peer_prefix,
+        pkt_id)` (`_handle_incoming_completion_frame` resolves the future
+        on receipt). Fully backward-compatible and fails safe: a peer
+        that doesn't understand `"Q"` frames, or whose own answer is
+        itself lost -- the same class of loss this whole mechanism exists
+        to route around, just at much lower stakes for one small frame --
+        simply never resolves the future, and this returns False once
+        `direct_completion_check_timeout_s` elapses, falling back to
+        exactly today's give-up behavior. Never raises: a local send
+        failure here is treated the same as no answer, not propagated.
+
+        Step 3 (2026-09-18): now a thin wrapper over
+        `_query_remote_fragments`, which is also called *between* the
+        passes as the reconcile step -- see `_send_direct_fragmented`."""
+        answer = await self._query_remote_fragments(
+            target, peer_prefix, pkt_id, frag_total, stage="final", priority=priority, hop_count=hop_count,
+        )
+        return answer is not None and answer.complete
+
+    def _completion_unacked_grace_s(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> float:
+        """Answer wait after a QUERY whose own firmware ACK was missed
+        (2026-09-20, see `direct_completion_unacked_grace_s`): the multihop
+        value from 2 hops, else the base; 0 = no cap."""
+        if hop_count is None:
+            resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+            hop_count = resolved.out_path_len if resolved is not None else 0
+        if hop_count is not None and hop_count >= 2:
+            return max(0.0, self.direct_completion_unacked_grace_multihop_s)
+        return max(0.0, self.direct_completion_unacked_grace_s)
+
+    def _completion_query_timeout_cap_s(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> float:
+        """The ceiling on a completion-ANSWER wait (field fix, 2026-09-19 --
+        see `direct_completion_check_timeout_max_s` for the evidence). With
+        no `hop_count`, the peer's resolved path decides (second audit: an
+        explicit argument instead of a shared mutable hint attribute)."""
+        if hop_count is None:
+            resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+            hop_count = resolved.out_path_len if resolved is not None else 0
+        if hop_count is not None and hop_count >= 2:
+            return self.direct_completion_check_timeout_max_multihop_s
+        return self.direct_completion_check_timeout_max_s
+
+    def _completion_query_timeout_s(self, peer_prefix: str, hop_count: Optional[int] = None) -> float:
+        """How long to wait for a completion ANSWER: the measured
+        QUERY -> ANSWER round trip for this peer when one exists, else the
+        firmware's own hop-aware ACK bound doubled (a round trip is two
+        exchanges), clamped into
+        [`direct_completion_check_timeout_s`, `_completion_query_timeout_cap_s`].
+
+        Field fix (2026-09-19 evening session, multi-agent capture audit).
+        This replaced a stack of three escalations -- a `x (1 + hops)`
+        multiplier on the floor, an RTT term of `2 x (srtt + 4*rttvar)`, and
+        a per-queued-exchange contention term -- whose combined effect was
+        budgets of 21-45s (median 41.4s on the timed-out checks). The session
+        evidence is unambiguous that this was counter-productive: 96% of
+        answers that ever arrived did so within 15s, every band beyond 20s
+        produced two answers in the whole session, and the answer rate FELL
+        as the budget grew (92% at 10-20s vs 34% at 40-45s). A long budget
+        marks bad conditions; it does not repair them. The dominant real
+        causes of an unanswered reconcile, established by pairing every query
+        against the peer's own records, are plain frame loss: 48% the QUERY
+        never reached the peer's application at all, 38% the peer answered
+        and the answer never arrived. Neither is helped by waiting longer.
+        The RTT term is kept (inside the cap) because it is genuinely
+        adaptive downward on a good link; only the unbounded growth is gone.
+        """
+        # The FLOOR stays hop-aware, only the ceiling is new (correction made
+        # while testing this change: dropping the hop term from the floor as
+        # well took a first query at 1 hop from 10s to 5s, and the session's
+        # own measurements say a query->answer round trip is median 3.2-5.7s
+        # with a p90 of 11.7-16.1s -- so a flat 5s floor would abandon the p90
+        # case before any RTT sample exists to widen it. The simulated 1-hop
+        # raw scenario caught exactly that.)
+        hops = max(0, hop_count or 0)
+        floor_s = (
+            self.direct_completion_check_timeout_s
+            + self.direct_completion_check_timeout_per_hop_s * hops
+        )
+        cap_s = max(self.direct_completion_check_timeout_s,
+                    self._completion_query_timeout_cap_s(hop_count, peer_prefix))
+        floor_s = min(floor_s, cap_s)
+        timeout_s = floor_s
+        qs = self._query_rtt.get(peer_prefix)
+        if qs is not None:
+            timeout_s = 2.0 * (qs["srtt"] + 4.0 * qs["rttvar"])
+        else:
+            fw = self._last_firmware_ack_timeout_s.get(peer_prefix)
+            if fw is not None:
+                timeout_s = 2.0 * fw
+        if self.rx_log_holds_enabled:
+            # The peer's ANSWER pays its own pre-transmit hold before it can
+            # leave, assuming it runs the same hold cap -- the best this side
+            # can know. Inside the cap, not added on top of it.
+            timeout_s += self.rx_log_hold_max_s
+        return min(max(timeout_s, floor_s), cap_s)
+
+    def _completion_quiet_window_s(self, hop_count: Optional[int], timeout_s: float,
+                                   peer_prefix: Optional[str] = None) -> Optional[float]:
+        """How long after a reconcile QUERY's firmware ACK the radio-quiet
+        window lasts (field fix 2026-09-19 night; re-anchored at the ACK and
+        made RTT-adaptive 2026-09-20, see `direct_completion_quiet_base_s`):
+        `base + per_hop x hops` (or the measured round trip's srtt + 2 x
+        rttvar when larger), never more than
+        `timeout_s` (the answer budget -- the window can only move time
+        that was being spent waiting anyway). None when the window is
+        disabled (both keys 0), so the answer wait is fully radio-free as
+        it was in commit 1919074. `_send_direct_frame_and_wait_for_ack`
+        anchors it at the frame's MSG_SENT moment."""
+        if self.direct_completion_quiet_base_s <= 0 and self.direct_completion_quiet_per_hop_s <= 0:
+            return None
+        if hop_count is None and peer_prefix is not None:
+            # Same fallback as _completion_query_timeout_cap_s: the peer's
+            # resolved path knows the hop count when the caller did not.
+            resolved = self._resolved_paths.get(peer_prefix)
+            hop_count = resolved.out_path_len if resolved is not None else 0
+        hops = max(0, hop_count if hop_count is not None else 0)
+        window_s = self.direct_completion_quiet_base_s + self.direct_completion_quiet_per_hop_s * hops
+        # Review (2026-09-20): adaptive upward from the measured QUERY -> ANSWER
+        # round trip (itself measured from the QUERY's ACK, the same anchor
+        # this window uses) once three samples exist; the budget still caps it.
+        qs = self._query_rtt.get(peer_prefix) if peer_prefix else None
+        if qs is not None and qs.get("samples", 0) >= 3:
+            window_s = max(window_s, qs["srtt"] + 2.0 * qs["rttvar"])
+        return max(0.0, min(timeout_s, window_s))
+
+    async def _query_remote_fragments(
+        self, target: str, peer_prefix: str, pkt_id: int, frag_total: int, stage: str,
+        priority: int = PRIORITY_NORMAL, hop_count: Optional[int] = None,
+        send_info: Optional[dict] = None,
+    ) -> Optional[_CompletionFrame]:
+        """Step 3 (2026-09-18, see module docstring): one `"Q"` QUERY to the
+        receiver, answered with its have-bitmap (v2) or a bare complete
+        flag (a v1 peer). Returns the decoded ANSWER, or None if none
+        arrived (lost, or the peer predates `"Q"`/v2 frames) -- callers
+        treat None as "no information", never as "nothing arrived".
+        `stage` is "reconcile" (between pass 0 and pass 1) or "final"
+        (after pass 1, the pre-step-3 last resort) -- capture-only.
+
+        The QUERY is sent as one ordinary ACKed DIRECT exchange (lock held
+        through its transmit and firmware ACK by `_send_direct_frame_and_
+        wait_for_ack`), the lock is then kept for a short hop-scaled
+        radio-quiet window (`direct_completion_quiet_base` + `..._per_hop`
+        x hops after the transmit -- field fix 2026-09-19 night, the
+        hidden-node collision at the repeater), and the rest of the ANSWER
+        budget is awaited with the radio free -- see the comment at that
+        call site for why holding the lock through the WHOLE answer wait
+        was reverted. `priority` is the enclosing
+        send's own tier (the reconcile stage sits inside a fragmented send
+        whose receiver-side clock is already running; queueing it behind
+        every ordinary send at PRIORITY_LOW defeated its purpose), and the
+        QUERY is `time_critical` for the same reason.
+
+        Audit fix (2026-09-19): an ANSWER whose `frag_total` does not match
+        this query's is ignored (see `_handle_incoming_completion_frame`) --
+        `_completion_query_waiters` is keyed only `(peer_prefix, pkt_id)`,
+        so a late answer to a *previous* query for the same packet could
+        otherwise be applied authoritatively to this one."""
+        key = (peer_prefix, pkt_id)
+        fut = asyncio.get_running_loop().create_future()
+        # Field fix (2026-09-19): a per-query nonce so a late answer to an
+        # EARLIER query for this same pkt_id cannot resolve this one (the
+        # frag_total guard alone could not -- five such stale resolutions
+        # happened in the evening session, one applying held=[]).
+        # 2026-09-20: cycles 1..COMPLETION_QUERY_NONCE_MAX, leaving 0 and the
+        # 0xF0.. range to receiver-initiated reports (see the constant).
+        self._completion_query_nonce = (self._completion_query_nonce % self.COMPLETION_QUERY_NONCE_MAX) + 1
+        query_nonce = self._completion_query_nonce
+        self._completion_query_waiters[key] = (fut, frag_total, query_nonce)
+        outcome = "send_failed"
+        answer: Optional[_CompletionFrame] = None
+        timeout_s = self._completion_query_timeout_s(peer_prefix, hop_count)
+        try:
+            frame = self._encode_completion_frame(
+                self.COMPLETION_TYPE_QUERY, pkt_id, frag_total, nonce=query_nonce,
+            )
+            # First raw field test (2026-09-18 night): the QUERY is one
+            # ordinary ACKed exchange -- lock held through its transmit and
+            # firmware ACK -- and the ANSWER is then awaited with the radio
+            # free. Holding the lock through the answer wait (the earlier
+            # review's shape) blocked this node's own ANSWERs to the peer's
+            # queries for up to 50s under bidirectional traffic.
+            sent_at = time.monotonic()
+            # Field fix (2026-09-19 night): the first seconds of that answer
+            # wait are NOT radio-free any more. `_send_direct_frame_and_wait_
+            # for_ack` keeps the lock past its own listen delay until this
+            # query's answer future resolves or this deadline passes -- the
+            # span in which the ANSWER is actually crossing the repeater
+            # chain, where the querier's own next burst would collide with it
+            # at the repeater (a hidden node from both ends). See
+            # `direct_completion_quiet_base_s` for the measured sizing and
+            # the module docstring's 2026-09-19 night entry for the answer-
+            # delivery numbers that motivated it. Anchored at the QUERY's own
+            # transmit (inside the ack-wait method, after any lock wait) and
+            # never longer than the answer budget itself, so this can only
+            # ever move time that was already being spent waiting.
+            quiet_window_s = self._completion_quiet_window_s(hop_count, timeout_s, peer_prefix)
+            quiet_info: dict = {}
+            try:
+                # 2026-09-19: the QUERY rides PRIORITY_ANSWER (unless the
+                # enclosing send is a handshake, which is higher still) --
+                # see that constant's comment. A stalled transfer's one
+                # small question should not queue behind this node's own
+                # bulk bursts to other packets.
+                # Field fix (2026-09-19): `attempt` varies per try instead of
+                # being hardcoded 0, so the firmware's own content-derived
+                # dedup/retry differentiation is actually exercised on a
+                # repeated query. The evening session found a repeated
+                # (pkt_id, frag_total) query answered only 43% of the time
+                # versus 90% for a first-time query, at equal link quality --
+                # mechanism unexplained, but leaving the firmware's attempt
+                # field pinned at 0 on every retry could only be contributing.
+                # Derived from the rolling nonce, so it advances on every query
+                # without threading a second counter through the callers.
+                q_ok, q_waited_full = await self._send_direct_frame_and_wait_for_ack(
+                    target, frame, query_nonce & 0x03, peer_prefix=peer_prefix,
+                    priority=min(priority, self.PRIORITY_ANSWER),
+                    time_critical=True, kind="completion_query", hop_count=hop_count,
+                    quiet_wait=fut, quiet_window_s=quiet_window_s, quiet_info=quiet_info,
+                )
+                # Field fix (2026-09-19 morning): the QUERY's own firmware
+                # ACK outcome, for the caller's stale-path evidence
+                # (_record_query_path_evidence). `send_info` is the same
+                # out-param shape _send_direct_payload uses.
+                if send_info is not None:
+                    send_info["acked"] = bool(q_ok)
+                    send_info["waited_full_timeout"] = bool(q_waited_full)
+            except Exception as exc:
+                if send_info is not None:
+                    send_info["acked"] = False
+                    send_info["waited_full_timeout"] = False
+                self._debug(
+                    f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
+                    f"send failed locally: {exc} -- treating as no answer."
+                )
+                return None
+            # Audit fix (2026-09-19): the ANSWER budget starts when the QUERY
+            # is actually out, not when this coroutine began. `_completion_
+            # query_timeout_s` documents itself as "how long to wait for a
+            # completion ANSWER", but the send call above also covers
+            # `_direct_exchange_lock` queueing (49s observed in the
+            # 2026-09-18 captures), the pre-transmit gate and the QUERY's own
+            # firmware ACK wait. Charging all of that against the peer's
+            # reply left `max(0.5, ...)` -- i.e. 0.5s -- for an ANSWER that
+            # really needed seconds, and 36 of 106 archived completion checks
+            # timed out. A timeout here means "no information", so every one
+            # of those cost a full re-drive of fragments the receiver already
+            # held (or, on the raw path, a false fallback strike).
+            answer_wait_start = time.monotonic()
+            # Field fix (2026-09-19 night; review fix 2026-09-20): the quiet
+            # hold already spent part of this budget with the radio held --
+            # it is charged here, so the window moves waiting time rather
+            # than adding to it (the evening session's evidence is that a
+            # longer budget marks bad conditions, it does not repair them).
+            # The round trip is measured from the QUERY's ACK either way: for
+            # an answer that arrived inside the hold, from the timestamps
+            # the ack-wait method handed back; otherwise from here (which
+            # is the same point, since the hold ended before this line).
+            quiet_hold_s = float(quiet_info.get("hold_s", 0.0) or 0.0)
+            remaining = max(0.0, timeout_s - quiet_hold_s)
+            if not q_ok:
+                # Dead-wait trims (2026-09-20): no firmware ACK for the QUERY
+                # -> it most likely never reached the peer; a short grace
+                # covers the answers that do arrive (see the config comment).
+                grace_s = self._completion_unacked_grace_s(hop_count, peer_prefix)
+                if grace_s > 0:
+                    remaining = min(remaining, grace_s)
+            rtt_origin = quiet_info.get("ack_done_at", answer_wait_start)
+            try:
+                got: _CompletionFrame = await asyncio.wait_for(fut, timeout=remaining)
+                answer = got
+                outcome = "answered"
+                # Measured from the QUERY's ACK, so the estimator models the
+                # peer's reply latency rather than this node's own queueing
+                # (which would inflate every later timeout and hold the
+                # radio longer on failures).
+                answered_at = quiet_info.get("answered_at") or time.monotonic()
+                if not quiet_info.get("not_sent") and (
+                        got.nonce is None or (got.nonce & 0xF0) != self.COMPLETION_REPORT_NONCE_BASE):
+                    # A late REPORT that resolved this QUERY's future (the
+                    # monotone rule) is the report estimator's sample, not
+                    # a QUERY round trip (phase 1, 2026-09-20: 24 of 29
+                    # hop-0 "answered" outcomes were this, and they were
+                    # shrinking _query_rtt with ~0 s samples).
+                    self._record_query_rtt(peer_prefix, answered_at - rtt_origin)
+                self._debug(
+                    f"completion ANSWER ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
+                    f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
+                    f"after {answered_at - rtt_origin:.1f}s from its ACK "
+                    f"({quiet_hold_s:.1f}s of it inside the quiet hold; "
+                    f"{time.monotonic() - sent_at:.1f}s including the QUERY's own send)."
+                )
+                return got
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+                self._debug(
+                    f"completion QUERY ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): "
+                    f"no answer within {timeout_s:.1f}s ({quiet_hold_s:.1f}s of it as the quiet hold) -- "
+                    f"no information, proceeding as if unanswered."
+                )
+                return None
+        finally:
+            self._completion_query_waiters.pop(key, None)
+            self._capture_completion_check_result(
+                peer_prefix, pkt_id, frag_total, outcome,
+                answer.complete if answer is not None else False,
+                stage=stage, timeout_s=timeout_s,
+                answer_version=answer.version if answer is not None else None,
+                held=sorted(answer.held) if answer is not None and answer.held is not None else None,
+            )
+
+    def _handle_incoming_completion_frame(self, marker_and_body: str, sender_token: str) -> None:
+        """Receive side of the `"Q"`-marker completion check (see
+        `_check_remote_completion`'s own docstring for the full
+        mechanism/motivation). A QUERY is answered directly from the
+        existing whole-packet dedup cache -- `_add_channel_fragment`
+        already records a completed DIRECT-fragmented reassembly there
+        under exactly the key `(mode, sender_token, pkt_id, frag_total)`
+        this method rebuilds, so answering "do you have pkt_id X
+        complete" needs no new state of its own, just a lookup into state
+        that already exists for an unrelated reason (§7's dedup). Uses
+        `sender_token` as received here, uncanonicalized -- matching
+        `_reassembly_key`'s own convention of keying on the raw
+        MeshCore-native token, never this interface's canonical 6-byte
+        peer prefix, so this lookup can never silently miss due to a
+        canonicalization mismatch against how the entry was actually
+        stored."""
+        try:
+            frame = self._decode_completion_frame(marker_and_body)
+        except ValueError as exc:
+            self._debug(f"discarding malformed completion-check frame from {sender_token!r}: {exc}")
+            return
+
+        if frame.type == self.COMPLETION_TYPE_QUERY:
+            # Step 3 (2026-09-18): answer with what we actually hold, not
+            # just complete/not. The key is exactly _reassembly_key's for
+            # a non-coop DIRECT frame, so both the dedup cache (a finished
+            # reassembly) and a still-open bucket are consulted with the
+            # same tuple. A bucket that was evicted or idle-expired reads
+            # as "holds nothing" -- correct: the sender must re-drive it
+            # all, and would have had to anyway.
+            key = ("direct", sender_token or "~anon", frame.pkt_id, frame.frag_total)
+            complete = self._dedup_contains(key)
+            if complete:
+                held = set(range(frame.frag_total))
+            else:
+                bucket = self._reassembly.get(key)
+                held = set(bucket.fragments.keys()) if bucket is not None else set()
+            self._debug(
+                f"completion QUERY (v{frame.version}) from {sender_token!r} for pkt_id={frame.pkt_id} "
+                f"frag_total={frame.frag_total}: answering complete={complete} held={sorted(held)}."
+            )
+            if self._packet_capture_file is not None:
+                self._capture_event("in", {
+                    "event": "completion_query_received",
+                    "sender_token": sender_token,
+                    "pkt_id": frame.pkt_id,
+                    "frag_total": frame.frag_total,
+                    "query_version": frame.version,
+                    "answering_complete": complete,
+                    "answering_held": sorted(held),
+                })
+            self._spawn_background_task(
+                self._send_completion_answer(
+                    sender_token, frame.pkt_id, frame.frag_total, complete,
+                    held=held, version=frame.version, nonce=frame.nonce,
+                )
+            )
+            return
+
+        # ANSWER: correlate against our own canonical peer prefix, since
+        # that's the key _query_remote_fragments registered the waiter
+        # future under. The whole decoded frame is handed over -- the
+        # querying side decides what `complete`/`held` mean for its stage.
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        if peer_prefix is None:
+            return
+        is_report = frame.nonce is not None and (frame.nonce & 0xF0) == self.COMPLETION_REPORT_NONCE_BASE
+        if is_report and frame.complete:
+            # A receiver-initiated REPORT: sample its latency whether or
+            # not a waiter still exists (a late report is the case the
+            # estimator most needs to see) -- phase 1, 2026-09-20. Complete
+            # reports only: the second-last fragment's incomplete report
+            # arrives ~1.5-2 s before the complete one and would train the
+            # window short.
+            latency_s = self._record_report_latency(peer_prefix, frame.pkt_id)
+            if latency_s is not None:
+                self._debug(
+                    f"completion REPORT from {sender_token!r} for pkt_id={frame.pkt_id} arrived "
+                    f"{latency_s:.2f}s after the burst ended (window estimator "
+                    f"srtt={self._report_rtt[peer_prefix]['srtt']:.2f}s)."
+                )
+        waiter = self._completion_query_waiters.get((peer_prefix, frame.pkt_id))
+        if waiter is None:
+            return
+        fut, expected_frag_total, expected_nonce = waiter
+        stale_nonce = (
+            frame.nonce is not None and expected_nonce is not None and frame.nonce != expected_nonce
+        )
+        if stale_nonce and frame.complete and frame.frag_total == expected_frag_total:
+            # A late answer may only ever tell us the receiver has MORE, never
+            # less (field fix, 2026-09-19). An answer whose nonce belongs to an
+            # earlier, already-timed-out query for this same packet describes
+            # the peer's state as of that query -- so its `held` set is not
+            # trustworthy as a replacement for our own (that is exactly the
+            # `held=[]` case that discarded real fragments). But
+            # `complete=True` is monotone: a receiver that had the whole
+            # packet then cannot have less of it now, short of a bucket
+            # eviction which only makes a re-send necessary anyway. Accepting
+            # it finishes a transfer that is genuinely done instead of waiting
+            # for an answer whose round trip exceeds the budget cap -- the
+            # case where the peer's answers are consistently slower than
+            # `direct_completion_check_timeout_max_s`.
+            self._debug(
+                f"accepting a LATE completion ANSWER from {sender_token!r} for pkt_id={frame.pkt_id}: "
+                f"nonce {frame.nonce} is from an earlier query (outstanding is {expected_nonce}), but it "
+                f"reports the packet complete, which cannot become untrue."
+            )
+            if not fut.done():
+                fut.set_result(frame)
+            return
+        if stale_nonce:
+            # Field fix (2026-09-19): a v3 answer whose echoed nonce does not
+            # match the outstanding query is a reply to an earlier, already
+            # timed-out query for the same packet. Applying it would overwrite
+            # this send's fragment state with stale information.
+            self._debug(
+                f"discarding completion ANSWER from {sender_token!r} for pkt_id={frame.pkt_id}: "
+                f"nonce {frame.nonce} does not match the outstanding query's {expected_nonce} "
+                f"-- stale answer to an earlier query."
+            )
+            return
+        if frame.frag_total != expected_frag_total:
+            # Audit fix (2026-09-19): the waiter is keyed only on
+            # (peer_prefix, pkt_id), so a late ANSWER to a *previous* query
+            # for this packet -- a timed-out reconcile whose reply arrived
+            # after the next query went out -- would otherwise resolve this
+            # query's future and be applied authoritatively (the caller
+            # overwrites `acked` from it by design). A mismatched frag_total
+            # is the one stale case this side can detect for certain: raw
+            # and text fragment the same payload into different counts, and
+            # a resumed send re-fragments too. The same-frag_total stale
+            # answer this comment used to call out as unaddressed is now
+            # caught by the v3 query nonce checked above (2026-09-19
+            # evening); this frag_total check remains as the v2-peer
+            # fallback, since a v2 answer carries no nonce to check.
+            self._debug(
+                f"discarding completion ANSWER from {sender_token!r} for pkt_id={frame.pkt_id}: "
+                f"frag_total={frame.frag_total} does not match the outstanding query's "
+                f"{expected_frag_total} -- stale answer to an earlier query."
+            )
+            return
+        if not fut.done():
+            fut.set_result(frame)
+
+    def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set) -> None:
+        """Receiver-initiated completion report (2026-09-20): one unsolicited
+        v3 ANSWER for a raw burst, nonce `COMPLETION_REPORT_NONCE_BASE |
+        round` (the raw header's attempt bits), spawned from the raw receive
+        path -- on completion, on a flagged last fragment that left gaps, and
+        on a flagged duplicate of a packet already delivered. Best effort
+        like the QUERY's answer; the sender's QUERY fallback is the recovery
+        path if it is lost. Off when `direct_raw_report_enabled` is no."""
+        if not self.direct_raw_report_enabled or header.pkt_id is None:
+            return
+        nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
+        self._debug(
+            f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
+            f"complete={complete} held={sorted(held)} (round {(header.attempt or 0) & 0x03})."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", {
+                "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
+                "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
+                "round": (header.attempt or 0) & 0x03,
+            })
+        self._spawn_background_task(
+            self._send_completion_answer(
+                sender_token, header.pkt_id, header.frag_total, complete,
+                held=held, version=self.COMPLETION_PROTOCOL_VERSION, nonce=nonce, report=True,
+            )
+        )
+
+    async def _send_completion_answer(
+        self, sender_token: str, pkt_id: int, frag_total: int, complete: bool,
+        held: "Optional[set]" = None, version: Optional[int] = None,
+        nonce: Optional[int] = None, report: bool = False,
+    ) -> None:
+        """Best-effort ANSWER send for `_handle_incoming_completion_frame`'s
+        QUERY branch. Deliberately no retry loop: this is already the
+        second half of a mechanism built to route around lost ACKs, so
+        piling a multi-attempt cycle on top of the answer itself would
+        just relocate the same risk rather than reduce it. If this answer
+        is lost, the querying side's own `direct_completion_check_timeout_
+        s` simply elapses and it falls back to today's give-up behavior --
+        no worse than before this feature existed.
+
+        Code review (2026-09-18): one attempt through `_send_direct_frame_
+        and_wait_for_ack`, so -- like every other DIRECT exchange -- the
+        frame's own firmware ACK is waited out while `_direct_exchange_
+        lock` is held, rather than the lock being released with that ACK
+        still in flight for the next send to collide with (the previous
+        shape). `PRIORITY_NORMAL`, not `PRIORITY_LOW`: the querier is a
+        stalled fragmented send waiting ~5s for this, and a LOW answer
+        behind a single missed-ACK timeout on this node (5-45s) can never
+        make that deadline, turning the peer's QUERY into pure wasted
+        airtime. `time_critical` for the same reason. The ACK outcome is
+        recorded (`kind="completion_answer"` in the capture) but not
+        retried."""
+        contact = self._resolve_contact(sender_token)
+        target = contact.get("public_key") if contact is not None else None
+        if not target:
+            self._debug(
+                f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) not sent -- "
+                f"no resolvable contact/public_key."
+            )
+            return
+        frame = self._encode_completion_frame(
+            self.COMPLETION_TYPE_ANSWER, pkt_id, frag_total, complete=complete, nonce=nonce,
+            held=held, version=version,
+        )
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        # Simulation finding (2026-09-19, one-hop raw scenario): this
+        # ANSWER used to leave the radio right behind the firmware's own
+        # ACK for the QUERY, and through a repeater it reached the chain
+        # while the repeater was still forwarding that ACK -- half-duplex,
+        # so six of six answers were lost with no ACK. Exactly the
+        # fragment-chasing-fragment collision `_raw_fragment_gap_s` paces
+        # raw bursts for; the same hop-scaled gap here, sized for the ACK
+        # frame the repeater is busy with. Zero hop: no gap.
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix is not None else None
+        if resolved is not None:
+            hops = max(0, resolved.out_path_len)
+        else:
+            out_path_len = contact.get("out_path_len", 0) if isinstance(contact, dict) else 0
+            hops = 1 if out_path_len is None or out_path_len < 0 else int(out_path_len)
+        # A report (2026-09-20) follows a raw fragment, which the firmware
+        # does not ACK, so there is no ACK relay to wait out: no hold.
+        gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
+        if gap_s > 0:
+            await asyncio.sleep(gap_s)
+        try:
+            ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
+                target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
+                priority=self.PRIORITY_ANSWER, time_critical=True,
+                kind="completion_report" if report else "completion_answer",
+                # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
+                # used to run with hop_count=None, i.e. the flat firmware
+                # suggestion, so neither the hop cap nor the abort applied).
+                hop_count=hops,
+                # Phase 1 (2026-09-20): best effort, never retried -- a
+                # queued Link handshake may cut this ACK wait once the
+                # peer's expected ACK time has passed.
+                preemptible=True,
+            )
+            if not ok:
+                self._debug(
+                    f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) got no ACK -- "
+                    f"not retried; the querier's own timeout is the recovery path."
+                )
+        except Exception as exc:
+            self._debug(
+                f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) failed "
+                f"locally: {exc}."
+            )
+
+    def _completion_answer_hold_s(self, hops: int) -> float:
+        """Quiet time before a completion ANSWER leaves, through repeaters
+        (MeshBench finding 3, 2026-09-20, real firmware): the firmware ACKs
+        the QUERY the instant it arrives, and every repeater in the chain
+        then relays that ACK; the ANSWER used to go out the millisecond the
+        ACK's own airtime ended, exactly as the first repeater keyed its
+        relay of it, and all three two-hop ANSWERs in `two_hop` were lost
+        that way. The ACK's airtime x (1 + 2.5 x hops) covers the relay
+        chain including the repeaters' random forward delay (0 to 1.5
+        airtimes each). Zero hop: no relay, no hold."""
+        if hops <= 0:
+            return 0.0
+        ack_airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=12)
+        return max(0.0, ack_airtime_s * (1.0 + 2.5 * hops))
+
+    def _handle_direct_multifragment_frame(
+        self, header: _FrameHeader, payload: bytes, sender_token: str, raw: bool = False,
+        report_requested: bool = False,
+    ) -> None:
+        """docs/wire_format_design.md's DIRECT-needs-fragmenting receive
+        side (Milestone 6) -- reuses the exact same reassembly/dedup
+        machinery `_handle_channel_frame`/`_add_channel_fragment` already
+        built for CHANNEL. Both are keyed off `(mode, sender_token,
+        pkt_id, frag_total)` (`_reassembly_key`) -- `mode` is included
+        specifically so DIRECT's own `sender_token` (a peer's
+        `pubkey_prefix`) and CHANNEL's (a node's own plaintext,
+        attacker-controlled `adv_name`) can never collide in
+        `self._reassembly`/`self._dedup`, even though nothing stops a
+        CHANNEL sender from choosing an `adv_name` equal to some other
+        peer's real pubkey_prefix (a code-review-found gap this method's
+        own docstring used to wrongly claim was structurally impossible
+        without this). The one real difference from CHANNEL: once
+        reassembly completes, §7's
+        opportunistic token learning runs on the *complete* packet, using
+        the peer identity DIRECT alone can authenticate -- CHANNEL's own
+        multi-fragment path can't do this at all (no sender identity to
+        learn from), which is why `_add_channel_fragment` itself stays
+        deliberately silent on this and this caller adds it instead of
+        pushing DIRECT-specific behavior down into the shared helper.
+
+        Field-diagnosed fix (2026-09-18, see module docstring): this is
+        also the only place `_last_incoming_direct_at` (`_wait_for_
+        incoming_quiet`'s trigger) gets set now, and only when this
+        fragment leaves its bucket still incomplete -- concrete evidence
+        this sender has more fragments of this specific transfer still
+        coming, unlike the old "any DIRECT frame heard" trigger that
+        counted its own ACKs/PROOFs/completion-checks and caused a mutual
+        reset feedback loop between two chatty nodes."""
+        key = self._reassembly_key(header, sender_token, mode="direct")
+
+        if self._dedup_contains(key):
+            self._incoming_dropped_total += 1
+            self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
+            if raw and report_requested:
+                # Completion report (2026-09-20): a flagged fragment for a
+                # packet already delivered means the sender never got the
+                # report (or a QUERY's answer) and re-burst -- tell it again,
+                # so it stops without a QUERY round trip.
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+            return
+
+        complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
+        if complete_data is None:
+            self._last_incoming_direct_at = time.monotonic()
+            if raw and report_requested:
+                # One of the burst's last two fragments landed but the bucket
+                # has gaps: report the bitmap unasked, so the sender re-drives
+                # exactly the missing fragments without a QUERY first.
+                bucket = self._reassembly.get(key)
+                held = set(bucket.fragments.keys()) if bucket is not None else set()
+                self._send_completion_report(sender_token, header, complete=False, held=held)
+        else:
+            peer_prefix = self._canonical_peer_prefix(sender_token)
+            if raw:
+                # Report BEFORE RNS sees the packet, so the report enters the
+                # radio lock ahead of whatever RNS sends back (a PROOF, the
+                # next Resource request) and the sender learns first.
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+            if not raw:
+                self._observe_incoming_rns_packet(complete_data, peer_prefix)
+            else:
+                # raw=True (2026-09-18 night): the src prefix in a raw frame
+                # is unauthenticated, so nothing is learned from it -- unless
+                # the claimed peer is one this node already binds and routes
+                # to (2026-09-19, twice in one day: first the PROOF
+                # correlation, then the token learning a raw ANNOUNCE was
+                # silently denied) -- see _observe_raw_received_packet.
+                self._observe_raw_received_packet(complete_data, peer_prefix)
+            self.process_incoming(
+                complete_data, transport="direct_raw_multifragment" if raw else "direct_multifragment",
+                sender_peer_prefix=peer_prefix, frag_total=header.frag_total, pkt_id=header.pkt_id,
+            )
+
+    # -- Reassembly (docs/reliability_engine_design.md §5) ----------------
+
+    def _reassembly_key(self, header: _FrameHeader, sender_token: str, mode: str):
+        """§5.2's keying scheme. The `0x40`/coop branch keys on
+        `(pkt_id, frag_total)` alone, excluding sender identity entirely
+        -- required for cooperative broadcast's delegates (each
+        transmitting under their own firmware-assigned name) to ever land
+        in the same bucket, per wire_format_design.md's "cooperative-
+        broadcast reassembly bug" fix. Nothing sets this bit until
+        Milestone 7, but the branch is built now per the architecture
+        doc's own instruction, so M7 only has to add a sender, never
+        touch this receive path again (a DIRECT receiver rejects a
+        coop-flagged frame outright before ever reaching this method --
+        see `_handle_incoming_frame` -- so this branch is CHANNEL-only in
+        practice today, but `mode` is still included below rather than
+        relied on implicitly).
+
+        `mode` ("channel"/"direct") is included in every returned key --
+        a code-review-found gap, not just defensive style: DIRECT's own
+        `sender_token` (a peer's `pubkey_prefix`) and CHANNEL's (a node's
+        own plaintext, attacker-controlled `adv_name`) were previously
+        assumed to be unable to collide since they're "different kinds of
+        identifiers," but nothing actually enforced that -- a CHANNEL
+        sender can choose any `adv_name` string it likes, including one
+        that happens to equal another peer's real pubkey_prefix, which
+        would otherwise land its fragments in the same
+        `self._reassembly`/`self._dedup` bucket as that peer's genuine
+        DIRECT-fragmented send. Namespacing by transport makes that
+        structurally impossible instead of merely assumed-away, matching
+        this project's own established preference (e.g. the capability
+        hard-rule enforcement) for structural fixes over trusted
+        invariants."""
+        if header.coop:
+            return (mode, "~coop", header.pkt_id, header.frag_total)
+        return (mode, sender_token or "~anon", header.pkt_id, header.frag_total)
+
+    def _new_reassembly_bucket(self, key, frag_total: int, coop: bool) -> _ReassemblyBucket:
+        if len(self._reassembly) >= self.reassembly_max_keys:
+            self._evict_oldest_reassembly_bucket()
+        bucket = _ReassemblyBucket(frag_total=frag_total, coop=coop)
+        self._reassembly[key] = bucket
+        return bucket
+
+    def _evict_oldest_reassembly_bucket(self) -> None:
+        # §5.3: bounded capacity, oldest-by-last-progress -- a bucket
+        # that's kept receiving fragments across retry passes is clearly
+        # still alive regardless of when it happened to start, so
+        # eviction targets staleness, not age.
+        if not self._reassembly:
+            return
+        oldest_key = min(self._reassembly, key=lambda k: self._reassembly[k].last_progress)
+        self._incoming_dropped_total += 1
+        RNS.log(
+            f"{self}: reassembly map at capacity ({self.reassembly_max_keys} "
+            f"keys) -- evicting oldest-by-last-progress bucket {oldest_key}.",
+            RNS.LOG_WARNING,
+        )
+        del self._reassembly[oldest_key]
+
+    def _add_channel_fragment(self, key, header: _FrameHeader, payload: bytes, raw: bool = False) -> Optional[bytes]:
+        """Shared reassembly-fragment-accumulation logic for both CHANNEL
+        (`_handle_channel_frame`) and DIRECT
+        (`_handle_direct_multifragment_frame`) multi-fragment receipt --
+        the name predates DIRECT reassembly (Milestone 2) and is kept
+        rather than churned, since the logic itself was already
+        transport-agnostic (nothing below reads anything CHANNEL-
+        specific). Returns the complete reassembled payload the moment
+        the last fragment arrives, or `None` while still incomplete (or
+        on a same-index content collision, handled by evicting the whole
+        bucket) -- delivering to RNS core (`process_incoming`) and, for
+        DIRECT, opportunistic token learning are both the caller's job,
+        not this method's, since only the DIRECT caller needs the latter."""
+        bucket = self._reassembly.get(key)
+        if bucket is None:
+            bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+
+        if header.frag_idx in bucket.fragments:
+            # §6: a repeated frag_idx must be byte-identical by
+            # construction (every attempt of a given index carries the
+            # same payload bytes) -- verify rather than assume, since
+            # this is also the safety net for §5.1/§5.2's residual
+            # collision risk (two different transmissions sharing a key).
+            if bucket.fragments[header.frag_idx] != payload:
+                self._incoming_dropped_total += 1
+                RNS.log(
+                    f"{self}: reassembly collision detected for key {key} at "
+                    f"frag_idx {header.frag_idx} -- two different "
+                    f"transmissions produced different bytes for the same "
+                    f"slot; evicting rather than risk delivering a "
+                    f"corrupted amalgam.",
+                    RNS.LOG_WARNING,
+                )
+                self._reassembly.pop(key, None)
+            return None  # identical repeat: already counted, nothing more to do
+
+        bucket.fragments[header.frag_idx] = payload
+        bucket.last_progress = time.monotonic()
+        
+        if header.pkt_id is not None:
+            self._capture_fragment_received(
+                key[0], key[1], header.pkt_id, header.frag_idx, header.frag_total, len(bucket.fragments), raw=raw,
+            )
+
+        if len(bucket.fragments) < bucket.frag_total:
+            self._debug(
+                f"reassembly progress {key}: {len(bucket.fragments)}/{bucket.frag_total}"
+            )
+            return None
+
+        # Complete: per §6, delete from the reassembly map immediately
+        # and record it in the whole-packet dedup cache in the same step
+        # -- the two caches are sequential for a given key, never
+        # concurrent.
+        del self._reassembly[key]
+        complete_data = b"".join(bucket.fragments[i] for i in range(bucket.frag_total))
+        self._dedup_add(key, complete_data)
+        self._debug(f"reassembly complete {key}: {len(complete_data)} bytes")
+        return complete_data
+
+    async def _reassembly_cleanup_loop(self):
+        """§5.4's idle-since-last-progress TTL, swept periodically rather
+        than checked lazily -- a bucket that simply stops receiving
+        fragments needs to be reclaimed even if nothing ever queries it
+        again. Also sweeps expired whole-packet dedup entries (§7),
+        expired PROOF-correlation entries (§7's other table, Milestone 6
+        fix below), and idle unknown-destination backoff state
+        (code-review fix, `_unknown_dest_backoff_sweep`) in the same pass,
+        since all four live only on this event loop thread and share the
+        same natural cadence."""
+        try:
+            while not self.detached:
+                await asyncio.sleep(self.REASSEMBLY_CLEANUP_INTERVAL_S)
+                if self.detached:
+                    break
+
+                now = time.monotonic()
+                stale_keys = [
+                    key
+                    for key, bucket in self._reassembly.items()
+                    if now - bucket.last_progress > (
+                        self.reassembly_idle_timeout_coop_s
+                        if bucket.coop
+                        else self.reassembly_idle_timeout_s
+                    )
+                ]
+                for key in stale_keys:
+                    del self._reassembly[key]
+                    self._incoming_dropped_total += 1
+                    RNS.log(
+                        f"{self}: reassembly bucket {key} evicted -- idle "
+                        f"timeout exceeded with no completion.",
+                        RNS.LOG_WARNING,
+                    )
+
+                self._dedup_sweep(now)
+                self._proof_correlation_sweep(now)
+                self._unknown_dest_backoff_sweep(now)
+                self._path_response_rate_limit_sweep(now)
+                self._pending_link_request_sweep(now)
+                self._send_answered_sweep(now)
+                self._announce_cache_sweep(now)
+                self._outgoing_inflight_sweep(now)
+                self._resumable_sends_sweep(now)
+                self._closed_links_sweep(now)
+                self._pending_dest_proofs_sweep(now)
+                for path_hex in [p for p, n in self._raw_unsupported_paths.items()
+                                 if now - n["since"] >= self.direct_raw_path_unsupported_ttl_s]:
+                    del self._raw_unsupported_paths[path_hex]
+        except asyncio.CancelledError:
+            pass
+
+    def _proof_correlation_sweep(self, now: float) -> None:
+        """Field-diagnosed gap: `_resolve_routing_peer`'s own PROOF-
+        correlation lookup already expires an entry lazily, on the exact
+        lookup that would use it (§7), but most delivered packets never
+        actually get proved -- an RNS Link doesn't send a PROOF back for
+        every single DATA packet -- so an entry whose PROOF never comes
+        would otherwise sit in `_proof_correlation` forever, unlike
+        `_dedup`/`_reassembly`, which both already get swept here
+        regardless of whether anything ever queries them again. Confirmed
+        live: `proof_correlations_pending` sat perfectly flat for minutes
+        during a real field test, exactly the signature of a table with
+        no time-based reclaim. This is that reclaim, mirroring
+        `_dedup_sweep`'s own shape."""
+        expired = [h for h, (_peer, expiry) in self._proof_correlation.items() if now >= expiry]
+        for h in expired:
+            del self._proof_correlation[h]
+
+    # -- Whole-packet dedup (docs/reliability_engine_design.md §7) --------
+
+    def _dedup_get(self, key) -> Optional[bytes]:
+        """Returns the cached whole-packet payload for `key` if present
+        and not yet expired (also lazily evicting an expired entry it
+        finds along the way), else None."""
+        entry = self._dedup.get(key)
+        if entry is None:
+            return None
+        expiry, cached_payload = entry
+        if time.monotonic() >= expiry:
+            del self._dedup[key]
+            return None
+        return cached_payload
+
+    def _dedup_contains(self, key) -> bool:
+        return self._dedup_get(key) is not None
+
+    def _dedup_add(self, key, payload: bytes) -> None:
+        self._dedup[key] = (time.monotonic() + self.whole_packet_dedup_ttl_s, payload)
+
+    def _dedup_sweep(self, now: float) -> None:
+        expired = [k for k, (expiry, _payload) in self._dedup.items() if now >= expiry]
+        for k in expired:
+            del self._dedup[k]
