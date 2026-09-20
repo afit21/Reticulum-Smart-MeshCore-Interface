@@ -101,6 +101,7 @@ ENCODERS = (
     "_encode_direct_bare",
     "_encode_bind_frame",
     "_encode_completion_frame",
+    "_encode_completion_frame_v4",
     "_encode_raw_fragment",
 )
 BUDGETS = (
@@ -190,20 +191,38 @@ def build_cases(module):
                        frame_type=cls.BIND_TYPE_REQUEST, attempt=0))
 
     # -- "Q": completion frames ---------------------------------------------
-    versions = (("v1", cls.COMPLETION_PROTOCOL_VERSION_V1), ("v2", cls.COMPLETION_PROTOCOL_VERSION_V2), ("default", None))
+    # v3 is listed explicitly since 2026-09-20 (M2 made v4 the default): its
+    # layout stays pinned even though no frame is encoded as v3 by default.
+    versions = (("v1", cls.COMPLETION_PROTOCOL_VERSION_V1), ("v2", cls.COMPLETION_PROTOCOL_VERSION_V2),
+                ("v3", getattr(cls, "COMPLETION_PROTOCOL_VERSION_V3", 3)), ("default", None))
     types = (("query", cls.COMPLETION_TYPE_QUERY), ("answer", cls.COMPLETION_TYPE_ANSWER))
     for ver_name, version in versions:
         for type_name, frame_type in types:
             for frag_total in (1, 8, 9, 255):
                 for held_name, complete in (("none", False), ("some", False), ("all", True)):
                     held = {"none": [], "some": [0, 3, 7], "all": list(range(frag_total))}[held_name]
-                    nonces = (0, 0x5A, 0xF1) if version is None else (0,)
+                    nonces = (0, 0x5A, 0xF1) if (version is None or version >= 3) else (0,)
                     for nonce in nonces:
                         cases.append(_case(
                             f"completion_{ver_name}_{type_name}_total{frag_total}_held_{held_name}"
                             f"_complete{int(complete)}_nonce{nonce:02x}",
                             "_encode_completion_frame", frame_type=frame_type, pkt_id=PKT_ID,
                             frag_total=frag_total, complete=complete, held=held, version=version, nonce=nonce))
+    # -- "Q" v4: the multi-entry frame (phase 3 M2, 2026-09-20) -------------
+    # `entries` = [pkt_id, frag_total, complete, held-list]; a QUERY carries
+    # zero bitmaps, an ANSWER / REPORT the have-bitmaps.
+    v4_sets = {
+        "one": [[PKT_ID, 3, False, [0, 2]]],
+        "window4": [[PKT_ID, 3, True, [0, 1, 2]], [PKT_ID + 1, 4, False, [1, 3]], [PKT_ID + 2, 3, False, []],
+                    [PKT_ID + 3, 9, False, [0, 8]]],
+        "max8": [[PKT_ID + k, 3 + (k % 2), k % 3 == 0, list(range(k % 4))] for k in range(8)],
+        "held_out_of_range": [[PKT_ID, 3, False, [0, 3, 7]]],
+    }
+    for set_name, entries in v4_sets.items():
+        for type_name, frame_type in types:
+            for nonce in (0, 0x5A, 0xF1):
+                cases.append(_case(f"completion_v4_{type_name}_{set_name}_nonce{nonce:02x}",
+                                   "_encode_completion_frame_v4", frame_type=frame_type, entries=entries, nonce=nonce))
     # nonce is ignored below v3; `complete` is independent of the bitmap.
     cases.append(_case("completion_v1_answer_total8_nonce5a_ignored", "_encode_completion_frame",
                        frame_type=cls.COMPLETION_TYPE_ANSWER, pkt_id=PKT_ID, frag_total=8, complete=False,
@@ -260,6 +279,9 @@ def _invoke(iface, call, a):
         return iface._encode_completion_frame(
             a["frame_type"], a["pkt_id"], a["frag_total"], complete=a["complete"],
             held=set(a["held"]), version=a["version"], nonce=a["nonce"])
+    if call == "_encode_completion_frame_v4":
+        return iface._encode_completion_frame_v4(
+            a["frame_type"], [(p, t, c, set(h)) for p, t, c, h in a["entries"]], nonce=a["nonce"])
     if call == "_encode_raw_fragment":
         return iface._encode_raw_fragment(
             bytes.fromhex(a["payload_hex"]), a["dst_pubkey_hex"], a["src_prefix_hex"],
@@ -345,6 +367,21 @@ def check_decodes(module, case, kind, encoded):
         else:
             eq("held", cf.held, None)
         eq("nonce", cf.nonce, (a["nonce"] & 0xFF) if version >= 3 else None)
+    elif call == "_encode_completion_frame_v4":
+        cf = iface._decode_completion_frame(encoded)
+        eq("version", cf.version, cls.COMPLETION_PROTOCOL_VERSION)
+        eq("type", cf.type, a["frame_type"])
+        eq("nonce", cf.nonce, a["nonce"] & 0xFF)
+        eq("n", len(cf.entries), len(a["entries"]))
+        is_answer = a["frame_type"] == cls.COMPLETION_TYPE_ANSWER
+        for got, want in zip(cf.entries, a["entries"]):
+            p, t, c, h = want
+            eq("entry pkt_id", got[0], p)
+            eq("entry frag_total", got[1], t & 0xFF)
+            eq("entry complete", got[2], c)
+            eq("entry held", (set(got[3]) if got[3] is not None else None),
+               ({i for i in h if 0 <= i < t} if is_answer else None))
+        eq("first mirrored", (cf.pkt_id, cf.frag_total, cf.complete), (a["entries"][0][0], a["entries"][0][1] & 0xFF, a["entries"][0][2]))
     elif call == "_encode_raw_fragment":
         raw = bytes.fromhex(encoded)
         header, payload, src_prefix_hex, dst = iface._decode_raw_fragment(raw)

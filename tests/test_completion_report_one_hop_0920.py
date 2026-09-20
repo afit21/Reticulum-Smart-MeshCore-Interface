@@ -202,7 +202,7 @@ class _OneHopRawSend(SingleNodeCase):
             on_fragment(header, flagged, len(frame))
             return True
 
-        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=0, hop_count=None, send_info=None):
+        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=0, hop_count=None, send_info=None, entries=None):
             return on_query({"t": time.monotonic(), "stage": stage, "hop_count": hop_count,
                              "pkt_id": pkt_id, "frag_total": frag_total})
 

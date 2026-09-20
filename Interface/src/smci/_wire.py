@@ -204,6 +204,9 @@ class _WireFormatMixin:
         infer it)."""
         if version is None:
             version = self.COMPLETION_PROTOCOL_VERSION
+        if version >= 4:
+            # v4: a single-entry multi-part frame (phase 3 M2).
+            return self._encode_completion_frame_v4(frame_type, [(pkt_id, frag_total, complete, held)], nonce=nonce)
         body = bytes([
             version,
             frame_type,
@@ -222,6 +225,62 @@ class _WireFormatMixin:
             body += bytes(bitmap)
         return self.COMPLETION_MARKER + _z85_encode(body)
 
+    def _encode_completion_frame_v4(self, frame_type: int, entries, nonce: Optional[int] = None) -> str:
+        """The v4 multi-entry frame (phase 3 M2, 2026-09-20): `[4][type][n]
+        [nonce]` then, per entry, `[pkt_id:2 BE][frag_total][complete]
+        [bitmap ceil(frag_total/8)]`. `entries` is an iterable of
+        `(pkt_id, frag_total, complete, held)`; a QUERY's entries carry
+        complete=False and an all-zero bitmap (the bitmap is present on
+        every entry so the layout is one rule). At most
+        COMPLETION_V4_MAX_ENTRIES entries; 8 x (5 + 1) + 4 = 52 bytes,
+        66 Z85 chars plus the marker, inside the 160-char text limit."""
+        entries = list(entries)[: self.COMPLETION_V4_MAX_ENTRIES]
+        body = bytearray([self.COMPLETION_PROTOCOL_VERSION, frame_type, len(entries), (nonce or 0) & 0xFF])
+        for pkt_id, frag_total, complete, held in entries:
+            frag_total = max(1, min(255, int(frag_total)))
+            body += bytes([(pkt_id >> 8) & 0xFF, pkt_id & 0xFF, frag_total, 1 if complete else 0])
+            bitmap = bytearray(self._completion_bitmap_size(frag_total))
+            for idx in (held or ()):
+                if 0 <= idx < frag_total:
+                    bitmap[idx // 8] |= 1 << (idx % 8)
+            body += bytes(bitmap)
+        return self.COMPLETION_MARKER + _z85_encode(bytes(body))
+
+    def _decode_completion_frame_v4(self, raw: bytes) -> _CompletionFrame:
+        """See `_encode_completion_frame_v4`. Raises ValueError on a length
+        that does not match its own entry count. The first entry is
+        mirrored into the single-part fields."""
+        if len(raw) < self.COMPLETION_V4_HEADER_SIZE:
+            raise ValueError("v4 completion frame too short for its header")
+        frame_type, n, nonce = raw[1], raw[2], raw[3]
+        if n < 1 or n > self.COMPLETION_V4_MAX_ENTRIES:
+            raise ValueError(f"v4 completion frame with {n} entries")
+        i = self.COMPLETION_V4_HEADER_SIZE
+        entries = []
+        for _ in range(n):
+            if len(raw) < i + 4:
+                raise ValueError("v4 completion frame truncated inside an entry")
+            pkt_id = (raw[i] << 8) | raw[i + 1]
+            frag_total, complete = raw[i + 2], bool(raw[i + 3])
+            i += 4
+            size = self._completion_bitmap_size(frag_total)
+            if frag_total < 1 or len(raw) < i + size:
+                raise ValueError("v4 completion frame truncated inside a bitmap")
+            bitmap = raw[i:i + size]
+            i += size
+            held = frozenset(k for k in range(frag_total) if bitmap[k // 8] & (1 << (k % 8)))
+            entries.append((pkt_id, frag_total, complete, held))
+        if i != len(raw):
+            raise ValueError(f"v4 completion frame has {len(raw) - i} trailing byte(s)")
+        first = entries[0]
+        # A QUERY's bitmaps carry no information (see the encoder): held None.
+        held_first = first[3] if frame_type == self.COMPLETION_TYPE_ANSWER else None
+        return _CompletionFrame(
+            version=self.COMPLETION_PROTOCOL_VERSION, type=frame_type, complete=first[2],
+            pkt_id=first[0], frag_total=first[1], held=held_first, nonce=nonce,
+            entries=tuple((p, t, c, (h if frame_type == self.COMPLETION_TYPE_ANSWER else None)) for p, t, c, h in entries),
+        )
+
     def _decode_completion_frame(self, marker_and_body: str) -> _CompletionFrame:
         if not marker_and_body.startswith(self.COMPLETION_MARKER):
             raise ValueError("missing completion-frame marker")
@@ -232,11 +291,13 @@ class _WireFormatMixin:
         version, frame_type, complete_byte = raw[0], raw[1], raw[2]
         if version not in (
             self.COMPLETION_PROTOCOL_VERSION_V1, self.COMPLETION_PROTOCOL_VERSION_V2,
-            self.COMPLETION_PROTOCOL_VERSION,
+            self.COMPLETION_PROTOCOL_VERSION_V3, self.COMPLETION_PROTOCOL_VERSION,
         ):
             raise ValueError(f"unsupported completion-frame version {version}")
         if frame_type not in (self.COMPLETION_TYPE_QUERY, self.COMPLETION_TYPE_ANSWER):
             raise ValueError(f"unrecognized completion-frame type {frame_type}")
+        if version >= 4:
+            return self._decode_completion_frame_v4(raw)
 
         pkt_id = (raw[3] << 8) | raw[4]
         frag_total = raw[5]

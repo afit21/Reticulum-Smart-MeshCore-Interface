@@ -314,9 +314,24 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # discarded. Correction (second audit): a pre-v3 peer drops a v3 QUERY
     # as an unsupported version, so it never answers -- both nodes must be
     # on this build; the querying side does not fall back to v2.
-    COMPLETION_PROTOCOL_VERSION = 3
+    # v4 (2026-09-20, phase 3 M2, docs/reconcile_redesign.md): a MULTI-ENTRY
+    # frame -- `[4][type][n][nonce]` then n x `[pkt_id:2][frag_total]
+    # [complete][bitmap ceil(frag_total/8)]` -- so one REPORT covers every
+    # part of a window burst, one QUERY asks about all of a window's
+    # outstanding parts and one ANSWER answers them. v1-v3 frames still
+    # decode; a v3 QUERY is still answered in v3. Both nodes must run a v4
+    # build for window reports (a v3 peer drops the v4 frame as an
+    # unsupported version and the sender falls back to its v4 QUERY, which
+    # that peer drops too -- the same all-or-nothing as v3 was).
+    COMPLETION_PROTOCOL_VERSION = 4
+    COMPLETION_PROTOCOL_VERSION_V3 = 3
     COMPLETION_PROTOCOL_VERSION_V2 = 2
     COMPLETION_PROTOCOL_VERSION_V1 = 1
+    COMPLETION_V4_HEADER_SIZE = 4   # ver+type+n+nonce
+    COMPLETION_V4_MAX_ENTRIES = 8
+    # A v4 REPORT lists the sender's raw packets seen within this span
+    # (M2): longer than a window burst plus its report wait at three hops.
+    RECENT_RAW_PKT_SPAN_S = 60.0
     COMPLETION_TYPE_QUERY = 0
     COMPLETION_TYPE_ANSWER = 1
     COMPLETION_FRAME_RAW_SIZE = 6  # ver+type+complete+pkt_id(2)+frag_total -- the fixed body
@@ -795,6 +810,11 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
+        # Phase 3 M2 (2026-09-20): peer prefix -> the open _RawWindow parts
+        # join; sender token -> {(pkt_id, frag_total): last seen} for the
+        # v4 report's entries.
+        self._raw_windows = {}
+        self._recent_raw_pkts = {}
 
         self._contact_refresh_task = None
 

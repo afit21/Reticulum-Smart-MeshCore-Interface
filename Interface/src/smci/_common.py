@@ -233,6 +233,11 @@ class _CompletionFrame(NamedTuple):
     # None on a v1/v2 frame, meaning "cannot be verified" rather than
     # "mismatched".
     nonce: Optional[int] = None
+    # v4 (2026-09-20, phase 3 M2): every entry of a multi-part frame as
+    # (pkt_id, frag_total, complete, held-or-None); the first entry is
+    # also mirrored into pkt_id / frag_total / complete / held above so
+    # single-part code reads a v4 frame unchanged. Empty below v4.
+    entries: tuple = ()
 
 
 class _PeerRecord:

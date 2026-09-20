@@ -479,7 +479,7 @@ class NightSessionFixes(SingleNodeCase):
         async def fake_raw(path, frame, priority, telemetry=None, interrupt=None):
             return True
 
-        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=2, hop_count=None, send_info=None):
+        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=2, hop_count=None, send_info=None, entries=None):
             if send_info is not None:
                 send_info["acked"] = True
                 send_info["waited_full_timeout"] = True

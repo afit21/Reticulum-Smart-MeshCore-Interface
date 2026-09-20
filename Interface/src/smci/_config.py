@@ -524,6 +524,20 @@ class _ConfigMixin:
         # (`_report_hold_s`) and dropped if the bucket completes first. `no`
         # reports immediately as before.
         self.direct_report_debounce = _cfg_bool(cfg.get("direct_report_debounce", "yes"))
+        # Phase 3 M2 (2026-09-20): one report per WINDOW. RNS hands the
+        # sender a window of 4-6 Resource parts within milliseconds; each
+        # used to be its own burst-and-report exchange (two in flight per
+        # peer: ~12 reports and 6 quiet gaps per window). Now consecutive
+        # raw-eligible sends to one peer that arrive within
+        # `direct_raw_window_collect` seconds of the first (or up to
+        # `direct_raw_window_max_parts`) form ONE window burst: every
+        # fragment back to back, one quiet period, one v4 report carrying a
+        # bitmap per part; re-drives are batched the same way and the v4
+        # QUERY asks about the whole window. `direct_raw_window_enabled =
+        # no` sends each part as a window of one, with no collect wait.
+        self.direct_raw_window_enabled = _cfg_bool(cfg.get("direct_raw_window_enabled", "yes"))
+        self.direct_raw_window_collect_s = float(cfg.get("direct_raw_window_collect", 0.75))
+        self.direct_raw_window_max_parts = int(cfg.get("direct_raw_window_max_parts", 6))
         # Phase 1 (2026-09-20): base 2.0 -> 4.0 s, per hop 3.0 -> 2.5 s (the
         # answer budget's own slope, so the floor stays under the budget at
         # every depth: 4 / 6.5 / 9 / 11.5 s against 5 / 7.5 / 10 / 12.5 s),

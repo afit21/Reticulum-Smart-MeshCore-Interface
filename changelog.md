@@ -21,6 +21,14 @@ on the full suite and MeshBench `large_payload` + `relay` (two runs) against the
   ACK wait. A gaps report is held one fragment airtime (plus the relay gap) and dropped if the
   bucket completes first -- the second-last fragment's report and the duplicate last fragment it
   caused (20 of 43 zero-hop rounds) are gone. Tests: `tests/test_reconcile_m1_noack_reports_0920.py`.
+- **M2: one report per window** (new keys `direct_raw_window_enabled` yes, `direct_raw_window_collect`
+  0.75 s, `direct_raw_window_max_parts` 6; "Q" protocol v4, `COMPLETION_PROTOCOL_VERSION` 3 -> 4 --
+  both nodes must run this build). Parts to one peer arriving within the collect window burst as one,
+  the last two fragments flagged, one quiet period, one v4 multi-entry report (a bitmap per part,
+  the receiver's recent packets listed newest first); re-drives are batched the same way and the v4
+  QUERY asks about the whole window. The window takes the in-flight slot. Golden wire snapshot
+  regenerated: v1-v3 bytes unchanged (pinned under `v3` names), 96 v4 cases added. Tests:
+  `tests/test_reconcile_m2_window_0920.py`.
 
 ### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
 

@@ -3029,3 +3029,46 @@ from. Milestones in order, each gated on the full suite and MeshBench
      receiver tests that expected an immediate gaps report now wait out
      the hold. Shipped-default pins and golden config re-pinned (two new
      keys). Gate results are in `changelog.md`.
+
+ M2. **One report per window** (`direct_raw_window_enabled` yes,
+     `direct_raw_window_collect` 0.75 s, `direct_raw_window_max_parts` 6;
+     "Q" protocol v4; `_run_raw_window`, `_RawWindow`, `_RawPart`,
+     `_window_collect_s`, `_apply_window_entries`,
+     `_encode/_decode_completion_frame_v4`, `_recent_raw_entries`).
+     RNS's Resource sender emits a window of 4-6 parts within
+     milliseconds (`RNS/Resource.py` `request`); each was its own
+     burst-and-report exchange, two in flight per peer, so a 4-part
+     window cost about 12 reports and 6 quiet periods. Now consecutive
+     raw-eligible sends to one peer that arrive within the collect
+     window of the first form ONE window: every part's fragments burst
+     back to back (in part order, the usual gaps, the last two fragments
+     of the whole window flagged), one quiet period, one report. The
+     window takes the per-peer in-flight slot the parts used to take
+     (`direct_fragmented_max_in_flight` bounds windows now). The report
+     is "Q" version 4 -- `[4][type][n][nonce]` then per entry
+     `[pkt_id:2][frag_total][complete][bitmap]` -- listing every raw
+     packet the receiver saw from that sender within
+     RECENT_RAW_PKT_SPAN_S (60 s, newest first, at most 8, the
+     triggering one first). The sender registers one waiter future under
+     every pkt_id of the burst; the handler resolves it through the first
+     entry that passes the per-part rules (nonce, monotone completion,
+     frag_total) and `_apply_window_entries` applies every entry's bitmap
+     authoritatively; parts complete leave the window, the rest are
+     re-driven as the next round's burst; no report -> ONE v4 QUERY
+     listing the outstanding parts (`_query_remote_fragments(entries=)`,
+     the one future under every pkt_id), answered in v4 entry by entry.
+     Every single-part rule -- resume, the provisional second-last-
+     fragment report (its gap set is the union over the window's
+     entries), the re-query-before-re-burst valve, handshake yields, the
+     mid-send path-reset abort, the empty-burst and incomplete strikes,
+     the text fallback -- applies to the window as it applied to the
+     part; `_send_direct_raw_fragmented` is now "join or open the peer's
+     window and await this part's outcome", and a single part (or
+     batching off) is a window of one with no collect wait. v1-v3 frames
+     still decode and a v3 QUERY is answered in v3; the golden wire
+     snapshot was regenerated in the same commit: the 72 old
+     default-version cases are byte-identical under their new `v3`
+     names, the `default` cases moved to v4, and 96 v4 cases were added
+     (`COMPLETION_PROTOCOL_VERSION` 3 -> 4). Both nodes must run this
+     build. Tests: `tests/test_reconcile_m2_window_0920.py`; the golden
+     wire and config snapshots and the shipped-default pins re-pinned.

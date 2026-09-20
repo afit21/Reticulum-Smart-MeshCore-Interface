@@ -489,7 +489,11 @@ class _DirectSendMixin:
         # packets this way (method="slot_expired") -- a drop the receiver
         # then had to notice and re-request through RNS, which is strictly
         # slower than sending late. The slot is a pacing hint, not a gate.
-        slot = self._fragmented_send_slot(peer_prefix, priority)
+        # M2 (2026-09-20): with window batching on, a raw-eligible part joins
+        # its peer's window and the WINDOW takes the in-flight slot
+        # (`_run_raw_window`), so every part of an RNS window can join.
+        window_batched = self.direct_raw_window_enabled and self._raw_fragments_eligible(peer_prefix, priority)
+        slot = None if window_batched else self._fragmented_send_slot(peer_prefix, priority)
         slot_wait_s = 0.0
         slot_held = False
         if slot is not None:
