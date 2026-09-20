@@ -38,9 +38,14 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
   `direct_raw_report_wait_base` 2.0 -> 4.0 s, `direct_raw_report_wait_per_hop` 3.0 -> 2.5 s). Zero
   hop: the receiver's report waited p90 4-5 s for its own radio lock, so a 2 s window sent 29 of the
   desktop's 77 hop-0 rounds to a QUERY round trip for a report that was merely late. The window is
-  now max(floor 4 + 2.5 x hops, per-peer srtt + 4 x rttvar of burst-end -> report arrival, late
-  reports included), capped by the answer budget. Tests: `tests/test_report_window_0920.py`;
-  `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json` re-pinned.
+  now max(floor 4 + 2.5 x hops, per-peer srtt + 2 x rttvar of burst-end -> complete-report arrival,
+  late reports included), capped by the answer budget. From the review of the same capture: a
+  report missing only the last fragment sent (the second-last fragment's, which 20 of 43 hop-0
+  rounds had acted on, re-driving that fragment as a duplicate) is provisional for up to half the
+  window; a QUERY whose answer future a late report already resolved is not transmitted
+  (`answered_before_send`, 24 of 29 hop-0 "answered" rounds) and no longer shrinks `_query_rtt`.
+  Tests: `tests/test_report_window_0920.py`; `tests/test_shipped_defaults.py` and
+  `tests/golden/config_defaults.json` re-pinned.
 
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 

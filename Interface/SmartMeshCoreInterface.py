@@ -2780,12 +2780,37 @@ part had gone out once. That is the number phase 3 is sized against.
     `(peer, pkt_id)` expectation the sender registered at the burst's
     end -- on time or LATE (the estimator must see the reports the window
     missed, or it can never grow past the window) -- withdrawn when the
-    round ends; window = max(floor, srtt + 4 x rttvar), never above the
+    round ends; window = max(floor, srtt + 2 x rttvar), never above the
     QUERY answer budget; dropped with the peer's other path stats. The
     cost of a lost report at zero hop rises 2 -> 4 s of quiet radio (5 of
     77 rounds); the saving is a QUERY round trip on the late ones (29 of
     77). Tests: `tests/test_report_window_0920.py`; the shipped-default
     pins and the golden config snapshot re-pinned in the same commit.
+
+    Three things the review of the same capture added (same commit set):
+    (a) 20 of the desktop's 43 "reported" hop-0 rounds had acted on the
+    SECOND-LAST fragment's report -- both of a burst's last two
+    fragments are flagged, the receiver reports the gap the moment the
+    second-last lands, and that report (missing only the last fragment)
+    reached the sender first -- and each re-drove the last fragment as a
+    duplicate before the complete report arrived (the complete report
+    follows the incomplete one by a median 1.5-1.9 s at zero hop, its
+    ACK wait). `_await_completion_report` now treats a report whose only
+    gap is the last fragment sent as provisional: it re-arms the waiter
+    and keeps waiting up to half the window for the last fragment's own
+    report, acting on the provisional one only if nothing better arrives
+    (`provisional: true` in the capture). Only COMPLETE reports feed the
+    estimator, for the same reason. (b) 24 of the 29 "answered" hop-0
+    outcomes were a late report resolving the QUERY's future through the
+    monotone rule while the QUERY still waited for the lock -- the QUERY
+    then went out anyway, was answered, and the ~0 s "round trip" shrank
+    `_query_rtt`. A QUERY whose answer future is already done is no
+    longer transmitted (`ack_timeout_source="answered_before_send"`),
+    and a report that resolves a QUERY feeds `_report_rtt`, never
+    `_query_rtt`. (c) The window uses srtt + 2 x rttvar, the factor
+    `_completion_quiet_window_s` uses: the true zero-hop distribution is
+    median ~3 s / p90 ~7 s and +4 x rttvar would settle at 8-10 s, which
+    a lost report pays in full.
 
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
@@ -8909,7 +8934,11 @@ class SmartMeshCoreInterface(Interface):
         # hop-scaled floor; the QUERY answer budget still caps it.
         rs = self._report_rtt.get(peer_prefix)
         if rs is not None:
-            window_s = max(window_s, rs["srtt"] + 4.0 * rs["rttvar"])
+            # srtt + 2 x rttvar (the factor `_completion_quiet_window_s`
+            # uses), not RFC 6298's 4: a lost report at zero hop costs the
+            # whole window and the true distribution there is median ~3 s,
+            # p90 ~7 s (2026-09-20 review), which +4 x rttvar overshoots.
+            window_s = max(window_s, rs["srtt"] + 2.0 * rs["rttvar"])
         budget_s = self._completion_query_timeout_s(peer_prefix, hops)
         return max(0.0, min(window_s, budget_s))
 
@@ -8938,6 +8967,7 @@ class SmartMeshCoreInterface(Interface):
 
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
+        last_sent_idx: Optional[int] = None, rearm=None,
     ) -> Optional[_CompletionFrame]:
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
@@ -8945,18 +8975,63 @@ class SmartMeshCoreInterface(Interface):
         the QUERY path. A report is captured as a `completion_check_result`
         with outcome "reported" so the reconcile accounting stays in one
         record type; no record is written when nothing arrives (the QUERY
-        that follows writes its own)."""
+        that follows writes its own).
+
+        Phase 1 (2026-09-20): an INCOMPLETE report whose only gap is
+        `last_sent_idx` -- the burst's last fragment -- is the second-last
+        fragment's report (both are flagged), sent by the receiver moments
+        before the last fragment landed. Taken as final it re-drives that
+        fragment as a duplicate: 20 of the desktop's 43 "reported" hop-0
+        rounds in the 2026-09-20 session did exactly that (each followed by
+        a one-fragment round and a second report). It is now provisional:
+        `rearm()` puts a fresh future under the same key so the complete
+        report can still land, the wait continues for up to half the window
+        more (the complete report follows the incomplete one by a median
+        1.5-1.9 s at zero hop -- its ACK wait -- and the receiver-side
+        debounce of phase 3 removes the pair at the source), and the
+        provisional report is acted on only if nothing better arrives
+        (captured with `provisional: true`). When the last fragment really
+        was lost this costs at most that extra half window; today's
+        behaviour (re-drive it at once) is the fallback either way."""
         wait_s = self._completion_report_wait_s(hops, peer_prefix)
         started = time.monotonic()
-        try:
-            got: _CompletionFrame = await asyncio.wait_for(asyncio.shield(fut), timeout=wait_s)
-        except (asyncio.TimeoutError, Exception):
-            self._debug(
-                f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
-                f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
+        provisional: Optional[_CompletionFrame] = None
+        deadline_s = wait_s
+        while True:
+            remaining = deadline_s - (time.monotonic() - started)
+            if remaining <= 0:
+                got = None
+            else:
+                try:
+                    got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
+                except (asyncio.TimeoutError, Exception):
+                    got = None
+            if got is None:
+                if provisional is not None:
+                    got = provisional
+                    break
+                self._debug(
+                    f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
+                    f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
+                )
+                return None
+            missing_only_last = (
+                not got.complete and got.held is not None and last_sent_idx is not None and rearm is not None
+                and set(range(frag_total)) - set(got.held) == {last_sent_idx}
             )
-            return None
+            if missing_only_last and provisional is None:
+                provisional = got
+                fut = rearm()
+                deadline_s = min(wait_s, (time.monotonic() - started) + wait_s / 2.0)
+                self._debug(
+                    f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) misses only the "
+                    f"last fragment sent ({last_sent_idx}) -- the second-last fragment's report; provisional, "
+                    f"waiting the rest of the window for the last fragment's own."
+                )
+                continue
+            break
         waited_s = time.monotonic() - started
+        is_provisional = got is provisional
         self._debug(
             f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
             f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
@@ -8969,7 +9044,7 @@ class SmartMeshCoreInterface(Interface):
                 "outcome": "reported", "complete": got.complete, "stage": stage,
                 "timeout_s": round(wait_s, 3), "answer_version": got.version,
                 "held": sorted(got.held) if got.held is not None else None,
-                "report_wait_s": round(waited_s, 3),
+                "report_wait_s": round(waited_s, 3), "provisional": is_provisional,
             })
         return got
 
@@ -9150,6 +9225,14 @@ class SmartMeshCoreInterface(Interface):
                             await asyncio.sleep(gap_s)
                     if report_fut is not None:
                         stale_report = None
+
+                        def rearm(_key=report_key, _ft=frag_total, _rnd=rnd):
+                            fresh = asyncio.get_running_loop().create_future()
+                            self._completion_query_waiters[_key] = (
+                                fresh, _ft, self.COMPLETION_REPORT_NONCE_BASE | (_rnd & 0x03),
+                            )
+                            return fresh
+
                         if report_fut.done() and not report_fut.result().complete:
                             # An INCOMPLETE report that arrived while this
                             # burst was still going (the second-last fragment
@@ -9171,6 +9254,7 @@ class SmartMeshCoreInterface(Interface):
                         self._expect_report(peer_prefix, pkt_id, time.monotonic())
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, pkt_id, frag_total, gap_hops, stage=f"raw{rnd}",
+                            last_sent_idx=missing[-1] if missing else None, rearm=rearm,
                         )
                         if report is None and stale_report is not None:
                             # The last fragment (or its report) was lost: the
@@ -9872,7 +9956,14 @@ class SmartMeshCoreInterface(Interface):
                 # (which would inflate every later timeout and hold the
                 # radio longer on failures).
                 answered_at = quiet_info.get("answered_at") or time.monotonic()
-                self._record_query_rtt(peer_prefix, answered_at - rtt_origin)
+                if not quiet_info.get("not_sent") and (
+                        got.nonce is None or (got.nonce & 0xF0) != self.COMPLETION_REPORT_NONCE_BASE):
+                    # A late REPORT that resolved this QUERY's future (the
+                    # monotone rule) is the report estimator's sample, not
+                    # a QUERY round trip (phase 1, 2026-09-20: 24 of 29
+                    # hop-0 "answered" outcomes were this, and they were
+                    # shrinking _query_rtt with ~0 s samples).
+                    self._record_query_rtt(peer_prefix, answered_at - rtt_origin)
                 self._debug(
                     f"completion ANSWER ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
                     f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
@@ -10536,6 +10627,21 @@ class SmartMeshCoreInterface(Interface):
             async with self._direct_exchange_lock(priority):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
+                if quiet_wait is not None and quiet_wait.done():
+                    # Phase 1 (2026-09-20): the answer this frame asks for is
+                    # already in (a late REPORT resolved the QUERY's future
+                    # while the QUERY waited for the lock). Not transmitted;
+                    # `_query_remote_fragments` reads the future.
+                    self._capture_direct_attempt_result(
+                        peer_prefix, attempt, True, self._direct_exchange_queue_depth, time.monotonic() - wait_start, None,
+                        pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                        time_critical=time_critical, pass_number=pass_number,
+                        ack_timeout_source="answered_before_send", kind=kind,
+                    )
+                    if quiet_info is not None:
+                        quiet_info["answered_at"] = time.monotonic()
+                        quiet_info["not_sent"] = True
+                    return True, False
                 if attempt == 0 and self._expired(expires_at):
                     # Field fix (2026-09-18 evening): the lock wait itself
                     # (225s in the drive-home capture) is where a queued
@@ -11913,10 +12019,14 @@ class SmartMeshCoreInterface(Interface):
         peer_prefix = self._canonical_peer_prefix(sender_token)
         if peer_prefix is None:
             return
-        if frame.nonce is not None and (frame.nonce & 0xF0) == self.COMPLETION_REPORT_NONCE_BASE:
+        is_report = frame.nonce is not None and (frame.nonce & 0xF0) == self.COMPLETION_REPORT_NONCE_BASE
+        if is_report and frame.complete:
             # A receiver-initiated REPORT: sample its latency whether or
             # not a waiter still exists (a late report is the case the
-            # estimator most needs to see) -- phase 1, 2026-09-20.
+            # estimator most needs to see) -- phase 1, 2026-09-20. Complete
+            # reports only: the second-last fragment's incomplete report
+            # arrives ~1.5-2 s before the complete one and would train the
+            # window short.
             latency_s = self._record_report_latency(peer_prefix, frame.pkt_id)
             if latency_s is not None:
                 self._debug(

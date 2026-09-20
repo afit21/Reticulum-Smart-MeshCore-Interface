@@ -106,6 +106,70 @@ class ReportWindowGrowsWithMeasuredLatency(SingleNodeCase):
             iface._canonical_peer_prefix = original_canonical
             self._reset()
 
+    def test_second_last_fragment_report_is_provisional(self):
+        """2026-09-20 review of the desktop capture: 20 of its 43 hop-0
+        "reported" rounds acted on the second-last fragment's incomplete
+        report (missing only the last fragment sent) and re-drove that
+        fragment as a duplicate. Now: provisional -- the wait continues up
+        to half the window for the last fragment's own report; a complete
+        one supersedes it, otherwise it is acted on (`provisional: true`)."""
+        import asyncio
+        iface = self.iface
+        self._reset()
+        saved = (iface.direct_raw_report_wait_base_s, iface.direct_raw_report_wait_per_hop_s)
+        iface.direct_raw_report_wait_base_s, iface.direct_raw_report_wait_per_hop_s = 1.0, 0.0
+        module = self.module
+        incomplete = module._CompletionFrame(version=3, type=iface.COMPLETION_TYPE_ANSWER, complete=False,
+                                             pkt_id=9, frag_total=4, held=frozenset({0, 1, 2}), nonce=0xF0)
+        complete = module._CompletionFrame(version=3, type=iface.COMPLETION_TYPE_ANSWER, complete=True,
+                                           pkt_id=9, frag_total=4, held=frozenset({0, 1, 2, 3}), nonce=0xF0)
+        try:
+            async def superseded():
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                fresh = loop.create_future()
+                loop.call_later(0.1, fut.set_result, incomplete)
+                loop.call_later(0.3, fresh.set_result, complete)
+                t0 = time.monotonic()
+                got = await iface._await_completion_report(fut, PEER, 9, 4, 0, "raw0", last_sent_idx=3, rearm=lambda: fresh)
+                return got, time.monotonic() - t0
+
+            got, took = self.node.run_on_loop(superseded(), timeout=10.0)
+            self.assertTrue(got.complete, "the complete report that followed supersedes the provisional one")
+            self.assertLess(took, 0.8)
+
+            async def acted_on():
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                fresh = loop.create_future()   # never resolves: the last fragment really was lost
+                loop.call_later(0.1, fut.set_result, incomplete)
+                t0 = time.monotonic()
+                got = await iface._await_completion_report(fut, PEER, 9, 4, 0, "raw0", last_sent_idx=3, rearm=lambda: fresh)
+                return got, time.monotonic() - t0
+
+            got, took = self.node.run_on_loop(acted_on(), timeout=10.0)
+            self.assertFalse(got.complete)
+            self.assertEqual(set(got.held), {0, 1, 2}, "the provisional report is acted on when nothing better comes")
+            self.assertGreaterEqual(took, 0.55, "it waited up to half the window (0.5 s) past the provisional report")
+            self.assertLess(took, 1.0)
+
+            async def other_gap_is_final():
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                other = module._CompletionFrame(version=3, type=iface.COMPLETION_TYPE_ANSWER, complete=False,
+                                                pkt_id=9, frag_total=4, held=frozenset({0, 2, 3}), nonce=0xF0)
+                loop.call_later(0.1, fut.set_result, other)
+                t0 = time.monotonic()
+                got = await iface._await_completion_report(fut, PEER, 9, 4, 0, "raw0", last_sent_idx=3, rearm=lambda: loop.create_future())
+                return got, time.monotonic() - t0
+
+            got, took = self.node.run_on_loop(other_gap_is_final(), timeout=10.0)
+            self.assertEqual(set(got.held), {0, 2, 3}, "a report with any other gap is final at once")
+            self.assertLess(took, 0.4)
+        finally:
+            iface.direct_raw_report_wait_base_s, iface.direct_raw_report_wait_per_hop_s = saved
+            self._reset()
+
     def test_estimator_is_dropped_with_the_peer_path_stats(self):
         iface = self.iface
         self._reset()
