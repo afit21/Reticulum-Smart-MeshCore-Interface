@@ -218,6 +218,7 @@ CONFIGURE_RETRY = {
 }
 
 CONFIGURE_PATH_DISCOVERY = {
+    'announce_cache_ttl_s': 3600.0,
     'contact_refresh_interval_s': 30.0,
     'direct_path_reset_min_age_s': 60.0,
     'direct_path_reset_patience_multiplier': 3.0,
@@ -227,6 +228,7 @@ CONFIGURE_PATH_DISCOVERY = {
     'path_discovery_base_cooldown_s': 20.0,
     'path_discovery_max_cooldown_s': 900.0,
     'path_discovery_quick_attempts': 2,
+    'path_request_local_answer_min_interval_s': 120.0,
     'telemetry_grant_all_contacts': False,
 }
 

@@ -55,6 +55,16 @@ above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 
   time (60 s: 12 / 0; 30 s: 24 / 4). Checked before every attempt (one bare frame, nothing spent),
   never a path failure; link-class proofs exempt. Also closed: an attempt-0 expiry during the lock
   wait fell through to a transmitted attempt 1. Tests: `tests/test_proof_max_age_0920.py`.
+- **An RNS path re-request is answered from the cached announce** (new keys `announce_cache_ttl`
+  3600 s, `path_request_local_answer_min_interval` 120 s; 0 = off). A closed pending Link makes a
+  non-transport RNS node expire the path and ask again, and the far side replays the same cached
+  announce bytes: the laptop received one destination's 235-byte announce six times in an hour at two
+  hops (2-3 raw fragments plus reports each, after a 2-hop DIRECT request each). Announces a bound
+  peer delivered DIRECT are cached; a re-request for a cached, still-bound destination is answered
+  by handing the bytes back to RNS (context PATH_RESPONSE, so a transport node does not re-flood it)
+  and not transmitted; the next request inside the interval goes on air to verify. Path-request
+  records carry `requested_hash`. Tests: `tests/test_local_announce_cache_0920.py` (including the
+  real `RNS.Transport` accept / ignore / re-accept sequence).
 
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 

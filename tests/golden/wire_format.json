@@ -5636,6 +5636,7 @@
     }
   ],
   "constants": {
+    "ANNOUNCE_CACHE_MAX_KEYS": 256,
     "BIND_CAP_HAS_UPSTREAM_RNS": 1,
     "BIND_CAP_RAW_FRAGMENTS": 2,
     "BIND_FRAME_RAW_SIZE": 10,

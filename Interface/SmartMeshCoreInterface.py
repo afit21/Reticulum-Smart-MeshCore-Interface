@@ -2845,6 +2845,51 @@ part had gone out once. That is the number phase 3 is sized against.
     `tests/test_proof_max_age_0920.py`; shipped-default pins and golden
     config re-pinned in the same commit.
 
+ 3. **An RNS path re-request is answered from the cached announce**
+    (`_cache_announce`, `_answer_path_request_locally`;
+    `announce_cache_ttl` 3600 s, `path_request_local_answer_min_interval`
+    120 s, both 0 = off; `ANNOUNCE_CACHE_MAX_KEYS` 256). RNS mechanics,
+    verified in `Transport.py`: on a non-transport node a pending Link
+    that closes without activating makes `Transport.jobs` `expire_path`
+    the destination and request the path again; the cull removes the
+    entry, `has_path` is False, and the answering node replies from ITS
+    path table with the cached announce bytes (`path_request` /
+    `get_cached_packet`) -- the same bytes every time. `packet_filter`
+    passes a duplicate SINGLE announce even if its hash is in the
+    hashlist; the announce branch of `inbound` adds an unknown
+    destination unconditionally (`should_add = True`) and silently
+    ignores the same announce while the path exists; `request_path`
+    records the destination in `path_requests` before sending, which is
+    what exempts the answer from ingress limiting. Laptop captures
+    `*144922` / `*153130` at two hops: the identical 235-byte announce
+    for one destination arrived six times in an hour (payload hash
+    b8efb9197b7a), each a 2-3 fragment raw send with its reports at two
+    hops, each after a 2-hop DIRECT request (14 more requests
+    rate-limited); on the desktop each answer cost ~2.7 raw fragments,
+    ~2 QUERY attempts and ~14 s of radio lock, 7 answered and 5 more
+    suppressed as duplicates in flight. Now every ANNOUNCE a bound peer
+    delivers DIRECT is cached, bytes as received (CHANNEL announces are
+    not: no authenticated source); a path request whose target is
+    cached, whose source peer is still bound and not in discovery
+    backoff, and which was not answered locally inside the interval is
+    answered by handing the cached bytes back to RNS through
+    `process_incoming` (transport `local_announce_cache`, `rxb` not
+    counted) with the context byte rewritten to PATH_RESPONSE -- what it
+    is, and on a transport node the value that keeps `inbound` from
+    inserting it into the announce table for re-flooding; the announce
+    signature does not cover the context byte -- and the request is not
+    transmitted (`path_request_answered_locally`, naming the source
+    peer). The local answer verifies nothing: the next request for the
+    same destination inside the interval goes over the air, which is
+    how a dead destination is re-verified. Every path-request capture
+    record now carries `requested_hash`. Pinned against the real
+    `RNS.Transport` of the test process (unknown destination added,
+    duplicate ignored, accepted again after expire + cull) in
+    `tests/test_local_announce_cache_0920.py`; shipped-default pins and
+    golden config re-pinned in the same commit. Not persisted across a
+    restart of the RNS process (a non-transport node reloads no path
+    table either, so the first request after a restart is real).
+
 DESIGN INVARIANTS (carried forward from the prior implementation's own
 field-diagnosed lessons, restated here per CLAUDE.md; the full justification
 for each lives in `docs/meshcore_protocol_rules.md`'s "meshcore Python
@@ -3876,6 +3921,9 @@ class SmartMeshCoreInterface(Interface):
     # pseudo-destination hash). Same 20s as RNS.Transport's own automatic
     # PATH_REQUEST_MI floor, so only explicit client retries are affected.
     PATH_REQUEST_RATE_LIMIT_WINDOW_S = 20.0
+    # Bound on the local announce cache (2026-09-20): LRU, one entry per
+    # destination this interface delivered an announce for.
+    ANNOUNCE_CACHE_MAX_KEYS = 256
 
     # -------------------------------------------------------------------
     # Construction
@@ -4190,6 +4238,14 @@ class SmartMeshCoreInterface(Interface):
         # See _answered_send_key / _signal_send_answered.
         self._send_answered_events = {}
         self._send_answered_at = {}
+        # Phase 1 (2026-09-20): destination_hash -> (announce bytes as
+        # received, time.monotonic(), source peer prefix) for every ANNOUNCE
+        # a bound peer delivered to RNS through this interface (LRU,
+        # ANNOUNCE_CACHE_MAX_KEYS); destination_hash -> time.monotonic() of
+        # the last path request answered from it. See
+        # _answer_path_request_locally.
+        self._announce_cache = collections.OrderedDict()
+        self._path_request_local_answer_at = {}
 
         self._contact_refresh_task = None
 
@@ -5051,6 +5107,32 @@ class SmartMeshCoreInterface(Interface):
         # ever needs it to function.
         self.telemetry_grant_all_contacts = _cfg_bool(cfg.get("telemetry_grant_all_contacts", "no"))
 
+        # Phase 1 (2026-09-20): answer an RNS path re-request from the
+        # announce this interface already delivered. On a non-transport
+        # node a pending Link that closes without activating makes RNS
+        # `expire_path` the destination and request the path again
+        # (`Transport.jobs`, pending-links check); the answering node
+        # replies from ITS path table with the same cached announce bytes
+        # (`Transport.path_request`), and the requester accepts them
+        # because the destination is no longer in its table. The laptop
+        # (2 hops, 2026-09-20) received the identical 235-byte announce for
+        # one destination six times in an hour, each a 2-3 fragment raw
+        # send plus reports at two hops, each preceded by a 2-hop DIRECT
+        # request; the desktop answered 7 and suppressed 5 more as
+        # duplicates in flight. Every ANNOUNCE handed to RNS from a bound
+        # peer is cached (bytes as received, LRU, `announce_cache_ttl`);
+        # a path request whose target is cached, whose source peer is still
+        # bound and not in discovery backoff, and which has not been
+        # answered locally within `path_request_local_answer_min_interval`
+        # is answered by re-injecting the cached announce (context
+        # rewritten to PATH_RESPONSE so a transport node does not
+        # re-flood it) and is NOT transmitted. The local answer verifies
+        # nothing: the next request for the same destination inside the
+        # interval goes over the air, which is how a genuinely dead
+        # destination is re-verified. 0 disables either.
+        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 3600.0))
+        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 120.0))
+
     def _configure_peer_discovery(self, cfg):
         # Master on/off switch for the entire bind-frame subsystem (both
         # sending this node's own REQUEST/RESPONSE and answering others').
@@ -5650,6 +5732,12 @@ class SmartMeshCoreInterface(Interface):
     ) -> None:
         if self._packet_capture_file is None:
             return
+        # 2026-09-20: a path request's REQUESTED destination (the first 16
+        # bytes of its data), so a capture can say which path RNS asked for
+        # -- until now only the shared PLAIN path.request hash was recorded.
+        requested = None
+        if header is not None and header.packet_type == RNS.Packet.DATA and header.destination_type == RNS.Destination.PLAIN:
+            requested = self._path_request_target(data, header)
         self._capture_event("out", {
             **self._header_capture_fields(header),
             "priority": self._priority_tier(header),
@@ -5660,6 +5748,7 @@ class SmartMeshCoreInterface(Interface):
             "candidate_peers": candidate_peers,
             "small_mesh_mode": self._in_small_mesh_mode(),
             "bound_peers": len(self._peers),
+            "requested_hash": requested.hex() if requested else None,
         })
 
     def _capture_incoming(
@@ -7865,6 +7954,72 @@ class SmartMeshCoreInterface(Interface):
             return None
         return data[data_offset:data_offset + dst_len]
 
+    def _cache_announce(self, data: bytes, header: Optional[_RnsHeader], sender_peer_prefix: Optional[str]) -> None:
+        """Remember an ANNOUNCE a bound peer delivered DIRECT (phase 1,
+        2026-09-20), bytes exactly as received. CHANNEL announces are never
+        cached (no authenticated source, and `_answer_path_request_locally`
+        needs one to gate on)."""
+        if (header is None or header.packet_type != RNS.Packet.ANNOUNCE or header.destination_hash is None
+                or sender_peer_prefix is None or sender_peer_prefix not in self._peers
+                or self.announce_cache_ttl_s <= 0):
+            return
+        self._announce_cache.pop(header.destination_hash, None)
+        self._announce_cache[header.destination_hash] = (bytes(data), time.monotonic(), sender_peer_prefix)
+        while len(self._announce_cache) > self.ANNOUNCE_CACHE_MAX_KEYS:
+            self._announce_cache.popitem(last=False)
+
+    def _announce_cache_sweep(self, now: float) -> None:
+        stale = [k for k, (_raw, t, _src) in self._announce_cache.items() if now - t > self.announce_cache_ttl_s]
+        for k in stale:
+            del self._announce_cache[k]
+        stale = [k for k, t in self._path_request_local_answer_at.items() if now - t > self.path_request_local_answer_min_interval_s]
+        for k in stale:
+            del self._path_request_local_answer_at[k]
+
+    def _answer_path_request_locally(self, requested_hash: Optional[bytes]) -> Optional[str]:
+        """If this node's own RNS is asking for a path this interface has
+        already delivered an announce for, hand that announce back to RNS
+        and report the source peer; None when the request must go on air.
+        See `announce_cache_ttl`'s comment for the mechanism and the
+        evidence. Runs on the event loop (the outgoing worker), where
+        `owner.inbound` is called for every real reception too."""
+        if (requested_hash is None or self.announce_cache_ttl_s <= 0
+                or self.path_request_local_answer_min_interval_s <= 0):
+            return None
+        entry = self._announce_cache.get(requested_hash)
+        if entry is None:
+            return None
+        raw, cached_at, source_peer = entry
+        now = time.monotonic()
+        if now - cached_at > self.announce_cache_ttl_s:
+            self._announce_cache.pop(requested_hash, None)
+            return None
+        if source_peer not in self._peers or self._path_discovery_in_backoff(source_peer):
+            return None
+        last = self._path_request_local_answer_at.get(requested_hash)
+        if last is not None and now - last < self.path_request_local_answer_min_interval_s:
+            # The second re-request inside the interval is the one that
+            # verifies the destination over the air.
+            return None
+        header = self._parse_rns_header(raw)
+        if header is None:
+            return None
+        # Context -> PATH_RESPONSE: what this announce is, and on a
+        # transport node the value that keeps RNS from inserting it into
+        # the announce table for re-flooding (Transport.inbound's
+        # `packet.context != PATH_RESPONSE` guard). The announce signature
+        # covers destination, key, name hash, random hash, ratchet and app
+        # data -- not the context byte.
+        dst_len = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+        context_offset = (2 + 2 * dst_len) if header.header_type == 1 else (2 + dst_len)
+        if len(raw) <= context_offset:
+            return None
+        answer = bytearray(raw)
+        answer[context_offset] = RNS.Packet.PATH_RESPONSE
+        self._path_request_local_answer_at[requested_hash] = now
+        self.process_incoming(bytes(answer), transport="local_announce_cache", sender_peer_prefix=source_peer)
+        return source_peer
+
     def _path_request_rate_limited(self, requested_hash: Optional[bytes]) -> bool:
         """PATH_REQUEST_RATE_LIMIT_WINDOW_S -- same shape and fail-open
         convention as `_path_response_rate_limited`, including recording
@@ -8172,6 +8327,16 @@ class SmartMeshCoreInterface(Interface):
                     f"routing decision: path request for "
                     f"{requested.hex() if requested else None} -- dropped, one was already "
                     f"sent within {self.PATH_REQUEST_RATE_LIMIT_WINDOW_S:.0f}s."
+                )
+                return
+            answered_from = self._answer_path_request_locally(requested)
+            if answered_from is not None:
+                # Phase 1 (2026-09-20): answered from the cached announce,
+                # nothing transmitted -- see announce_cache_ttl.
+                self._capture_outgoing(header, data, "path_request_answered_locally", target_peer=answered_from)
+                self._debug(
+                    f"routing decision: path request for {requested.hex()} -- answered locally from the "
+                    f"announce {answered_from!r} delivered earlier; not transmitted."
                 )
                 return
 
@@ -13480,6 +13645,7 @@ class SmartMeshCoreInterface(Interface):
                 self._path_response_rate_limit_sweep(now)
                 self._pending_link_request_sweep(now)
                 self._send_answered_sweep(now)
+                self._announce_cache_sweep(now)
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
                 self._closed_links_sweep(now)
@@ -13548,11 +13714,14 @@ class SmartMeshCoreInterface(Interface):
         that doesn't care about packet capture."""
         if not self.online or self.detached:
             return
-        self.rxb += len(data)
+        if transport != "local_announce_cache":
+            self.rxb += len(data)
         header = self._parse_rns_header(data)
         self._note_link_closed(header)
         if transport.startswith("channel"):
             self._note_channel_proof(header, transport)
+        elif transport != "local_announce_cache":
+            self._cache_announce(data, header, sender_peer_prefix)
         if self._packet_capture_file is not None:
             self._capture_incoming(
                 data, transport=transport, sender_peer_prefix=sender_peer_prefix,
