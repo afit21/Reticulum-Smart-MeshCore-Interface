@@ -45,9 +45,10 @@ New in alpha 0.1.4:
 |    Feature    |    State    |        Description        |
 |----|----|----|
 | Automatic Link | Working | Automatically peers with other nodes running this interface, provided the companions share the same MeshCore settings. |
-| Z85 Encode | Battle Tested | Encodes RNS packets in Z85 for transport over MeshCore text messages (~25% overhead vs ~35% for base64). |
+| Raw Binary | Working | RNS packets are fragmented and sent over MeshCore in raw binary |
+| Z85 Encode | Battle Tested | Encodes RNS packets in Z85 for transport over MeshCore text messages (~25% overhead vs ~35% for base64). This is used for channel traffic and as a backup when repeaters in a path aren't capable of forwarding raw binary messages |
 | MeshCore Routing | Experimental | Broadcast traffic goes over a channel, direct traffic over direct messages. Keeps a cache of which RNS addresses route to each MeshCore contact, and with only a few known peers sends broadcast traffic as direct messages to avoid unnecessary floods. |
-| RNS Packet Aware Firewalling | Experimental | Inspects outgoing traffic and drops what the mesh doesn't need, out of respect for MeshCore users. |
+| RNS Packet Aware Firewalling | Working | Inspects outgoing traffic and drops what the mesh doesn't need, out of respect for MeshCore users. |
 | Packet Aware Self-throttling | Working | Not just a speed limit: delays and prioritises packets by type, e.g. holding link-handshake packets so fewer keepalives are needed over the life of an RNS link. |
 | Packet Capture Debug Tool | Battle Tested | Built-in packet capture for debugging the interface. Also logs every packet the radio overhears, not just our own. |
 | Radio Traffic Awareness | Working | Taps the companion radio's raw RX log to see every packet it decodes, including traffic that isn't ours. Costs no airtime. |
@@ -57,7 +58,6 @@ New in alpha 0.1.4:
 | Airtime Duty Cycle | Working | Caps the interface at 30% airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings. Link keepalives skip the wait but still count against the cap. |
 | Queue Hygiene | Working | Drops duplicate, stale and closed-link packets from the queue so a backlog isn't dumped onto the mesh when a path comes back, and forwards at most one spontaneous announce per destination every 5 minutes. |
 | Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear. Off by default. |
-| Raw Binary Fragments | Experimental | On by default. Packets too large for one text message go to a capable peer as MeshCore raw binary packets: no Z85, no text framing, no per-fragment ACK (about 43% less sender airtime). Reliability comes from Fragment Reconciliation; if raw never arrives on a path but text does, that path falls back to text for a while. Older peers still get text fragments. **Privacy note:** MeshCore raw packets are not encrypted or authenticated by the firmware. Your contents are still end-to-end encrypted by Reticulum, but the RNS packet header and both nodes' key prefixes are visible on air, and a third party could inject a fragment (Reticulum rejects it, but the transfer has to be re-sent). Set `direct_raw_fragments_enabled = no` to stay fully inside MeshCore's encryption. |
 | Parity Fragments | Experimental | On by default. From one MeshCore hop up, each burst of raw fragments ends with an XOR parity fragment, so a receiver that lost exactly one fragment rebuilds it instead of waiting for a retry round. Costs one extra fragment per burst; set `direct_raw_parity_enabled = no` to turn it off. |
 
 ## Requirements
