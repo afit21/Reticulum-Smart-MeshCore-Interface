@@ -3622,3 +3622,150 @@ update together; parity stays on; aim for no wire change.
     58-71 %, the failed QUERYs `hop1_loss` and not near B's reports), and
     `large_payload`'s reported fraction (50 % against 69 %). The field test
     proposed in the session report is the next step.
+
+
+**Alpha 0.1.6 pass (2026-09-22, from the alpha 0.1.5 field session's
+captures in `fieldtests/raw/Alpha0.1.5/`, desktop `afipc_` + laptop `a_`).**
+The metric is unchanged: on-air bytes per delivered RNS byte, read with the
+delivery rate and the per-part completion time, per hop count; for zero hop
+also the share of a transfer spent in duty-cycle waits. What the 2026-09-21
+evening session established: zero hop is done (the 12-part page 147 s ->
+38.7 s, re-sent fragments per part 0.47 -> 0.04, window collect waits 0.75 s
+-> 0.04 s, no duty waits under the 85 % cap) and is not touched here; multi-
+hop is where 0.1.5 fell short, and the captures say why (below, item 1).
+The owner's decisions in force: zero-hop DIRECT traffic up to 85 % of
+channel time, everything a repeater relays stays at 30 %; path selection
+weighs measured reliability, not hop count -- a two-hop path via a well-
+placed repeater over a zero- or one-hop path with a weak signal, hop count
+as a tiebreak, a delivering path never abandoned for a shorter one on hop
+count alone; this release may change the wire format (both field nodes
+update together, no compatibility with earlier builds during alpha);
+parity stays on.
+
+ 1. **Path selection by measured reliability** (`_paths.py`: `_PathBoard` /
+    `_PathCandidate` in `_common.py`, the pure rules `_path_delivery_rate`,
+    `_path_prior`, `_path_score`, `_rank_paths`, `_choose_path`,
+    `_switch_for_good`, the scoreboard `_add_path_candidate`,
+    `_note_path_signal`, `_note_peer_reported_path`, `_note_path_result`,
+    `_path_rate_for_wire`, and the one decision `_select_path`; new keys
+    `path_selection_enabled` yes (the old `path_adopt_enabled` accepted as
+    an alias), `path_weak_snr_db` 3.0, `path_switch_after_misses` 2,
+    `path_switch_margin` 0.25, `path_switch_cooldown` 120 s; constants
+    PATH_CANDIDATES_KEPT 4, PATH_SAMPLES_KEPT 8, PATH_SAMPLE_WINDOW_S 600,
+    PATH_SAMPLE_HALF_LIFE_S 180, PATH_PRIOR_OPTIMISTIC 0.8, PATH_PRIOR_WEAK
+    0.25, PATH_RATE_FLOOR 0.05; "Q" protocol v5). Replaces alpha 0.1.5's
+    shorter-path adoption (`_maybe_adopt_shorter_path`, `path_adopt_window`,
+    PATH_ADOPT_MISS_LIMIT and the `path_adopted` / `path_adoption_*` capture
+    events are gone).
+
+    The field (desktop capture, 22:00-22:35): at 22:00:49, two seconds after
+    the one-hop route `19` had been confirmed by a delivery, the shortest-
+    in-window rule adopted a zero-hop route the laptop's flood had shown
+    504 s earlier -- before it drove off -- because "shortest route seen
+    within 600 s" is all it knew; two misses, a reset, a second adoption of
+    `19` that missed twice (downstream loss), and discovery returned the
+    two-hop route `1976`, which the desktop kept from 22:05 to 22:35 while
+    the laptop reached it over `19` at 55/72 the whole time. It could not
+    recover: after a reset only floods newer than the reset counted, and
+    the only laptop floods heard in those 30 minutes came by the longer
+    route (22:08:42 and 22:19:13, path `7619`); the one-hop route was next
+    seen at 22:35:05 and adopted 14 s later. Floods are rare (three usable
+    ones in half an hour) and the desktop's own sends over `1976` missed
+    two in a row at 22:10:12 / 22:10:24 -- exactly the moment a re-try of
+    `19` was due and never came. Everything else bad at two hops followed:
+    link proofs at 50 % attempt success, MeshChat re-requesting every 17 s,
+    LRPROOFs 11-18 s behind a queue of depth 12 (item 2).
+
+    Now every route this node learns to a peer is a candidate on the peer's
+    scoreboard, at most four: the discovered path; the reverse of each
+    distinct flood copy the peer's floods took (`_note_flood_route`, one
+    per relaying repeater, with the record's SNR / RSSI -- the LAST leg's
+    signal, the repeater's for a relayed copy, the peer's own for a zero-
+    hop one); the zero-hop option once the peer has been heard directly (a
+    zero-hop flood, or its own report of a zero-hop path to us); and the
+    peer's reported path (below). A candidate records its send outcomes
+    (`record_direct_send_result` is the feed, one sample per send = one
+    attempt budget, as before), last success / failure, ACK latencies, the
+    signal of the last frame received over it (the ACK the rx-log matched
+    to our own send, `_classify_rx_log_for_window` -> `_note_path_signal`),
+    first / last seen. Score = expected transmissions per delivered frame
+    times (hops + 1) -- airtime per delivered byte in frame units, lower is
+    better -- with the delivery rate over the last eight sends, each
+    weighted 0.5 ** (age / 180 s), nothing older than ten minutes. An
+    untried path scores with the optimistic prior 0.8, so the shortest
+    untried path is tried first; a zero-hop candidate whose last direct
+    frame was below `path_weak_snr_db` scores with the weak prior. The weak
+    prior is 0.25, not the 0.4 the item named: at 0.4 a weak direct path
+    scores 2.5, exactly an untried one-hop path's 2.5, and the hop tiebreak
+    would pick the direct path the prior exists to avoid; the owner's rule
+    is that a TWO-hop path is preferred over a weak direct one, an untried
+    two-hop path scores 3.75, so the weak prior has to be below 0.8 / 3.
+    Switching (`_choose_path`, pure): the current path is kept while it has
+    missed fewer than `path_switch_after_misses` consecutive sends,
+    whatever the alternatives score; past that, the next real packet goes
+    on the best eligible candidate (a "trial", no dedicated probe; the
+    current one itself when it still ranks first); a candidate is eligible
+    while under the miss threshold or again once its last miss is older
+    than `path_switch_cooldown` -- the re-try the field lacked; every
+    candidate ineligible is "exhausted" and the caller runs discovery, the
+    only time it runs (the threshold detector `record_direct_send_result`
+    used to feed, with its min-age and healthy-patience guards, is
+    bypassed while selection is on). A trial that delivers becomes current
+    for good only when its score beats the current path's by
+    `path_switch_margin` and it is not on switch-back cooldown; the path
+    switched away from gets that cooldown. A candidate on cooldown ranks
+    behind every other. Text frames are routed by the device contact's
+    stored path (`send_msg` carries none; `BaseChatMesh::sendMessage` uses
+    `out_path`), so `_select_path` sets the contact (`change_contact_path`,
+    once per change, `device_path` remembers it) and mirrors the choice
+    into `_resolved_paths` for everything that reads it (raw fragments
+    take the path per fragment; the raw window is not switched mid-flight
+    -- `_select_path` stands aside while `peer in _raw_windows`, as adoption
+    did). Both decision points -- `_send_direct_packet` and `_send_direct_
+    supplement` -- call it where they called adoption. Every selection,
+    trial, switch and exhaustion writes a `path_selected` capture record
+    with every candidate's score, rate, whether measured, misses, signal
+    and source.
+
+    The peer's view, on the wire: floods are too rare to feed this (three
+    in half an hour), so every "Q" frame carries the sender's current path
+    length to the receiver and its measured delivery rate on it: protocol
+    v5 = the v4 header plus `[path_len: 0xFF none][rate: 1/250 steps, 0xFF
+    untried]` before the v4 entries, filled by `_path_rate_for_wire` in the
+    QUERY, ANSWER and REPORT producers, read in `_handle_incoming_
+    completion_frame` -> `_note_peer_reported_path`: a reported zero-hop
+    path makes the zero-hop candidate (the peer hears us directly), and the
+    reported rate is the prior for every untried candidate of that hop
+    count (the symmetric path's evidence). The receiver cannot learn the
+    route from the frame itself: the firmware strips each relaying
+    repeater's hash from a DIRECT packet (`Mesh::removeSelfFromPath`), so a
+    DIRECT frame arrives with an empty path and CONTACT_MSG_RECV_V3 reports
+    path_len 0xFF for it. v1-v4 frames still decode; a v4 QUERY is answered
+    in v4. Both nodes must run this build. Golden wire snapshot regenerated:
+    the 74 old `default` cases are byte-identical under new `v4` names (the
+    two `_ignored` cases keep their own names), the 24 v4 multi-entry cases
+    are unchanged, 121 v5 cases were added; `COMPLETION_PROTOCOL_VERSION`
+    4 -> 5, `COMPLETION_V5_HEADER_SIZE` 6, `COMPLETION_PATH_UNKNOWN` 0xFF,
+    `COMPLETION_RATE_SCALE` 250. Shipped-default pins and the config golden
+    re-pinned (two keys removed, five added).
+
+    Tests: `tests/test_path_selection_0922.py` -- the pure rules; the field
+    replay from `tests/fixtures/field_0921_desktop_22h.json` (the desktop
+    capture 21:50-22:40 reduced to floods, sends, attempts and the adoption
+    events): at 22:00:49 the 504 s old zero-hop route is not chosen over the
+    confirmed one-hop path (kept by the miss rule -- its aging success
+    record would otherwise outscore `19`, which is exactly the point), and
+    after the two misses on `1976` at 22:10:12 / 22:10:24 the one-hop route
+    is trialled with no flood newer than 22:08:42; the v5 codec; the
+    scoreboard on the fake node (eviction, the flood tap, the peer report,
+    `_select_path`'s contact write and events, the trial after two misses,
+    exhaustion once, a v5 report feeding the board); the shipped defaults
+    and the alias. `tests/test_shorter_path_adoption_0921.py` is removed
+    with the mechanism; `tests/test_timing_logic.py`'s threshold-detector
+    tests now run with selection off. MeshBench: `shortcut_appears`'s hard
+    check reads `path_selected` (a shorter path selected after the move,
+    confirmed by its next delivery); new scenario `weak_direct` (A -5 km, R
+    at 0 with a 50 m mast, B +5.4 km: A-R +20.7 dB, R-B +14.5 dB, A-B
+    +7.2 dB both ways, from `topology relay --place`), hard check: the
+    sender's last six DIRECT sends are at one hop and a `path_selected`
+    record exists. Gate results in `changelog.md`.

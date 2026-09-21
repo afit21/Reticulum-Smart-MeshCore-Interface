@@ -194,9 +194,9 @@ class _WireFormatMixin:
     def _encode_completion_frame(
         self, frame_type: int, pkt_id: int, frag_total: int, complete: bool = False,
         held: "Optional[set]" = None, version: Optional[int] = None,
-        nonce: Optional[int] = None,
+        nonce: Optional[int] = None, path_len: Optional[int] = None, rate: Optional[float] = None,
     ) -> str:
-        """`version` defaults to this build's own (v3 since 2026-09-19). Passing
+        """`version` defaults to this build's own (v5 since 2026-09-22). Passing
         `COMPLETION_PROTOCOL_VERSION_V1` produces the pre-step-3 fixed-body
         frame -- used to answer a v1 QUERY in kind. `held` is only encoded
         on a v2 ANSWER; `complete` is carried by both versions (redundant
@@ -204,6 +204,10 @@ class _WireFormatMixin:
         infer it)."""
         if version is None:
             version = self.COMPLETION_PROTOCOL_VERSION
+        if version >= 5:
+            # v5: a single-entry multi-part frame with the sender's path view.
+            return self._encode_completion_frame_v5(frame_type, [(pkt_id, frag_total, complete, held)], nonce=nonce,
+                                                    path_len=path_len, rate=rate)
         if version >= 4:
             # v4: a single-entry multi-part frame (phase 3 M2).
             return self._encode_completion_frame_v4(frame_type, [(pkt_id, frag_total, complete, held)], nonce=nonce)
@@ -234,8 +238,14 @@ class _WireFormatMixin:
         every entry so the layout is one rule). At most
         COMPLETION_V4_MAX_ENTRIES entries; 8 x (5 + 1) + 4 = 52 bytes,
         66 Z85 chars plus the marker, inside the 160-char text limit."""
+        return self.COMPLETION_MARKER + _z85_encode(bytes(
+            bytearray([self.COMPLETION_PROTOCOL_VERSION_V4, frame_type]) + self._completion_entries_bytes(entries, nonce)))
+
+    def _completion_entries_bytes(self, entries, nonce: Optional[int]) -> bytes:
+        """`[n][nonce]` then the v4 entries (shared by the v4 and v5
+        encoders)."""
         entries = list(entries)[: self.COMPLETION_V4_MAX_ENTRIES]
-        body = bytearray([self.COMPLETION_PROTOCOL_VERSION, frame_type, len(entries), (nonce or 0) & 0xFF])
+        body = bytearray([len(entries), (nonce or 0) & 0xFF])
         for pkt_id, frag_total, complete, held in entries:
             frag_total = max(1, min(255, int(frag_total)))
             body += bytes([(pkt_id >> 8) & 0xFF, pkt_id & 0xFF, frag_total, 1 if complete else 0])
@@ -244,18 +254,46 @@ class _WireFormatMixin:
                 if 0 <= idx < frag_total:
                     bitmap[idx // 8] |= 1 << (idx % 8)
             body += bytes(bitmap)
+        return bytes(body)
+
+    def _encode_completion_frame_v5(self, frame_type: int, entries, nonce: Optional[int] = None,
+                                    path_len: Optional[int] = None, rate: Optional[float] = None) -> str:
+        """The v5 frame (alpha 0.1.6, item 1, 2026-09-22): `[5][type][n]
+        [nonce][path_len][rate]` then the v4 entries unchanged. `path_len`
+        is the sender's current path length to the receiver
+        (COMPLETION_PATH_UNKNOWN when it has none) and `rate` its measured
+        delivery rate on that path in 1/COMPLETION_RATE_SCALE steps
+        (COMPLETION_PATH_UNKNOWN while untried): the peer's view of the
+        symmetric path, which floods are too rare to give. Two bytes more
+        than v4; 8 entries of frag_total 3 are 46 bytes, 58 Z85 chars plus
+        the marker, inside the 160-char text limit."""
+        entries = list(entries)[: self.COMPLETION_V4_MAX_ENTRIES]
+        path_byte = self.COMPLETION_PATH_UNKNOWN if path_len is None or path_len < 0 else min(0xFE, int(path_len))
+        rate_byte = (self.COMPLETION_PATH_UNKNOWN if rate is None
+                     else max(0, min(self.COMPLETION_RATE_SCALE, int(round(float(rate) * self.COMPLETION_RATE_SCALE)))))
+        body = bytearray([self.COMPLETION_PROTOCOL_VERSION, frame_type]) + self._completion_entries_bytes(entries, nonce)
+        body[4:4] = bytes([path_byte, rate_byte])
         return self.COMPLETION_MARKER + _z85_encode(bytes(body))
 
     def _decode_completion_frame_v4(self, raw: bytes) -> _CompletionFrame:
-        """See `_encode_completion_frame_v4`. Raises ValueError on a length
-        that does not match its own entry count. The first entry is
-        mirrored into the single-part fields."""
-        if len(raw) < self.COMPLETION_V4_HEADER_SIZE:
-            raise ValueError("v4 completion frame too short for its header")
+        """See `_encode_completion_frame_v4` / `_v5`: one decoder for both,
+        the header size by version. Raises ValueError on a length that
+        does not match its own entry count. The first entry is mirrored
+        into the single-part fields."""
+        version = raw[0]
+        header_size = self.COMPLETION_V5_HEADER_SIZE if version >= 5 else self.COMPLETION_V4_HEADER_SIZE
+        if len(raw) < header_size:
+            raise ValueError(f"v{version} completion frame too short for its header")
         frame_type, n, nonce = raw[1], raw[2], raw[3]
+        peer_path_len = peer_rate = None
+        if version >= 5:
+            if raw[4] != self.COMPLETION_PATH_UNKNOWN:
+                peer_path_len = int(raw[4])
+            if raw[5] != self.COMPLETION_PATH_UNKNOWN:
+                peer_rate = min(1.0, raw[5] / float(self.COMPLETION_RATE_SCALE))
         if n < 1 or n > self.COMPLETION_V4_MAX_ENTRIES:
-            raise ValueError(f"v4 completion frame with {n} entries")
-        i = self.COMPLETION_V4_HEADER_SIZE
+            raise ValueError(f"v{version} completion frame with {n} entries")
+        i = header_size
         entries = []
         for _ in range(n):
             if len(raw) < i + 4:
@@ -276,9 +314,10 @@ class _WireFormatMixin:
         # A QUERY's bitmaps carry no information (see the encoder): held None.
         held_first = first[3] if frame_type == self.COMPLETION_TYPE_ANSWER else None
         return _CompletionFrame(
-            version=self.COMPLETION_PROTOCOL_VERSION, type=frame_type, complete=first[2],
+            version=version, type=frame_type, complete=first[2],
             pkt_id=first[0], frag_total=first[1], held=held_first, nonce=nonce,
             entries=tuple((p, t, c, (h if frame_type == self.COMPLETION_TYPE_ANSWER else None)) for p, t, c, h in entries),
+            peer_path_len=peer_path_len, peer_rate=peer_rate,
         )
 
     def _decode_completion_frame(self, marker_and_body: str) -> _CompletionFrame:
@@ -291,7 +330,7 @@ class _WireFormatMixin:
         version, frame_type, complete_byte = raw[0], raw[1], raw[2]
         if version not in (
             self.COMPLETION_PROTOCOL_VERSION_V1, self.COMPLETION_PROTOCOL_VERSION_V2,
-            self.COMPLETION_PROTOCOL_VERSION_V3, self.COMPLETION_PROTOCOL_VERSION,
+            self.COMPLETION_PROTOCOL_VERSION_V3, self.COMPLETION_PROTOCOL_VERSION_V4, self.COMPLETION_PROTOCOL_VERSION,
         ):
             raise ValueError(f"unsupported completion-frame version {version}")
         if frame_type not in (self.COMPLETION_TYPE_QUERY, self.COMPLETION_TYPE_ANSWER):

@@ -13,11 +13,14 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.5 (alpha 0.1.4 plus the 2026-09-21 pass from that
-build's field session: the hop-aware airtime cap, the burst / report
-collision fixes, shorter-path adoption, the adaptive window collect and
-the report yield -- no wire change from 0.1.4; both nodes must run 0.1.4
-or later, the "Q" and raw wire formats changed in 0.1.4); the
+STATUS -- alpha 0.1.6 (alpha 0.1.5 plus the 2026-09-22 pass from that
+build's field session: path selection by measured reliability, the
+bounded multi-hop window hold, the connection supervisor, one report per
+window, the corrected calibration line -- the "Q" wire format changed
+(v5 carries the sender's path view), so BOTH NODES MUST RUN ALPHA 0.1.6);
+alpha 0.1.5 was alpha 0.1.4 plus the 2026-09-21 pass (the hop-aware
+airtime cap, the burst / report collision fixes, shorter-path adoption,
+the adaptive window collect, the report yield); the
 dated account of every design decision and field-driven fix from alpha
 0.1.0 (2026-09-15) onward is `docs/history.md` (moved out of this
 docstring on 2026-09-20, phase 2 of that pass, unchanged), with the
@@ -63,13 +66,19 @@ change regenerates it in the same commit):
     v2+ ANSWER adds the have-bitmap, ceil(frag_total / 8) bytes, bit i = fragment i held
   Version 4 (2026-09-20, one report per window), multi-part:
     [4][type][n: 1..8][nonce] then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
-  COMPLETION_PROTOCOL_VERSION is 4; v1-v3 frames still decode and a
-  v1 / v3 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
+  Version 5 (2026-09-22, alpha 0.1.6: the sender's path view for the
+  receiver's path scoreboard), the v4 entries behind two more header bytes:
+    [5][type][n: 1..8][nonce][path_len: hops to the receiver, 0xFF none]
+    [rate: delivery rate on that path in 1/250 steps, 0xFF untried]
+    then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
+  COMPLETION_PROTOCOL_VERSION is 5; v1-v4 frames still decode and a
+  v1 / v3 / v4 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
   (COMPLETION_QUERY_NONCE_MAX) and its ANSWER echoes it; a receiver-
   initiated REPORT is an ANSWER with nonce 0xF0 | round
   (COMPLETION_REPORT_NONCE_BASE), round being the raw header's attempt
-  bits. A pre-v3 peer drops a v3 QUERY and a pre-v4 peer a v4 frame, so
-  both nodes must run the same build for reconciliation to work. Reports
+  bits. A pre-v3 peer drops a v3 QUERY, a pre-v4 peer a v4 frame and a
+  pre-v5 peer a v5 frame, so both nodes must run the same build for
+  reconciliation to work (alpha 0.1.6: both nodes must run alpha 0.1.6). Reports
   and answers are sent as MeshCore TXT_TYPE_CLI_DATA (encrypted, never
   ACKed by the firmware) since 2026-09-20; the QUERY is a plain ACKed
   text message.

@@ -6,7 +6,7 @@ from typing import Optional
 
 import RNS
 
-from ._common import _ResolvedPath
+from ._common import _PathBoard, _PathCandidate, _ResolvedPath
 
 
 class _PathDiscoveryMixin:
@@ -490,12 +490,28 @@ class _PathDiscoveryMixin:
                     # measured over the previous one doesn't carry over.
                     self._invalidate_ack_rtt(pubkey_prefix, "path (re)discovered")
                     self._record_path_discovery_success(pubkey_prefix)
+                    if self.path_selection_enabled:
+                        # Alpha 0.1.6 (item 1): a candidate on the scoreboard,
+                        # with the PATH_RESPONSE that just came back over it
+                        # as its first delivery; current when nothing is.
+                        board = self._path_board(pubkey_prefix)
+                        cand = self._add_path_candidate(
+                            pubkey_prefix, resolved.out_path_hex, resolved.out_path_len,
+                            resolved.out_path_hash_len, "discovered", now=resolved.resolved_at,
+                        )
+                        cand.consecutive_misses = 0
+                        cand.samples.append((resolved.resolved_at, True))
+                        cand.last_success_at = resolved.resolved_at
+                        if board.current is None or board.current not in board.candidates \
+                                or board.candidates[board.current].consecutive_misses >= self.path_switch_after_misses:
+                            board.current = cand.path_hex
+                        board.last_reason = "discovered"
                     RNS.log(
                         f"{self}: path discovered to {pubkey_prefix!r} in "
                         f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
                         RNS.LOG_INFO,
                     )
-                    await self._persist_resolved_path(contact, resolved)
+                    await self._persist_resolved_path(contact, resolved, peer_prefix=pubkey_prefix)
                     return resolved
 
             self._debug(f"discover_path({pubkey_prefix!r}) attempt {attempt}: no response.")
@@ -551,13 +567,16 @@ class _PathDiscoveryMixin:
                 # until the 600s sweep.
                 future.cancel()
 
-    async def _persist_resolved_path(self, contact, resolved: _ResolvedPath) -> None:
+    async def _persist_resolved_path(self, contact, resolved: _ResolvedPath, peer_prefix: Optional[str] = None) -> None:
         """docs/path_discovery_spec.md's persistence fix: a successful
         discovery is NOT written to the device's own persistent contact
         record by the firmware itself (CMD_SEND_PATH_DISCOVERY_REQ's
         handler returns before reaching the code path that would). Skip
         this and this interface's own idea of "resolved" silently
-        diverges from what the official app / device flash state show."""
+        diverges from what the official app / device flash state show.
+        Since alpha 0.1.6 it is also how a selected path reaches the
+        radio for text frames (`_select_path`); the scoreboard remembers
+        what the contact holds (`device_path`) so a path is set once."""
         try:
             await self._run_command(
                 self._mc_ready.commands.change_contact_path(
@@ -566,6 +585,8 @@ class _PathDiscoveryMixin:
                 "change_contact_path",
                 self._EventType.OK,
             )
+            if peer_prefix is not None:
+                self._path_board(peer_prefix).device_path = (resolved.out_path_hex or "").lower()
         except Exception as exc:
             RNS.log(
                 f"{self}: persisting discovered path to the device contact "
@@ -576,14 +597,32 @@ class _PathDiscoveryMixin:
                 RNS.LOG_WARNING,
             )
 
-    # -- Shorter-path adoption (alpha 0.1.5, item 3) -----------------------
-    # A bound peer's floods carry the route they took; the reverse is a
-    # route to the peer. `_note_flood_route` (from the rx-log tap) records
-    # them per peer, `_maybe_adopt_shorter_path` (from `_send_direct_
-    # packet`, the one resolved-vs-discover decision) adopts a route at
-    # least one hop shorter than the resolved path, `_note_adopted_path_
-    # result` (from `record_direct_send_result`) drops a provisional path
-    # that misses its first PATH_ADOPT_MISS_LIMIT sends.
+    # -- Path selection by measured reliability (alpha 0.1.6, item 1) ------
+    # Every route this node learns to a peer is a candidate on the peer's
+    # scoreboard (`_PathBoard`): the discovered path, the reverse of each
+    # distinct flood copy the peer's own floods took (`_note_flood_route`,
+    # from the rx-log tap), the zero-hop option once the peer has been heard
+    # directly, and the path the peer reports in every "Q" v5 frame
+    # (`_note_peer_reported_path`). Each candidate is scored as expected
+    # transmissions per delivered frame times (hops + 1) -- airtime per
+    # delivered byte in frame units, lower is better -- from its measured
+    # delivery rate (`_note_path_result`, fed by `record_direct_send_result`)
+    # or, untried, a prior. `_select_path` is the one decision, consumed by
+    # `_send_direct_packet` and `_send_direct_supplement` where alpha 0.1.5's
+    # `_maybe_adopt_shorter_path` was; the pure functions below hold every
+    # rule and are tested directly (`tests/test_path_selection_0922.py`,
+    # replaying the 2026-09-21 22:00-22:35 desktop sequence).
+    #
+    # Why this replaced the shortest-route-in-window rule: at 22:00:49 that
+    # rule adopted a zero-hop route the laptop had shown 504 s earlier --
+    # before it drove off -- over a one-hop path confirmed 2 s earlier; two
+    # misses, a reset, and discovery returned a two-hop path the desktop
+    # then kept for 32 minutes while the laptop reached it in one hop the
+    # whole time, because the one-hop route was never re-tried without a
+    # fresh flood (three usable floods in half an hour). Here a delivering
+    # path is kept, a missing one is trialled against the best alternative
+    # on the next real packet, and a candidate that failed is eligible
+    # again once its last miss is older than the switch cooldown.
 
     @staticmethod
     def _reverse_flood_path(path_hex: str, hash_size: int = 1) -> str:
@@ -632,11 +671,13 @@ class _PathDiscoveryMixin:
         return None
 
     def _note_flood_route(self, payload: dict, fields: dict, now: float) -> None:
-        """Record the route an overheard flood from a bound peer took (cheap:
-        runs inline on the rx-log tap). Every copy of a flood is logged --
-        one per repeater that relayed it -- so the shortest within the
-        window, not the first, is what adoption reads."""
-        if not self.path_adopt_enabled:
+        """Record the route an overheard flood from a bound peer took as a
+        candidate path (cheap: runs inline on the rx-log tap). Every copy of
+        a flood is logged -- one per repeater that relayed it -- so one
+        flood can add several candidates. The record's SNR / RSSI is the
+        signal of the LAST leg (the relaying repeater's transmission for a
+        relayed copy, the peer's own for a zero-hop one)."""
+        if not self.path_selection_enabled:
             return
         try:
             who = self._attribute_flood_to_peer(payload, fields)
@@ -648,141 +689,353 @@ class _PathDiscoveryMixin:
             reversed_hex = self._reverse_flood_path(str(fields.get("path") or ""), hash_size)
             if hops > 0 and len(reversed_hex) != hops * hash_size * 2:
                 return
-            routes = self._flood_routes_seen.setdefault(peer_prefix, collections.deque(maxlen=self.FLOOD_ROUTES_KEPT))
-            routes.append((now, hops, reversed_hex, hash_size, source))
+            self._add_path_candidate(
+                peer_prefix, reversed_hex, hops, hash_size, "flood", now=now,
+                snr=fields.get("snr"), rssi=fields.get("rssi"),
+            )
         except Exception as exc:
             self._debug(f"flood route observer: ignored an rx-log record: {exc}")
 
-    def _shortest_flood_route(self, peer_prefix: str, now: float, since: Optional[float] = None) -> "Optional[tuple]":
-        """The shortest route seen on this peer's floods within
-        `path_adopt_window` (pure over the recorded routes): (hops,
-        reversed path hex, hash size, source, seen at), the most recent
-        among equals, excluding routes on adoption cooldown and, with
-        `since`, routes seen before that time."""
-        window_s = max(0.0, self.path_adopt_window_s)
-        cooldown = self._adoption_cooldown.get(peer_prefix, {})
-        best = None
-        for seen_at, hops, reversed_hex, hash_size, source in self._flood_routes_seen.get(peer_prefix, ()):
-            if now - seen_at > window_s:
-                continue
-            if since is not None and seen_at < since:
-                continue
-            if cooldown.get(reversed_hex, 0.0) > now:
-                continue
-            if best is None or hops < best[0] or (hops == best[0] and seen_at > best[4]):
-                best = (hops, reversed_hex, hash_size, source, seen_at)
-        return best
+    # The pure rules. `views` are plain dicts so the tests drive them from
+    # a field replay without an interface: {path_hex, hops, samples
+    # [(t, ok)], snr, peer_rate, cooldown_until, consecutive_misses,
+    # last_failure_at, last_seen}.
 
-    async def _maybe_adopt_shorter_path(self, peer_prefix: str, resolved: "Optional[_ResolvedPath]"):
-        """Adopt the shortest flood route to `peer_prefix` when it is at
-        least one hop shorter than the resolved path -- or when there is no
-        resolved path at all (a stale-path reset just forgot it, or none was
-        ever discovered) and a recent flood route exists: set it on the
-        device contact (`change_contact_path`, as discovery persists), make
-        it the resolved path (provisional), and return it. Otherwise return
-        `resolved` unchanged. Not while a raw window to the peer is in
-        flight (its fragments are source-routed on the old path and a
-        change mid-send aborts it), and not while an earlier adoption is
-        still provisional.
+    @staticmethod
+    def _path_delivery_rate(samples, now: float, window_s: float, half_life_s: float) -> Optional[float]:
+        """The weighted delivery rate over `samples` [(t, ok)] (pure): each
+        outcome weighs 0.5 ** (age / half_life_s), outcomes older than
+        `window_s` count for nothing. None when nothing counts."""
+        num = den = 0.0
+        for t, ok in samples:
+            age = now - t
+            if age < 0 or age > window_s:
+                continue
+            w = 0.5 ** (age / max(1e-6, half_life_s))
+            den += w
+            if ok:
+                num += w
+        return (num / den) if den > 0 else None
 
-        The no-path case is from MeshBench `shortcut_appears` (2026-09-21,
-        first run): B's one-hop floods reached A 10 s AFTER A's own stale-
-        path reset had forgotten the three-hop path, so the first cut stood
-        aside for discovery, which took 220 s more under its backoff. In
-        that case only routes seen AFTER the reset count (`_path_reset_at`):
-        the second run adopted a 571 s old two-hop route from before the
-        topology changed, missed twice and dropped it -- evidence older than
-        the failure describes the topology that just failed. With a path
-        still resolved, older evidence does count: the field's two-hop
-        floods were three minutes old when the four-hop path was
-        discovered, and were never refreshed in the 35 minutes after."""
-        if not self.path_adopt_enabled:
-            return resolved
-        if peer_prefix in self._adopted_paths or peer_prefix in self._raw_windows:
-            return resolved
-        now = time.monotonic()
-        since = self._path_reset_at.get(peer_prefix) if resolved is None else None
-        best = self._shortest_flood_route(peer_prefix, now, since=since)
-        if best is None:
-            return resolved
-        hops, reversed_hex, hash_size, source, seen_at = best
-        if resolved is not None and hops > max(0, resolved.out_path_len) - 1:
-            return resolved
-        contact = self._resolve_contact(peer_prefix)
-        if contact is None:
-            return resolved
-        adopted = _ResolvedPath(out_path_hex=reversed_hex, out_path_len=hops, out_path_hash_len=hash_size, resolved_at=now)
-        previous = resolved
-        self._resolved_paths[peer_prefix] = adopted
-        self._adopted_paths[peer_prefix] = {
-            "path_hex": reversed_hex, "previous": previous, "misses": 0, "adopted_at": now, "source": source,
+    @staticmethod
+    def _path_prior(hops: int, snr: Optional[float], weak_snr_db: float, peer_rate: Optional[float] = None,
+                    optimistic: float = 0.8, weak: float = 0.25) -> float:
+        """The delivery rate an UNTRIED candidate is scored with (pure): the
+        peer's own reported rate on a path of this length when it sent one,
+        else the weak prior for a zero-hop candidate whose last direct frame
+        was below `weak_snr_db` (the owner's repeater assumption), else the
+        optimistic prior -- so the shortest untried path scores best and is
+        tried first."""
+        if peer_rate is not None:
+            return max(0.0, min(1.0, float(peer_rate)))
+        if hops == 0 and snr is not None and float(snr) < weak_snr_db:
+            return weak
+        return optimistic
+
+    @staticmethod
+    def _path_score(hops: int, rate: float, rate_floor: float = 0.05) -> float:
+        """Expected transmissions per delivered frame times (hops + 1)
+        (pure): airtime per delivered byte in frame units, lower is
+        better."""
+        return (max(0, int(hops)) + 1) / max(rate_floor, float(rate))
+
+    @classmethod
+    def _rank_paths(cls, views, now: float, weak_snr_db: float, window_s: float, half_life_s: float,
+                    optimistic: float = 0.8, weak: float = 0.25, rate_floor: float = 0.05) -> list:
+        """Every candidate scored (pure): [(score, view, rate, measured)]
+        sorted best first -- a candidate on switch-back cooldown ranks
+        behind every other, then by score, then fewer hops (the tiebreak),
+        then most recently seen."""
+        ranked = []
+        for v in views:
+            rate = cls._path_delivery_rate(v.get("samples") or (), now, window_s, half_life_s)
+            measured = rate is not None
+            if not measured:
+                rate = cls._path_prior(int(v.get("hops") or 0), v.get("snr"), weak_snr_db, v.get("peer_rate"),
+                                       optimistic=optimistic, weak=weak)
+            score = cls._path_score(int(v.get("hops") or 0), rate, rate_floor=rate_floor)
+            ranked.append((score, v, rate, measured))
+        ranked.sort(key=lambda r: ((r[1].get("cooldown_until") or 0.0) > now, r[0], int(r[1].get("hops") or 0),
+                                   -float(r[1].get("last_seen") or 0.0)))
+        return ranked
+
+    @classmethod
+    def _choose_path(cls, views, current_hex: Optional[str], now: float, switch_after_misses: int, cooldown_s: float,
+                     weak_snr_db: float, window_s: float, half_life_s: float, **kw) -> "tuple[Optional[str], str, list]":
+        """The switching rule (pure): (path hex or None, reason, ranked).
+        A candidate is eligible while it has missed fewer than
+        `switch_after_misses` consecutive sends, or again once its last
+        miss is older than `cooldown_s` (the re-try the field lacked). With
+        no current path the best eligible candidate is "selected"; a current
+        path still under the miss threshold is kept ("current", whatever the
+        alternatives score -- a delivering path is not abandoned on hop
+        count); past it, the best eligible candidate is used: the current
+        one itself ("current_best") or another as a "trial". "exhausted":
+        every candidate has failed its last sends -- the caller runs
+        discovery; "none": nothing is known."""
+        views = list(views)
+        if not views:
+            return None, "none", []
+        ranked = cls._rank_paths(views, now, weak_snr_db, window_s, half_life_s, **kw)
+
+        def eligible(v) -> bool:
+            if int(v.get("consecutive_misses") or 0) < switch_after_misses:
+                return True
+            last = v.get("last_failure_at")
+            return last is not None and now - float(last) >= cooldown_s
+
+        by_hex = {v["path_hex"]: v for v in views}
+        current = by_hex.get(current_hex) if current_hex is not None else None
+        if current is None:
+            for _score, v, _rate, _m in ranked:
+                if eligible(v):
+                    return v["path_hex"], "selected", ranked
+            return None, "exhausted", ranked
+        if int(current.get("consecutive_misses") or 0) < switch_after_misses:
+            return current_hex, "current", ranked
+        for _score, v, _rate, _m in ranked:
+            if eligible(v):
+                return v["path_hex"], ("current_best" if v is current else "trial"), ranked
+        return None, "exhausted", ranked
+
+    @staticmethod
+    def _switch_for_good(current_score: float, candidate_score: float, margin: float,
+                         candidate_cooldown_until: float, now: float) -> bool:
+        """Whether a trial that delivered becomes the current path (pure):
+        its score must beat the current path's by `margin` and it must not
+        be on switch-back cooldown."""
+        if candidate_cooldown_until > now:
+            return False
+        return candidate_score <= current_score * (1.0 - margin)
+
+    # The scoreboard.
+
+    def _path_board(self, peer_prefix: str) -> "_PathBoard":
+        board = self._path_boards.get(peer_prefix)
+        if board is None:
+            board = _PathBoard()
+            self._path_boards[peer_prefix] = board
+        return board
+
+    def _path_view(self, cand: "_PathCandidate") -> dict:
+        return {
+            "path_hex": cand.path_hex, "hops": cand.hops, "samples": list(cand.samples), "snr": cand.snr,
+            "peer_rate": cand.peer_rate, "cooldown_until": cand.cooldown_until,
+            "consecutive_misses": cand.consecutive_misses, "last_failure_at": cand.last_failure_at,
+            "last_seen": cand.last_seen, "source": cand.source,
         }
-        self._direct_path_failures.pop(peer_prefix, None)
-        self._invalidate_ack_rtt(peer_prefix, "shorter path adopted")
-        was = (f"replaces {previous.out_path_hex or '<zero-hop>'} ({previous.out_path_len} hop(s))"
-               if previous is not None else "where no path was resolved (discovery skipped)")
-        RNS.log(
-            f"{self}: adopted a path to {peer_prefix!r} from its own {source} flood: "
-            f"{reversed_hex or '<zero-hop>'} ({hops} hop(s)) {was}, seen {now - seen_at:.0f}s ago; "
-            f"provisional until it delivers.",
-            RNS.LOG_INFO,
-        )
-        if self._packet_capture_file is not None:
-            self._capture_event("out", {
-                "event": "path_adopted", "peer_prefix": peer_prefix, "source": source,
-                "old_path_len": previous.out_path_len if previous is not None else None,
-                "old_path_hex": previous.out_path_hex if previous is not None else None,
-                "new_path_len": hops, "new_path_hex": reversed_hex, "seen_age_s": round(now - seen_at, 1),
-            })
-        await self._persist_resolved_path(contact, adopted)
-        return adopted
 
-    def _note_adopted_path_result(self, pubkey_prefix: str, succeeded: bool, waited_full_timeout: bool) -> bool:
-        """Bookkeeping for a provisional adopted path, from `record_direct_
-        send_result`. Returns True when the failure was consumed here (the
-        adopted path was dropped and the ordinary detector should not count
-        it). A success confirms the adoption; PATH_ADOPT_MISS_LIMIT
-        consecutive full-timeout failures before any success drop it: the
-        route goes on cooldown for the window, the resolved path is
-        forgotten so the next send runs discovery, exactly as before the
-        adoption."""
-        entry = self._adopted_paths.get(pubkey_prefix)
-        if entry is None:
-            return False
-        resolved = self._resolved_paths.get(pubkey_prefix)
-        if resolved is None or resolved.out_path_hex != entry["path_hex"]:
-            self._adopted_paths.pop(pubkey_prefix, None)
-            return False
-        if succeeded:
-            self._adopted_paths.pop(pubkey_prefix, None)
-            if self._packet_capture_file is not None:
-                self._capture_event("out", {"event": "path_adoption_confirmed", "peer_prefix": pubkey_prefix,
-                                            "path_len": resolved.out_path_len, "path_hex": resolved.out_path_hex,
-                                            "after_s": round(time.monotonic() - entry["adopted_at"], 1)})
-            return False
-        if not waited_full_timeout:
-            return False
-        entry["misses"] += 1
-        if entry["misses"] < self.PATH_ADOPT_MISS_LIMIT:
-            return True
-        self._adopted_paths.pop(pubkey_prefix, None)
+    def _path_rank_kwargs(self) -> dict:
+        return {
+            "weak_snr_db": self.path_weak_snr_db, "window_s": self.PATH_SAMPLE_WINDOW_S,
+            "half_life_s": self.PATH_SAMPLE_HALF_LIFE_S, "optimistic": self.PATH_PRIOR_OPTIMISTIC,
+            "weak": self.PATH_PRIOR_WEAK, "rate_floor": self.PATH_RATE_FLOOR,
+        }
+
+    def _add_path_candidate(self, peer_prefix: str, path_hex: str, hops: int, hash_size: int, source: str,
+                            now: Optional[float] = None, snr: Optional[float] = None,
+                            rssi: Optional[float] = None) -> "_PathCandidate":
+        """Create or refresh a candidate path to `peer_prefix`. A known
+        route keeps its statistics and first source and gains the fresher
+        last-seen time (and signal, when given); a fifth candidate evicts
+        the worst-ranked one that is not current."""
+        now = time.monotonic() if now is None else now
+        board = self._path_board(peer_prefix)
+        path_hex = (path_hex or "").lower()
+        cand = board.candidates.get(path_hex)
+        if cand is None:
+            if len(board.candidates) >= self.PATH_CANDIDATES_KEPT:
+                ranked = self._rank_paths([self._path_view(c) for c in board.candidates.values()], now,
+                                          **self._path_rank_kwargs())
+                for _score, v, _rate, _m in reversed(ranked):
+                    if v["path_hex"] != board.current:
+                        board.candidates.pop(v["path_hex"], None)
+                        break
+            cand = _PathCandidate(path_hex, int(hops), max(1, int(hash_size)), source, now)
+            board.candidates[path_hex] = cand
+        cand.last_seen = now
+        if snr is not None or rssi is not None:
+            cand.snr, cand.rssi, cand.signal_at = snr, rssi, now
+        return cand
+
+    def _note_path_signal(self, peer_prefix: str, path_hex: Optional[str], snr: Optional[float],
+                          rssi: Optional[float], now: Optional[float] = None) -> None:
+        """The signal of the last frame received over a candidate path --
+        for a relayed path that is its LAST leg only (the repeater's
+        transmission), the only leg this radio hears; for the zero-hop
+        path it is the peer's own signal, which is what the weak-direct
+        prior reads. Fed with the ACK the rx-log matched to our own send
+        (`_classify_rx_log_for_window`)."""
+        if path_hex is None or (snr is None and rssi is None):
+            return
+        cand = self._path_board(peer_prefix).candidates.get((path_hex or "").lower())
+        if cand is not None:
+            cand.snr, cand.rssi, cand.signal_at = snr, rssi, (time.monotonic() if now is None else now)
+
+    def _note_peer_reported_path(self, peer_prefix: str, hops: Optional[int], rate: Optional[float],
+                                 now: Optional[float] = None) -> None:
+        """The peer's own view, from a "Q" v5 frame: its current path
+        length to us and its delivery rate on it. A zero-hop report makes
+        (or refreshes) the zero-hop candidate -- the peer hears us
+        directly; a reported rate is evidence for the symmetric path: every
+        candidate of that hop count scores with it while untried."""
+        if hops is None or not self.path_selection_enabled:
+            return
+        now = time.monotonic() if now is None else now
+        board = self._path_board(peer_prefix)
+        board.peer_path_len, board.peer_rate, board.peer_report_at = int(hops), rate, now
+        if hops == 0:
+            self._add_path_candidate(peer_prefix, "", 0, 1, "peer_report", now=now)
+        if rate is not None:
+            for cand in board.candidates.values():
+                if cand.hops == hops:
+                    cand.peer_rate, cand.peer_rate_at = float(rate), now
+
+    def _path_rate_for_wire(self, peer_prefix: Optional[str]) -> "tuple[Optional[int], Optional[float]]":
+        """What this node tells the peer in a "Q" v5 header: the hop count
+        of its current path to the peer and the measured delivery rate on
+        it (None while untried)."""
+        if peer_prefix is None:
+            return None, None
+        resolved = self._resolved_paths.get(peer_prefix)
+        board = self._path_boards.get(peer_prefix)
+        if resolved is None:
+            return None, None
+        cand = board.candidates.get((resolved.out_path_hex or "").lower()) if board is not None else None
+        rate = None
+        if cand is not None:
+            rate = self._path_delivery_rate(cand.samples, time.monotonic(), self.PATH_SAMPLE_WINDOW_S,
+                                            self.PATH_SAMPLE_HALF_LIFE_S)
+        return int(resolved.out_path_len), rate
+
+    def _note_path_result(self, peer_prefix: str, path_hex: Optional[str], ok: bool,
+                          ack_latency_s: Optional[float] = None, now: Optional[float] = None) -> None:
+        """One send's outcome on a candidate path (a send = its whole
+        attempt budget, as `record_direct_send_result` counts). A success
+        on a trial path that beats the current one by `path_switch_margin`
+        makes it current for good and puts the old current on switch-back
+        cooldown (`path_switch_cooldown`)."""
+        if path_hex is None:
+            return
+        now = time.monotonic() if now is None else now
+        board = self._path_board(peer_prefix)
+        path_hex = (path_hex or "").lower()
+        cand = board.candidates.get(path_hex)
+        if cand is None:
+            hops = len(path_hex) // 2
+            cand = self._add_path_candidate(peer_prefix, path_hex, hops, 1, "discovered", now=now)
+        cand.samples.append((now, bool(ok)))
+        if ok:
+            cand.consecutive_misses = 0
+            cand.last_success_at = now
+            if ack_latency_s is not None and ack_latency_s > 0:
+                cand.ack_latencies.append(float(ack_latency_s))
+        else:
+            cand.consecutive_misses += 1
+            cand.last_failure_at = now
+        if board.current is None:
+            board.current = path_hex
+            return
+        if ok and path_hex != board.current:
+            ranked = self._rank_paths([self._path_view(c) for c in board.candidates.values()], now,
+                                      **self._path_rank_kwargs())
+            scores = {v["path_hex"]: s for s, v, _r, _m in ranked}
+            if board.current in scores and self._switch_for_good(
+                    scores[board.current], scores[path_hex], self.path_switch_margin, cand.cooldown_until, now):
+                previous = board.candidates.get(board.current)
+                if previous is not None:
+                    previous.cooldown_until = now + self.path_switch_cooldown_s
+                board.current = path_hex
+                self._capture_path_selected(peer_prefix, "switch", cand, previous, ranked)
+                RNS.log(
+                    f"{self}: path to {peer_prefix!r} switched to {path_hex or '<zero-hop>'} ({cand.hops} hop(s), "
+                    f"score {scores[path_hex]:.2f}) from {previous.path_hex or '<zero-hop>' if previous else '?'} "
+                    f"(score {scores.get(previous.path_hex, 0.0) if previous else 0.0:.2f}) for good.",
+                    RNS.LOG_INFO,
+                )
+
+    def _capture_path_selected(self, peer_prefix: str, reason: str, cand: "Optional[_PathCandidate]",
+                               previous: "Optional[_PathCandidate]", ranked) -> None:
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", {
+            "event": "path_selected", "peer_prefix": peer_prefix, "reason": reason,
+            "path_hex": cand.path_hex if cand is not None else None,
+            "path_len": cand.hops if cand is not None else None,
+            "previous_path_hex": previous.path_hex if previous is not None else None,
+            "previous_path_len": previous.hops if previous is not None else None,
+            "scores": [{
+                "path_hex": v["path_hex"], "hops": v["hops"], "score": round(score, 3), "rate": round(rate, 3),
+                "measured": measured, "misses": v["consecutive_misses"], "snr": v.get("snr"), "source": v.get("source"),
+            } for score, v, rate, measured in ranked],
+        })
+
+    async def _select_path(self, peer_prefix: str) -> "Optional[_ResolvedPath]":
+        """The one path decision for a DIRECT send to `peer_prefix`: the
+        `_ResolvedPath` to use, set on the device contact when it differs
+        from what the contact holds (text frames are routed by the contact's
+        stored path; raw fragments carry theirs explicitly), or None when
+        every candidate is exhausted (the caller runs discovery, exactly
+        where it did before) or nothing is known. Not while a raw window to
+        the peer is in flight -- its fragments are source-routed on the
+        current path and a change mid-send aborts it."""
+        resolved = self._resolved_paths.get(peer_prefix)
+        if not self.path_selection_enabled or peer_prefix in self._raw_windows:
+            return resolved
         now = time.monotonic()
-        self._adoption_cooldown.setdefault(pubkey_prefix, {})[entry["path_hex"]] = now + max(0.0, self.path_adopt_window_s)
-        self._resolved_paths.pop(pubkey_prefix, None)
-        self._path_reset_at[pubkey_prefix] = now
-        self._direct_path_failures.pop(pubkey_prefix, None)
-        self._invalidate_ack_rtt(pubkey_prefix, "adopted path dropped")
-        RNS.log(
-            f"{self}: adopted path {entry['path_hex'] or '<zero-hop>'} to {pubkey_prefix!r} missed its first "
-            f"{entry['misses']} send(s) -- dropped; the next send goes through path discovery.",
-            RNS.LOG_WARNING,
+        board = self._path_board(peer_prefix)
+        if resolved is not None and (resolved.out_path_hex or "").lower() not in board.candidates:
+            cand = self._add_path_candidate(peer_prefix, resolved.out_path_hex, resolved.out_path_len,
+                                            resolved.out_path_hash_len, "discovered", now=resolved.resolved_at)
+            if board.current is None:
+                board.current = cand.path_hex
+        views = [self._path_view(c) for c in board.candidates.values()]
+        chosen_hex, reason, ranked = self._choose_path(
+            views, board.current, now, self.path_switch_after_misses, self.path_switch_cooldown_s,
+            **self._path_rank_kwargs(),
         )
-        if self._packet_capture_file is not None:
-            self._capture_event("out", {"event": "path_adoption_failed", "peer_prefix": pubkey_prefix,
-                                        "path_hex": entry["path_hex"], "misses": entry["misses"],
-                                        "previous_path_len": (entry["previous"].out_path_len
-                                                              if entry["previous"] is not None else None)})
-        return True
+        previous = board.candidates.get((resolved.out_path_hex or "").lower()) if resolved is not None else None
+        if chosen_hex is None:
+            if reason != board.last_reason:
+                self._capture_path_selected(peer_prefix, reason, None, previous, ranked)
+                if reason == "exhausted":
+                    RNS.log(
+                        f"{self}: every candidate path to {peer_prefix!r} has missed its last "
+                        f"{self.path_switch_after_misses} send(s) -- running path discovery.",
+                        RNS.LOG_WARNING,
+                    )
+            board.last_reason = reason
+            if resolved is not None:
+                self._resolved_paths.pop(peer_prefix, None)
+                self._invalidate_ack_rtt(peer_prefix, "candidate paths exhausted")
+            return None
+        cand = board.candidates[chosen_hex]
+        if reason == "selected":
+            board.current = chosen_hex
+        elif reason == "trial":
+            cand.trials += 1
+        changed = resolved is None or (resolved.out_path_hex or "").lower() != chosen_hex
+        if changed or reason != board.last_reason and reason in ("selected", "trial", "switch"):
+            self._capture_path_selected(peer_prefix, reason, cand, previous, ranked)
+            RNS.log(
+                f"{self}: path to {peer_prefix!r}: {reason} {chosen_hex or '<zero-hop>'} ({cand.hops} hop(s), "
+                f"{cand.source}" + (f", {cand.consecutive_misses} miss(es)" if cand.consecutive_misses else "") + ")"
+                + (f" instead of {previous.path_hex or '<zero-hop>'} ({previous.hops} hop(s), "
+                   f"{previous.consecutive_misses} miss(es))" if previous is not None and previous is not cand else "")
+                + ".",
+                RNS.LOG_INFO if reason != "trial" else RNS.LOG_DEBUG,
+            )
+        board.last_reason = reason
+        if changed:
+            resolved = _ResolvedPath(out_path_hex=chosen_hex, out_path_len=cand.hops,
+                                     out_path_hash_len=cand.hash_size, resolved_at=now)
+            self._resolved_paths[peer_prefix] = resolved
+            self._invalidate_ack_rtt(peer_prefix, "path selected")
+        if board.device_path != chosen_hex:
+            contact = self._resolve_contact(peer_prefix)
+            if contact is not None:
+                await self._persist_resolved_path(contact, resolved, peer_prefix=peer_prefix)
+        return resolved
 
     # -- Stale cached-path detection and reset (§8) ------------------------
 
@@ -792,6 +1045,8 @@ class _PathDiscoveryMixin:
         succeeded: bool,
         waited_full_timeout: bool,
         rssi: Optional[float] = None,
+        path_hex: Optional[str] = None,
+        ack_latency_s: Optional[float] = None,
     ) -> None:
         """docs/path_discovery_spec.md §8 / reliability_engine_design.md
         §8: call this after every DIRECT send attempt made against an
@@ -824,9 +1079,18 @@ class _PathDiscoveryMixin:
         feed this floor honestly. Left as configured/tested-but-unreached
         rather than deleted or faked with a converted value that hasn't
         been validated against real hardware."""
-        # Alpha 0.1.5 (item 3): a provisional adopted path keeps its own
-        # two-miss rule; a failure it consumed is not the detector's.
-        if self._note_adopted_path_result(pubkey_prefix, succeeded, waited_full_timeout):
+        # Alpha 0.1.6 (item 1): with path selection on, every send outcome
+        # is a sample on the path it went over (`path_hex`, else the current
+        # resolved path) and the scoreboard's exhaustion rule -- every
+        # candidate missed its last sends -> discovery -- replaces the
+        # threshold detector below, whose min-age and healthy-patience
+        # guards belong to a world with one path per peer.
+        if self.path_selection_enabled:
+            if path_hex is None:
+                resolved = self._resolved_paths.get(pubkey_prefix)
+                path_hex = resolved.out_path_hex if resolved is not None else None
+            if succeeded or waited_full_timeout:
+                self._note_path_result(pubkey_prefix, path_hex, succeeded, ack_latency_s=ack_latency_s)
             return
         if succeeded:
             self._direct_path_failures.pop(pubkey_prefix, None)
@@ -908,7 +1172,6 @@ class _PathDiscoveryMixin:
         # again rather than retry a path already known to be dead.
         self._direct_path_failures.pop(pubkey_prefix, None)
         self._resolved_paths.pop(pubkey_prefix, None)
-        self._path_reset_at[pubkey_prefix] = time.monotonic()   # item 3: older flood routes describe the dead topology
         self._invalidate_ack_rtt(pubkey_prefix, "stale path reset")
 
         contact = self._resolve_contact(pubkey_prefix)

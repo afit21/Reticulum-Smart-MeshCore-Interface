@@ -27,9 +27,13 @@ As this project is under a GPL license, there is nothing stopping you from lifti
 
 In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
 
-## Features (Version alpha0.1.5)
+## Features (Version alpha0.1.6)
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
+
+New in alpha 0.1.6 (**wire change: both nodes must run alpha 0.1.6** -- the fragment-reconciliation frames now carry each node's view of its path to the other):
+
+- path selection by measured reliability replaces shorter-path adoption: every route a node learns to a peer (discovered, seen on the peer's own floods, direct, or reported by the peer) is scored by airtime per delivered byte from its measured delivery rate, a delivering path is kept, a path that misses twice is trialled against the best alternative, and a weak direct signal is scored below a repeater path (`path_selection_enabled`, `path_weak_snr_db`, `path_switch_after_misses`, `path_switch_margin`, `path_switch_cooldown`; `path_adopt_window` is gone, `path_adopt_enabled` still works as an alias).
 
 New in alpha 0.1.5 (no wire change from 0.1.4; both nodes should still run the same build):
 
@@ -65,13 +69,13 @@ New in alpha 0.1.4:
 | Packet Capture Debug Tool | Battle Tested | Built-in packet capture for debugging the interface. Also logs every packet the radio overhears, not just our own. |
 | Radio Traffic Awareness | Working | Taps the companion radio's raw RX log to see every packet it decodes, including traffic that isn't ours. Costs no airtime. |
 | Adaptive ACK Timing | Working | Measures the real round trip to each peer and shortens ACK waits to match, never waiting longer than the hop-scaled ceiling. A missed ACK doubles the next wait rather than discarding the measurement. |
-| Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.4 or later (the wire format changed in 0.1.4). |
+| Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.6 (the wire format changed in 0.1.4 and again in 0.1.6). |
 | Dead Hop Detection | Experimental | If the first repeater never echoes our frame, the attempt is abandoned early and a stale path is re-discovered in about 30 seconds instead of 4 minutes. |
 | Airtime Duty Cycle | Working | Caps the interface's airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings: 30% for anything a repeater relays (`duty_cycle_max_fraction`), 85% for zero-hop direct traffic (`duty_cycle_max_fraction_zero_hop`). Link keepalives skip the wait but still count against the cap. |
 | Queue Hygiene | Working | Drops duplicate, stale and closed-link packets from the queue so a backlog isn't dumped onto the mesh when a path comes back, and forwards at most one spontaneous announce per destination every 5 minutes. |
 | Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear. Off by default. |
 | Raw Binary Fragments | Experimental | On by default. Packets too large for one text message go to a capable peer as MeshCore raw binary packets: no Z85, no text framing, no per-fragment ACK (about 43% less sender airtime). Reliability comes from Fragment Reconciliation; if raw never arrives on a path but text does, that path falls back to text for a while. Older peers still get text fragments. **Privacy note:** MeshCore raw packets are not encrypted or authenticated by the firmware. Your contents are still end-to-end encrypted by Reticulum, but the RNS packet header and both nodes' key prefixes are visible on air, and a third party could inject a fragment (Reticulum rejects it, but the transfer has to be re-sent). Set `direct_raw_fragments_enabled = no` to stay fully inside MeshCore's encryption. |
-| Shorter-Path Adoption | Experimental | On by default. When a peer's own MeshCore floods (its adverts, its path requests to us) arrive over a shorter route than the path this node holds for it, that route is adopted for the contact instead of waiting for a stale-path reset and rediscovery. A newly adopted path that misses its first two sends is dropped again. `path_adopt_enabled = no` turns it off; `path_adopt_window` (600 s) is how recent a flood must be. |
+| Path Selection | Experimental | On by default. Keeps a scoreboard of every route it knows to a peer -- the discovered path, routes seen on the peer's own MeshCore floods, the direct link, and the path the peer reports -- scored by airtime per delivered byte from the measured delivery rate. A path that is delivering is kept; after two missed sends the next packet tries the best-scoring alternative, and a switch is made for good only when it clearly wins. A direct link heard below `path_weak_snr_db` (3 dB) is scored below a repeater path. `path_selection_enabled = no` turns it off; `path_switch_after_misses` (2), `path_switch_margin` (0.25), `path_switch_cooldown` (120 s) tune it. |
 | Parity Fragments | Experimental | On by default. From one MeshCore hop up, each burst of raw fragments ends with an XOR parity fragment, so a receiver that lost exactly one fragment rebuilds it instead of waiting for a retry round. Costs one extra fragment per burst; set `direct_raw_parity_enabled = no` to turn it off. |
 
 ## Requirements

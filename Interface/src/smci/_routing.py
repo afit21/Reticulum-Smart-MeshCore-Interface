@@ -1179,13 +1179,10 @@ class _RoutingMixin:
         `_send_direct_to_all_peers`, which is the one caller that has no
         broadcast running alongside to cover for a False and therefore needs
         to know)."""
-        resolved = self._resolved_paths.get(peer_prefix)
-        # Alpha 0.1.5 (item 3, from shortcut_appears): the same shorter-path
-        # adoption `_send_direct_packet` makes -- this is the other place a
-        # send decides resolved-versus-discover (DIRECT-to-all and the
-        # supplements route a destination with no token through here), and
-        # a run in which no PROOF ever came back never reached the first.
-        resolved = await self._maybe_adopt_shorter_path(peer_prefix, resolved)
+        # Alpha 0.1.6 (item 1): the same scoreboard decision `_send_direct_
+        # packet` makes -- this is the other place a send decides resolved-
+        # versus-discover (a DIRECT-to-all copy never reaches it).
+        resolved = await self._select_path(peer_prefix)
         if resolved is None:
             if not trigger_discovery:
                 return False

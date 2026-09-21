@@ -1,5 +1,45 @@
 # Changelog
 
+## unreleased -- alpha-0.1.6 (2026-09-22)
+
+The items of the alpha 0.1.6 pass, each from the alpha 0.1.5 field session's captures
+(`fieldtests/raw/Alpha0.1.5/`, desktop `afipc_` + laptop `a_`, the 2026-09-21 evening drive).
+**Wire change: the "Q" completion frame is protocol v5 (it carries the sender's path view), so both
+nodes must run alpha 0.1.6.** The dated design record is `docs/history.md` ("Alpha 0.1.6 pass");
+MeshBench results per item are at the end of this section. New config keys, all optional (defaults
+shown): `path_selection_enabled = yes` (the old `path_adopt_enabled` is accepted as an alias),
+`path_weak_snr_db = 3.0`, `path_switch_after_misses = 2`, `path_switch_margin = 0.25`,
+`path_switch_cooldown = 120`. Removed: `path_adopt_window`. Every default is pinned by
+`tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`; the wire golden gained the
+v5 cases (the v4 cases are byte-identical under their new names).
+
+- **Path selection by measured reliability** (replaces shorter-path adoption; `_paths.py`). Every
+  route this node learns to a peer -- the discovered path, the reverse of each flood copy the peer's
+  own floods took, the zero-hop option once the peer has been heard directly, and the path the peer
+  itself reports -- is a candidate on a per-peer scoreboard (at most four), scored as expected
+  transmissions per delivered frame times (hops + 1): airtime per delivered byte, lower is better,
+  from its delivery rate over its last eight sends (older ones weighted down, nothing older than ten
+  minutes). An untried path scores with an optimistic prior (0.8) so the shortest untried path is
+  tried first, except a zero-hop candidate heard below `path_weak_snr_db`, which scores with a weak
+  prior (0.25 -- below the 0.4 first proposed, because at 0.4 it would tie an untried one-hop path
+  and the hop tiebreak would choose the weak direct path). The current path is kept while it
+  delivers; after `path_switch_after_misses` consecutive missed sends the next real packet goes on
+  the best-scoring alternative (a trial, no probe); a trial that delivers becomes current for good
+  only when it beats the current path's score by `path_switch_margin`, and a path switched away from
+  is not switched back to for `path_switch_cooldown`. Discovery runs only when every candidate has
+  missed its last sends; a candidate whose last miss is older than the cooldown is tried again --
+  the re-try the field lacked. Field motivation: at 22:00:49 the old rule adopted a 504 s old
+  zero-hop route over a one-hop path confirmed 2 s earlier, and the desktop then sat on a two-hop
+  path for 32 minutes while the laptop reached it in one, with only three usable floods in that
+  half hour. Capture: `path_selected` (reason selected / trial / switch / exhausted, every
+  candidate's score). Tests: `tests/test_path_selection_0922.py` (the pure rules, the field replay
+  from `tests/fixtures/field_0921_desktop_22h.json`, the v5 codec, the scoreboard on the fake node).
+  MeshBench: `shortcut_appears`'s hard check reads `path_selected`; new scenario `weak_direct`.
+- **"Q" protocol v5.** Every QUERY, ANSWER and REPORT carries the sender's current path length to
+  the receiver and its measured delivery rate on it (two header bytes, 0xFF unknown); the receiver
+  adds a reported zero-hop path as a candidate and uses the reported rate as the prior for untried
+  candidates of that hop count. v1-v4 frames still decode; a v4 QUERY is answered in v4.
+
 ## alpha-0.1.5 (2026-09-21)
 
 The items of the alpha 0.1.5 pass, each from the alpha 0.1.4 field session's captures

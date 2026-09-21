@@ -1202,8 +1202,10 @@ class _ReconcileMixin:
         answer: Optional[_CompletionFrame] = None
         timeout_s = self._completion_query_timeout_s(peer_prefix, hop_count)
         try:
-            frame = self._encode_completion_frame_v4(
+            wire_path_len, wire_rate = self._path_rate_for_wire(peer_prefix)
+            frame = self._encode_completion_frame_v5(
                 self.COMPLETION_TYPE_QUERY, [(p, t, False, None) for p, t in query_entries], nonce=query_nonce,
+                path_len=wire_path_len, rate=wire_rate,
             )
             # First raw field test (2026-09-18 night): the QUERY is one
             # ordinary ACKed exchange -- lock held through its transmit and
@@ -1363,6 +1365,12 @@ class _ReconcileMixin:
         except ValueError as exc:
             self._debug(f"discarding malformed completion-check frame from {sender_token!r}: {exc}")
             return
+        if frame.peer_path_len is not None:
+            # v5 (alpha 0.1.6, item 1): the sender's path view feeds this
+            # node's scoreboard for the symmetric path.
+            _peer = self._canonical_peer_prefix(sender_token)
+            if _peer is not None:
+                self._note_peer_reported_path(_peer, frame.peer_path_len, frame.peer_rate)
 
         if frame.type == self.COMPLETION_TYPE_QUERY:
             # Step 3 (2026-09-18): answer with what we actually hold, not
@@ -1377,7 +1385,7 @@ class _ReconcileMixin:
                 # one v4 ANSWER lists every part's state.
                 entries = [(p, t) + self._bucket_state(sender_token, p, t) for p, t, _c, _h in frame.entries]
                 self._debug(
-                    f"completion QUERY (v4) from {sender_token!r} for {[(p, t) for p, t, _c, _h in frame.entries]}: "
+                    f"completion QUERY (v{frame.version}) from {sender_token!r} for {[(p, t) for p, t, _c, _h in frame.entries]}: "
                     f"answering {[(p, c, sorted(h)) for p, _t, c, h in entries]}."
                 )
                 if self._packet_capture_file is not None:
@@ -1763,14 +1771,20 @@ class _ReconcileMixin:
                 f"no resolvable contact/public_key."
             )
             return
-        if entries and (version is None or version >= 4):
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        # v5 (alpha 0.1.6, item 1): every ANSWER and REPORT carries this
+        # node's path length to the peer and its delivery rate on it.
+        wire_path_len, wire_rate = self._path_rate_for_wire(peer_prefix)
+        if entries and (version is None or version >= 5):
+            frame = self._encode_completion_frame_v5(self.COMPLETION_TYPE_ANSWER, entries, nonce=nonce,
+                                                     path_len=wire_path_len, rate=wire_rate)
+        elif entries and version >= 4:
             frame = self._encode_completion_frame_v4(self.COMPLETION_TYPE_ANSWER, entries, nonce=nonce)
         else:
             frame = self._encode_completion_frame(
                 self.COMPLETION_TYPE_ANSWER, pkt_id, frag_total, complete=complete, nonce=nonce,
-                held=held, version=version,
+                held=held, version=version, path_len=wire_path_len, rate=wire_rate,
             )
-        peer_prefix = self._canonical_peer_prefix(sender_token)
         # Simulation finding (2026-09-19, one-hop raw scenario): this
         # ANSWER used to leave the radio right behind the firmware's own
         # ACK for the QUERY, and through a repeater it reached the chain

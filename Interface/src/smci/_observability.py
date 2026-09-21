@@ -593,6 +593,8 @@ class _ObservabilityMixin:
             "path_reply_seen_s": None,    # PATH from target to us (the flood-mode ACK carrier)
             "foreign_rx_count": 0,
             "foreign_rx": [],             # up to _RX_LOG_WINDOW_FOREIGN_CAP (typename, route, path_len, t, src_hash)
+            "ack_snr": None,              # the matched ACK's signal (alpha 0.1.6 item 1)
+            "ack_rssi": None,
         }
         self._rx_log_window = window
         return window
@@ -617,6 +619,9 @@ class _ObservabilityMixin:
         if ptype == self._RX_LOG_PAYLOAD_TYPE_ACK and w["expected_ack"] and fields.get("ack_code") == w["expected_ack"]:
             if w["ack_seen_on_air_s"] is None:
                 w["ack_seen_on_air_s"] = t
+                # Alpha 0.1.6 (item 1): the ACK's signal is the last leg of
+                # the path this frame went on (`_note_path_signal`).
+                w["ack_snr"], w["ack_rssi"] = fields.get("snr"), fields.get("rssi")
             return
         if (
             ptype == self._RX_LOG_PAYLOAD_TYPE_TEXT_MSG

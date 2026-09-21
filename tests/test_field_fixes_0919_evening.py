@@ -289,6 +289,12 @@ class HealthyPathPatience(SingleNodeCase):
     def setUp(self):
         self.iface._direct_path_recent_success.pop(PEER, None)
         self.iface._direct_path_failures.pop(PEER, None)
+        # The threshold detector runs only with path selection off (alpha 0.1.6 item 1).
+        self._selection = self.iface.path_selection_enabled
+        self.iface.path_selection_enabled = False
+
+    def tearDown(self):
+        self.iface.path_selection_enabled = self._selection
 
     def test_success_is_remembered_and_ages_out(self):
         iface = self.iface

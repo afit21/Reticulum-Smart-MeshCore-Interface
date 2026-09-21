@@ -391,11 +391,12 @@ class _DirectSendMixin:
         interface's own record being out of sync with the device contact
         table can cause -- see path_discovery_spec.md's persistence
         note)."""
-        resolved = self._resolved_paths.get(peer_prefix)
-        # Alpha 0.1.5 (item 3): a shorter route seen on the peer's own floods
-        # replaces a longer resolved path here, inside the one place that
-        # decides resolved-versus-discover, never beside it.
-        resolved = await self._maybe_adopt_shorter_path(peer_prefix, resolved)
+        # Alpha 0.1.6 (item 1): the scoreboard's one decision -- the current
+        # path while it delivers, a trial of the best-scoring alternative
+        # after it misses, None once every candidate has failed -- inside
+        # the one place that decides resolved-versus-discover, never beside
+        # it (alpha 0.1.5's shorter-path adoption stood here before).
+        resolved = await self._select_path(peer_prefix)
         if resolved is None:
             # Milestone 6: docs/reliability_engine_design.md §8's "next
             # send attempt for this peer goes through discover_path()
@@ -1019,7 +1020,8 @@ class _DirectSendMixin:
                 if record_result and not (
                         cancel_event is not None and cancel_event.is_set()
                         and self._send_answered_by(cancel_key) != peer_prefix):
-                    self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                    self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True,
+                                                   ack_latency_s=attempt_info.get("ack_latency_s"))
                 return True
             # No per-attempt delay here anymore -- the post-send listen
             # window (outcome-dependent range, 2026-09-16) fires inside
@@ -1588,6 +1590,15 @@ class _DirectSendMixin:
                     # (_send_direct_with_attempts) see and log this exactly
                     # as it did before this fix.
                     raise send_exc
+                if attempt_info is not None:
+                    attempt_info["ack_latency_s"] = ack_latency_s
+                if ok and peer_prefix is not None and rx_window.get("ack_snr") is not None:
+                    # Alpha 0.1.6 (item 1): the ACK the radio log matched to
+                    # this frame is the last frame received over the path
+                    # it went on -- its signal is the candidate's.
+                    _r = self._resolved_paths.get(peer_prefix)
+                    self._note_path_signal(peer_prefix, _r.out_path_hex if _r is not None else None,
+                                           rx_window.get("ack_snr"), rx_window.get("ack_rssi"))
                 return ok, waited_full_timeout
         finally:
             self._direct_exchange_queue_depth -= 1

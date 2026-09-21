@@ -783,30 +783,44 @@ class _ConfigMixin:
         self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 20.0))
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
         self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 1.8))
-        # Alpha 0.1.5 (item 3, 2026-09-21): shorter-path adoption. A bound
-        # peer's flood packets (its adverts; its path-discovery and text
-        # floods addressed to us) carry the route they took -- each relaying
-        # repeater appends its hash (`Mesh::routeRecvPacket`) -- and the
-        # reverse of that route is a route to the peer. When the peer's
-        # current out_path is at least one hop longer than the shortest
-        # route its floods showed within `path_adopt_window`, that reversed
-        # route is set on the contact (`change_contact_path`, the same
-        # library call discovery persists with) and used, instead of running
-        # discovery. The field: from 11:05 on 2026-09-21 the desktop's
-        # discovery returned a four-hop path (19 76 be d6) to the laptop
-        # while the laptop reached the desktop in two (d6 19), three stale-
-        # path resets rediscovered the same four hops, and the desktop's
-        # radio log had seen the laptop's floods arrive over the two-hop
-        # route (`path` d619) the whole time -- 35 minutes of 17 s ACK
-        # timeouts at 50 % success. An adopted path is provisional: if it
-        # misses its first PATH_ADOPT_MISS_LIMIT sends it is dropped, put on
-        # cooldown for the window, and the next send goes through discovery
-        # as before. Attribution is conservative: an advert by its full
-        # key; an addressed flood only when it is addressed to us and its
-        # 1-byte source hash matches exactly one bound peer and no other
-        # contact on the device. No wire change.
-        self.path_adopt_enabled = _cfg_bool(cfg.get("path_adopt_enabled", "yes"))
-        self.path_adopt_window_s = float(cfg.get("path_adopt_window", 600.0))
+        # Alpha 0.1.6 (item 1, 2026-09-22): path selection by measured
+        # reliability, replacing alpha 0.1.5's shorter-path adoption. Every
+        # route this node learns to a peer -- the discovered path, the
+        # reverse of each distinct flood copy the peer's own floods took,
+        # the zero-hop option when the peer has been heard directly, and the
+        # path the peer itself reports in every "Q" v5 frame -- is a
+        # candidate on a per-peer scoreboard (`_PathBoard`, `_paths.py`).
+        # Each candidate is scored as expected transmissions per delivered
+        # frame times (hops + 1): airtime per delivered byte, lower is
+        # better, from its delivery rate over its last PATH_SAMPLES_KEPT
+        # sends (older ones weighted down, nothing older than
+        # PATH_SAMPLE_WINDOW_S counted). An untried path scores with the
+        # optimistic prior PATH_PRIOR_OPTIMISTIC, except a zero-hop candidate
+        # whose last direct frame from the peer was below `path_weak_snr_db`
+        # (the owner's repeater assumption: a two-hop path via a well-placed
+        # repeater beats a weak direct one), which scores with
+        # PATH_PRIOR_WEAK. The current path is kept while it delivers; after
+        # `path_switch_after_misses` consecutive missed sends the next real
+        # packet goes on the best-scoring alternative (a trial, no dedicated
+        # probe); the switch is made for good only when the alternative's
+        # score beats the current one by `path_switch_margin`, and a path
+        # switched away from is not switched back to for
+        # `path_switch_cooldown` seconds. Discovery runs only when every
+        # candidate has missed its last `path_switch_after_misses` sends
+        # (and a candidate whose last miss is older than the cooldown is
+        # tried again). The field (2026-09-21 evening, 22:00-22:35): the
+        # shortest-in-window rule adopted a 504 s old zero-hop route over a
+        # one-hop path confirmed 2 s earlier, missed twice, reset, and the
+        # desktop then sat on a two-hop path for 32 minutes while the
+        # laptop reached it in one, because the one-hop route was never
+        # re-tried without a fresh flood. The old key `path_adopt_enabled`
+        # is accepted as an alias of `path_selection_enabled`.
+        legacy = cfg.get("path_adopt_enabled")
+        self.path_selection_enabled = _cfg_bool(cfg.get("path_selection_enabled", "yes" if legacy is None else legacy))
+        self.path_weak_snr_db = float(cfg.get("path_weak_snr_db", 3.0))
+        self.path_switch_after_misses = max(1, int(cfg.get("path_switch_after_misses", 2)))
+        self.path_switch_margin = max(0.0, float(cfg.get("path_switch_margin", 0.25)))
+        self.path_switch_cooldown_s = max(0.0, float(cfg.get("path_switch_cooldown", 120.0)))
 
         # Stale cached-DIRECT-path detection (§8). Built and unit-tested in
         # Milestone 4; since Milestone 5 every live DIRECT send path feeds it

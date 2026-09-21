@@ -73,10 +73,18 @@ class AdaptiveAckTimeoutTests(SingleNodeCase):
 
 
 class StalePathResetTests(SingleNodeCase):
+    """The threshold detector -- the path-reset rule when path selection is
+    off (alpha 0.1.6, item 1: with `path_selection_enabled` the scoreboard's
+    exhaustion rule replaces it, pinned in tests/test_path_selection_0922.py)."""
 
     def setUp(self):
         self.iface._direct_path_failures.clear()
         self.iface._resolved_paths.clear()
+        self._selection = self.iface.path_selection_enabled
+        self.iface.path_selection_enabled = False
+
+    def tearDown(self):
+        self.iface.path_selection_enabled = self._selection
 
     def _resolve(self, prefix, age_s=0.0):
         self.iface._resolved_paths[prefix] = self.module._ResolvedPath(

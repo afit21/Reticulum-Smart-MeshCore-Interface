@@ -241,8 +241,9 @@ class ReceiverSideV4(SingleNodeCase):
             self.assertTrue(entries[801][2])
             self.assertEqual(gaps_report["entries"][0][0], 802, "the triggering packet comes first")
 
-            # a v4 QUERY about both is answered entry by entry
-            query = iface._encode_completion_frame_v4(iface.COMPLETION_TYPE_QUERY, [(801, 2, False, None), (802, 3, False, None)], nonce=7)
+            # a multi-entry QUERY about both is answered entry by entry (v5
+            # since alpha 0.1.6: the v4 shape plus the sender's path view)
+            query = iface._encode_completion_frame_v5(iface.COMPLETION_TYPE_QUERY, [(801, 2, False, None), (802, 3, False, None)], nonce=7)
             self.on_loop(lambda: iface._handle_incoming_completion_frame(query, PEER))
             self.assertTrue(wait_until(lambda: len(answers) == 3, 2.0))
             ans = answers[2]

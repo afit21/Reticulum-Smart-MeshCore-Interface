@@ -493,10 +493,7 @@ class _PeerStateMixin:
         # Alpha 0.1.5 (2b): a held complete report for this sender.
         self._cancel_sender_report(pubkey_prefix)
         self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
-        self._flood_routes_seen.pop(pubkey_prefix, None)   # item 3
-        self._adopted_paths.pop(pubkey_prefix, None)
-        self._adoption_cooldown.pop(pubkey_prefix, None)
-        self._path_reset_at.pop(pubkey_prefix, None)
+        self._path_boards.pop(pubkey_prefix, None)   # alpha 0.1.6 item 1: the path scoreboard
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 

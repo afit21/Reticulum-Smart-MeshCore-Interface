@@ -323,11 +323,18 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # build for window reports (a v3 peer drops the v4 frame as an
     # unsupported version and the sender falls back to its v4 QUERY, which
     # that peer drops too -- the same all-or-nothing as v3 was).
-    COMPLETION_PROTOCOL_VERSION = 4
+    COMPLETION_PROTOCOL_VERSION = 5
+    COMPLETION_PROTOCOL_VERSION_V4 = 4
     COMPLETION_PROTOCOL_VERSION_V3 = 3
     COMPLETION_PROTOCOL_VERSION_V2 = 2
     COMPLETION_PROTOCOL_VERSION_V1 = 1
     COMPLETION_V4_HEADER_SIZE = 4   # ver+type+n+nonce
+    # v5 (alpha 0.1.6, item 1): the v4 header plus the sender's path length
+    # to the receiver (0xFF: none) and its delivery rate on it in 1/250
+    # steps (0xFF: untried) -- the peer's view for the path scoreboard.
+    COMPLETION_V5_HEADER_SIZE = 6   # ver+type+n+nonce+path_len+rate
+    COMPLETION_PATH_UNKNOWN = 0xFF
+    COMPLETION_RATE_SCALE = 250
     COMPLETION_V4_MAX_ENTRIES = 8
     # A v4 REPORT lists the sender's raw packets seen within this span
     # (M2): longer than a window burst plus its report wait at three hops.
@@ -857,14 +864,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Alpha 0.1.5 (item 5): peer prefix -> recent raw part arrival times
         # (monotonic), the window collect's inter-part spacing estimate.
         self._raw_part_arrivals = {}
-        # Alpha 0.1.5 (item 3): peer prefix -> recent flood routes seen from
-        # that peer (monotonic time, hops, reversed path hex, hash size,
-        # source); peer prefix -> the provisional adopted path's bookkeeping;
-        # peer prefix -> {path hex: cooldown until} for routes that failed.
-        self._flood_routes_seen = {}
-        self._adopted_paths = {}
-        self._adoption_cooldown = {}
-        self._path_reset_at = {}     # peer prefix -> when its path was last reset / dropped
+        # Alpha 0.1.6 (item 1): peer prefix -> `_PathBoard`, the scoreboard
+        # of candidate paths to that peer (`_paths.py`).
+        self._path_boards = {}
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 
@@ -1504,10 +1506,14 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     _TXT_MSG_FIXED_OVERHEAD_BYTES = 2 + 1 + 1 + 2
     _TXT_MSG_PLAINTEXT_OVERHEAD_BYTES = 4 + 1 + 1
 
-    # Alpha 0.1.5 (item 3): an adopted path that misses this many sends in
-    # a row before its first success is dropped for discovery.
-    PATH_ADOPT_MISS_LIMIT = 2
-    FLOOD_ROUTES_KEPT = 16
+    # Alpha 0.1.6 (item 1): the per-peer path scoreboard (`_paths.py`).
+    PATH_CANDIDATES_KEPT = 4        # candidate paths kept per peer
+    PATH_SAMPLES_KEPT = 8           # send outcomes a candidate's delivery rate is over
+    PATH_SAMPLE_WINDOW_S = 600.0    # outcomes older than this count for nothing
+    PATH_SAMPLE_HALF_LIFE_S = 180.0 # an outcome's weight halves every this many seconds
+    PATH_PRIOR_OPTIMISTIC = 0.8     # an untried path's assumed delivery rate
+    PATH_PRIOR_WEAK = 0.25          # ... a zero-hop one heard below path_weak_snr_db (see _configure_path_discovery)
+    PATH_RATE_FLOOR = 0.05          # a measured rate is never scored below this
     _RX_LOG_PAYLOAD_TYPE_ADVERT = 4
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT

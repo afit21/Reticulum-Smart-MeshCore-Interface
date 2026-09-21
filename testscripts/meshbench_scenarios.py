@@ -177,6 +177,7 @@ Exit code 0 iff every hard check held.
 """
 import argparse
 import collections
+import statistics
 import glob
 import json
 import math
@@ -343,6 +344,20 @@ SCENARIOS = {
               "`path_adoption_failed`; informational: how many of A's path_resolved events after the move rediscovered "
               "three hops (a stale-path reset + rediscovery, the old way), the hop count of A's sends after adoption. "
               "Delivery is not asserted (B's own three-hop path to A dies with the move and it must reset and rediscover).",
+    ),
+    "weak_direct": Scenario(
+        "weak_direct", "A and B hear each other directly but weakly; R reaches both strongly: path selection by measured reliability (alpha 0.1.6 item 1) should settle on the one-hop path.",
+        nodes=[comp("A", -5), rep("R", 0), comp("B", 5.4)],
+        must_link=[("A", "R"), ("R", "B"), ("A", "B")], must_block=[], expected_hops=None, min_delivered=0.0,
+        probes=16, start_after_paths=True,
+        notes="Placements from `topology relay --place A=-5,0 --place B=5.4,0 --pair A-B` (2026-09-22): A-R +20.7 dB, "
+              "R-B +14.5 dB, A-B +7.2 dB both ways (10.4 km, terrain at 10.3 km sits on the line of sight; B's placement "
+              "matters at the 0.05 km level -- re-measure before nudging it). Hard check: the sender's last six DIRECT "
+              "sends are at one hop and a `path_selected` record exists. The direct link's loss rate under MeshBench's "
+              "channel model decides how the scoreboard gets there: the weak-SNR prior (below path_weak_snr_db) if the "
+              "firmware reports the direct frames that low, else two missed sends on the direct path and a trial of the "
+              "one-hop candidate; if the +7 dB link never loses a frame in MeshBench, a delivering direct path is kept "
+              "by design and this scenario reports that.",
     ),
     "failover": Scenario(
         "failover", "A - R1 - B with R2 a cold standby; after --fail-after probes R1's firmware dies and R2's starts. "
@@ -1052,30 +1067,70 @@ def run_scenario(scenario: Scenario, args) -> int:
                 check(non_small > 0, f"sender routed with small-mesh mode OFF ({non_small} sends outside small-mesh mode)")
                 measurements.update(bound_peers_max=bound_max, sends_outside_small_mesh=non_small)
             if scenario.name == "shortcut_appears" and capture_dir:
+                # Alpha 0.1.6 (item 1): the shorter-path adoption events are
+                # `path_selected` records now (reason selected / trial /
+                # switch); the hard check is that the sender left the
+                # three-hop path for a shorter one on its scoreboard and the
+                # next delivery on that path confirmed it.
                 recs = read_capture(capture_dir, scenario.sender)
-                adopted = [r for r in recs if r.get("event") == "path_adopted"]
-                failed = [r for r in recs if r.get("event") == "path_adoption_failed"]
-                confirmed = [r for r in recs if r.get("event") == "path_adoption_confirmed"]
-                check(bool(adopted) and all(r["old_path_len"] is None or r["new_path_len"] < r["old_path_len"] for r in adopted),
-                      f"sender adopted a shorter path from the responder's floods: "
-                      f"{[(r['old_path_len'], r['new_path_len'], r['source']) for r in adopted]}")
-                check(not failed, f"no adopted path was dropped for missing its first sends: {len(failed)}")
+                selected = [r for r in recs if r.get("event") == "path_selected"
+                            and r.get("reason") in ("selected", "trial", "switch")]
+                shorter = [r for r in selected if r.get("previous_path_len") is None
+                           or (r.get("path_len") is not None and r["path_len"] < r["previous_path_len"])]
                 move = next((a for a in actions if a.action == "move"), None)
-                # Each probe event carries the sender's MeshCore out_path_len per peer
-                # (`resolved`); after the move the sequence shows when, and how, the
-                # sender left the three-hop path (adoption: no gap; reset +
-                # rediscovery: probes with an empty map in between).
+                move_seq = None
+                if move is not None and move.fired_at_probe is not None:
+                    move_seq = min((p.get("seq") or 0 for p in plist if (p.get("seq") or 0) > move.fired_at_probe), default=None)
+                after_move_shorter = [r for r in shorter if r.get("path_len") is not None and r["path_len"] < 3]
+                confirmed = []
+                for r in after_move_shorter:
+                    nxt = next((d for d in recs if d.get("event") == "direct_send_result"
+                                and d.get("seq", 0) > r.get("seq", 0) and d.get("out_path_hex") == r.get("path_hex")), None)
+                    if nxt is not None and nxt.get("ok"):
+                        confirmed.append(r)
+                check(bool(after_move_shorter),
+                      f"sender selected a shorter path than three hops from its scoreboard: "
+                      f"{[(r.get('previous_path_len'), r.get('path_len'), r.get('reason')) for r in after_move_shorter]}")
+                check(bool(confirmed), f"a shorter selected path delivered its next send: {len(confirmed)} of {len(after_move_shorter)}")
                 after_move = [(p.get("seq"), sorted((p.get("resolved") or {}).values())) for p in plist
                               if move is not None and move.fired_at_probe is not None and (p.get("seq") or 0) > move.fired_at_probe]
+                first = after_move_shorter[0] if after_move_shorter else None
                 after_sends = [r.get("out_path_len") for r in recs if r.get("event") == "direct_send_result"
-                               and adopted and r.get("seq", 0) > adopted[0].get("seq", 0)]
-                measurements.update(path_adopted=[(r["old_path_len"], r["new_path_len"], r["source"]) for r in adopted],
-                                    path_adoption_confirmed=len(confirmed), path_adoption_failed=len(failed),
+                               and first is not None and r.get("seq", 0) > first.get("seq", 0)]
+                measurements.update(path_selected=[(r.get("previous_path_len"), r.get("path_len"), r.get("reason")) for r in selected],
+                                    path_selected_shorter_confirmed=len(confirmed),
                                     sender_resolved_after_move=after_move,
-                                    sender_out_path_len_after_adoption=dict(collections.Counter(after_sends)))
-                log(f"info  adoption: {measurements['path_adopted']} confirmed {len(confirmed)}; sender's out_path_len per "
-                    f"probe after the move {after_move}; sends after adoption by out_path_len "
-                    f"{measurements['sender_out_path_len_after_adoption']}")
+                                    sender_out_path_len_after_selection=dict(collections.Counter(after_sends)))
+                log(f"info  selection: {measurements['path_selected']} shorter confirmed {len(confirmed)}; sender's out_path_len per "
+                    f"probe after the move {after_move}; sends after the first shorter selection by out_path_len "
+                    f"{measurements['sender_out_path_len_after_selection']}")
+            if scenario.name == "weak_direct" and capture_dir:
+                # Alpha 0.1.6 (item 1): A and B hear each other directly but
+                # weakly while R reaches both strongly. The hard check: the
+                # sender's DIRECT sends end up on the one-hop path and stay
+                # there -- of its last six `direct_send_result`s at least
+                # five are at one hop -- and a `path_selected` record shows
+                # the scoreboard made the choice (a trial or a switch after
+                # misses on the direct path, or the one-hop path selected
+                # first because the direct one was heard below
+                # path_weak_snr_db).
+                recs = read_capture(capture_dir, scenario.sender)
+                sends = [r for r in recs if r.get("event") == "direct_send_result"]
+                last = [r.get("out_path_len") for r in sends[-6:]]
+                selected = [r for r in recs if r.get("event") == "path_selected"]
+                one_hop_last = sum(1 for h in last if h == 1)
+                check(len(last) >= 6 and one_hop_last >= 5,
+                      f"sender's last six DIRECT sends are at one hop (via R): {last}")
+                check(bool(selected), f"the scoreboard recorded its decisions: {len(selected)} path_selected record(s)")
+                by_hops = collections.Counter(r.get("out_path_len") for r in sends)
+                ok_by_hops = collections.Counter(r.get("out_path_len") for r in sends if r.get("ok"))
+                direct_snr = [r.get("snr") for r in recs if r.get("event") == "rx_log" and r.get("route_type") in (2, 3)
+                              and r.get("path_len") == 0 and r.get("snr") is not None]
+                measurements.update(sends_by_out_path_len=dict(by_hops), ok_by_out_path_len=dict(ok_by_hops),
+                                    path_selected=[(r.get("previous_path_len"), r.get("path_len"), r.get("reason")) for r in selected],
+                                    direct_rx_snr_median=(statistics.median(direct_snr) if direct_snr else None))
+                log(f"info  weak_direct: sends by out_path_len {dict(by_hops)} (ok {dict(ok_by_hops)}); selections "
+                    f"{measurements['path_selected']}; direct rx SNR median {measurements['direct_rx_snr_median']}")
             for name in repeaters:
                 stopped_forever = any(a.action == "stop" and a.node == name and not any(
                     b.action == "start" and b.node == name for b in actions) for a in actions)

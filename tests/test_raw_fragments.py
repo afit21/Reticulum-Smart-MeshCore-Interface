@@ -209,6 +209,8 @@ class RawGapAndPathEvidence(SingleNodeCase):
         miss = {"acked": False, "waited_full_timeout": True}
         cut_short = {"acked": False, "waited_full_timeout": False}
         hit = {"acked": True, "waited_full_timeout": True}
+        selection = iface.path_selection_enabled
+        iface.path_selection_enabled = False   # the threshold detector: selection off (alpha 0.1.6 item 1)
         try:
             iface._direct_path_failures.pop(peer, None)
             self.on_loop(iface._record_query_path_evidence, peer, [])
@@ -230,6 +232,7 @@ class RawGapAndPathEvidence(SingleNodeCase):
             self.on_loop(lambda: iface._record_query_path_evidence(peer, [miss, miss], answered=True))
             self.assertNotIn(peer, iface._direct_path_failures)
         finally:
+            iface.path_selection_enabled = selection
             iface._direct_path_failures.pop(peer, None)
 
 
