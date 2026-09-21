@@ -1,6 +1,43 @@
 # Changelog
 
-## unreleased (since alpha-0.1.1, 2026-09-18 night)
+## alpha-0.1.4 (2026-09-21)
+
+Everything since alpha-0.1.1 (2026-09-18 night), released as one version: the raw binary DIRECT
+fragments that alpha 0.1.2 introduced, the one-hop and multi-hop field fixes of alpha 0.1.3, the
+MeshBench real-firmware test tier, and the 2026-09-20 airtime / throughput pass (phases 1-3 below)
+that rebuilt the fragment reconcile. In short:
+
+- **Less airtime per delivered byte, more of the large packets delivered.** MeshBench
+  `large_payload` (483-byte parts through one repeater), medians over three seeds: delivered 17 % ->
+  83 %, on-air bytes per RNS byte 12.76 -> 5.11 (`tests/baselines/2026-09-20-meshbench-6cf0876.md`
+  against the frozen alpha 0.1.3 suite). Every other scenario inside its run-to-run spread. No field
+  numbers for this build yet; the field A/B is the next step.
+- **How:** fragment reports and answers no longer wait for a MeshCore ACK (M1); one report covers a
+  whole window of parts ("Q" protocol v4, M2); a 483-byte part is three raw fragments instead of
+  four (9-byte raw header, M3); from one hop up each burst carries an XOR parity fragment so a
+  single lost fragment is rebuilt without a retry round (M4, on by default); a DIRECT send stops
+  retrying once its reply is seen, stale PROOFs never go on air, RNS path re-requests are answered
+  from a local announce cache, link handshakes pre-empt idle radio holds, and the report window is
+  sized from measured report latency (phase 1).
+- **Both nodes must run alpha 0.1.4 or later.** The "Q" completion frames (v4) and the raw fragment
+  header (version 2) are not decoded by earlier builds; compatibility with earlier builds is not a
+  goal while the project is in alpha.
+- **Install is unchanged**: copy `Interface/SmartMeshCoreInterface.py` into `~/.reticulum/interfaces/`.
+  The file is now assembled from `Interface/src/smci/` by `python3 Interface/build_interface.py`
+  (edit the sources, run the build, commit both).
+- **New config keys, all optional** (defaults shown): `direct_report_noack = yes`,
+  `direct_report_debounce = yes`, `direct_raw_window_enabled = yes`, `direct_raw_window_collect = 0.75`,
+  `direct_raw_window_max_parts = 6`, `direct_raw_parity_enabled = yes`, `direct_raw_parity_min_hops = 1`,
+  `proof_max_age = 45`, `announce_cache_ttl = 3600`, `path_request_local_answer_min_interval = 120`;
+  `direct_raw_report_wait_base` is now 4 s and `direct_raw_report_wait_per_hop` 2.5 s. Every default
+  is pinned by `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`, every wire
+  byte by `tests/golden/wire_format.json`.
+- **Tests:** 288 unit tests (`python3 -m unittest discover -s tests`), the MeshBench scenario suite
+  (`testscripts/meshbench_scenarios.py`, nineteen scenarios against real MeshCore v1.17.1 firmware),
+  and the dated history in `docs/history.md`.
+
+The dated sections below are the record, newest first.
+
 
 Field evidence: `fieldtests/raw/Alpha0.1.1/` -- a zero-hop NomadNet page
 session and an evening drive through 1-3 repeater hops, both sides
