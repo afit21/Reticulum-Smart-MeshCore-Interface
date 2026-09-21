@@ -137,12 +137,13 @@ def collect(paths: list, node_filter: str = None) -> list:
             continue
         for r in load_jsonl(f):
             r["_node"] = node
+            r["_file"] = f
             recs.append(r)
     recs.sort(key=lambda r: r.get("ts", 0))
     return recs
 
 
-def analyse_set(recs: list, hop_filter=None) -> dict:
+def analyse_set(recs: list, hop_filter=None, radio=(7, 62.5, 8)) -> dict:
     out = {"records": len(recs), "nodes": sorted({r["_node"] for r in recs}),
            "span_s": (recs[-1]["ts"] - recs[0]["ts"]) if len(recs) > 1 else 0.0}
     att = [r for r in recs if r.get("event") == "direct_attempt_result"
@@ -346,16 +347,95 @@ def analyse_set(recs: list, hop_filter=None) -> dict:
     # Alpha 0.1.5 (item 8): estimator calibration -- the firmware's measured
     # transmit time (CMD_GET_STATS, whole seconds) against the interface's
     # summed airtime estimate, first to last `radio_stats` record per node.
+    # Alpha 0.1.6 (item 5): the firmware's transmit time includes every
+    # frame the RADIO sent that the interface never keyed -- the ACK it
+    # returns for each ACK-able frame it receives, PATH returns, its own
+    # adverts (about 200 ACKs in the laptop's 32-minute 2026-09-21 capture:
+    # its raw ratio was 0.56 while the desktop's, which received little,
+    # was 0.93). The packet counters give the radio's total transmissions;
+    # the frames the interface keyed are known; the remainder is priced as
+    # ACKs at the ACK's airtime and taken out of the firmware seconds.
+    # Per capture FILE, then summed: the interface's own counters restart
+    # with the process (the laptop's session was four files), while the
+    # firmware's counters run on across restarts.
     calib = {}
     for node in out["nodes"]:
-        rs = [r for r in recs if r.get("event") == "radio_stats" and r["_node"] == node and r.get("tx_air_secs") is not None]
-        if len(rs) >= 2:
-            fw = rs[-1]["tx_air_secs"] - rs[0]["tx_air_secs"]
-            est = (rs[-1].get("estimated_tx_air_s") or 0.0) - (rs[0].get("estimated_tx_air_s") or 0.0)
-            frames = (rs[-1].get("frames_keyed") or 0) - (rs[0].get("frames_keyed") or 0)
-            calib[node] = {"firmware_tx_air_s": fw, "estimated_tx_air_s": round(est, 1), "frames": frames,
-                           "estimate_over_firmware": (round(est / fw, 3) if fw else None), "records": len(rs)}
+        by_file = collections.defaultdict(list)
+        for r in recs:
+            if r.get("event") == "radio_stats" and r["_node"] == node and r.get("tx_air_secs") is not None:
+                by_file[r.get("_file")].append(r)
+        parts = [calibration(rs[0], rs[-1], radio=radio) for rs in by_file.values() if len(rs) >= 2]
+        if parts:
+            calib[node] = sum_calibrations(parts)
     out["estimator_calibration"] = calib
+    return out
+
+
+def sum_calibrations(parts: list) -> dict:
+    """One node's calibration over several capture files (pure)."""
+    total = {k: sum(p.get(k) or 0 for p in parts) for k in (
+        "firmware_tx_air_s", "estimated_tx_air_s", "frames", "radio_frames_sent", "firmware_only_frames",
+        "firmware_only_air_s", "corrected_firmware_tx_air_s")}
+    fw, est = total["firmware_tx_air_s"], total["estimated_tx_air_s"]
+    out = {"firmware_tx_air_s": fw, "estimated_tx_air_s": round(est, 1), "frames": total["frames"],
+           "estimate_over_firmware": (round(est / fw, 3) if fw else None), "records": len(parts)}
+    if any(p.get("radio_frames_sent") is not None for p in parts):
+        corrected = total["corrected_firmware_tx_air_s"]
+        out.update({"radio_frames_sent": total["radio_frames_sent"], "firmware_only_frames": total["firmware_only_frames"],
+                    "firmware_only_air_s": round(total["firmware_only_air_s"], 1),
+                    "ack_airtime_s": next(p["ack_airtime_s"] for p in parts if "ack_airtime_s" in p),
+                    "corrected_firmware_tx_air_s": round(corrected, 1),
+                    "estimate_over_corrected": (round(est / corrected, 3) if corrected > 0 else None)})
+    return out
+
+
+def lora_airtime_s(nbytes: int, sf: int, bw_khz: float, cr: int) -> float:
+    """The interface's own LoRa time-on-air model (`_estimate_airtime_s`:
+    explicit header, CRC, low-data-rate optimisation above 16 ms symbols,
+    preamble 32 symbols at SF<=8 else 16, as the firmware configures)."""
+    tsym = (2 ** sf) / (bw_khz * 1000.0)
+    n_preamble = 32 if sf <= 8 else 16
+    t_preamble = (n_preamble + 4.25) * tsym
+    de = 1 if tsym > 0.016 else 0
+    num = 8 * max(1, nbytes) - 4 * sf + 28 + 16
+    den = 4 * (sf - 2 * de)
+    payload_symbols = 8 + max(0, -(-num // den)) * cr
+    return t_preamble + payload_symbols * tsym
+
+
+ACK_ON_AIR_BYTES = 8   # header + path_len + a 1-2 byte path + the 4-byte ACK code
+
+
+def calibration(first: dict, last: dict, radio=(7, 62.5, 8)) -> dict:
+    """The estimator calibration between two `radio_stats` records (pure):
+    the raw ratio `estimate / firmware tx air` and, when the packet counters
+    are present, the ratio corrected for the frames the radio sent on its
+    own -- `packets_sent` (or flood_tx + direct_tx) minus `frames_keyed` --
+    each priced at an ACK's airtime at `radio` (sf, bw kHz, cr). The raw
+    ratio is a calibration only on a node that receives little; the
+    corrected one is what to read on a receiver."""
+    fw = last["tx_air_secs"] - first["tx_air_secs"]
+    est = (last.get("estimated_tx_air_s") or 0.0) - (first.get("estimated_tx_air_s") or 0.0)
+    frames = (last.get("frames_keyed") or 0) - (first.get("frames_keyed") or 0)
+
+    def sent(r):
+        if r.get("packets_sent") is not None:
+            return r["packets_sent"]
+        if r.get("flood_tx") is not None or r.get("direct_tx") is not None:
+            return (r.get("flood_tx") or 0) + (r.get("direct_tx") or 0)
+        return None
+
+    radio_sent = None if sent(first) is None or sent(last) is None else sent(last) - sent(first)
+    out = {"firmware_tx_air_s": fw, "estimated_tx_air_s": round(est, 1), "frames": frames,
+           "estimate_over_firmware": (round(est / fw, 3) if fw else None), "records": None}
+    if radio_sent is not None:
+        extra = max(0, radio_sent - frames)
+        ack_s = lora_airtime_s(ACK_ON_AIR_BYTES, *radio)
+        corrected_fw = fw - extra * ack_s
+        out.update({"radio_frames_sent": radio_sent, "firmware_only_frames": extra,
+                    "firmware_only_air_s": round(extra * ack_s, 1), "ack_airtime_s": round(ack_s, 3),
+                    "corrected_firmware_tx_air_s": round(corrected_fw, 1),
+                    "estimate_over_corrected": (round(est / corrected_fw, 3) if corrected_fw > 0 else None)})
     return out
 
 
@@ -425,13 +505,21 @@ def print_comparison(sets: dict, min_n: int) -> None:
         row(f"h{h} parity sent / reconstructed",
             [f"{a.get('parity_fragments_sent_by_hop', {}).get(h, 0)} / {a.get('parity_reconstructions_by_hop', {}).get(h, 0)}"
              for a in sets.values()])
-    print("\n  -- airtime estimator vs the radio's own transmit time (radio_stats, item 8) --")
+    print("\n  -- airtime estimator vs the radio's own transmit time (radio_stats, item 8; corrected line item 5 of 0.1.6) --")
     nodes_seen = sorted({n for a in sets.values() for n in a.get("estimator_calibration", {})})
     for node in nodes_seen:
-        row(f"{node}: estimate / firmware tx air s (frames)",
+        row(f"{node}: RAW estimate / firmware tx air s (frames keyed)",
             [(f"{c['estimated_tx_air_s']} / {c['firmware_tx_air_s']} = {fmt(c['estimate_over_firmware'], 2)} ({c['frames']})" if c else "-")
              for c in (a.get("estimator_calibration", {}).get(node) for a in sets.values())])
-    if not nodes_seen:
+        row(f"{node}: CORRECTED estimate / (firmware - radio's own ACKs) (radio frames - keyed = ACK-priced)",
+            [(f"{c['estimated_tx_air_s']} / {c['corrected_firmware_tx_air_s']} = {fmt(c['estimate_over_corrected'], 2)} "
+              f"({c['radio_frames_sent']} - {c['frames']} = {c['firmware_only_frames']} x {c['ack_airtime_s']} s)"
+              if c and c.get("radio_frames_sent") is not None else "-")
+             for c in (a.get("estimator_calibration", {}).get(node) for a in sets.values())])
+    if nodes_seen:
+        print("  (the RAW ratio counts the ACKs the radio sends for every ACK-able frame it receives against the interface;"
+              " read the CORRECTED one on a node that receives a lot)")
+    else:
         print("  (no radio_stats records: a pre-0.1.5 capture, or a firmware without CMD_GET_STATS)")
     print("\n  -- airtime --")
     row("RNS bytes out / in", [f"{s['rns_bytes_out']} / {s['rns_bytes_in']}" for s in sets.values()])
@@ -456,6 +544,9 @@ def main() -> None:
     ap.add_argument("--hop", type=int, default=None, help="Only attempts / parts at this hop count")
     ap.add_argument("--min-n", type=int, default=20, help="Flag hop buckets with fewer attempts than this")
     ap.add_argument("--json", action="store_true", help="Also print the analysis as JSON")
+    ap.add_argument("--radio", default="7,62.5,8", type=lambda t: [float(x) if i == 1 else int(float(x)) for i, x in enumerate(t.split(","))],
+                    help="SF,BW kHz,CR the captures were made at (the ACK airtime the corrected calibration prices "
+                         "the radio's own frames at); the field Heltecs: 7,62.5,8")
     args = ap.parse_args()
 
     windows = {}
@@ -474,7 +565,7 @@ def main() -> None:
             recs = [r for r in recs if lo <= r.get("ts", 0) <= hi]
             if not recs:
                 sys.exit(f"set {label!r}: no records inside the window {windows[label]}")
-        sets[label] = analyse_set(recs, args.hop)
+        sets[label] = analyse_set(recs, args.hop, radio=tuple(args.radio))
     print(f"field A/B comparison -- {time.strftime('%Y-%m-%d %H:%M')} -- {len(sets)} set(s)"
           + (f", node {args.node}" if args.node else "") + (f", hop {args.hop} only" if args.hop is not None else ""))
     print_comparison(sets, args.min_n)

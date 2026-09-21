@@ -29,6 +29,24 @@ happened; this is the procedure that makes two of them comparable.
   LXMF delivery destination handed to RNS and never answered, and without the RNS log there is
   no telling whether RNS refused them or MeshChat never replied. That is RNS/MeshChat behaviour,
   not the interface's, but the A/B verdict should be able to set it aside on evidence.
+- **Start `rnsd` with its output redirected to a log file** (alpha 0.1.6, item 5) -- the level-6
+  link lines the LXMF question needs did not exist for the 2026-09-21 session because rnsd's
+  output went to a terminal that was gone by the time they were wanted:
+
+      nohup rnsd > ~/.reticulum/rnsd-$(hostname)-$(date +%Y%m%dT%H%M%S).log 2>&1 &
+
+  Note that RNS (Python) block-buffers its output when it is redirected, so the file lags the
+  terminal by up to a few kilobytes; the lines are all there once rnsd exits or flushes, so read
+  the log after the session, not during it (or start it with `PYTHONUNBUFFERED=1` when watching
+  live). Keep the log next to the session's captures.
+- The calibration line (`field_ab_compare.py`, "airtime estimator vs the radio's own transmit
+  time") prints two ratios since alpha 0.1.6: the RAW `estimate / firmware tx air`, which counts
+  the ACKs the radio sends for every ACK-able frame it receives against the interface's estimate
+  (the laptop's 2026-09-21 raw ratio read 0.56 for that reason plus interface restarts), and the
+  CORRECTED one with the radio's own frames (packet counters minus frames the interface keyed)
+  priced as ACKs and taken out -- read the corrected one on a node that receives a lot. Both are
+  computed per capture file and summed, because the interface's counters restart with the
+  process while the firmware's run on.
 - One route, driven the same way both times, and one page: the NomadNet page that gives 12 parts of
   483 B (the field's page-transfer class), fetched from the laptop off the desktop's node. A few LXMF
   messages per phase are fine; the page fetch is the unit of comparison.

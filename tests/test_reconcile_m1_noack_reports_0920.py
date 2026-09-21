@@ -60,8 +60,11 @@ class PureTimingFunctions(SingleNodeCase):
         try:
             frag = 172
             airtime = iface._estimate_tx_airtime_s("", on_air_bytes=frag)
-            self.assertAlmostEqual(iface._report_hold_s(frag, 0), airtime)
-            self.assertAlmostEqual(iface._report_hold_s(frag, 1), 3.0 * airtime)
+            # Alpha 0.1.6 (item 3): one sender spacing plus half an airtime
+            # (it was one airtime at zero hop, the relay gap through repeaters).
+            margin = iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+            self.assertAlmostEqual(iface._report_hold_s(frag, 0), airtime + max(0.0, iface.direct_raw_zero_hop_gap_s) + margin)
+            self.assertAlmostEqual(iface._report_hold_s(frag, 1), 3.0 * airtime + margin)
             self.assertGreater(iface._report_hold_s(frag, 2), iface._report_hold_s(frag, 1))
         finally:
             iface.direct_raw_hop_gap_factor = saved

@@ -59,6 +59,21 @@ v5 cases (the v4 cases are byte-identical under their new names).
   names any other process holding it (`/proc/*/fd`). Capture: `connection_state` records. Tests:
   `tests/test_connection_supervisor_0922.py` against the fake `meshcore`, which now models the
   library's connection lifecycle with fault injection.
+- **One report per window, finished.** The receiver's gaps hold is one sender spacing plus half an
+  airtime (~1.5 s at zero hop; the hop gap plus 0.45 s through repeaters), its holds scale by the
+  larger of its own hop count and the path length the sender reports in its v5 frames, and a
+  flagged frame for a packet already delivered is not reported again within the burst tail of a
+  report just sent (a late re-drive still is). Field: 6 of 15 zero-hop reports were a gaps report and
+  the complete report 0.01 s apart, and seven packets were reported complete twice on the parity
+  fragment behind the completing one. `held_s` is on every report record (0.0 = at once);
+  `meshbench_report.py` prints reports per reported packet. Tests:
+  `tests/test_one_report_per_window_0922.py`.
+- **Calibration line corrected** (`field_ab_compare.py --radio SF,BW,CR`). The estimator ratio is now
+  computed per capture file (the interface's counters restart with the process, the firmware's run
+  on) and printed twice: raw, and corrected for the frames the radio sent on its own (packet counters
+  minus frames keyed, priced as ACKs). On the 2026-09-21 captures: laptop 0.92 raw / 0.98 corrected,
+  desktop 0.93 / 1.00 -- the estimator is calibrated. `fieldtests/AB_PROTOCOL.md`: start rnsd with
+  its output redirected to a log file (RNS buffers it). Tests: `tests/test_calibration_summary_0922.py`.
 - **"Q" protocol v5.** Every QUERY, ANSWER and REPORT carries the sender's current path length to
   the receiver and its measured delivery rate on it (two header bytes, 0xFF unknown); the receiver
   adds a reported zero-hop path as a candidate and uses the reported rate as the prior for untried

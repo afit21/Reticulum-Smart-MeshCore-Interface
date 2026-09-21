@@ -3915,3 +3915,67 @@ parity stays on.
     default pin and golden config re-pinned (seven keys added, one default
     changed). MeshBench: none (the install-load check and the fast suite);
     the hardware checks are the field test's.
+
+ 3. **One report per window, finished** (`RAW_GAPS_HOLD_SPACINGS` 1.0,
+    `_report_hold_s` gaps case widened, `_report_recently_sent`, `_last_
+    complete_report_at`, `_receiver_hops_to` reading the sender's reported
+    path length, `held_s` on every report record; `meshbench_report.py`
+    prints reports per reported packet and the held count). The field's
+    receiver reports (both captures): 6 of 15 zero-hop reports were a gaps
+    report and then the complete report 0.01 s apart -- the M1 debounce
+    held the gaps report one fragment airtime (0.91 s) and the completing
+    fragment landed just outside it, because the sender's start-to-start
+    spacing at zero hop is the airtime plus `direct_raw_zero_hop_gap`; at
+    two hops the same pair 0.1-1.55 s past a 1.93 s hold, because the
+    laptop held at ITS one-hop count while the desktop spaced its
+    fragments for two hops (4.6 s); and seven packets were reported
+    complete twice, 0.85-5.4 s apart, the second on the flagged parity
+    fragment (or a relayed duplicate) arriving behind the completing data
+    fragment -- the "flagged frame of a delivered packet means a re-drive"
+    rule of 2026-09-20 read the burst's own tail as a re-drive. Three
+    changes: the gaps hold is one sender spacing plus the half-airtime
+    margin (2b's formula with one spacing instead of two; ~1.5 s at zero
+    hop, the hop gap plus 0.45 s through repeaters); the receiver's holds
+    scale by the larger of its own hop count and the path length the
+    sender reports in its "Q" v5 frames (item 1's wire change is what
+    makes this possible); and a flagged frame for a packet already
+    delivered is not reported again within the burst tail
+    (`_report_hold_s(arriving=True)`, two spacings plus the margin) of a
+    complete report just sent -- a real re-drive comes after the sender's
+    report wait, past that window, and is reported as before. `held_s` is
+    0.0 on an immediate report so the field can count the held ones.
+    Tests: `tests/test_one_report_per_window_0922.py` (the hold rule and
+    the field lags it covers; the reported path length raising the hold,
+    never lowering it; no second report inside the tail, one for a late
+    re-drive; the rule itself; a gaps report dropped when the completing
+    fragment lands inside the hold); the M1 and 2b hold pins re-pinned.
+    MeshBench: `large_payload` and `zero_hop`, two runs each, reports per
+    reported packet the number to read, in `changelog.md`.
+
+ 5. **Calibration line and capture hygiene** (`field_ab_compare.py`:
+    `lora_airtime_s`, `calibration`, `sum_calibrations`, `--radio`;
+    `fieldtests/AB_PROTOCOL.md`). The laptop's `estimate / firmware tx
+    air` read 0.56 against the desktop's 0.93. Two causes, both in the
+    summariser: the firmware's `tx_air_secs` includes every frame the
+    RADIO sent that the interface never keyed -- the ACK it returns for
+    each ACK-able frame it receives (about 200 in the laptop's 32 minutes),
+    PATH returns, its own adverts -- and the laptop's session was four
+    capture files (interface restarts) while the calibration spanned the
+    first to the last record across them: the interface's counters restart
+    with the process, the firmware's run on. Now per capture file and
+    summed, and two ratios: the RAW one as before, and the CORRECTED one
+    with (radio frames sent - frames keyed) priced at an ACK's airtime
+    (the interface's own LoRa model at `--radio` SF,BW,CR, default the
+    field Heltecs' 7,62.5,8; an ACK is 8 bytes on air, 0.14 s) and taken
+    out of the firmware seconds; the printout says which is which and
+    which to read on a receiver. On the 2026-09-21 captures: laptop raw
+    0.92, corrected 0.98; desktop raw 0.93, corrected 1.00 -- the
+    estimator is calibrated and is not changed. `AB_PROTOCOL.md` now asks
+    for rnsd to be started with its output redirected to a log file
+    (`nohup rnsd > ~/.reticulum/rnsd-<host>-<stamp>.log 2>&1 &`; the
+    level-6 link lines the LXMF question needs did not exist for the
+    session), notes that RNS block-buffers redirected output, and explains
+    the two ratios. Tests: `tests/test_calibration_summary_0922.py` (the
+    airtime model against the interface's, the raw and corrected ratios,
+    the flood + direct counters as a stand-in, no counters -> raw only,
+    never negative, several files summed).

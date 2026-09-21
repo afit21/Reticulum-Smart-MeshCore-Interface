@@ -863,6 +863,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # for a complete report held while that sender's fragments are still
         # arriving; re-armed by every fragment, superseded by any report.
         self._pending_sender_reports = {}
+        # Alpha 0.1.6 (item 3): (sender token, pkt_id) -> when a complete
+        # report for it last went out (`_report_recently_sent`).
+        self._last_complete_report_at = {}
         # Phase 3 M2 (2026-09-20): peer prefix -> the open _RawWindow parts
         # join; sender token -> {(pkt_id, frag_total): last seen} for the
         # v4 report's entries.

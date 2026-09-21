@@ -224,6 +224,13 @@ def analyse_capture(recs: list) -> dict:
     n["in_types"] = dict(collections.Counter(r.get("packet_type_name") for r in pk_in))
     n["reports_sent"] = sum(1 for r in recs if r.get("event") == "completion_report_sent")
     n["reports_sent_complete"] = sum(1 for r in recs if r.get("event") == "completion_report_sent" and r.get("complete"))
+    # Alpha 0.1.6 (item 3): reports per reported packet -- the field's
+    # doubled reports were two records for one (sender, pkt_id, round);
+    # 1.0 is one report per window.
+    _rep_keys = {(r.get("sender_token"), r.get("pkt_id"), r.get("round"))
+                 for r in recs if r.get("event") == "completion_report_sent"}
+    n["reports_per_packet"] = round(n["reports_sent"] / len(_rep_keys), 2) if _rep_keys else None
+    n["reports_held"] = sum(1 for r in recs if r.get("event") == "completion_report_sent" and (r.get("held_s") or 0) > 0)
     n["queries_received"] = sum(1 for r in recs if r.get("event") == "completion_query_received")
     n["small_mesh_mode"] = dict(collections.Counter(r.get("small_mesh_mode") for r in pk_out))
     n["bound_peers_max"] = max((r.get("bound_peers") or 0 for r in pk_out), default=0)
@@ -483,7 +490,8 @@ def print_block(r: dict) -> None:
                   f"lock med {fmt(b['lock_med'], 2)} quiet_hold sum {fmt(b['quiet_hold_sum'], 1)} missed-ACK timeout max {fmt(b['missed_timeout_max'], 1)}")
         print(f"    attempt kinds {n['attempt_kinds']} failed {n['attempt_kinds_failed']} diagnosis {n['miss_diagnosis']}")
         print(f"    completion checks {n['completion_n']} {n['completion']}; reports sent {n['reports_sent']} "
-              f"(complete {n['reports_sent_complete']}); queries received {n['queries_received']}")
+              f"(complete {n['reports_sent_complete']}, held {n['reports_held']}, per reported packet {n['reports_per_packet']}); "
+              f"queries received {n['queries_received']}")
         print(f"    raw fragments sent {n['raw_sent']} ({n['raw_bytes']} B) rounds {n['raw_rounds']}; fragments received {n['frag_recv']} (raw {n['frag_recv_raw']}); "
               f"duty-cycle waits {dist_str(n['duty_cycle_waits'])}"
               + (f" by ledger {n['duty_cycle_wait_by_ledger']}" if n.get("duty_cycle_wait_by_ledger") else ""))

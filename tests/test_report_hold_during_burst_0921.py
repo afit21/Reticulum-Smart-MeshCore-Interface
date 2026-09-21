@@ -43,8 +43,9 @@ class ArrivingHoldArithmetic(SingleNodeCase):
         iface = self.iface
         frag = 161 + iface.RAW_HEADER_SIZE
         airtime = iface._estimate_tx_airtime_s("", on_air_bytes=frag)
-        self.assertAlmostEqual(iface._report_hold_s(frag, 0), airtime, places=6)   # M1 gaps hold, unchanged
         spacing = airtime + max(0.0, iface.direct_raw_zero_hop_gap_s)
+        # the M1 gaps hold is one spacing plus the margin since alpha 0.1.6 (item 3)
+        self.assertAlmostEqual(iface._report_hold_s(frag, 0), spacing + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime, places=6)
         expected = iface.RAW_ARRIVING_HOLD_SPACINGS * spacing + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
         self.assertAlmostEqual(iface._report_hold_s(frag, 0, arriving=True), expected, places=6)
         self.assertEqual(iface.RAW_ARRIVING_HOLD_SPACINGS, 2.0, "one lost fragment must not end the silence")
@@ -57,7 +58,7 @@ class ArrivingHoldArithmetic(SingleNodeCase):
         airtime = iface._estimate_tx_airtime_s("", on_air_bytes=frag)
         for hops in (1, 2, 3):
             gap = iface._raw_fragment_gap_s(hops, frag)
-            self.assertAlmostEqual(iface._report_hold_s(frag, hops), gap, places=6)
+            self.assertAlmostEqual(iface._report_hold_s(frag, hops), gap + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime, places=6)
             self.assertAlmostEqual(iface._report_hold_s(frag, hops, arriving=True),
                                    iface.RAW_ARRIVING_HOLD_SPACINGS * gap + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime, places=6)
             # MeshBench page_transfer (2026-09-21): with one spacing the hold
@@ -106,7 +107,7 @@ class OneReportPerWindow(_ReceiverScaffold):
         self.assertEqual(len(self.sent), 1, f"one report for the window, got {self.sent}")
         self.assertEqual(self.sent[0]["pkt_id"], 103)
         self.assertTrue(self.sent[0]["complete"])
-        self.assertIsNone(self.sent[0]["held_s"], "the flagged last fragment reports at once, not from a hold")
+        self.assertEqual(self.sent[0]["held_s"], 0.0, "the flagged last fragment reports at once, not from a hold")
         # Nothing held for this sender remains, and nothing fires later.
         self.assertNotIn(PEER, self.iface._pending_sender_reports)
         hold = self.iface._report_hold_s(10 + self.iface.RAW_HEADER_SIZE, 0, arriving=True)
@@ -142,7 +143,7 @@ class OneReportPerWindow(_ReceiverScaffold):
         self._frag(120, 1, 3, False)
         self.assertEqual(len(self.sent), 1, "completion after the tail reports immediately")
         self.assertTrue(self.sent[0]["complete"])
-        self.assertIsNone(self.sent[0]["held_s"])
+        self.assertEqual(self.sent[0]["held_s"], 0.0)
 
     def test_knob_off_reports_every_completion_at_once(self):
         saved = self.iface.direct_report_hold_during_burst

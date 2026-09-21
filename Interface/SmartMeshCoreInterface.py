@@ -9487,18 +9487,29 @@ class _ReconcileMixin:
     # 8 reports reached the sender (MeshBench: half-duplex / collision at
     # the repeater). Exactly the collision 2b exists to remove.
     RAW_ARRIVING_HOLD_SPACINGS = 2.0
+    # Alpha 0.1.6 (item 3): the gaps hold spans ONE sender spacing plus the
+    # margin (it was one airtime at zero hop, the relay gap through
+    # repeaters, with no margin). The 2026-09-21 session: the completing
+    # fragment landed 0.01 s after the 0.91 s hold at zero hop and 0.1-1.55 s
+    # after the 1.93 s hold at two hops, so 6 of 15 receiver reports were a
+    # gaps report and a complete report back to back.
+    RAW_GAPS_HOLD_SPACINGS = 1.0
 
     def _report_hold_s(self, fragment_on_air_bytes: int, hops: int, arriving: bool = False) -> float:
         """How long a receiver holds a report (pure function, phase 3 M1;
-        generalised in alpha 0.1.5 2b).
+        generalised in alpha 0.1.5 2b; the gaps hold widened in alpha 0.1.6
+        item 3).
 
         Gaps case (`arriving=False`): after a flagged fragment that left
-        gaps, the time the burst's LAST fragment needs to arrive -- one
-        fragment's airtime plus, through repeaters, the hop-scaled relay gap
-        the sender itself observes between fragments (`_raw_fragment_gap_s`).
-        Field: the complete report followed the gaps report by 0.22-0.43 s
-        at the receiver at zero hop, one fragment airtime (~0.9 s at
-        SF7/BW62.5) covers it.
+        gaps, the time the burst's LAST fragment needs to arrive -- one of
+        the sender's start-to-start spacings at this hop count (a fragment's
+        airtime plus `direct_raw_zero_hop_gap` at zero hop; the hop-scaled
+        relay gap, which contains the airtime, through repeaters) plus half
+        an airtime of margin. Field: the complete report followed the gaps
+        report by 0.22-0.43 s at zero hop in the 2026-09-20 session, but in
+        the 2026-09-21 session the completing fragment landed just outside
+        the one-airtime hold (0.01 s at zero hop, up to 1.55 s past the
+        relay-gap hold at two hops).
 
         Still-arriving case (`arriving=True`): after an UNFLAGGED fragment
         completed a part, the silence that says the sender's window burst
@@ -9513,17 +9524,42 @@ class _ReconcileMixin:
             hold = self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
         else:
             hold = airtime
-        if arriving:
-            spacing = hold + (max(0.0, self.direct_raw_zero_hop_gap_s) if hops <= 0 else 0.0)
-            hold = self.RAW_ARRIVING_HOLD_SPACINGS * spacing + self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
-        return hold
+        spacing = hold + (max(0.0, self.direct_raw_zero_hop_gap_s) if hops <= 0 else 0.0)
+        spacings = self.RAW_ARRIVING_HOLD_SPACINGS if arriving else self.RAW_GAPS_HOLD_SPACINGS
+        return spacings * spacing + self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+
+    def _report_recently_sent(self, sender_token: str, pkt_id: Optional[int], fragment_on_air_bytes: int) -> bool:
+        """Alpha 0.1.6 (item 3): whether a complete report for this packet
+        went out within the sender's burst tail -- a flagged frame arriving
+        inside that window (the parity fragment behind the completing data
+        fragment, a duplicate relayed twice) is the same burst, not a
+        re-drive, and reporting again is the second report per window the
+        field counted (six of fifteen at zero hop; pairs 0.85-5.4 s apart
+        at two hops). A re-drive comes after the sender's report wait, well
+        past the window, and is reported as before."""
+        if pkt_id is None:
+            return False
+        sent_at = self._last_complete_report_at.get((sender_token, pkt_id))
+        if sent_at is None:
+            return False
+        window = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token), arriving=True)
+        return time.monotonic() - sent_at < window
 
     def _receiver_hops_to(self, sender_token: str) -> int:
-        """The receiver's own resolved hop count to a sender (0 when it has
-        none) -- what its report holds are scaled by."""
+        """The hop count a receiver scales its report holds by: the larger
+        of its own resolved hop count to the sender and the path length the
+        sender reported in its last "Q" v5 frame (alpha 0.1.6, item 3). The
+        sender's fragment spacing follows the SENDER's path, and the field's
+        two-hop doubles came from a laptop holding at its own one-hop count
+        (1.93 s) while the desktop spaced its fragments for two hops
+        (4.6 s), so the completing fragment landed up to 1.55 s after the
+        hold. 0 when neither is known."""
         peer_prefix = self._canonical_peer_prefix(sender_token)
         resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
-        return max(0, resolved.out_path_len) if resolved is not None else 0
+        own = max(0, resolved.out_path_len) if resolved is not None else 0
+        board = self._path_boards.get(peer_prefix) if peer_prefix else None
+        reported = board.peer_path_len if board is not None and board.peer_path_len is not None else 0
+        return max(own, reported)
 
     def _schedule_sender_report(self, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
         """Alpha 0.1.5 (2b): a part completed on an unflagged fragment --
@@ -9617,6 +9653,13 @@ class _ReconcileMixin:
         # 2b: every report lists the sender's recent packets, so a report
         # held for "still arriving" is covered by whichever goes out now.
         self._cancel_sender_report(sender_token)
+        if complete:
+            # Item 3 (alpha 0.1.6): a flagged frame of this packet within the
+            # burst tail of this report is not reported again.
+            self._last_complete_report_at[(sender_token, header.pkt_id)] = time.monotonic()
+            if len(self._last_complete_report_at) > 256:
+                for k in list(self._last_complete_report_at)[:64]:
+                    self._last_complete_report_at.pop(k, None)
         nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
         self._debug(
             f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
@@ -9627,7 +9670,7 @@ class _ReconcileMixin:
                 "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
                 "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
                 "round": (header.attempt or 0) & 0x03,
-                "held_s": round(held_s, 3) if held_s is not None else None,   # M1 debounce hold, gaps reports only
+                "held_s": round(held_s, 3) if held_s is not None else None,   # the hold this report waited (0.0: at once; item 3)
                 "noack": self.direct_report_noack,
             })
         # M2 (2026-09-20): the report lists this sender's recent raw packets
@@ -9838,8 +9881,8 @@ class _ReconcileMixin:
             # take the one path.
             if self._dedup_contains(key):
                 self._incoming_dropped_total += 1
-                if report_requested:
-                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                if report_requested and not self._report_recently_sent(sender_token, header.pkt_id, len(payload) + self.RAW_HEADER_SIZE):
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
                 return
             bucket = self._reassembly.get(key)
             if bucket is None:
@@ -9866,12 +9909,14 @@ class _ReconcileMixin:
         if self._dedup_contains(key):
             self._incoming_dropped_total += 1
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
-            if raw and report_requested:
+            if raw and report_requested and not self._report_recently_sent(
+                    sender_token, header.pkt_id, len(payload) + self.RAW_HEADER_SIZE):
                 # Completion report (2026-09-20): a flagged fragment for a
                 # packet already delivered means the sender never got the
                 # report (or a QUERY's answer) and re-burst -- tell it again,
-                # so it stops without a QUERY round trip.
-                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                # so it stops without a QUERY round trip. Not within the
+                # burst tail of a report just sent (item 3, alpha 0.1.6).
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
             return
 
         # 2b: the burst's tail is here if THIS fragment is flagged or an
@@ -9914,7 +9959,7 @@ class _ReconcileMixin:
                 # supersedes it (M1 debounce).
                 self._cancel_gaps_report(key)
                 if tail_seen or not self.direct_report_hold_during_burst:
-                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
                 else:
                     # 2b: an unflagged fragment completed this part, so the
                     # sender's window is still on the air -- one report for
@@ -12751,6 +12796,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # for a complete report held while that sender's fragments are still
         # arriving; re-armed by every fragment, superseded by any report.
         self._pending_sender_reports = {}
+        # Alpha 0.1.6 (item 3): (sender token, pkt_id) -> when a complete
+        # report for it last went out (`_report_recently_sent`).
+        self._last_complete_report_at = {}
         # Phase 3 M2 (2026-09-20): peer prefix -> the open _RawWindow parts
         # join; sender token -> {(pkt_id, frag_total): last seen} for the
         # v4 report's entries.
