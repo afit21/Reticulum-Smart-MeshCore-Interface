@@ -1,5 +1,6 @@
 """Raw fragmentation and the reconcile: the raw burst-then-report/QUERY sender with its resume and text-fallback verdicts, the report window and QUERY answer budgets, the completion QUERY / ANSWER / REPORT handling on both sides, and the per-sender reassembly buckets, dedup cache and their sweeps. Phase 3 of the 2026-09-20 pass redesigns this module around one burst-and-report state machine."""
 import asyncio
+import collections
 import time
 from typing import Optional
 
@@ -486,7 +487,7 @@ class _ReconcileMixin:
             self.priority = priority
 
     class _RawWindow:
-        __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed")
+        __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed", "last_join_at")
 
         def __init__(self, peer_prefix, target):
             self.peer_prefix = peer_prefix
@@ -495,16 +496,61 @@ class _ReconcileMixin:
             self.opened_at = time.monotonic()
             self.leader = None
             self.closed = False
+            self.last_join_at = self.opened_at   # item 5: the collect's silence clock
+
+    # Alpha 0.1.5 (item 5): the shortest silence after which a window stops
+    # waiting for more parts -- RNS's Resource sender emits a window's parts
+    # in one loop and the outgoing worker hands them over within a few
+    # loop turns, so a lone packet starts within this.
+    RAW_WINDOW_COLLECT_FLOOR_S = 0.04
+    # How many recent part arrivals per peer feed the spacing estimate.
+    RAW_PART_ARRIVALS_KEPT = 8
 
     def _window_collect_s(self) -> float:
-        """How long a window stays open for further parts after its first
-        (pure function): RNS's Resource sender emits a window's parts within
-        milliseconds and the outgoing worker dequeues one per loop turn, so
-        `direct_raw_window_collect` (0.75 s) gathers a whole RNS window;
-        0 when window batching is off (a single part never waits)."""
+        """The LONGEST a window stays open for further parts after its first
+        (pure function): `direct_raw_window_collect` (0.75 s), the maximum
+        since alpha 0.1.5 (item 5) -- the collect ends earlier once nothing
+        is queued from RNS and no part has joined within the observed
+        inter-part spacing (`_window_collect_continue`); 0 when window
+        batching is off (a single part never waits)."""
         if not self.direct_raw_window_enabled:
             return 0.0
         return max(0.0, self.direct_raw_window_collect_s)
+
+    def _note_raw_part_arrival(self, peer_prefix: str, now: float) -> None:
+        """A raw-eligible part for this peer reached the window machine."""
+        arrivals = self._raw_part_arrivals.setdefault(peer_prefix, collections.deque(maxlen=self.RAW_PART_ARRIVALS_KEPT))
+        arrivals.append(now)
+
+    def _observed_part_spacing_s(self, peer_prefix: str, max_s: float) -> float:
+        """The inter-part spacing of this peer's current transfer (pure over
+        the recorded arrivals, alpha 0.1.5 item 5): twice the median gap
+        between consecutive recent arrivals that fell inside `max_s` (gaps
+        longer than the collect maximum are between windows, not between a
+        window's parts), never below RAW_WINDOW_COLLECT_FLOOR_S nor above
+        `max_s`; the floor alone when nothing has been observed yet."""
+        floor = self.RAW_WINDOW_COLLECT_FLOOR_S
+        arrivals = list(self._raw_part_arrivals.get(peer_prefix, ()))
+        gaps = sorted(b - a for a, b in zip(arrivals, arrivals[1:]) if 0.0 <= b - a < max_s)
+        if not gaps:
+            return min(max_s, floor) if max_s > 0 else 0.0
+        median = gaps[len(gaps) // 2]
+        return max(floor, min(max_s, 2.0 * median))
+
+    def _window_collect_continue(self, now: float, opened_at: float, last_join_at: float, n_parts: int,
+                                 max_parts: int, queue_depth: int, spacing_s: float, max_s: float) -> bool:
+        """Whether the window keeps collecting (pure function, alpha 0.1.5
+        item 5): never past `max_s` from opening or `max_parts` parts; while
+        the outgoing queue still holds packets (RNS's next part may be one
+        of them) or a part joined within the observed inter-part spacing.
+        A lone part -- nothing queued, no join within the spacing -- stops
+        within the floor instead of the 0.75 s maximum, which the
+        zero-hop probe RTT paid on every single packet."""
+        if now - opened_at >= max_s or n_parts >= max_parts:
+            return False
+        if queue_depth > 0:
+            return True
+        return (now - last_join_at) < spacing_s
 
     async def _send_direct_raw_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
@@ -541,6 +587,7 @@ class _ReconcileMixin:
         part.acked, part.resumed = self._resume_state(resume, part.frag_total, pkt_id, peer_prefix, raw=True)
         part.last_progress_at = time.monotonic() if part.resumed else None
         part.future = asyncio.get_running_loop().create_future()
+        self._note_raw_part_arrival(peer_prefix, time.monotonic())
         window = self._raw_windows.get(peer_prefix)
         max_parts = max(1, self.direct_raw_window_max_parts)
         if window is None or window.closed or len(window.parts) >= max_parts or window.target != target:
@@ -560,6 +607,7 @@ class _ReconcileMixin:
                         p.future.set_result(None)
             return part.future.result()
         window.parts.append(part)
+        window.last_join_at = time.monotonic()
         self._debug(f"RAW part pkt_id={pkt_id} joined the open window to {peer_prefix!r} ({len(window.parts)} parts).")
         return await part.future
 
@@ -609,9 +657,21 @@ class _ReconcileMixin:
         peer_prefix, target = window.peer_prefix, window.target
         collect_s = self._window_collect_s()
         if collect_s > 0:
-            deadline = time.monotonic() + collect_s
-            while time.monotonic() < deadline and len(window.parts) < max(1, self.direct_raw_window_max_parts):
-                await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            # Item 5 (alpha 0.1.5): adaptive collect -- stop as soon as
+            # nothing is queued from RNS and no part has joined within the
+            # transfer's observed inter-part spacing; `collect_s` is the cap.
+            spacing_s = self._observed_part_spacing_s(peer_prefix, collect_s)
+            while self._window_collect_continue(
+                time.monotonic(), window.opened_at, window.last_join_at, len(window.parts),
+                max(1, self.direct_raw_window_max_parts), self._outqueue.qsize(), spacing_s, collect_s,
+            ):
+                await asyncio.sleep(0.01)
+            if self._packet_capture_file is not None:
+                self._capture_event("out", {
+                    "event": "raw_window_collect", "peer_prefix": peer_prefix, "parts": len(window.parts),
+                    "collect_s": round(time.monotonic() - window.opened_at, 3), "spacing_s": round(spacing_s, 3),
+                    "max_s": collect_s,
+                })
         window.closed = True
         parts = window.parts
         hop_count = parts[0].hop_count

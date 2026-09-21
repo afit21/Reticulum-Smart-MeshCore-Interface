@@ -847,6 +847,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # v4 report's entries.
         self._raw_windows = {}
         self._recent_raw_pkts = {}
+        # Alpha 0.1.5 (item 5): peer prefix -> recent raw part arrival times
+        # (monotonic), the window collect's inter-part spacing estimate.
+        self._raw_part_arrivals = {}
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 

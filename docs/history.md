@@ -3387,3 +3387,20 @@ update together; parity stays on; aim for no wire change.
     unanswered in this session with nothing to say why). Tests:
     `tests/test_capture_label_0921.py`; shipped-default pin and golden
     config re-pinned for the new key.
+
+ 5. **Adaptive window collect** (`_window_collect_continue`, `_observed_
+    part_spacing_s`, `_note_raw_part_arrival`, `RAW_WINDOW_COLLECT_FLOOR_S`
+    0.04; `direct_raw_window_collect` keeps its 0.75 s as the MAXIMUM).
+    M2's collect was a fixed wait every raw send paid, a lone packet
+    included -- ~0.7 s of every zero-hop probe's round trip. RNS's
+    Resource sender emits a window's parts in one loop (`RNS/Resource.py`
+    `request`) and the outgoing worker hands them over within a few loop
+    turns, so the window now keeps collecting only while the outgoing
+    queue still holds packets or a part joined within the transfer's
+    observed inter-part spacing (twice the median of the recent gaps that
+    fell inside the maximum, per peer, floored at 40 ms), and closes as
+    soon as neither holds. A lone part starts within the floor; parts
+    arriving together still batch. Captured as `raw_window_collect`
+    (parts, collect_s, spacing_s, max_s). Tests: `tests/test_adaptive_
+    window_collect_0921.py` (the two pure rules, the maximum, a lone part
+    within 50 ms, four parts one window).

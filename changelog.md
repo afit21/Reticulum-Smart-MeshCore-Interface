@@ -40,6 +40,11 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   node name from SELF_INFO): `<label>_capture_<interface>_<stamp>.jsonl`. The capture readers accept
   both forms. `fieldtests/AB_PROTOCOL.md`: laptop files need the label; MeshChat's RNS at loglevel 6.
   Tests: `tests/test_capture_label_0921.py`.
+- **Adaptive window collect.** `direct_raw_window_collect` (0.75 s) is now the maximum: a window
+  keeps collecting only while packets are still queued from RNS or a part joined within the
+  transfer's observed inter-part spacing (floor 40 ms). A lone packet starts within 50 ms instead
+  of 0.75 s; a window of parts still batches. Capture: `raw_window_collect`. Tests:
+  `tests/test_adaptive_window_collect_0921.py`.
 
 ## alpha-0.1.4 (2026-09-21)
 

@@ -492,6 +492,7 @@ class _PeerStateMixin:
         self._pending_path_discoveries.pop(pubkey_prefix, None)
         # Alpha 0.1.5 (2b): a held complete report for this sender.
         self._cancel_sender_report(pubkey_prefix)
+        self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 

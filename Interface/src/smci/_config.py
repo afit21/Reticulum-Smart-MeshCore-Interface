@@ -582,6 +582,12 @@ class _ConfigMixin:
         # bitmap per part; re-drives are batched the same way and the v4
         # QUERY asks about the whole window. `direct_raw_window_enabled =
         # no` sends each part as a window of one, with no collect wait.
+        # Alpha 0.1.5 (item 5): `direct_raw_window_collect` is the MAXIMUM
+        # -- the collect ends as soon as nothing is queued from RNS and no
+        # part has joined within the transfer's observed inter-part spacing
+        # (floor 40 ms), so a lone packet starts within that floor instead
+        # of paying the whole 0.75 s (every zero-hop probe did), while a
+        # window of parts arriving together still batches.
         self.direct_raw_window_enabled = _cfg_bool(cfg.get("direct_raw_window_enabled", "yes"))
         self.direct_raw_window_collect_s = float(cfg.get("direct_raw_window_collect", 0.75))
         self.direct_raw_window_max_parts = int(cfg.get("direct_raw_window_max_parts", 6))
