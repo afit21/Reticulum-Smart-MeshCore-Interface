@@ -3598,3 +3598,27 @@ update together; parity stays on; aim for no wire change.
     adoption function, called from the two places a send already decides
     resolved-versus-discover. The alpha 0.1.5 baseline's three
     `shortcut_appears` runs are on this cut.
+
+ Close-out (2026-09-21 evening). Full suite 366 tests OK (`SMCI_SKIP_SLOW`
+    off: 362 at the time of the last full run, before the second cuts; the
+    fast suite green after each). Version alpha 0.1.5 (no wire change; the
+    wire golden did not move, the config golden gained eight keys).
+    Baseline `tests/baselines/2026-09-21-meshbench-7dcc232.md` -- nine
+    scenarios (the seven of alpha 0.1.4 plus `duty_cycle_pages` and
+    `shortcut_appears`) x seeds 7/11/17 on the final build with nothing
+    else running; the comparison against alpha 0.1.4 is in `changelog.md`.
+    The per-item gates were run on each item's own build with the default
+    seed 7, two at a time, while the next item was being written and
+    committed; four of those 23 runs (item-1 `large_payload` -1 and -3,
+    item-6 `large_payload-2` and `page_transfer_bidir-2`) never bound the
+    peers -- B's bind frames lost at the repeater while it relayed A's
+    bootstrap floods, 0 DIRECT frames in the run -- and each overlapped a
+    pre-commit hook's fast suite on all twelve cores, the same failure the
+    alpha 0.1.4 baseline recorded for its seed-7 `zero_hop` under the unit
+    suite's load. The gates changed three items before close-out (2b's
+    hold, item 6's report wait, item 3 three times); the readings that
+    remain open, none attributable to this pass from the records: the
+    QUERY fallback's own attempt success in `page_transfer` (43 % against
+    58-71 %, the failed QUERYs `hop1_loss` and not near B's reports), and
+    `large_payload`'s reported fraction (50 % against 69 %). The field test
+    proposed in the session report is the next step.

@@ -83,6 +83,39 @@ is now a maximum. Every default is pinned by `tests/test_shipped_defaults.py` an
   `field_ab_compare.py` prints the estimate / firmware ratio per node. The estimator itself is
   unchanged. Tests: `tests/test_radio_stats_0921.py`.
 
+**MeshBench, alpha 0.1.5 (`tests/baselines/2026-09-21-meshbench-7dcc232.md`, nine scenarios x seeds
+7/11/17, run with nothing else on the machine) against alpha 0.1.4
+(`tests/baselines/2026-09-20-meshbench-6cf0876.md`, parity off; the parity-on reference in
+`docs/history.md` for large_payload / relay), medians [ranges]:**
+
+- `duty_cycle_pages` (new to the baseline; the cap's scenario): 3/4 pages on every seed, page median
+  124 s [104-371], duty-cycle waits 0 on every run where the alpha 0.1.3 reference runs waited
+  105-163 s each; on-air 1.84 B/B.
+- `zero_hop`: 100 % [88-100] (was 100 %), RTT median 2.8 s [2.8-9.1] (was 4.9 [3.5-14.1] -- the
+  0.75 s collect wait gone), on-air 2.72 (was 2.79).
+- `relay`: 88 % [75-100] (was 88 % [75-88]), RTT 14.1 s (parity-off 10.6 [7.9-12.6]; parity-on
+  reference 13.0-16.4, the right comparator), on-air 5.96 [4.98-9.03] (parity-on 5.54-6.52).
+- `two_hop`: 75 % [62-100] (was 88 % [38-100]), RTT 10.9 s [10.9-29.1] (was 29.6 [17.6-36.0]),
+  on-air 9.75 (was 9.31).
+- `large_payload`: 50 % [33-67] against parity-off 83 % [50-100] and the parity-on reference's
+  67 %, 83 %, 17 %; every 0.1.5 build today that bound its peers scored 2-4 of 6 (mean 3.0/6, the
+  parity-on 0.1.4 reference's mean 3.3/6). On-air 5.61 [5.15-10.62] (parity-on 5.00-7.52), RTT 33.4
+  (was 32.9). Not outside the parity-on spread, and not better; the one-hop lossy regime is where
+  MeshBench's alternating relay loss punishes parity (M4 gate) and where this pass changed the
+  least. Reported fraction 50 % [47-62] against 69 % [56-71]: fewer rounds resolved by a report.
+- `page_transfer`: 33 % [0-33] (was 33 % [0-67]), page median 473 s [432-514] (was 534 [472-596]),
+  0 re-sent parts; `page_transfer_bidir`: 0 % [0-33] (was 0 %; one seed delivered a page for the
+  first time on this machine); `link_setup`: 88 % [75-100] (same), handshakes inside MeshChat's 15 s:
+  62 % [25-75] (was 25 % [12-62]), links median 8.8 s (was 26.5).
+- `shortcut_appears` (new): 2 of 3 seeds passed the hard check (the sender adopted the one-hop route
+  from the peer's flood after the move and confirmed it by delivery); seed 7 never resolved a
+  three-hop path before the move (the start gate timed out) and so had nothing to shorten.
+
+Mechanics FAILs in the suite: none other than the delivery floors above and that seed-7 bring-up.
+Per-item gates (two runs each on each item's own build, `/tmp/mb/015/<item>/`), the second cuts
+they forced (2b, 6, 3 x3) and the four bring-up failures under pre-commit-hook CPU load are in
+`docs/history.md`'s "Alpha 0.1.5 pass" entry.
+
 ## alpha-0.1.4 (2026-09-21)
 
 Everything since alpha-0.1.1 (2026-09-18 night), released as one version: the raw binary DIRECT
