@@ -57,7 +57,10 @@ is now a maximum. Every default is pinned by `tests/test_shipped_defaults.py` an
 - **A raw window yields to a pending completion report between its parts.** Under both-ways load a
   node's own report queued behind its whole outgoing window (12-15 s); reports now have their own
   pre-emption class on the radio lock and the window lets one out between two parts (never inside a
-  part), resuming ahead of ordinary waiters. Capture: `report_yields` on `raw_fragment_sent`. Tests:
+  part), resuming ahead of ordinary waiters, and a queued report also releases the window's
+  radio-free report wait (second cut: MeshBench `page_transfer_bidir` showed RNS shrinking the
+  Resource window to one part, so reports waited 11-13 s behind that wait, never behind a part
+  boundary). Capture: `report_yields` on `raw_fragment_sent`. Tests:
   `tests/test_report_yield_between_parts_0921.py`.
 - **Shorter-path adoption** (new keys `path_adopt_enabled = yes`, `path_adopt_window = 600`; no wire
   change). A bound peer's floods (its adverts; its path requests and text floods addressed to us)

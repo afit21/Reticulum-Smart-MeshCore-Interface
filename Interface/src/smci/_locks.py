@@ -70,6 +70,7 @@ class _PriorityAsyncLock:
         # its parts (never inside a part's burst, never at the other idle
         # points a handshake pre-empts).
         self._report_waiters: set = set()
+        self._report_event: "Optional[asyncio.Event]" = None
 
     def locked(self) -> bool:
         return self._locked
@@ -101,6 +102,26 @@ class _PriorityAsyncLock:
         """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
         return bool(self._report_waiters)
 
+    def report_event(self) -> "asyncio.Event":
+        """The event set while a REPORT waiter is queued (item 6), for the
+        holder's radio-free idle phases -- created on the running loop the
+        first time it is asked for, like `preempt_event`."""
+        if self._report_event is None:
+            self._report_event = asyncio.Event()
+            if self._report_waiters:
+                self._report_event.set()
+        return self._report_event
+
+    def _report_add(self, fut) -> None:
+        self._report_waiters.add(fut)
+        if self._report_event is not None:
+            self._report_event.set()
+
+    def _report_remove(self, fut) -> None:
+        self._report_waiters.discard(fut)
+        if not self._report_waiters and self._report_event is not None:
+            self._report_event.clear()
+
     async def yield_to_preempt(self, resume_priority: Optional[float] = None) -> None:
         """Called by a holder at an idle point when `preempt_requested()`:
         hands the lock over and re-acquires it at YIELDED_PRIORITY, so
@@ -122,7 +143,7 @@ class _PriorityAsyncLock:
         if preempt:
             self._preempt_add(fut)
         if report:
-            self._report_waiters.add(fut)
+            self._report_add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -152,7 +173,7 @@ class _PriorityAsyncLock:
             if preempt:
                 self._preempt_remove(fut)
             if report:
-                self._report_waiters.discard(fut)
+                self._report_remove(fut)
 
     def release(self) -> None:
         if not self._wake_next():

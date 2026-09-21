@@ -324,14 +324,18 @@ class _ReconcileMixin:
                     if not released:
                         # Phase 1 (2026-09-20): a queued Link handshake takes
                         # the radio; the rest of this wait is radio-free (the
-                        # report future outlives the wait either way).
-                        done, cut = await self._wait_future_or_preempt(fut, remaining)
+                        # report future outlives the wait either way). Item 6
+                        # (alpha 0.1.5): so does a completion REPORT this
+                        # node owes the far sender -- under both-ways load
+                        # it waited 11-13 s behind this very wait.
+                        done, cut = await self._wait_future_or_preempt(fut, remaining, also_reports=True)
                         if cut:
                             release_lock()
                             released = True
                             self._debug(
                                 f"report wait ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) released the radio to a "
-                                f"Link handshake after {time.monotonic() - started:.2f}s; still listening for the report."
+                                f"queued Link handshake or completion report after {time.monotonic() - started:.2f}s; "
+                                f"still listening for the report."
                             )
                             continue
                         got = fut.result() if done else None

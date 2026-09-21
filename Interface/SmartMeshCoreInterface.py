@@ -491,6 +491,7 @@ class _PriorityAsyncLock:
         # its parts (never inside a part's burst, never at the other idle
         # points a handshake pre-empts).
         self._report_waiters: set = set()
+        self._report_event: "Optional[asyncio.Event]" = None
 
     def locked(self) -> bool:
         return self._locked
@@ -522,6 +523,26 @@ class _PriorityAsyncLock:
         """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
         return bool(self._report_waiters)
 
+    def report_event(self) -> "asyncio.Event":
+        """The event set while a REPORT waiter is queued (item 6), for the
+        holder's radio-free idle phases -- created on the running loop the
+        first time it is asked for, like `preempt_event`."""
+        if self._report_event is None:
+            self._report_event = asyncio.Event()
+            if self._report_waiters:
+                self._report_event.set()
+        return self._report_event
+
+    def _report_add(self, fut) -> None:
+        self._report_waiters.add(fut)
+        if self._report_event is not None:
+            self._report_event.set()
+
+    def _report_remove(self, fut) -> None:
+        self._report_waiters.discard(fut)
+        if not self._report_waiters and self._report_event is not None:
+            self._report_event.clear()
+
     async def yield_to_preempt(self, resume_priority: Optional[float] = None) -> None:
         """Called by a holder at an idle point when `preempt_requested()`:
         hands the lock over and re-acquires it at YIELDED_PRIORITY, so
@@ -543,7 +564,7 @@ class _PriorityAsyncLock:
         if preempt:
             self._preempt_add(fut)
         if report:
-            self._report_waiters.add(fut)
+            self._report_add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -573,7 +594,7 @@ class _PriorityAsyncLock:
             if preempt:
                 self._preempt_remove(fut)
             if report:
-                self._report_waiters.discard(fut)
+                self._report_remove(fut)
 
     def release(self) -> None:
         if not self._wake_next():
@@ -5817,37 +5838,42 @@ class _DirectSendMixin:
             telemetry["radio_busy_until"] = busy_until
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
-    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":
+    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float,
+                                      also_reports: bool = False) -> "tuple[bool, bool]":
         """Await `fut` (shielded: it outlives this wait) for up to
         `timeout_s`, ending early when a Link handshake queues for the
-        radio lock (phase 1, 2026-09-20). Returns `(future_done, cut_by_a
-        _handshake)`; the future's own exception is the caller's."""
+        radio lock (phase 1, 2026-09-20) -- or, with `also_reports` (item
+        6, alpha 0.1.5), when a completion REPORT this node owes the far
+        sender does: the report wait is radio-free, so the holder loses
+        nothing by letting the report out. Returns `(future_done, cut)`;
+        the future's own exception is the caller's."""
         if fut.done():
             return True, False
-        event = self._direct_exchange_lock.preempt_event()
-        if event.is_set():
+        lock = self._direct_exchange_lock
+        events = [lock.preempt_event()] + ([lock.report_event()] if also_reports else [])
+        if any(e.is_set() for e in events):
             return False, True
         if timeout_s <= 0:
             return False, False
         loop = asyncio.get_running_loop()
         fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
-        preempt_wait = loop.create_task(event.wait())
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
         try:
-            done, _pending = await asyncio.wait({fut_wait, preempt_wait}, return_when=asyncio.FIRST_COMPLETED)
+            done, _pending = await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 if not t.done():
                     t.cancel()
             # Retrieve the timed-out / cancelled task's exception so asyncio
             # does not log "Task exception was never retrieved".
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 try:
                     await t
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
         if fut.done():
             return True, False
-        return False, preempt_wait in done
+        return False, any(w in done for w in waits[1:])
 
     async def _idle_hold(self, seconds: float, floor_s: float = 0.0) -> bool:
         """Sleep `seconds` with the radio lock held, but return early
@@ -7652,14 +7678,18 @@ class _ReconcileMixin:
                     if not released:
                         # Phase 1 (2026-09-20): a queued Link handshake takes
                         # the radio; the rest of this wait is radio-free (the
-                        # report future outlives the wait either way).
-                        done, cut = await self._wait_future_or_preempt(fut, remaining)
+                        # report future outlives the wait either way). Item 6
+                        # (alpha 0.1.5): so does a completion REPORT this
+                        # node owes the far sender -- under both-ways load
+                        # it waited 11-13 s behind this very wait.
+                        done, cut = await self._wait_future_or_preempt(fut, remaining, also_reports=True)
                         if cut:
                             release_lock()
                             released = True
                             self._debug(
                                 f"report wait ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) released the radio to a "
-                                f"Link handshake after {time.monotonic() - started:.2f}s; still listening for the report."
+                                f"queued Link handshake or completion report after {time.monotonic() - started:.2f}s; "
+                                f"still listening for the report."
                             )
                             continue
                         got = fut.result() if done else None

@@ -21,7 +21,12 @@ Pinned:
     report class, a QUERY ANSWER does not;
   * a report queued mid-window goes out before the next part starts (all of
     the current part's fragments first), counted as `report_yields` on the
-    `raw_fragment_sent` records that follow.
+    `raw_fragment_sent` records that follow;
+  * a report queued during the window's radio-free report wait releases the
+    lock at once (the wait continues radio-free), as a handshake does --
+    MeshBench page_transfer_bidir showed RNS shrinking the Resource window
+    to one part, so the node's reports waited 11-13 s behind that wait and
+    never behind a part boundary.
 """
 import asyncio
 import time
@@ -134,6 +139,52 @@ class NoAckFrameUsesTheReportClass(SingleNodeCase):
         calls = self._run_noack("completion_answer")
         self.assertEqual(len(calls), 1)
         self.assertFalse(calls[0]["report"])
+
+
+class ReportWaitReleasesToAReport(SingleNodeCase):
+    def test_report_waiter_ends_the_idle_report_wait_and_gets_the_lock(self):
+        """The second half of item 6 (from MeshBench page_transfer_bidir on
+        the first cut): RNS shrank the Resource window to one part, so
+        "between parts" never happened and the node's own reports waited
+        11-13 s behind its report wait -- the radio-free idle phase Link
+        handshakes already pre-empt. A queued report now releases it too."""
+        iface = self.iface
+        lock = iface._direct_exchange_lock
+        order = []
+
+        async def scenario():
+            await lock.acquire(iface.PRIORITY_NORMAL)
+            fut = asyncio.get_running_loop().create_future()
+            released = {"at": None}
+
+            def release():
+                lock.release()
+                released["at"] = time.monotonic()
+
+            async def report():
+                await asyncio.sleep(0.15)
+                await lock.acquire(iface.PRIORITY_ANSWER, report=True)
+                order.append(("report got lock", time.monotonic()))
+                lock.release()
+
+            t0 = time.monotonic()
+            asyncio.ensure_future(report())
+            saved = (iface.direct_raw_report_wait_base_s, iface.direct_raw_report_wait_per_hop_s)
+            iface.direct_raw_report_wait_base_s, iface.direct_raw_report_wait_per_hop_s = 2.0, 0.0
+            try:
+                got = await iface._await_completion_report(fut, PEER, 1, 2, 0, stage="t", release_lock=release)
+            finally:
+                iface.direct_raw_report_wait_base_s, iface.direct_raw_report_wait_per_hop_s = saved
+            return t0, released["at"], got, time.monotonic()
+
+        t0, released_at, got, ended = self.node.run_on_loop(scenario(), timeout=10)
+        self.assertIsNone(got, "no report ever arrived: the wait still ran to its window")
+        self.assertIsNotNone(released_at, "the lock was released to the queued report")
+        self.assertLess(released_at - t0, 0.6, "released as soon as the report queued, not at the window's end")
+        self.assertEqual(len(order), 1)
+        self.assertLess(order[0][1] - t0, 0.6, "the report went out during the wait")
+        self.assertGreaterEqual(ended - t0, 1.9, "the (radio-free) wait itself ran its window")
+        self.assertFalse(lock.locked())
 
 
 class WindowYieldsBetweenParts(_WindowSend):

@@ -3549,3 +3549,17 @@ update together; parity stays on; aim for no wire change.
     window (1.69 / 1.64 vs 2.27-2.88) but more QUERY timeouts (21 / 23 vs
     7-12), the 8 lost held reports being part of that. Negative
     `since_own_tx_s` appears in every multi-frame scenario (2a in use).
+
+    Item 6, second cut (same day, from its MeshBench gate). `page_transfer_
+    bidir` on the first cut (build 5993ec8): `report_yields` was 0 on every
+    fragment. RNS had shrunk the Resource window to ONE part on the lossy
+    one-hop link (every one of A's 14 windows had one part), so "between
+    two parts" never occurred, while A's own reports waited a median 3 s
+    and up to 13 s for the lock -- behind A's report WAIT, the radio-free
+    idle phase a Link handshake already pre-empts (phase 1.4b). A queued
+    report now releases that wait too (`_wait_future_or_preempt(...,
+    also_reports=True)`, `_PriorityAsyncLock.report_event`): the lock is
+    released, the report goes out, the wait keeps listening radio-free,
+    exactly the handshake path. The between-parts yield stays for the
+    windows RNS does hand over whole. Pinned in `tests/test_report_yield_
+    between_parts_0921.py`.

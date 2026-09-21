@@ -240,37 +240,42 @@ class _DirectSendMixin:
             telemetry["radio_busy_until"] = busy_until
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
-    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":
+    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float,
+                                      also_reports: bool = False) -> "tuple[bool, bool]":
         """Await `fut` (shielded: it outlives this wait) for up to
         `timeout_s`, ending early when a Link handshake queues for the
-        radio lock (phase 1, 2026-09-20). Returns `(future_done, cut_by_a
-        _handshake)`; the future's own exception is the caller's."""
+        radio lock (phase 1, 2026-09-20) -- or, with `also_reports` (item
+        6, alpha 0.1.5), when a completion REPORT this node owes the far
+        sender does: the report wait is radio-free, so the holder loses
+        nothing by letting the report out. Returns `(future_done, cut)`;
+        the future's own exception is the caller's."""
         if fut.done():
             return True, False
-        event = self._direct_exchange_lock.preempt_event()
-        if event.is_set():
+        lock = self._direct_exchange_lock
+        events = [lock.preempt_event()] + ([lock.report_event()] if also_reports else [])
+        if any(e.is_set() for e in events):
             return False, True
         if timeout_s <= 0:
             return False, False
         loop = asyncio.get_running_loop()
         fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
-        preempt_wait = loop.create_task(event.wait())
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
         try:
-            done, _pending = await asyncio.wait({fut_wait, preempt_wait}, return_when=asyncio.FIRST_COMPLETED)
+            done, _pending = await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 if not t.done():
                     t.cancel()
             # Retrieve the timed-out / cancelled task's exception so asyncio
             # does not log "Task exception was never retrieved".
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 try:
                     await t
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
         if fut.done():
             return True, False
-        return False, preempt_wait in done
+        return False, any(w in done for w in waits[1:])
 
     async def _idle_hold(self, seconds: float, floor_s: float = 0.0) -> bool:
         """Sleep `seconds` with the radio lock held, but return early
