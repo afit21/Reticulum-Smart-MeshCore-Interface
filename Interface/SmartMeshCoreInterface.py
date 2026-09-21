@@ -8883,9 +8883,19 @@ class _ReconcileMixin:
         return entries
 
     # Alpha 0.1.5 (2b): the margin, in fragment airtimes, a "still arriving"
-    # hold adds to the sender's start-to-start spacing for relay and host
-    # jitter before the receiver concludes the burst has ended.
+    # hold adds to the sender's spacing for relay and host jitter before the
+    # receiver concludes the burst has ended.
     RAW_ARRIVING_HOLD_MARGIN_AIRTIMES = 0.5
+    # How many of the sender's start-to-start spacings the hold spans: TWO,
+    # so one lost fragment does not end the silence. MeshBench
+    # `page_transfer` on the first cut (one spacing + the margin, 3.19 s at
+    # one hop against a 2.74 s spacing): the hold fired 8 times, 7 of them
+    # while the sender still had 1-7 frames of its re-drive to send -- the
+    # fragment after the completing one had been lost at the repeater, so
+    # the receiver's silence ran past one spacing mid-burst -- and 0 of the
+    # 8 reports reached the sender (MeshBench: half-duplex / collision at
+    # the repeater). Exactly the collision 2b exists to remove.
+    RAW_ARRIVING_HOLD_SPACINGS = 2.0
 
     def _report_hold_s(self, fragment_on_air_bytes: int, hops: int, arriving: bool = False) -> float:
         """How long a receiver holds a report (pure function, phase 3 M1;
@@ -8901,19 +8911,20 @@ class _ReconcileMixin:
 
         Still-arriving case (`arriving=True`): after an UNFLAGGED fragment
         completed a part, the silence that says the sender's window burst
-        is over -- the sender's start-to-start spacing at this hop count
-        (airtime + `direct_raw_zero_hop_gap` at zero hop, the hop-scaled
-        gap, which contains the airtime, through repeaters) plus half an
-        airtime for relay and host jitter. Re-armed by every fragment."""
+        is over -- RAW_ARRIVING_HOLD_SPACINGS (two) of the sender's start-
+        to-start spacings at this hop count (airtime + `direct_raw_zero_
+        hop_gap` at zero hop; the hop-scaled gap, which contains the
+        airtime, through repeaters), so one lost fragment does not end the
+        silence, plus half an airtime for relay and host jitter. Re-armed
+        by every fragment."""
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
         if hops > 0:
             hold = self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
         else:
             hold = airtime
         if arriving:
-            if hops <= 0:
-                hold += max(0.0, self.direct_raw_zero_hop_gap_s)
-            hold += self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+            spacing = hold + (max(0.0, self.direct_raw_zero_hop_gap_s) if hops <= 0 else 0.0)
+            hold = self.RAW_ARRIVING_HOLD_SPACINGS * spacing + self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
         return hold
 
     def _receiver_hops_to(self, sender_token: str) -> int:

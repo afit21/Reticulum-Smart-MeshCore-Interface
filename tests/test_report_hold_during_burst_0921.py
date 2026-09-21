@@ -14,11 +14,13 @@ had landed. 18 fragments re-sent, 14 of them unnecessary.
 
 Pinned here:
   * `_report_hold_s(bytes, hops, arriving=True)` -- the silence after which
-    a receiver concludes a sender's window is over: the sender's start-to-
-    start spacing at that hop count (airtime + `direct_raw_zero_hop_gap` at
-    zero hop; the hop-scaled gap, which contains the airtime, through
-    repeaters) plus half an airtime of margin; `arriving=False` is the M1
-    gaps hold, unchanged;
+    a receiver concludes a sender's window is over: TWO of the sender's
+    start-to-start spacings at that hop count (airtime + `direct_raw_zero_
+    hop_gap` at zero hop; the hop-scaled gap, which contains the airtime,
+    through repeaters) plus half an airtime of margin -- two, because the
+    first cut's one spacing fired mid-burst whenever a single fragment was
+    lost (MeshBench page_transfer, 2026-09-21: 8 held reports, 7 mid-burst,
+    0 received); `arriving=False` is the M1 gaps hold, unchanged;
   * a window of four parts arriving back to back produces ONE report -- on
     the flagged last fragment, at once -- and no held report fires after it;
   * a part completed by an UNFLAGGED fragment is reported only after the
@@ -42,8 +44,11 @@ class ArrivingHoldArithmetic(SingleNodeCase):
         frag = 161 + iface.RAW_HEADER_SIZE
         airtime = iface._estimate_tx_airtime_s("", on_air_bytes=frag)
         self.assertAlmostEqual(iface._report_hold_s(frag, 0), airtime, places=6)   # M1 gaps hold, unchanged
-        expected = airtime + max(0.0, iface.direct_raw_zero_hop_gap_s) + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+        spacing = airtime + max(0.0, iface.direct_raw_zero_hop_gap_s)
+        expected = iface.RAW_ARRIVING_HOLD_SPACINGS * spacing + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
         self.assertAlmostEqual(iface._report_hold_s(frag, 0, arriving=True), expected, places=6)
+        self.assertEqual(iface.RAW_ARRIVING_HOLD_SPACINGS, 2.0, "one lost fragment must not end the silence")
+        self.assertGreater(iface._report_hold_s(frag, 0, arriving=True), 2.0 * spacing)
         self.assertGreater(iface._report_hold_s(frag, 0, arriving=True), iface._report_hold_s(frag, 0))
 
     def test_relayed_hold_is_the_hop_gap_plus_half_an_airtime(self):
@@ -54,7 +59,10 @@ class ArrivingHoldArithmetic(SingleNodeCase):
             gap = iface._raw_fragment_gap_s(hops, frag)
             self.assertAlmostEqual(iface._report_hold_s(frag, hops), gap, places=6)
             self.assertAlmostEqual(iface._report_hold_s(frag, hops, arriving=True),
-                                   gap + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime, places=6)
+                                   iface.RAW_ARRIVING_HOLD_SPACINGS * gap + iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime, places=6)
+            # MeshBench page_transfer (2026-09-21): with one spacing the hold
+            # fired mid-burst after a single lost fragment (7 of 8 times).
+            self.assertGreater(iface._report_hold_s(frag, hops, arriving=True), 2.0 * gap)
 
 
 class _ReceiverScaffold(SingleNodeCase):

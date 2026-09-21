@@ -3522,3 +3522,30 @@ update together; parity stays on; aim for no wire change.
     (measured from its own air model) and the counters behind them.
     Tests: `tests/test_radio_stats_0921.py`; shipped-default pin and
     golden config re-pinned for the new key.
+
+    2b, second cut (same day, from the item-2 MeshBench gate). The first
+    cut's "still arriving" silence was ONE sender spacing plus half an
+    airtime (3.19 s at one hop against a 2.74 s spacing). MeshBench
+    `page_transfer` (two runs, build 40e2ef9): the hold fired 8 times, all
+    in re-drive rounds, 7 of them while the sender still had 1-7 frames of
+    its burst to send -- the fragment after the completing one had been
+    lost at the repeater, so the receiver's silence ran past one spacing
+    mid-burst -- and 0 of the 8 reports reached the sender (MeshBench's
+    events: half-duplex or collision at the repeater), while the M1 gaps
+    reports of the same runs reached it 13 of 15 times. Exactly the
+    collision 2b exists to remove, recreated by a single loss. The hold
+    now spans TWO spacings plus the margin (`RAW_ARRIVING_HOLD_SPACINGS`
+    2.0: ~2.6 s at zero hop, ~5.9 s at one hop at SF7/BW62.5), so one lost
+    fragment does not end it; the flagged tail still reports at once. The
+    same gate's other readings: `zero_hop` 7/8 and 8/8 with reports per
+    window 1.00 and no re-sends (single-fragment probes -- the zero-hop
+    pacing and the early-report path cannot show there; both are pinned by
+    the unit tests instead); `large_payload` 4/6 and 3/6 inside the
+    parity-on reference; `relay` 7/8 and 6/8 with RTT medians 12.8 / 14.2 s,
+    the same as the item-1 build's 13.8 / 14.4 s on the same day (above the
+    parity-off baseline, inside the parity-on reference); `page_transfer`
+    1/3 and 0/3 inside the baseline's 2/3, 1/3, 0/3, with fewer round-1
+    fragments per part (1.61 / 1.94 vs 2.03-2.83) and fewer reports per
+    window (1.69 / 1.64 vs 2.27-2.88) but more QUERY timeouts (21 / 23 vs
+    7-12), the 8 lost held reports being part of that. Negative
+    `since_own_tx_s` appears in every multi-frame scenario (2a in use).

@@ -34,7 +34,9 @@ is now a maximum. Every default is pinned by `tests/test_shipped_defaults.py` an
   once the sender's fragments have stopped arriving (one fragment spacing plus half an airtime,
   re-armed by every fragment); a flagged fragment -- or a bucket that has already seen one -- reports
   at once. One report per window instead of one per part; the mid-burst reports that ended the
-  field sender's wait early and collided with its own queue are gone. Tests:
+  field sender's wait early and collided with its own queue are gone. The silence spans two sender
+  spacings (second cut: MeshBench `page_transfer` showed a one-spacing hold firing mid-burst after a
+  single lost fragment, 8 reports sent into the sender's burst, none received). Tests:
   `tests/test_report_hold_during_burst_0921.py`.
 - **An early report is progress, not the end of the wait (2c).** A report that lands before the
   burst has ended on air is applied to the parts it names and the sender keeps waiting until
