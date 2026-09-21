@@ -1,64 +1,27 @@
-# Smart MeshCore Interface
+<div align="center">
 
-### Overview
+  <img width="450" height="110" alt="rnsmeshcoreinterface" src="https://github.com/user-attachments/assets/63093ecc-61b0-43d4-8db7-619bf3d7f8f3" />
 
-An [Reticulum](https://reticulum.network/) (RNS) interface that lets RNS nodes communicate over a [MeshCore](https://meshcore.co.uk/) LoRa mesh without nuking your local MeshCore network!
+  <h1>Reticulum Smart MeshCore Interface</h1>
 
-This project aims to let you access Nomadnet and send LXMF messages over a MeshCore network as a 'last mile' RNS hop without flooding MeshCore with traffic. In summary this is achieved by firewalling traffic entering the interface, prioritizing, artificially delaying some traffic, and making decisions on how to efficiently rout traffic over MeshCore.
+  <p>
+    A <a href="https://reticulum.network/">Reticulum</a> (RNS) interface that lets RNS nodes communicate over a <a href="https://meshcore.co.uk/">MeshCore</a> LoRa mesh without nuking your local MeshCore network!
+    <img src="https://shields.io" alt="GitHub stars">
+  </p>
+  
+</div>
+
+
+## Overview
+This project aims to let you access Nomadnet and send LXMF messages over a MeshCore network as a 'last mile' RNS hop without flooding MeshCore with traffic. In summary this is achieved by using direct messages where possible, limiting traffic, only sending whats necessary, artificially delaying, and prioritizing some RNS traffic.
 
 The project also aims to be as easy as possible to configure on your RNS nodes. In most situations, a minimal config is needed, just setup your MeshCore companion radio with the MeshCore app before using the interface.
-
-This diagram isn't 100% accurate to how the interface works but should give you a basic idea :)
-<img width="1156" height="700" alt="senddiagram" src="https://github.com/user-attachments/assets/f5efbb53-4530-4287-ad89-6438dbd2a88f" />
 
 
 ## TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
 
-This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.2) I have airtime capped at 30% which in my field tests is the minimum which allows for a usable Nomadnet experience.
-
-As more data is collected, we can move this to a dynamic cap to automically increase this based on other factors such as MeshCore hop count, the Mesh's radio settings, etc.
-
-As this project is under a GPL license, there is nothing stopping you from lifting the caps in your own fork, however I would consider doing this on an established MeshCore Mesh for the sake of personal performance without testing wreckless and disrespectful to those who contribute to the infrustrucure you're using.
-
-In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
-
-## Features (Version alpha0.1.4)
-
-In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
-
-New in alpha 0.1.4:
-
-- less airtime per delivered byte. Fragment reports no longer wait for a MeshCore ACK, one report covers a whole window of parts, a large packet is three raw fragments instead of four, and from one hop up each burst carries a parity fragment so a single lost fragment is repaired without a retry round.
-
-- ~60 % less airtime per delivered byte on multi-fragment transfers, with about five times the delivery rate 
-
-**Battle Tested** - Tested and confident this is reliable.
-
-**Working** - Working, but testing has been limited.
-
-**Experimental** - Works most of the time, or unreliable over multiple MeshCore hops or other conditions.
-
-**Unstable** - Works sometimes.
-
-**Basic** - Only a bare-bones implementation exists. It may not be tested at all.
-
-|    Feature    |    State    |        Description        |
-|----|----|----|
-| Automatic Link | Working | Automatically peers with other nodes running this interface, provided the companions share the same MeshCore settings. |
-| Raw Binary | Working | RNS packets are fragmented and sent over MeshCore in raw binary |
-| Z85 Encode | Battle Tested | Encodes RNS packets in Z85 for transport over MeshCore text messages (~25% overhead vs ~35% for base64). This is used for channel traffic and as a backup when repeaters in a path aren't capable of forwarding raw binary messages |
-| MeshCore Routing | Experimental | Broadcast traffic goes over a channel, direct traffic over direct messages. Keeps a cache of which RNS addresses route to each MeshCore contact, and with only a few known peers sends broadcast traffic as direct messages to avoid unnecessary floods. |
-| RNS Packet Aware Firewalling | Working | Inspects outgoing traffic and drops what the mesh doesn't need, out of respect for MeshCore users. |
-| Packet Aware Self-throttling | Working | Not just a speed limit: delays and prioritises packets by type, e.g. holding link-handshake packets so fewer keepalives are needed over the life of an RNS link. |
-| Packet Capture Debug Tool | Battle Tested | Built-in packet capture for debugging the interface. Also logs every packet the radio overhears, not just our own. |
-| Radio Traffic Awareness | Working | Taps the companion radio's raw RX log to see every packet it decodes, including traffic that isn't ours. Costs no airtime. |
-| Adaptive ACK Timing | Working | Measures the real round trip to each peer and shortens ACK waits to match, never waiting longer than the hop-scaled ceiling. A missed ACK doubles the next wait rather than discarding the measurement. |
-| Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.4 or later (the wire format changed in 0.1.4). |
-| Dead Hop Detection | Experimental | If the first repeater never echoes our frame, the attempt is abandoned early and a stale path is re-discovered in about 30 seconds instead of 4 minutes. |
-| Airtime Duty Cycle | Working | Caps the interface at 30% airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings. Link keepalives skip the wait but still count against the cap. |
-| Queue Hygiene | Working | Drops duplicate, stale and closed-link packets from the queue so a backlog isn't dumped onto the mesh when a path comes back, and forwards at most one spontaneous announce per destination every 5 minutes. |
-| Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear. Off by default. |
-| Parity Fragments | Experimental | On by default. From one MeshCore hop up, each burst of raw fragments ends with an XOR parity fragment, so a receiver that lost exactly one fragment rebuilds it instead of waiting for a retry round. Costs one extra fragment per burst; set `direct_raw_parity_enabled = no` to turn it off. |
+This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.4) I have airtime capped at 30% which results in a usable experience.
+As more testing is done, the project will move towards dynamic airtime limiting, however please don't remove the limits unless you know what you're doing or your local user base is fine with it.
 
 ## Requirements
 
@@ -102,6 +65,46 @@ Reference config for a non-transfer node:
 
 Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~140 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
 
+## Features (Version alpha0.1.4)
+
+In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
+
+New in alpha 0.1.4:
+
+- less airtime per delivered byte. Fragment reports no longer wait for a MeshCore ACK, one report covers a whole window of parts, a large packet is three raw fragments instead of four, and from one hop up each burst carries a parity fragment so a single lost fragment is repaired without a retry round.
+
+- ~60 % less airtime per delivered byte on multi-fragment transfers, with about five times the delivery rate 
+
+**Battle Tested** - Tested and confident this is reliable.
+
+**Working** - Working, but testing has been limited.
+
+**Experimental** - Works most of the time, or unreliable over multiple MeshCore hops or other conditions.
+
+**Unstable** - Works sometimes.
+
+**Basic** - Only a bare-bones implementation exists. It may not be tested at all.
+
+|    Feature    |    State    |        Description        |
+|----|----|----|
+| Automatic Link | Working | Automatically peers with other nodes running this interface, provided the companions share the same MeshCore settings. |
+| Raw Binary | Working | RNS packets are fragmented and sent over MeshCore in raw binary |
+| Z85 Encode | Battle Tested | Encodes RNS packets in Z85 for transport over MeshCore text messages (~25% overhead vs ~35% for base64). This is used for channel traffic and as a backup when repeaters in a path aren't capable of forwarding raw binary messages |
+| MeshCore Routing | Experimental | Broadcast traffic goes over a channel, direct traffic over direct messages. Keeps a cache of which RNS addresses route to each MeshCore contact, and with only a few known peers sends broadcast traffic as direct messages to avoid unnecessary floods. |
+| RNS Packet Aware Firewalling | Working | Inspects outgoing traffic and drops what the mesh doesn't need, out of respect for MeshCore users. |
+| Packet Aware Self-throttling | Working | Not just a speed limit: delays and prioritises packets by type, e.g. holding link-handshake packets so fewer keepalives are needed over the life of an RNS link. |
+| Packet Capture Debug Tool | Battle Tested | Built-in packet capture for debugging the interface. Also logs every packet the radio overhears, not just our own. |
+| Radio Traffic Awareness | Working | Taps the companion radio's raw RX log to see every packet it decodes, including traffic that isn't ours. Costs no airtime. |
+| Adaptive ACK Timing | Working | Measures the real round trip to each peer and shortens ACK waits to match, never waiting longer than the hop-scaled ceiling. A missed ACK doubles the next wait rather than discarding the measurement. |
+| Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.4 or later (the wire format changed in 0.1.4). |
+| Dead Hop Detection | Experimental | If the first repeater never echoes our frame, the attempt is abandoned early and a stale path is re-discovered in about 30 seconds instead of 4 minutes. |
+| Airtime Duty Cycle | Working | Caps the interface at 30% airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings. Link keepalives skip the wait but still count against the cap. |
+| Queue Hygiene | Working | Drops duplicate, stale and closed-link packets from the queue so a backlog isn't dumped onto the mesh when a path comes back, and forwards at most one spontaneous announce per destination every 5 minutes. |
+| Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear. Off by default. |
+| Parity Fragments | Experimental | On by default. From one MeshCore hop up, each burst of raw fragments ends with an XOR parity fragment, so a receiver that lost exactly one fragment rebuilds it instead of waiting for a retry round. Costs one extra fragment per burst; set `direct_raw_parity_enabled = no` to turn it off. |
+
+This diagram isn't 100% accurate to how the interface works but should give you a basic idea :)
+<img width="1056" height="600" alt="senddiagram" src="https://github.com/user-attachments/assets/f5efbb53-4530-4287-ad89-6438dbd2a88f" />
 
 ## Field Testing
 
