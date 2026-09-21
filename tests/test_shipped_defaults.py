@@ -194,6 +194,7 @@ CONFIGURE_RETRY = {
     'direct_path_healthy_patience_multiplier': 2.5,
     'direct_path_healthy_recent_successes': 5,
     'direct_path_healthy_window_s': 120.0,
+    'direct_raw_burst_queue_ahead': 1,
     'direct_raw_fallback_cooldown_s': 120.0,
     'direct_raw_fallback_strikes': 2,
     'direct_raw_fragments_enabled': True,

@@ -618,6 +618,15 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # telling a repeater's echo of our frame apart from unrelated
         # traffic once real captures exist to check that against.
         self._last_own_tx_at = None
+        # Alpha 0.1.5 (2a, 2026-09-21): when this node's radio is estimated
+        # to finish transmitting everything it has been handed. Every keyed
+        # frame extends it by its own airtime from the later of now and the
+        # previous value (`_note_radio_keyed`, in `_pre_transmit_gate`):
+        # `send_raw_data` / `send_msg` return when the frame is QUEUED, so a
+        # zero-hop burst of 15 fragments was "sent" in 2.6 s while the
+        # radio needed ~14 s -- the window's burst end, the report wait,
+        # the report estimator and `since_own_tx_s` all read this instead.
+        self._radio_busy_until = 0.0
         # Step 2 (2026-09-18): per-peer measured ACK RTT -- peer_prefix ->
         # {"srtt", "rttvar", "samples", "last_rtt"}; see _record_ack_rtt/
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on

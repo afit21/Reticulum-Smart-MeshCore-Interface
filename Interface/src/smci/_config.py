@@ -474,6 +474,22 @@ class _ConfigMixin:
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
+        # Alpha 0.1.5 (2a, 2026-09-21): how many frames a zero-hop raw burst
+        # may hold queued in the firmware ahead of the one on air. The
+        # firmware queues a frame and returns OK at once, so the pre-0.1.5
+        # loop handed a whole window (15 fragments, ~14 s of air) to the
+        # radio in 2.6 s: the burst was "over" before the radio had started
+        # on most of it, a report arriving meanwhile was read as the end of
+        # the wait, handshake yields between fragments yielded nothing (the
+        # handshake queued behind the burst), and the companion's packet
+        # pool is 16 entries shared with reception (StaticPoolPacketManager
+        # in MyMesh.cpp). Now the next fragment is handed over when the
+        # radio is estimated to have at most this many frames ahead of it
+        # (`_raw_burst_next_send_wait_s`); 1 keeps the air back to back
+        # with one frame queued. Through repeaters the hop-scaled gap
+        # already exceeds the airtime, so this never binds there. 0 = off
+        # (the pre-0.1.5 behaviour).
+        self.direct_raw_burst_queue_ahead = int(cfg.get("direct_raw_burst_queue_ahead", 1))
         # Quiet time after each fragment of a burst (the last one included):
         # a flat gap at zero hop (the receiver sends no ACK, so only its own
         # processing needs covering), or this factor x hop count x the

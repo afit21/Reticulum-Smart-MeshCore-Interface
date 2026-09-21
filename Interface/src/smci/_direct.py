@@ -231,7 +231,13 @@ class _DirectSendMixin:
         # Stamped here, not at the send_msg/send_chan_msg call itself: this
         # is the last common point every radio-keying path passes through,
         # and the command is issued immediately after this returns.
-        self._last_own_tx_at = time.monotonic()
+        now = time.monotonic()
+        self._last_own_tx_at = now
+        # Alpha 0.1.5 (2a): the frame is about to be QUEUED in the firmware;
+        # the radio is busy for its airtime after whatever it already holds.
+        busy_until = self._note_radio_keyed(self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes), now)
+        if telemetry is not None:
+            telemetry["radio_busy_until"] = busy_until
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
     async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":

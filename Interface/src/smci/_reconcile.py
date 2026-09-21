@@ -185,6 +185,24 @@ class _ReconcileMixin:
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
         return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
 
+    def _raw_burst_next_send_wait_s(self, hops: int, gap_s: float, airtime_s: float, now: float,
+                                    busy_until: float, queue_ahead: Optional[int] = None) -> float:
+        """How long the burst loop sleeps before handing the firmware the
+        NEXT fragment (pure function, alpha 0.1.5 2a). Through repeaters the
+        hop-scaled gap (which contains the frame's airtime) is the answer, as
+        before. At zero hop the flat gap alone let the loop queue a whole
+        window into the firmware in seconds; the loop now also waits until
+        the radio is estimated to have at most `direct_raw_burst_queue_ahead`
+        frames of air left ahead of it -- `busy_until - queue_ahead x
+        airtime` -- so the air stays back to back with a bounded queue and
+        the loop's own clock tracks the radio's. 0 frames ahead disables
+        the pacing (the pre-0.1.5 loop)."""
+        wait_s = max(0.0, gap_s)
+        queue_ahead = self.direct_raw_burst_queue_ahead if queue_ahead is None else queue_ahead
+        if hops <= 0 and queue_ahead > 0:
+            wait_s = max(wait_s, (busy_until - queue_ahead * max(0.0, airtime_s)) - now)
+        return max(0.0, wait_s)
+
     def _completion_report_wait_s(self, hops: int, peer_prefix: str) -> float:
         """How long a raw sender keeps its radio quiet after a burst for the
         receiver's unsolicited completion report (2026-09-20): `direct_raw_
@@ -224,6 +242,11 @@ class _ReconcileMixin:
         if burst_end is None:
             return None
         latency_s = time.monotonic() - burst_end
+        if latency_s < 0:
+            # 2a: a report that lands before the burst's estimated end on air
+            # measures the airtime estimate's pessimism, not the report path;
+            # it does not train the window.
+            return None
         self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
         return latency_s
 
@@ -239,6 +262,7 @@ class _ReconcileMixin:
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
         last_sent_idx: Optional[int] = None, rearm=None, release_lock=None, window_pkts=None,
+        burst_end: Optional[float] = None,
     ) -> Optional[_CompletionFrame]:
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
@@ -265,7 +289,10 @@ class _ReconcileMixin:
         was lost this costs at most that extra half window; today's
         behaviour (re-drive it at once) is the fallback either way."""
         wait_s = self._completion_report_wait_s(hops, peer_prefix)
-        started = time.monotonic()
+        # 2a (alpha 0.1.5): the window is measured from the burst's
+        # estimated end on air (`burst_end`, the radio's busy-until when the
+        # last fragment was queued), which may still be in the future.
+        started = time.monotonic() if burst_end is None else max(burst_end, 0.0)
         provisional: Optional[_CompletionFrame] = None
         deadline_s = wait_s
         released = release_lock is None
@@ -693,13 +720,21 @@ class _ReconcileMixin:
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
+                                "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
                                 "handshake_yields": yields, "window_parts": len(parts),
                                 "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
-                        gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
-                        if gap_s > 0:
-                            await asyncio.sleep(gap_s)
+                        on_air_bytes = 2 + len(path) + len(frame)
+                        gap_s = self._raw_fragment_gap_s(gap_hops, on_air_bytes)
+                        # 2a: at zero hop, also wait for the radio to catch
+                        # up (bounded firmware queue, loop clock = air clock).
+                        wait_s = self._raw_burst_next_send_wait_s(
+                            gap_hops, gap_s, self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes),
+                            time.monotonic(), self._radio_busy_until,
+                        )
+                        if wait_s > 0:
+                            await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()
@@ -713,13 +748,18 @@ class _ReconcileMixin:
                         if report_fut.done() and not report_fut.result().complete:
                             stale_report = report_fut.result()
                             report_fut = rearm()
+                        # 2a: the burst ends when the radio is estimated to
+                        # have finished the last queued fragment, not when
+                        # the last send command returned -- the report wait
+                        # and the report-latency estimator both anchor here.
+                        burst_end = max(time.monotonic(), self._radio_busy_until)
                         for p, _ in missing:
-                            self._expect_report(peer_prefix, p.pkt_id, time.monotonic())
+                            self._expect_report(peer_prefix, p.pkt_id, burst_end)
                         last_part, last_idx = missing[-1]
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, last_part.pkt_id, last_part.frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=last_idx, rearm=rearm, release_lock=release_for_handshake,
-                            window_pkts=live_pkts,
+                            window_pkts=live_pkts, burst_end=burst_end,
                         )
                         if report is None and stale_report is not None:
                             report = stale_report

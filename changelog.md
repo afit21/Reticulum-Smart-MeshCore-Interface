@@ -13,6 +13,15 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   page of 2026-09-21 spent 109 of its 147 s in duty-cycle waits at 30%. Capture: `duty_cycle_ledger`
   on `direct_attempt_result` / `raw_fragment_sent`. Tests: `tests/test_duty_cycle_hop_aware_0921.py`;
   shipped-default pin and `tests/golden/config_defaults.json` re-pinned for the new key.
+- **Radio-busy accounting (2a)** (new key `direct_raw_burst_queue_ahead = 1`). The firmware queues a
+  frame and returns at once, so a zero-hop window of 15 fragments was "sent" in 2.6 s against ~14 s of
+  air, and a report arriving meanwhile ended the sender's wait. Every keyed frame now extends a
+  per-interface busy-until by its estimated airtime; the raw window's burst end, report wait and
+  report-latency estimator anchor to it, `since_own_tx_s` in the radio log is measured from it
+  (negative while our own queue is still on air), and a zero-hop burst hands the next fragment over
+  only when at most one frame is queued ahead of the one on air. Tests:
+  `tests/test_radio_busy_until_0921.py`; the unit fake's radio block is SF8/BW250 so its estimate
+  matches its air model.
 
 ## alpha-0.1.4 (2026-09-21)
 

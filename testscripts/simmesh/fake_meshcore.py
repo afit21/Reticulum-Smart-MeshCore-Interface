@@ -129,7 +129,15 @@ class SimCommands:
     async def send_appstart(self) -> SimEvent:
         return SimEvent(EventType.SELF_INFO, {
             "name": self._radio.name, "public_key": self._radio.pubkey, "adv_type": 1,
-            "tx_power": 20, "max_tx_power": 22, "radio_freq": 915.5, "radio_bw": 250, "radio_sf": 10, "radio_cr": 5,
+            # SF8/BW250/CR5 (alpha 0.1.5, 2026-09-21): the interface prices its
+            # frames with the LoRa time-on-air of this block, and since 2a
+            # paces zero-hop bursts and sizes its report waits by that
+            # estimate, the block should agree with the fake air model
+            # (`airtime_base_ms` 50 + 1 ms/byte): SF8/BW250 gives 0.27 s for
+            # a 172-byte raw fragment against the fake's 0.22 s and 0.10 s
+            # for a 40-byte report against 0.09 s. The previous SF10 priced
+            # them at 0.83 / 0.30 s, four times the fake's air.
+            "tx_power": 20, "max_tx_power": 22, "radio_freq": 915.5, "radio_bw": 250, "radio_sf": 8, "radio_cr": 5,
         })
 
     async def set_radio(self, freq, bw, sf, cr, repeat=None) -> SimEvent:

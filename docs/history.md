@@ -3261,3 +3261,55 @@ update together; parity stays on; aim for no wire change.
     0.95 so the unit scenarios are not slowed. MeshBench gate in
     `changelog.md`: `zero_hop` and `duty_cycle_pages` should move,
     `large_payload` and `relay` must not (relayed traffic).
+
+ 2. **The burst / report collision** -- three coupled changes, one commit
+    each, from the same 08:37-08:40 zero-hop timeline on both machines:
+    the desktop queued window [8..12] (15 raw fragments, ~14 s of air at
+    SF7/BW62.5) into the firmware in 2.6 s -- `send_raw_data` returns OK
+    when the frame is QUEUED (`MyMesh.cpp` CMD_SEND_RAW_DATA: `sendDirect
+    (...); writeOKFrame();`, the outbound queue drained by `Dispatcher::
+    checkSend` one frame at a time) -- and treated the burst as over when
+    the last command returned; the laptop reported each part as it
+    completed; the report for part 8 arrived mid-burst and resolved the
+    window's wait at once (`report_wait_s` 0.0), so parts 9-12, absent from
+    it because they had not landed, were re-burst immediately behind the
+    round-0 frames still in the radio; the laptop's reports for parts 9
+    and 10 went out while the desktop's radio was transmitting that queue
+    and were never heard; every one of the page's four on-air losses sat
+    within 2 s of a laptop report. 33 round-0 fragments, 18 re-sent, 14 of
+    them unnecessary. The radio log agreed from the other side:
+    `since_own_tx_s` was measured from the last send command and read 9 s
+    of "idle" while ten queued fragments were on air.
+
+    2a. **Radio-busy accounting** (`_radio_busy_until`, `_note_radio_
+    keyed`, `_radio_busy_remaining_s`; new key `direct_raw_burst_queue_
+    ahead`, 1). `_pre_transmit_gate` -- the one point every keying path
+    passes -- extends a per-interface busy-until by the frame's estimated
+    airtime from the later of now and the previous value. The raw window
+    reads it: the burst ends at `max(now, busy_until)` when the last
+    fragment is queued, and that is what `_expect_report` registers and
+    what `_await_completion_report` measures its window from (a report
+    that lands before the estimated end trains nothing -- it measures the
+    estimate, not the report path); `since_own_tx_s` in the radio log is
+    now measured from the end of this node's own last frame and reads
+    negative while a queued burst is still on air. And the zero-hop burst
+    paces itself (`_raw_burst_next_send_wait_s`, pure): the next fragment
+    is handed over when the radio is estimated to have at most
+    `direct_raw_burst_queue_ahead` frames of air ahead of it -- one on
+    air, one queued, the air back to back -- so the loop's clock is the
+    radio's, a handshake yield between fragments actually reaches the
+    air (it used to queue behind the whole window), and the companion's
+    16-entry packet pool (`StaticPoolPacketManager(16)`, shared with
+    reception) is never asked to hold a window; through repeaters the
+    hop-scaled gap already exceeds the airtime, so nothing changes there.
+    0 restores the old loop. The unit fake's SELF_INFO radio block moved
+    from SF10/BW250 to SF8/BW250/CR5 so the interface's airtime estimate
+    (0.27 s per 172-byte frame) agrees with the fake air model (0.22 s)
+    instead of pricing it at 0.83 s: with pacing and a busy-until anchored
+    wait, a 4x mismatch would have slowed every unit scenario. Tests:
+    `tests/test_radio_busy_until_0921.py` (the accumulation, the pure
+    pacing rule, the gate's stamp, the negative `since_own_tx_s`, and the
+    headline: a paced zero-hop burst whose QUERY fallback leaves two
+    airtimes plus the window after the last command, with `_expect_report`
+    registered at the busy-until); shipped-default pin and golden config
+    re-pinned for the new key.

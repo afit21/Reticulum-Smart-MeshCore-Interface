@@ -1313,6 +1313,22 @@ class _ConfigMixin:
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
+        # Alpha 0.1.5 (2a, 2026-09-21): how many frames a zero-hop raw burst
+        # may hold queued in the firmware ahead of the one on air. The
+        # firmware queues a frame and returns OK at once, so the pre-0.1.5
+        # loop handed a whole window (15 fragments, ~14 s of air) to the
+        # radio in 2.6 s: the burst was "over" before the radio had started
+        # on most of it, a report arriving meanwhile was read as the end of
+        # the wait, handshake yields between fragments yielded nothing (the
+        # handshake queued behind the burst), and the companion's packet
+        # pool is 16 entries shared with reception (StaticPoolPacketManager
+        # in MyMesh.cpp). Now the next fragment is handed over when the
+        # radio is estimated to have at most this many frames ahead of it
+        # (`_raw_burst_next_send_wait_s`); 1 keeps the air back to back
+        # with one frame queued. Through repeaters the hop-scaled gap
+        # already exceeds the airtime, so this never binds there. 0 = off
+        # (the pre-0.1.5 behaviour).
+        self.direct_raw_burst_queue_ahead = int(cfg.get("direct_raw_burst_queue_ahead", 1))
         # Quiet time after each fragment of a burst (the last one included):
         # a flat gap at zero hop (the receiver sends no ACK, so only its own
         # processing needs covering), or this factor x hop count x the
@@ -2852,6 +2868,24 @@ class _ObservabilityMixin:
             return hold, reason
         return 0.0, "unknown"
 
+    # -- Own-transmit busy accounting (alpha 0.1.5, 2a) ----------------------
+
+    def _note_radio_keyed(self, airtime_s: float, now: Optional[float] = None) -> float:
+        """One more frame handed to the firmware: the radio is busy until
+        the later of now and its previous busy-until, plus this frame's
+        estimated airtime (pure over its inputs; the firmware's own CAD
+        deferral and tx budget can only push the real end later, so this is
+        a floor). Returns the new busy-until."""
+        now = time.monotonic() if now is None else now
+        self._radio_busy_until = max(now, self._radio_busy_until) + max(0.0, airtime_s)
+        return self._radio_busy_until
+
+    def _radio_busy_remaining_s(self, now: Optional[float] = None) -> float:
+        """Seconds until this node's own queued frames are estimated to be
+        off the air (0.0 when idle)."""
+        now = time.monotonic() if now is None else now
+        return max(0.0, self._radio_busy_until - now)
+
     def _extend_medium_busy(self, hold_s: float, reason: str, now: float) -> None:
         if hold_s <= 0:
             return
@@ -2921,7 +2955,12 @@ class _ObservabilityMixin:
             payload = event.payload if isinstance(event.payload, dict) else {}
             now = time.monotonic()
             since_last_rx = (now - self._last_rx_log_at) if self._last_rx_log_at is not None else None
-            since_own_tx = (now - self._last_own_tx_at) if self._last_own_tx_at is not None else None
+            # Alpha 0.1.5 (2a): measured from the estimated END of this
+            # node's own last frame on air, not from the send command --
+            # negative while a queued burst is still estimated to be on air
+            # (the field's radio log read 9 s "idle" with ten queued
+            # fragments transmitting).
+            since_own_tx = (now - self._radio_busy_until) if self._last_own_tx_at is not None else None
             self._last_rx_log_at = now
             self._rx_log_feed_seen = True
             self._rx_log_events_total += 1
@@ -5366,7 +5405,13 @@ class _DirectSendMixin:
         # Stamped here, not at the send_msg/send_chan_msg call itself: this
         # is the last common point every radio-keying path passes through,
         # and the command is issued immediately after this returns.
-        self._last_own_tx_at = time.monotonic()
+        now = time.monotonic()
+        self._last_own_tx_at = now
+        # Alpha 0.1.5 (2a): the frame is about to be QUEUED in the firmware;
+        # the radio is busy for its airtime after whatever it already holds.
+        busy_until = self._note_radio_keyed(self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes), now)
+        if telemetry is not None:
+            telemetry["radio_busy_until"] = busy_until
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
     async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":
@@ -7059,6 +7104,24 @@ class _ReconcileMixin:
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
         return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
 
+    def _raw_burst_next_send_wait_s(self, hops: int, gap_s: float, airtime_s: float, now: float,
+                                    busy_until: float, queue_ahead: Optional[int] = None) -> float:
+        """How long the burst loop sleeps before handing the firmware the
+        NEXT fragment (pure function, alpha 0.1.5 2a). Through repeaters the
+        hop-scaled gap (which contains the frame's airtime) is the answer, as
+        before. At zero hop the flat gap alone let the loop queue a whole
+        window into the firmware in seconds; the loop now also waits until
+        the radio is estimated to have at most `direct_raw_burst_queue_ahead`
+        frames of air left ahead of it -- `busy_until - queue_ahead x
+        airtime` -- so the air stays back to back with a bounded queue and
+        the loop's own clock tracks the radio's. 0 frames ahead disables
+        the pacing (the pre-0.1.5 loop)."""
+        wait_s = max(0.0, gap_s)
+        queue_ahead = self.direct_raw_burst_queue_ahead if queue_ahead is None else queue_ahead
+        if hops <= 0 and queue_ahead > 0:
+            wait_s = max(wait_s, (busy_until - queue_ahead * max(0.0, airtime_s)) - now)
+        return max(0.0, wait_s)
+
     def _completion_report_wait_s(self, hops: int, peer_prefix: str) -> float:
         """How long a raw sender keeps its radio quiet after a burst for the
         receiver's unsolicited completion report (2026-09-20): `direct_raw_
@@ -7098,6 +7161,11 @@ class _ReconcileMixin:
         if burst_end is None:
             return None
         latency_s = time.monotonic() - burst_end
+        if latency_s < 0:
+            # 2a: a report that lands before the burst's estimated end on air
+            # measures the airtime estimate's pessimism, not the report path;
+            # it does not train the window.
+            return None
         self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
         return latency_s
 
@@ -7113,6 +7181,7 @@ class _ReconcileMixin:
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
         last_sent_idx: Optional[int] = None, rearm=None, release_lock=None, window_pkts=None,
+        burst_end: Optional[float] = None,
     ) -> Optional[_CompletionFrame]:
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
@@ -7139,7 +7208,10 @@ class _ReconcileMixin:
         was lost this costs at most that extra half window; today's
         behaviour (re-drive it at once) is the fallback either way."""
         wait_s = self._completion_report_wait_s(hops, peer_prefix)
-        started = time.monotonic()
+        # 2a (alpha 0.1.5): the window is measured from the burst's
+        # estimated end on air (`burst_end`, the radio's busy-until when the
+        # last fragment was queued), which may still be in the future.
+        started = time.monotonic() if burst_end is None else max(burst_end, 0.0)
         provisional: Optional[_CompletionFrame] = None
         deadline_s = wait_s
         released = release_lock is None
@@ -7567,13 +7639,21 @@ class _ReconcileMixin:
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
+                                "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
                                 "handshake_yields": yields, "window_parts": len(parts),
                                 "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
-                        gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
-                        if gap_s > 0:
-                            await asyncio.sleep(gap_s)
+                        on_air_bytes = 2 + len(path) + len(frame)
+                        gap_s = self._raw_fragment_gap_s(gap_hops, on_air_bytes)
+                        # 2a: at zero hop, also wait for the radio to catch
+                        # up (bounded firmware queue, loop clock = air clock).
+                        wait_s = self._raw_burst_next_send_wait_s(
+                            gap_hops, gap_s, self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes),
+                            time.monotonic(), self._radio_busy_until,
+                        )
+                        if wait_s > 0:
+                            await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()
@@ -7587,13 +7667,18 @@ class _ReconcileMixin:
                         if report_fut.done() and not report_fut.result().complete:
                             stale_report = report_fut.result()
                             report_fut = rearm()
+                        # 2a: the burst ends when the radio is estimated to
+                        # have finished the last queued fragment, not when
+                        # the last send command returned -- the report wait
+                        # and the report-latency estimator both anchor here.
+                        burst_end = max(time.monotonic(), self._radio_busy_until)
                         for p, _ in missing:
-                            self._expect_report(peer_prefix, p.pkt_id, time.monotonic())
+                            self._expect_report(peer_prefix, p.pkt_id, burst_end)
                         last_part, last_idx = missing[-1]
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, last_part.pkt_id, last_part.frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=last_idx, rearm=rearm, release_lock=release_for_handshake,
-                            window_pkts=live_pkts,
+                            window_pkts=live_pkts, burst_end=burst_end,
                         )
                         if report is None and stale_report is not None:
                             report = stale_report
@@ -11172,6 +11257,15 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # telling a repeater's echo of our frame apart from unrelated
         # traffic once real captures exist to check that against.
         self._last_own_tx_at = None
+        # Alpha 0.1.5 (2a, 2026-09-21): when this node's radio is estimated
+        # to finish transmitting everything it has been handed. Every keyed
+        # frame extends it by its own airtime from the later of now and the
+        # previous value (`_note_radio_keyed`, in `_pre_transmit_gate`):
+        # `send_raw_data` / `send_msg` return when the frame is QUEUED, so a
+        # zero-hop burst of 15 fragments was "sent" in 2.6 s while the
+        # radio needed ~14 s -- the window's burst end, the report wait,
+        # the report estimator and `since_own_tx_s` all read this instead.
+        self._radio_busy_until = 0.0
         # Step 2 (2026-09-18): per-peer measured ACK RTT -- peer_prefix ->
         # {"srtt", "rttvar", "samples", "last_rtt"}; see _record_ack_rtt/
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on

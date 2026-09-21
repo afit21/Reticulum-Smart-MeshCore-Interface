@@ -742,6 +742,24 @@ class _ObservabilityMixin:
             return hold, reason
         return 0.0, "unknown"
 
+    # -- Own-transmit busy accounting (alpha 0.1.5, 2a) ----------------------
+
+    def _note_radio_keyed(self, airtime_s: float, now: Optional[float] = None) -> float:
+        """One more frame handed to the firmware: the radio is busy until
+        the later of now and its previous busy-until, plus this frame's
+        estimated airtime (pure over its inputs; the firmware's own CAD
+        deferral and tx budget can only push the real end later, so this is
+        a floor). Returns the new busy-until."""
+        now = time.monotonic() if now is None else now
+        self._radio_busy_until = max(now, self._radio_busy_until) + max(0.0, airtime_s)
+        return self._radio_busy_until
+
+    def _radio_busy_remaining_s(self, now: Optional[float] = None) -> float:
+        """Seconds until this node's own queued frames are estimated to be
+        off the air (0.0 when idle)."""
+        now = time.monotonic() if now is None else now
+        return max(0.0, self._radio_busy_until - now)
+
     def _extend_medium_busy(self, hold_s: float, reason: str, now: float) -> None:
         if hold_s <= 0:
             return
@@ -811,7 +829,12 @@ class _ObservabilityMixin:
             payload = event.payload if isinstance(event.payload, dict) else {}
             now = time.monotonic()
             since_last_rx = (now - self._last_rx_log_at) if self._last_rx_log_at is not None else None
-            since_own_tx = (now - self._last_own_tx_at) if self._last_own_tx_at is not None else None
+            # Alpha 0.1.5 (2a): measured from the estimated END of this
+            # node's own last frame on air, not from the send command --
+            # negative while a queued burst is still estimated to be on air
+            # (the field's radio log read 9 s "idle" with ten queued
+            # fragments transmitting).
+            since_own_tx = (now - self._radio_busy_until) if self._last_own_tx_at is not None else None
             self._last_rx_log_at = now
             self._rx_log_feed_seen = True
             self._rx_log_events_total += 1
