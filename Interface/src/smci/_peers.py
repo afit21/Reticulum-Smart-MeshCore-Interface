@@ -490,6 +490,8 @@ class _PeerStateMixin:
         # risking an InvalidStateError from cancelling a future that
         # coroutine still intends to resolve normally.
         self._pending_path_discoveries.pop(pubkey_prefix, None)
+        # Alpha 0.1.5 (2b): a held complete report for this sender.
+        self._cancel_sender_report(pubkey_prefix)
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 

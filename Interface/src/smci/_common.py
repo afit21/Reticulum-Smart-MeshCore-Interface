@@ -151,7 +151,7 @@ class _ReassemblyBucket:
     staleness metric, and also the sort key §5.3's oldest-by-last-progress
     capacity eviction uses."""
 
-    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity")
+    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity", "flagged_seen")
 
     def __init__(self, frag_total: int, coop: bool):
         self.frag_total = frag_total
@@ -161,6 +161,10 @@ class _ReassemblyBucket:
         # Phase 3 M4 (2026-09-20): coverage mask -> (last_covered_len, xor
         # bytes) of the raw parity fragments held for this bucket.
         self.parity: dict = {}
+        # Alpha 0.1.5 (2b): a report-flagged frame (data or parity) of this
+        # packet has arrived -- the burst's tail is here, so a completion
+        # reports at once rather than waiting out the "still arriving" hold.
+        self.flagged_seen = False
 
 
 class _RnsHeader(NamedTuple):

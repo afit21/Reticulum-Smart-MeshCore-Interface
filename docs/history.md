@@ -3313,3 +3313,33 @@ update together; parity stays on; aim for no wire change.
     airtimes plus the window after the last command, with `_expect_report`
     registered at the busy-until); shipped-default pin and golden config
     re-pinned for the new key.
+
+    2b. **The receiver holds reports while a window is still arriving**
+    (`direct_report_hold_during_burst`, yes; `_schedule_sender_report` /
+    `_rearm_sender_report` / `_cancel_sender_report`, `_pending_sender_
+    reports`; `_report_hold_s(..., arriving=True)`; `_ReassemblyBucket.
+    flagged_seen`). A part completed by an UNFLAGGED fragment (not one of
+    the burst's last two) is no longer reported at once: one complete
+    report for the sender is held until its fragments stop arriving for
+    the sender's start-to-start spacing at this hop count plus half an
+    airtime (`_report_hold_s` generalised: airtime + `direct_raw_zero_hop_
+    gap` + 0.5 airtime at zero hop, ~1.5 s at SF7/BW62.5; the hop-scaled
+    gap + 0.5 airtime through repeaters), re-armed by every further
+    fragment from that sender. A flagged fragment reports as before -- at
+    once when it completes, after the M1 debounce when it leaves gaps --
+    and a bucket that has already seen a flagged frame (the flagged
+    parity that arrived first, the flagged fragment of a re-drive)
+    reports its completion at once too, since the burst's tail is
+    provably here. Every report lists the sender's recent packets, so
+    whichever report goes out supersedes the held one (`_send_completion_
+    report` cancels it), and a four-part window arriving back to back
+    produces exactly one report, on its flagged last fragment. A lone
+    single-part burst is unchanged (its last two fragments are flagged).
+    The receiver's reports for parts 8, 9 and 10 of the field window --
+    the one that ended the sender's wait early and the two the sender's
+    own queue drowned -- are the reports this removes. Tests: `tests/
+    test_report_hold_during_burst_0921.py` (the two hold arithmetics, one
+    report per window, the re-armed silence hold, the flagged-tail-seen
+    rule, the knob); `test_completion_reports_even_without_the_flag`
+    re-pinned to the held report. Shipped-default pin and golden config
+    re-pinned for the new key.

@@ -22,6 +22,13 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   only when at most one frame is queued ahead of the one on air. Tests:
   `tests/test_radio_busy_until_0921.py`; the unit fake's radio block is SF8/BW250 so its estimate
   matches its air model.
+- **The receiver holds reports while a window is still arriving (2b)** (new key
+  `direct_report_hold_during_burst = yes`). A part completed by an unflagged fragment is reported only
+  once the sender's fragments have stopped arriving (one fragment spacing plus half an airtime,
+  re-armed by every fragment); a flagged fragment -- or a bucket that has already seen one -- reports
+  at once. One report per window instead of one per part; the mid-burst reports that ended the
+  field sender's wait early and collided with its own queue are gone. Tests:
+  `tests/test_report_hold_during_burst_0921.py`.
 
 ## alpha-0.1.4 (2026-09-21)
 

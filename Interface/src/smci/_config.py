@@ -552,6 +552,25 @@ class _ConfigMixin:
         # (`_report_hold_s`) and dropped if the bucket completes first. `no`
         # reports immediately as before.
         self.direct_report_debounce = _cfg_bool(cfg.get("direct_report_debounce", "yes"))
+        # Alpha 0.1.5 (2b, 2026-09-21): the receiver sends no per-part
+        # complete report while fragments of the same sender's window are
+        # still arriving. The field (zero-hop 12-part page, 08:38): the
+        # laptop reported each part the moment it completed, while the
+        # desktop's radio was still transmitting the rest of the window --
+        # the report for part 8 reached the desktop mid-burst and ended its
+        # wait early, the reports for parts 9 and 10 were transmitted into
+        # the desktop's own queue and never heard, and every one of the
+        # four on-air losses of that page sat within 2 s of one of those
+        # reports. Now a completed part that arrived UNFLAGGED (not one of
+        # the burst's last two fragments) is reported after a silence of one
+        # fragment's start-to-start spacing at this hop count plus half an
+        # airtime (`_report_hold_s(..., arriving=True)`), re-armed by every
+        # further fragment from that sender; a flagged fragment reports at
+        # once (complete) or after the M1 debounce (gaps), as before, and
+        # every report lists the sender's recent packets, so one report
+        # covers the window. A lone single-part burst is unchanged: its last
+        # two fragments are flagged. `no` reports every completion at once.
+        self.direct_report_hold_during_burst = _cfg_bool(cfg.get("direct_report_hold_during_burst", "yes"))
         # Phase 3 M2 (2026-09-20): one report per WINDOW. RNS hands the
         # sender a window of 4-6 Resource parts within milliseconds; each
         # used to be its own burst-and-report exchange (two in flight per

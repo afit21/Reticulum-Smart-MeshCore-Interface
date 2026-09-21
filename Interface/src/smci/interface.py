@@ -838,6 +838,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
+        # Alpha 0.1.5 (2b): sender token -> {"task", "header", "frag_bytes"}
+        # for a complete report held while that sender's fragments are still
+        # arriving; re-armed by every fragment, superseded by any report.
+        self._pending_sender_reports = {}
         # Phase 3 M2 (2026-09-20): peer prefix -> the open _RawWindow parts
         # join; sender token -> {(pkt_id, frag_total): last seen} for the
         # v4 report's entries.

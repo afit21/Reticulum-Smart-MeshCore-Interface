@@ -1431,17 +1431,89 @@ class _ReconcileMixin:
             entries.append((pkt_id, frag_total, complete, held))
         return entries
 
-    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int) -> float:
-        """How long a receiver holds a gaps report after a flagged fragment
-        that left gaps (pure function, phase 3 M1): the time the burst's
-        LAST fragment needs to arrive -- one fragment's airtime plus, through
-        repeaters, the hop-scaled relay gap the sender itself observes
-        between fragments (`_raw_fragment_gap_s`). Field: the complete
-        report followed the gaps report by 0.22-0.43 s at the receiver at
-        zero hop, one fragment airtime (~0.9 s at SF7/BW62.5) covers it."""
+    # Alpha 0.1.5 (2b): the margin, in fragment airtimes, a "still arriving"
+    # hold adds to the sender's start-to-start spacing for relay and host
+    # jitter before the receiver concludes the burst has ended.
+    RAW_ARRIVING_HOLD_MARGIN_AIRTIMES = 0.5
+
+    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int, arriving: bool = False) -> float:
+        """How long a receiver holds a report (pure function, phase 3 M1;
+        generalised in alpha 0.1.5 2b).
+
+        Gaps case (`arriving=False`): after a flagged fragment that left
+        gaps, the time the burst's LAST fragment needs to arrive -- one
+        fragment's airtime plus, through repeaters, the hop-scaled relay gap
+        the sender itself observes between fragments (`_raw_fragment_gap_s`).
+        Field: the complete report followed the gaps report by 0.22-0.43 s
+        at the receiver at zero hop, one fragment airtime (~0.9 s at
+        SF7/BW62.5) covers it.
+
+        Still-arriving case (`arriving=True`): after an UNFLAGGED fragment
+        completed a part, the silence that says the sender's window burst
+        is over -- the sender's start-to-start spacing at this hop count
+        (airtime + `direct_raw_zero_hop_gap` at zero hop, the hop-scaled
+        gap, which contains the airtime, through repeaters) plus half an
+        airtime for relay and host jitter. Re-armed by every fragment."""
+        airtime = self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
         if hops > 0:
-            return self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
-        return self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
+            hold = self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
+        else:
+            hold = airtime
+        if arriving:
+            if hops <= 0:
+                hold += max(0.0, self.direct_raw_zero_hop_gap_s)
+            hold += self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+        return hold
+
+    def _receiver_hops_to(self, sender_token: str) -> int:
+        """The receiver's own resolved hop count to a sender (0 when it has
+        none) -- what its report holds are scaled by."""
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        return max(0, resolved.out_path_len) if resolved is not None else 0
+
+    def _schedule_sender_report(self, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
+        """Alpha 0.1.5 (2b): a part completed on an unflagged fragment --
+        the sender's window is still in the air. Hold ONE complete report
+        for this sender until its fragments stop arriving for
+        `_report_hold_s(..., arriving=True)`; `_rearm_sender_report` pushes
+        the deadline on every further fragment, and any report that goes
+        out meanwhile (the flagged last fragment's, a gaps report, a
+        duplicate's) supersedes it, since every report lists the sender's
+        recent packets. `header` names the part whose completion is the
+        report's trigger."""
+        if not self.direct_raw_report_enabled:
+            return
+        hold_s = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token), arriving=True)
+        self._cancel_sender_report(sender_token)
+        entry = {"header": header, "frag_bytes": fragment_on_air_bytes, "hold_s": hold_s, "task": None}
+
+        async def fire():
+            try:
+                await asyncio.sleep(hold_s)
+                if self._pending_sender_reports.get(sender_token) is not entry:
+                    return
+                self._pending_sender_reports.pop(sender_token, None)
+                self._send_completion_report(
+                    sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=hold_s,
+                )
+            except asyncio.CancelledError:
+                pass
+
+        entry["task"] = self._spawn_background_task(fire())
+        self._pending_sender_reports[sender_token] = entry
+
+    def _rearm_sender_report(self, sender_token: str) -> None:
+        """Another fragment from this sender: the held report waits again."""
+        entry = self._pending_sender_reports.get(sender_token)
+        if entry is None:
+            return
+        self._schedule_sender_report(sender_token, entry["header"], entry["frag_bytes"])
+
+    def _cancel_sender_report(self, sender_token: str) -> None:
+        entry = self._pending_sender_reports.pop(sender_token, None)
+        if entry is not None and entry.get("task") is not None and not entry["task"].done():
+            entry["task"].cancel()
 
     def _schedule_gaps_report(self, key, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
         """Hold the gaps report for `_report_hold_s` (M1 debounce); if the
@@ -1456,10 +1528,7 @@ class _ReconcileMixin:
         if not self.direct_report_debounce or not self.direct_raw_report_enabled:
             self._send_completion_report(sender_token, header, complete=False, held=held_now())
             return
-        peer_prefix = self._canonical_peer_prefix(sender_token)
-        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
-        hops = max(0, resolved.out_path_len) if resolved is not None else 0
-        hold_s = self._report_hold_s(fragment_on_air_bytes, hops)
+        hold_s = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token))
         self._cancel_gaps_report(key)
 
         async def fire():
@@ -1492,6 +1561,9 @@ class _ReconcileMixin:
         path if it is lost. Off when `direct_raw_report_enabled` is no."""
         if not self.direct_raw_report_enabled or header.pkt_id is None:
             return
+        # 2b: every report lists the sender's recent packets, so a report
+        # held for "still arriving" is covered by whichever goes out now.
+        self._cancel_sender_report(sender_token)
         nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
         self._debug(
             f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
@@ -1695,6 +1767,9 @@ class _ReconcileMixin:
         key = self._reassembly_key(header, sender_token, mode="direct")
         if raw and header.pkt_id is not None:
             self._note_recent_raw_pkt(sender_token, header.pkt_id, header.frag_total)
+            # 2b: this sender is still bursting -- a held complete report
+            # waits for the silence again.
+            self._rearm_sender_report(sender_token)
 
         if raw and parity:
             # M4: a parity fragment. Keep it on the bucket (opening one if
@@ -1710,6 +1785,8 @@ class _ReconcileMixin:
             bucket = self._reassembly.get(key)
             if bucket is None:
                 bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+            if report_requested:
+                bucket.flagged_seen = True
             if len(payload) >= 2:
                 bucket.parity[header.frag_idx] = (payload[0], bytes(payload[1:]))
                 bucket.last_progress = time.monotonic()
@@ -1720,7 +1797,7 @@ class _ReconcileMixin:
                 idx, data = reconstructed
                 self._handle_direct_multifragment_frame(
                     _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
-                    data, sender_token, raw=True, report_requested=report_requested,
+                    data, sender_token, raw=True, report_requested=report_requested or bucket.flagged_seen,
                 )
                 return
             if report_requested and key in self._reassembly:
@@ -1738,17 +1815,24 @@ class _ReconcileMixin:
                 self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
             return
 
+        # 2b: the burst's tail is here if THIS fragment is flagged or an
+        # earlier flagged frame (data or parity) of this packet was; read
+        # before the bucket is consumed by a completion.
+        bucket_before = self._reassembly.get(key)
+        tail_seen = bool(report_requested or (bucket_before is not None and bucket_before.flagged_seen))
         complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
         if complete_data is None and raw:
-            # M4: a parity that arrived earlier may now cover exactly one gap.
             bucket = self._reassembly.get(key)
+            if bucket is not None and report_requested:
+                bucket.flagged_seen = True   # the bucket may have been opened by this fragment
+            # M4: a parity that arrived earlier may now cover exactly one gap.
             if bucket is not None and bucket.parity:
                 reconstructed = self._reconstruct_from_parity(key, bucket)
                 if reconstructed is not None:
                     idx, data = reconstructed
                     self._handle_direct_multifragment_frame(
                         _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
-                        data, sender_token, raw=True, report_requested=report_requested,
+                        data, sender_token, raw=True, report_requested=report_requested or bucket.flagged_seen,
                     )
                     return
         if complete_data is None:
@@ -1770,7 +1854,14 @@ class _ReconcileMixin:
                 # report still held for this bucket is dropped: complete
                 # supersedes it (M1 debounce).
                 self._cancel_gaps_report(key)
-                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                if tail_seen or not self.direct_report_hold_during_burst:
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                else:
+                    # 2b: an unflagged fragment completed this part, so the
+                    # sender's window is still on the air -- one report for
+                    # the whole window once its fragments stop arriving,
+                    # unless the flagged last fragment reports first.
+                    self._schedule_sender_report(sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
             else:

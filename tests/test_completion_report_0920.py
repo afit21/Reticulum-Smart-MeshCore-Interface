@@ -148,6 +148,11 @@ class LastTwoFragmentsCarryTheFlag(SingleNodeCase):
             iface._reassembly.pop(key, None)
 
     def test_completion_reports_even_without_the_flag(self):
+        """Alpha 0.1.5 (2b): an UNFLAGGED completion still reports, but only
+        after the sender's fragments have stopped arriving for
+        `_report_hold_s(..., arriving=True)` -- mid-window reports were what
+        collided with the sender's own queued burst in the 2026-09-21 field
+        session. The report still says complete."""
         iface = self.iface
         sent = []
         original = iface._send_completion_report
@@ -157,9 +162,14 @@ class LastTwoFragmentsCarryTheFlag(SingleNodeCase):
             h1 = self.module._FrameHeader(iface.PROTOCOL_VERSION, True, False, 42, 1, 2, 0)
             self.on_loop(lambda: iface._handle_direct_multifragment_frame(h0, b"a" * 10, PEER, raw=True))
             self.on_loop(lambda: iface._handle_direct_multifragment_frame(h1, b"b" * 10, PEER, raw=True))
-            self.assertTrue(sent and sent[-1][1].get("complete"))
+            self.assertEqual(sent, [], "an unflagged completion is held while the window may still be arriving")
+            hold = iface._report_hold_s(10 + iface.RAW_HEADER_SIZE, 0, arriving=True)
+            self.assertTrue(wait_until(lambda: len(sent) == 1, hold + 2.0), "the held report goes out after the silence")
+            self.assertTrue(sent[-1][1].get("complete"))
+            self.assertAlmostEqual(sent[-1][1].get("held_s"), hold, places=3)
         finally:
             iface._send_completion_report = original
+            iface._cancel_sender_report(PEER)
 
     def test_sender_flags_the_last_two_fragments_of_a_burst(self):
         iface = self.iface
