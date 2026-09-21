@@ -1,10 +1,17 @@
 # Changelog
 
-## Unreleased (alpha 0.1.5, 2026-09-21)
+## alpha-0.1.5 (2026-09-21)
 
 The items of the alpha 0.1.5 pass, each from the alpha 0.1.4 field session's captures
-(`fieldtests/raw/Alpha0.1.4/`, desktop `afipc_` + laptop). No wire change so far. The dated design
-record is `docs/history.md` ("Alpha 0.1.5 pass").
+(`fieldtests/raw/Alpha0.1.4/`, desktop `afipc_` + laptop). No wire change: a 0.1.4 node interoperates
+(both nodes should still run the same build). The dated design record is `docs/history.md`
+("Alpha 0.1.5 pass"); the MeshBench results and the baseline file are recorded at the end of this
+section. New config keys, all optional (defaults shown): `duty_cycle_max_fraction_zero_hop = 0.85`,
+`direct_raw_burst_queue_ahead = 1`, `direct_report_hold_during_burst = yes`, `packet_capture_label`
+(default: the MeshCore node name), `path_adopt_enabled = yes`, `path_adopt_window = 600`,
+`direct_raw_gap_own_airtime = yes`, `radio_stats_interval = 300`; `direct_raw_window_collect` (0.75)
+is now a maximum. Every default is pinned by `tests/test_shipped_defaults.py` and
+`tests/golden/config_defaults.json`; the wire golden did not move.
 
 - **Hop-aware airtime cap** (new key `duty_cycle_max_fraction_zero_hop = 0.85`; `duty_cycle_max_fraction`
   stays 0.30). Two ledgers over the same 60 s window: everything a repeater relays (multi-hop DIRECT,

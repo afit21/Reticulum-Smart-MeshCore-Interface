@@ -27,9 +27,17 @@ As this project is under a GPL license, there is nothing stopping you from lifti
 
 In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
 
-## Features (Version alpha0.1.4)
+## Features (Version alpha0.1.5)
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
+
+New in alpha 0.1.5 (no wire change from 0.1.4; both nodes should still run the same build):
+
+- zero-hop direct traffic may use up to 85% of channel time while anything a repeater relays stays at 30% (see the airtime section above; `duty_cycle_max_fraction_zero_hop`).
+- the sender tracks when its radio has actually finished transmitting a burst, paces zero-hop bursts to the radio (`direct_raw_burst_queue_ahead`), the receiver sends one completion report per window instead of one per part (`direct_report_hold_during_burst`), and a report that arrives early is progress rather than the end of the wait -- the field session's unnecessary re-sends are what this removes.
+- shorter-path adoption from a peer's own floods (`path_adopt_enabled`, `path_adopt_window`).
+- a lone packet no longer waits the window-collect time (`direct_raw_window_collect` is now a maximum), and a completion report owed to the other side goes out between the parts of this node's own window.
+- capture files are named after the MeshCore node (`packet_capture_label`), the radio's own transmit statistics are recorded (`radio_stats_interval`), and `direct_raw_gap_own_airtime` exists for the one-hop gap field A/B (default unchanged).
 
 New in alpha 0.1.4:
 
