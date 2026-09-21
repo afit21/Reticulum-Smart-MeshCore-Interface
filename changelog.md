@@ -65,8 +65,9 @@ is now a maximum. Every default is pinned by `tests/test_shipped_defaults.py` an
 - **Shorter-path adoption** (new keys `path_adopt_enabled = yes`, `path_adopt_window = 600`; no wire
   change). A bound peer's floods (its adverts; its path requests and text floods addressed to us)
   carry the route they took; when that route, reversed, is at least one hop shorter than the peer's
-  resolved path it is set on the contact and used instead of running discovery. Provisional: two
-  missed sends before a success drop it for discovery. Field motivation: 35 minutes on a four-hop
+  resolved path -- or when no path is resolved at all, after a stale-path reset -- it is set on the
+  contact and used instead of running discovery. Provisional: two missed sends before a success
+  drop it for discovery. Field motivation: 35 minutes on a four-hop
   path while the peer's floods arrived over two. Capture: `path_adopted`, `path_adoption_confirmed`,
   `path_adoption_failed`. MeshBench: new scenario `shortcut_appears`. Tests:
   `tests/test_shorter_path_adoption_0921.py`.

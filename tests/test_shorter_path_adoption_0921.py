@@ -29,7 +29,10 @@ Pinned:
   * the scenario: a four-hop resolved path and a two-hop flood route become
     a two-hop resolved path AND a two-hop device contact, captured as
     `path_adopted`; a route only as long as the path is not adopted; nothing
-    is adopted while a raw window to the peer is in flight;
+    is adopted while a raw window to the peer is in flight; with NO resolved
+    path (after a stale-path reset) a recent flood route is adopted instead
+    of running discovery (MeshBench shortcut_appears, first run: the floods
+    arrived 10 s after the reset and discovery then took 220 s);
   * provisional: two full-timeout send failures before any success drop the
     adopted path (resolved path forgotten -> discovery next, route on
     cooldown); one success confirms it;
@@ -184,8 +187,30 @@ class AdoptionScenario(_Scaffold):
             self.assertEqual(same.out_path_hex, "1976bed6")
         finally:
             iface.path_adopt_enabled = saved
+        iface._flood_routes_seen.pop(PEER, None)
         self.assertIsNone(self.node.run_on_loop(iface._maybe_adopt_shorter_path(PEER, None), timeout=10),
-                          "no resolved path: discovery's job, unchanged")
+                          "no resolved path and no flood route seen: discovery's job, unchanged")
+
+    def test_no_resolved_path_adopts_a_recent_flood_route_instead_of_discovery(self):
+        # MeshBench shortcut_appears, first run: B's one-hop floods reached A
+        # 10 s after A's stale-path reset; discovery then took 220 s more.
+        iface = self.iface
+        iface._note_flood_route(*self._flood(0, "6a", src="34", dst="7b"), time.monotonic())
+        sink = []
+        orig = iface._capture_event
+        iface._capture_event = lambda direction, fields: sink.append(fields)
+        iface._packet_capture_file = object()
+        try:
+            adopted = self.node.run_on_loop(iface._maybe_adopt_shorter_path(PEER, None), timeout=10)
+        finally:
+            iface._capture_event = orig
+            iface._packet_capture_file = None
+        self.assertEqual((adopted.out_path_hex, adopted.out_path_len), ("6a", 1))
+        self.assertIs(iface._resolved_paths[PEER], adopted)
+        self.assertIn(PEER, iface._adopted_paths, "provisional, with the same two-miss fallback")
+        ev = [f for f in sink if f.get("event") == "path_adopted"]
+        self.assertEqual((ev[0]["old_path_len"], ev[0]["new_path_len"]), (None, 1))
+        self.assertEqual(self.node.radio.contacts[PEER_KEY]["out_path"], "6a")
 
     def _adopt(self):
         iface = self.iface

@@ -3563,3 +3563,16 @@ update together; parity stays on; aim for no wire change.
     exactly the handshake path. The between-parts yield stays for the
     windows RNS does hand over whole. Pinned in `tests/test_report_yield_
     between_parts_0921.py`.
+
+    Item 3, second cut (same day, from `shortcut_appears`'s first run,
+    build 1fd4e00). A's capture had B's one-hop floods (PATH and REQ from
+    81 to 1c, path 6a) from 627 s -- but A's own sends over the dead
+    three-hop path had already failed three times and its stale-path reset
+    had forgotten the path at ~615 s, so `_maybe_adopt_shorter_path(None)`
+    stood aside and the send went to discovery, which under its backoff
+    resolved the one-hop path only at 843 s (`FAIL sender adopted a shorter
+    path ... []`; probes 6-10 unresolved). "Instead of running discovery"
+    has to cover that case: with no resolved path and a recent flood
+    route, the route is adopted (provisional, the same two-miss fallback)
+    and discovery is skipped; `path_adopted` then carries `old_path_len`
+    None. The scenario's check accepts that form.

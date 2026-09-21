@@ -5359,14 +5359,21 @@ class _PathDiscoveryMixin:
 
     async def _maybe_adopt_shorter_path(self, peer_prefix: str, resolved: "Optional[_ResolvedPath]"):
         """Adopt the shortest flood route to `peer_prefix` when it is at
-        least one hop shorter than the resolved path: set it on the device
-        contact (`change_contact_path`, as discovery persists), make it the
-        resolved path (provisional), and return it. Otherwise return
+        least one hop shorter than the resolved path -- or when there is no
+        resolved path at all (a stale-path reset just forgot it, or none was
+        ever discovered) and a recent flood route exists: set it on the
+        device contact (`change_contact_path`, as discovery persists), make
+        it the resolved path (provisional), and return it. Otherwise return
         `resolved` unchanged. Not while a raw window to the peer is in
         flight (its fragments are source-routed on the old path and a
         change mid-send aborts it), and not while an earlier adoption is
-        still provisional."""
-        if not self.path_adopt_enabled or resolved is None:
+        still provisional.
+
+        The no-path case is from MeshBench `shortcut_appears` (2026-09-21,
+        first run): B's one-hop floods reached A 10 s AFTER A's own stale-
+        path reset had forgotten the three-hop path, so the first cut stood
+        aside for discovery, which took 220 s more under its backoff."""
+        if not self.path_adopt_enabled:
             return resolved
         if peer_prefix in self._adopted_paths or peer_prefix in self._raw_windows:
             return resolved
@@ -5375,7 +5382,7 @@ class _PathDiscoveryMixin:
         if best is None:
             return resolved
         hops, reversed_hex, hash_size, source, seen_at = best
-        if hops > max(0, resolved.out_path_len) - 1:
+        if resolved is not None and hops > max(0, resolved.out_path_len) - 1:
             return resolved
         contact = self._resolve_contact(peer_prefix)
         if contact is None:
@@ -5388,16 +5395,19 @@ class _PathDiscoveryMixin:
         }
         self._direct_path_failures.pop(peer_prefix, None)
         self._invalidate_ack_rtt(peer_prefix, "shorter path adopted")
+        was = (f"replaces {previous.out_path_hex or '<zero-hop>'} ({previous.out_path_len} hop(s))"
+               if previous is not None else "where no path was resolved (discovery skipped)")
         RNS.log(
-            f"{self}: adopted a shorter path to {peer_prefix!r} from its own {source} flood: "
-            f"{reversed_hex or '<zero-hop>'} ({hops} hop(s)) replaces {previous.out_path_hex or '<zero-hop>'} "
-            f"({previous.out_path_len} hop(s)), seen {now - seen_at:.0f}s ago; provisional until it delivers.",
+            f"{self}: adopted a path to {peer_prefix!r} from its own {source} flood: "
+            f"{reversed_hex or '<zero-hop>'} ({hops} hop(s)) {was}, seen {now - seen_at:.0f}s ago; "
+            f"provisional until it delivers.",
             RNS.LOG_INFO,
         )
         if self._packet_capture_file is not None:
             self._capture_event("out", {
                 "event": "path_adopted", "peer_prefix": peer_prefix, "source": source,
-                "old_path_len": previous.out_path_len, "old_path_hex": previous.out_path_hex,
+                "old_path_len": previous.out_path_len if previous is not None else None,
+                "old_path_hex": previous.out_path_hex if previous is not None else None,
                 "new_path_len": hops, "new_path_hex": reversed_hex, "seen_age_s": round(now - seen_at, 1),
             })
         await self._persist_resolved_path(contact, adopted)
@@ -5445,7 +5455,8 @@ class _PathDiscoveryMixin:
         if self._packet_capture_file is not None:
             self._capture_event("out", {"event": "path_adoption_failed", "peer_prefix": pubkey_prefix,
                                         "path_hex": entry["path_hex"], "misses": entry["misses"],
-                                        "previous_path_len": entry["previous"].out_path_len})
+                                        "previous_path_len": (entry["previous"].out_path_len
+                                                              if entry["previous"] is not None else None)})
         return True
 
     # -- Stale cached-path detection and reset (§8) ------------------------

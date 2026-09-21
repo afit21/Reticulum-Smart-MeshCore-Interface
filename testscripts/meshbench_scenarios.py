@@ -1056,7 +1056,7 @@ def run_scenario(scenario: Scenario, args) -> int:
                 adopted = [r for r in recs if r.get("event") == "path_adopted"]
                 failed = [r for r in recs if r.get("event") == "path_adoption_failed"]
                 confirmed = [r for r in recs if r.get("event") == "path_adoption_confirmed"]
-                check(bool(adopted) and all(r["new_path_len"] < r["old_path_len"] for r in adopted),
+                check(bool(adopted) and all(r["old_path_len"] is None or r["new_path_len"] < r["old_path_len"] for r in adopted),
                       f"sender adopted a shorter path from the responder's floods: "
                       f"{[(r['old_path_len'], r['new_path_len'], r['source']) for r in adopted]}")
                 check(not failed, f"no adopted path was dropped for missing its first sends: {len(failed)}")
