@@ -262,7 +262,7 @@ class _ReconcileMixin:
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
         last_sent_idx: Optional[int] = None, rearm=None, release_lock=None, window_pkts=None,
-        burst_end: Optional[float] = None,
+        burst_end: Optional[float] = None, on_early=None,
     ) -> Optional[_CompletionFrame]:
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
@@ -295,6 +295,21 @@ class _ReconcileMixin:
         started = time.monotonic() if burst_end is None else max(burst_end, 0.0)
         provisional: Optional[_CompletionFrame] = None
         deadline_s = wait_s
+        # 2c (alpha 0.1.5): a report that arrives BEFORE the burst has ended
+        # on air -- the future already resolved when this wait starts, or a
+        # report landing while `time.monotonic() < burst_end` -- is progress,
+        # not the end of the wait: `on_early(frame)` applies it to the parts
+        # it mentions and says whether anything is still missing; the wait
+        # then continues to burst_end + window for the receiver's word on
+        # the rest. Only when that expires is the last early report acted
+        # on (captured as `reported_stale`), so parts absent from any report
+        # are re-burst only after the wait has actually expired -- the
+        # field's part-8 report ended the wait with parts 9-12 unmentioned
+        # and still in the sender's own radio queue. With nothing missing
+        # after an early report the wait ends at once.
+        early: Optional[_CompletionFrame] = None
+        early_reports = 0
+        done_at_entry = fut.done()
         released = release_lock is None
         while True:
             remaining = deadline_s - (time.monotonic() - started)
@@ -324,11 +339,31 @@ class _ReconcileMixin:
                 if provisional is not None:
                     got = provisional
                     break
+                if early is not None:
+                    got = early
+                    break
                 self._debug(
                     f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
                     f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
                 )
                 return None
+            arrived_early = on_early is not None and rearm is not None and (
+                done_at_entry or (burst_end is not None and time.monotonic() < burst_end))
+            done_at_entry = False
+            if arrived_early:
+                early_reports += 1
+                early = got
+                still_missing = on_early(got)
+                if not still_missing:
+                    # Everything this window sent is held: nothing to wait for.
+                    break
+                fut = rearm()
+                self._debug(
+                    f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) arrived before the burst "
+                    f"ended on air ({self._radio_busy_remaining_s():.1f}s of own air left) -- applied as progress, "
+                    f"waiting for the receiver's word on the rest."
+                )
+                continue
             if got.entries and window_pkts is not None:
                 # v4 window report (M2): the gaps of every entry that belongs
                 # to this window, as (pkt_id, frag_idx) pairs.
@@ -355,6 +390,7 @@ class _ReconcileMixin:
             break
         waited_s = max(0.0, time.monotonic() - started)
         is_provisional = got is provisional
+        acted_on_early = early is not None and got is early and (time.monotonic() - started) >= deadline_s - 0.001
         self._debug(
             f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
             f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
@@ -364,10 +400,12 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result",
                 "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
-                "outcome": "reported", "complete": got.complete, "stage": stage,
+                "outcome": "reported_stale" if acted_on_early else "reported", "complete": got.complete, "stage": stage,
                 "timeout_s": round(wait_s, 3), "answer_version": got.version,
                 "held": sorted(got.held) if got.held is not None else None,
+                "entries": [(e[0], e[1], e[2], sorted(e[3]) if e[3] is not None else None) for e in got.entries] or None,
                 "report_wait_s": round(waited_s, 3), "provisional": is_provisional,
+                "early_reports": early_reports,
             })
         return got
 
@@ -524,6 +562,13 @@ class _ReconcileMixin:
         window.parts.append(part)
         self._debug(f"RAW part pkt_id={pkt_id} joined the open window to {peer_prefix!r} ({len(window.parts)} parts).")
         return await part.future
+
+    def _frame_entries(self, frame: "_CompletionFrame") -> tuple:
+        """A completion frame's per-part entries: the v4 list, or the single
+        v1-v3 part as one entry (held None when it carried no bitmap)."""
+        if frame.entries:
+            return tuple(frame.entries)
+        return ((frame.pkt_id, frame.frag_total, frame.complete, self._held_from_answer(frame, frame.frag_total)),)
 
     def _window_missing(self, parts) -> list:
         """[(part, frag_idx)] still to send, in part order."""
@@ -744,10 +789,6 @@ class _ReconcileMixin:
                     if yields:
                         self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
                     if report_fut is not None:
-                        stale_report = None
-                        if report_fut.done() and not report_fut.result().complete:
-                            stale_report = report_fut.result()
-                            report_fut = rearm()
                         # 2a: the burst ends when the radio is estimated to
                         # have finished the last queued fragment, not when
                         # the last send command returned -- the report wait
@@ -756,18 +797,20 @@ class _ReconcileMixin:
                         for p, _ in missing:
                             self._expect_report(peer_prefix, p.pkt_id, burst_end)
                         last_part, last_idx = missing[-1]
+
+                        def apply_early(frame) -> bool:
+                            # 2c: a report from before the burst's end on
+                            # air (the field's part-8 report) is applied to
+                            # the parts it names; True while parts of this
+                            # window are still missing.
+                            self._apply_window_entries(window, self._frame_entries(frame), "early report")
+                            return bool(self._window_missing(parts))
+
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, last_part.pkt_id, last_part.frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=last_idx, rearm=rearm, release_lock=release_for_handshake,
-                            window_pkts=live_pkts, burst_end=burst_end,
+                            window_pkts=live_pkts, burst_end=burst_end, on_early=apply_early,
                         )
-                        if report is None and stale_report is not None:
-                            report = stale_report
-                            self._capture_completion_check_result(
-                                peer_prefix, last_part.pkt_id, last_part.frag_total, "reported_stale", stale_report.complete,
-                                stage=f"raw{rnd}", answer_version=stale_report.version,
-                                held=sorted(stale_report.held) if stale_report.held is not None else None,
-                            )
                 finally:
                     release_for_handshake()
                 for p, _ in missing:
@@ -803,8 +846,7 @@ class _ReconcileMixin:
                     fail_rest(False)
                     return
                 continue
-            entries = answer.entries if answer.entries else ((answer.pkt_id, answer.frag_total, answer.complete,
-                                                              self._held_from_answer(answer, answer.frag_total)),)
+            entries = self._frame_entries(answer)
             if all(e[3] is None for e in entries):
                 query_unanswered_rounds += 1
                 consecutive_unanswered += 1

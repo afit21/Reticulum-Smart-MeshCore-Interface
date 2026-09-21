@@ -29,6 +29,13 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   at once. One report per window instead of one per part; the mid-burst reports that ended the
   field sender's wait early and collided with its own queue are gone. Tests:
   `tests/test_report_hold_during_burst_0921.py`.
+- **An early report is progress, not the end of the wait (2c).** A report that lands before the
+  burst has ended on air is applied to the parts it names and the sender keeps waiting until
+  burst end + report window; parts absent from any report are re-burst only after that wait has
+  expired (the field's part-8 report ended the wait with parts 9-12 unmentioned and re-burst them
+  behind the sender's own queue). The `completion_check_result` record gains `early_reports` and the
+  report's `entries`. Tests: `tests/test_early_report_is_progress_0921.py` (the 08:38 sequence
+  re-sends nothing).
 
 ## alpha-0.1.4 (2026-09-21)
 

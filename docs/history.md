@@ -3343,3 +3343,30 @@ update together; parity stays on; aim for no wire change.
     rule, the knob); `test_completion_reports_even_without_the_flag`
     re-pinned to the held report. Shipped-default pin and golden config
     re-pinned for the new key.
+
+    2c. **An early report is progress, not the end of the wait**
+    (`_await_completion_report(..., burst_end=, on_early=)`, `_frame_
+    entries`). A report that arrives before the burst has ended on air --
+    the waiter future already resolved when the wait starts, or a report
+    landing while `time.monotonic() < burst_end` -- is applied to the
+    parts it names (`_apply_window_entries`, so a completed part's future
+    resolves and RNS moves on) and the wait continues to burst_end plus
+    the report window for the receiver's word on the rest; only when that
+    expires is the last early report acted on (captured as `reported_
+    stale`, the outcome the pre-2c caller wrote for a kept mid-burst
+    report, now with `early_reports` and the report's `entries`), so
+    parts absent from any report are re-burst only after the wait has
+    actually expired. An early report that leaves nothing missing ends
+    the wait at once. The caller's own stale-report pre-handling is
+    folded into this (one place decides what a report means for the
+    wait). Tests: `tests/test_early_report_is_progress_0921.py` -- the
+    08:38 sequence (the part-8 report mid-burst, the receiver's window
+    report after the burst end) re-sends nothing: one round, no QUERY;
+    the early report alone re-bursts parts 9-12 only after burst_end +
+    window, without a QUERY, and never part 8; an early report that
+    completes everything ends the wait at once. `SenderKeepsAMidBurst
+    ReportAsTheFallback` re-pinned to the record's new fields (same
+    outcome, same re-drive, still no QUERY). Target from the field for
+    2a-2c together: re-sent fragments per part at zero hop from 0.55
+    towards 0.1, the page's duty-cycle share to nearly all of its
+    remaining time. MeshBench gate in `changelog.md`.
