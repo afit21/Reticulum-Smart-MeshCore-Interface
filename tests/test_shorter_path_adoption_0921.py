@@ -266,6 +266,38 @@ class AdoptionScenario(_Scaffold):
         self.assertEqual(iface._direct_path_failures.get(PEER, 0), 1)
 
 
+class SupplementPathAlsoAdopts(_Scaffold):
+    def test_direct_supplement_adopts_before_discovery(self):
+        # shortcut_appears re-run 2: A never learned a token for B (no PROOF
+        # came back), so every probe went DIRECT-to-all through
+        # _send_direct_supplement, which decides resolved-vs-discover on its
+        # own and never reached _send_direct_packet's adoption.
+        iface = self.iface
+        iface._note_flood_route(*self._flood(0, "6a", src="34", dst="7b"), time.monotonic())
+        discovered = []
+        sent = []
+
+        async def fake_discover(prefix):
+            discovered.append(prefix)
+            return None
+
+        async def fake_send_payload(target, peer_prefix, data, priority=None, hop_count=None, expires_at=None, **kw):
+            sent.append((peer_prefix, hop_count))
+            return True
+
+        saved = (iface._discover_path_coalesced, iface._send_direct_payload)
+        iface._discover_path_coalesced, iface._send_direct_payload = fake_discover, fake_send_payload
+        try:
+            ok = self.node.run_on_loop(iface._send_direct_supplement(
+                b"\x00" * 20, PEER, priority=iface.PRIORITY_NORMAL, trigger_discovery=True, alongside_broadcast=False), timeout=10)
+        finally:
+            iface._discover_path_coalesced, iface._send_direct_payload = saved
+        self.assertTrue(ok)
+        self.assertEqual(discovered, [], "the flood route was adopted instead of running discovery")
+        self.assertEqual(sent, [(PEER, 1)])
+        self.assertEqual(iface._resolved_paths[PEER].out_path_hex, "6a")
+
+
 class RxLogTapFeedsTheObserver(_Scaffold):
     def test_advert_event_records_the_reversed_route(self):
         iface = self.iface

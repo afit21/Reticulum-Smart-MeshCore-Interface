@@ -3585,3 +3585,16 @@ update together; parity stays on; aim for no wire change.
     evidence still counts -- the field's two-hop floods (11:02) were three
     minutes older than the four-hop path (11:05) and never refreshed in
     the 35 minutes after, which is the case the item exists for.
+    Fourth cut, from the re-run on the third cut (build 4627e00, two runs):
+    run 1 PASSED the hard check (adopted B's one-hop route 18 s after its
+    addressed flood, where no path was resolved, discovery skipped,
+    confirmed by the next delivery; probes 9-10 at one hop); run 2 saw
+    B's floods at 586, 590, 615 and 765 s but adopted nothing, because
+    A never learned an RNS token for B in that run (no PROOF ever came
+    back) and every probe went DIRECT-to-all through `_send_direct_
+    supplement`, which decides resolved-versus-discover on its own and
+    never reaches `_send_direct_packet`. The same `_maybe_adopt_shorter_
+    path` now runs at that second decision point too -- still one
+    adoption function, called from the two places a send already decides
+    resolved-versus-discover. The alpha 0.1.5 baseline's three
+    `shortcut_appears` runs are on this cut.
