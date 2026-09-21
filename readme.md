@@ -26,9 +26,11 @@ In the future I plan on making this interface hostile to other peers transmittin
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
 
-New in alpha 0.1.2: raw binary data is sent by default, with Z85 text as a fallback if a repeater in the path doesn't support raw messages.
+New in alpha 0.1.4:
 
-New in alpha 0.1.4: less airtime per delivered byte. Fragment reports no longer wait for a MeshCore ACK, one report covers a whole window of parts, a large packet is three raw fragments instead of four, and from one hop up each burst carries a parity fragment so a single lost fragment is repaired without a retry round. **Both nodes must run alpha 0.1.4 or later** - the reconcile and raw-fragment wire formats changed, and an older node will not decode them. New config keys (all optional, defaults shown): `direct_report_noack = yes`, `direct_report_debounce = yes`, `direct_raw_window_enabled = yes`, `direct_raw_window_collect = 0.75`, `direct_raw_window_max_parts = 6`, `direct_raw_parity_enabled = yes`, `direct_raw_parity_min_hops = 1`, `proof_max_age = 45`, `announce_cache_ttl = 3600`, `path_request_local_answer_min_interval = 120`; `direct_raw_report_wait_base` is now 4 s and `direct_raw_report_wait_per_hop` 2.5 s.
+- less airtime per delivered byte. Fragment reports no longer wait for a MeshCore ACK, one report covers a whole window of parts, a large packet is three raw fragments instead of four, and from one hop up each burst carries a parity fragment so a single lost fragment is repaired without a retry round.
+
+- ~60 % less airtime per delivered byte on multi-fragment transfers, with about five times the delivery rate 
 
 **Battle Tested** - Tested and confident this is reliable.
 
@@ -77,25 +79,25 @@ Then add a block to `~/.reticulum/config`, under `[interfaces]`. A minimal real-
 Reference config for a transfer node - by default, the interface will use the MeshCore settings saved to your companion:
 
 ```ini
-[[Smart MeshCore Interface]]
-  type = SmartMeshCoreInterface
-  interface_enabled = yes
-  transport = serial
-  port = /dev/ttyUSB0 #Please verify this is your MeshCore radio
-  baudrate = 115200
-  
-  mode = access_point
+  [[Smart MeshCore Interface]]
+    type = SmartMeshCoreInterface
+    interface_enabled = yes
+    transport = serial
+    port = /dev/ttyUSB0 #Please verify this is your MeshCore radio
+    baudrate = 115200
+    declares_upstream_rns = yes
+    mode = access_point
 ```
 
 Reference config for a non-transfer node:
 
 ```ini
-[[Smart MeshCore Interface]]
-  type = SmartMeshCoreInterface
-  interface_enabled = yes
-  transport = serial
-  port = /dev/ttyUSB0 #Please verify this is your MeshCore radio
-  baudrate = 115200
+  [[Smart MeshCore Interface]]
+    type = SmartMeshCoreInterface
+    interface_enabled = yes
+    transport = serial
+    port = /dev/ttyUSB0 #Please verify this is your MeshCore radio
+    baudrate = 115200
 ```
 
 Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~140 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
