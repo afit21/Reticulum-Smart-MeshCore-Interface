@@ -1204,6 +1204,22 @@ class _ConfigMixin:
         # renamed by hand), or this value. Empty and no node name gives the
         # pre-0.1.5 filename. `_capture_filename` is the pure rule.
         self.packet_capture_label = str(cfg.get("packet_capture_label", "") or "").strip()
+        # Alpha 0.1.5 (item 8, 2026-09-21): airtime estimator calibration,
+        # instrumentation only. Firmware v1.17.1's CMD_GET_STATS (56,
+        # companion protocol v8+; `MyMesh.cpp`) returns the radio's measured
+        # transmit time -- `Dispatcher::checkSend` adds the wall-clock
+        # duration of every completed send to `total_air_time`; reported as
+        # whole seconds -- and per-type packet counts; the library exposes
+        # them as `get_stats_radio()` (tx_air_secs, rx_air_secs, noise floor,
+        # last RSSI/SNR) and `get_stats_packets()` (recv, sent, flood/direct
+        # tx/rx). The interface reads both at start, at stop and every
+        # `radio_stats_interval` seconds (0 = start and stop only) into a
+        # `radio_stats` capture record next to its own summed airtime
+        # estimate and frame count since start, so a field summary can
+        # compare the estimator against the radio. The estimator itself is
+        # unchanged. A firmware without the command (an ERROR reply) is
+        # logged once and the poll stops.
+        self.radio_stats_interval_s = float(cfg.get("radio_stats_interval", 300.0))
 
         # User-requested (2026-09-18, "lessen our reliance on arbitrary
         # wait times" -- step 1 of that plan, see module docstring): tap

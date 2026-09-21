@@ -768,6 +768,8 @@ class _ObservabilityMixin:
         a floor). Returns the new busy-until."""
         now = time.monotonic() if now is None else now
         self._radio_busy_until = max(now, self._radio_busy_until) + max(0.0, airtime_s)
+        self._estimated_tx_air_total_s += max(0.0, airtime_s)   # item 8: the estimator's running sum
+        self._frames_keyed_total += 1
         return self._radio_busy_until
 
     def _radio_busy_remaining_s(self, now: Optional[float] = None) -> float:
@@ -775,6 +777,81 @@ class _ObservabilityMixin:
         off the air (0.0 when idle)."""
         now = time.monotonic() if now is None else now
         return max(0.0, self._radio_busy_until - now)
+
+    # -- Radio transmit statistics (alpha 0.1.5, item 8) --------------------
+
+    def _radio_stats_record(self, reason: str, radio: Optional[dict], packets: Optional[dict]) -> dict:
+        """The `radio_stats` capture record (pure over its inputs): the
+        firmware's measured transmit / receive airtime and packet counts
+        beside this interface's own summed airtime estimate and frame count
+        since start, so a field summary can calibrate the estimator against
+        the radio (`tx_air_secs` is `Dispatcher::total_air_time` in whole
+        seconds, wall-clock from send start to send complete)."""
+        radio = radio or {}
+        packets = packets or {}
+        return {
+            "event": "radio_stats", "reason": reason,
+            "tx_air_secs": radio.get("tx_air_secs"), "rx_air_secs": radio.get("rx_air_secs"),
+            "noise_floor": radio.get("noise_floor"), "last_rssi": radio.get("last_rssi"), "last_snr": radio.get("last_snr"),
+            "packets_sent": packets.get("sent"), "packets_recv": packets.get("recv"),
+            "flood_tx": packets.get("flood_tx"), "direct_tx": packets.get("direct_tx"),
+            "flood_rx": packets.get("flood_rx"), "direct_rx": packets.get("direct_rx"),
+            "recv_errors": packets.get("recv_errors"),
+            "estimated_tx_air_s": round(self._estimated_tx_air_total_s, 3),
+            "frames_keyed": self._frames_keyed_total,
+            "uptime_s": round(time.time() - self._connected_since, 1) if self._connected_since else None,
+        }
+
+    async def _poll_radio_stats(self, reason: str) -> Optional[dict]:
+        """Read the firmware's radio and packet statistics (CMD_GET_STATS,
+        companion protocol v8+) and write one `radio_stats` record. Best
+        effort: a firmware or library without the command is logged once and
+        never asked again. Returns the record, or None."""
+        if self._radio_stats_unsupported or self._mc is None:
+            return None
+        commands = getattr(self._mc, "commands", None)
+        if commands is None or not hasattr(commands, "get_stats_radio") or not hasattr(commands, "get_stats_packets"):
+            self._radio_stats_unsupported = True
+            self._debug("radio stats: the meshcore library has no get_stats_radio/get_stats_packets -- not polled.")
+            return None
+        radio = packets = None
+        try:
+            async with self._command_lock:
+                ev = await asyncio.wait_for(commands.get_stats_radio(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                radio = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+                ev = await asyncio.wait_for(commands.get_stats_packets(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                packets = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+        except Exception as exc:
+            if not self._radio_stats_unsupported:
+                self._radio_stats_unsupported = True
+                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_INFO)
+            return None
+        record = self._radio_stats_record(reason, radio, packets)
+        self._debug(
+            f"radio stats ({reason}): firmware tx_air {record['tx_air_secs']}s rx_air {record['rx_air_secs']}s "
+            f"sent {record['packets_sent']} -- interface estimate {record['estimated_tx_air_s']}s over {record['frames_keyed']} frames."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", record)
+        return record
+
+    async def _radio_stats_loop(self):
+        """`radio_stats` on a fixed cadence (`radio_stats_interval`; 0 =
+        start and stop only)."""
+        try:
+            while not self.detached and self.radio_stats_interval_s > 0 and not self._radio_stats_unsupported:
+                await asyncio.sleep(self._loop_interval_s(self.radio_stats_interval_s, "radio_stats_interval"))
+                if self.detached:
+                    break
+                await self._poll_radio_stats("interval")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._debug(f"radio stats loop stopped: {exc}")
 
     def _extend_medium_busy(self, hold_s: float, reason: str, now: float) -> None:
         if hold_s <= 0:

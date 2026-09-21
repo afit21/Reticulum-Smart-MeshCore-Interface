@@ -2068,6 +2068,22 @@ class _ConfigMixin:
         # renamed by hand), or this value. Empty and no node name gives the
         # pre-0.1.5 filename. `_capture_filename` is the pure rule.
         self.packet_capture_label = str(cfg.get("packet_capture_label", "") or "").strip()
+        # Alpha 0.1.5 (item 8, 2026-09-21): airtime estimator calibration,
+        # instrumentation only. Firmware v1.17.1's CMD_GET_STATS (56,
+        # companion protocol v8+; `MyMesh.cpp`) returns the radio's measured
+        # transmit time -- `Dispatcher::checkSend` adds the wall-clock
+        # duration of every completed send to `total_air_time`; reported as
+        # whole seconds -- and per-type packet counts; the library exposes
+        # them as `get_stats_radio()` (tx_air_secs, rx_air_secs, noise floor,
+        # last RSSI/SNR) and `get_stats_packets()` (recv, sent, flood/direct
+        # tx/rx). The interface reads both at start, at stop and every
+        # `radio_stats_interval` seconds (0 = start and stop only) into a
+        # `radio_stats` capture record next to its own summed airtime
+        # estimate and frame count since start, so a field summary can
+        # compare the estimator against the radio. The estimator itself is
+        # unchanged. A firmware without the command (an ERROR reply) is
+        # logged once and the poll stops.
+        self.radio_stats_interval_s = float(cfg.get("radio_stats_interval", 300.0))
 
         # User-requested (2026-09-18, "lessen our reliance on arbitrary
         # wait times" -- step 1 of that plan, see module docstring): tap
@@ -2988,6 +3004,8 @@ class _ObservabilityMixin:
         a floor). Returns the new busy-until."""
         now = time.monotonic() if now is None else now
         self._radio_busy_until = max(now, self._radio_busy_until) + max(0.0, airtime_s)
+        self._estimated_tx_air_total_s += max(0.0, airtime_s)   # item 8: the estimator's running sum
+        self._frames_keyed_total += 1
         return self._radio_busy_until
 
     def _radio_busy_remaining_s(self, now: Optional[float] = None) -> float:
@@ -2995,6 +3013,81 @@ class _ObservabilityMixin:
         off the air (0.0 when idle)."""
         now = time.monotonic() if now is None else now
         return max(0.0, self._radio_busy_until - now)
+
+    # -- Radio transmit statistics (alpha 0.1.5, item 8) --------------------
+
+    def _radio_stats_record(self, reason: str, radio: Optional[dict], packets: Optional[dict]) -> dict:
+        """The `radio_stats` capture record (pure over its inputs): the
+        firmware's measured transmit / receive airtime and packet counts
+        beside this interface's own summed airtime estimate and frame count
+        since start, so a field summary can calibrate the estimator against
+        the radio (`tx_air_secs` is `Dispatcher::total_air_time` in whole
+        seconds, wall-clock from send start to send complete)."""
+        radio = radio or {}
+        packets = packets or {}
+        return {
+            "event": "radio_stats", "reason": reason,
+            "tx_air_secs": radio.get("tx_air_secs"), "rx_air_secs": radio.get("rx_air_secs"),
+            "noise_floor": radio.get("noise_floor"), "last_rssi": radio.get("last_rssi"), "last_snr": radio.get("last_snr"),
+            "packets_sent": packets.get("sent"), "packets_recv": packets.get("recv"),
+            "flood_tx": packets.get("flood_tx"), "direct_tx": packets.get("direct_tx"),
+            "flood_rx": packets.get("flood_rx"), "direct_rx": packets.get("direct_rx"),
+            "recv_errors": packets.get("recv_errors"),
+            "estimated_tx_air_s": round(self._estimated_tx_air_total_s, 3),
+            "frames_keyed": self._frames_keyed_total,
+            "uptime_s": round(time.time() - self._connected_since, 1) if self._connected_since else None,
+        }
+
+    async def _poll_radio_stats(self, reason: str) -> Optional[dict]:
+        """Read the firmware's radio and packet statistics (CMD_GET_STATS,
+        companion protocol v8+) and write one `radio_stats` record. Best
+        effort: a firmware or library without the command is logged once and
+        never asked again. Returns the record, or None."""
+        if self._radio_stats_unsupported or self._mc is None:
+            return None
+        commands = getattr(self._mc, "commands", None)
+        if commands is None or not hasattr(commands, "get_stats_radio") or not hasattr(commands, "get_stats_packets"):
+            self._radio_stats_unsupported = True
+            self._debug("radio stats: the meshcore library has no get_stats_radio/get_stats_packets -- not polled.")
+            return None
+        radio = packets = None
+        try:
+            async with self._command_lock:
+                ev = await asyncio.wait_for(commands.get_stats_radio(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                radio = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+                ev = await asyncio.wait_for(commands.get_stats_packets(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                packets = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+        except Exception as exc:
+            if not self._radio_stats_unsupported:
+                self._radio_stats_unsupported = True
+                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_INFO)
+            return None
+        record = self._radio_stats_record(reason, radio, packets)
+        self._debug(
+            f"radio stats ({reason}): firmware tx_air {record['tx_air_secs']}s rx_air {record['rx_air_secs']}s "
+            f"sent {record['packets_sent']} -- interface estimate {record['estimated_tx_air_s']}s over {record['frames_keyed']} frames."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", record)
+        return record
+
+    async def _radio_stats_loop(self):
+        """`radio_stats` on a fixed cadence (`radio_stats_interval`; 0 =
+        start and stop only)."""
+        try:
+            while not self.detached and self.radio_stats_interval_s > 0 and not self._radio_stats_unsupported:
+                await asyncio.sleep(self._loop_interval_s(self.radio_stats_interval_s, "radio_stats_interval"))
+                if self.detached:
+                    break
+                await self._poll_radio_stats("interval")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._debug(f"radio stats loop stopped: {exc}")
 
     def _extend_medium_busy(self, hold_s: float, reason: str, now: float) -> None:
         if hold_s <= 0:
@@ -11793,6 +11886,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # radio needed ~14 s -- the window's burst end, the report wait,
         # the report estimator and `since_own_tx_s` all read this instead.
         self._radio_busy_until = 0.0
+        # Alpha 0.1.5 (item 8): the interface's own summed airtime estimate
+        # and frame count since start, written beside the firmware's measured
+        # transmit time in every `radio_stats` record.
+        self._estimated_tx_air_total_s = 0.0
+        self._frames_keyed_total = 0
+        self._radio_stats_task = None
+        self._radio_stats_unsupported = False
         # Step 2 (2026-09-18): per-peer measured ACK RTT -- peer_prefix ->
         # {"srtt", "rttvar", "samples", "last_rtt"}; see _record_ack_rtt/
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on
@@ -12637,6 +12737,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         await self._start_auto_message_fetching()
 
         self._stats_task = asyncio.ensure_future(self._stats_loop())
+        # Item 8 (alpha 0.1.5): the radio's own transmit statistics at start,
+        # then on the cadence.
+        await self._poll_radio_stats("start")
+        self._radio_stats_task = asyncio.ensure_future(self._radio_stats_loop())
         self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
         self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
         self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
@@ -12782,6 +12886,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         RNS.log(f"{self}: detached.", RNS.LOG_INFO)
 
     async def _async_teardown(self):
+        if self._radio_stats_task is not None:
+            self._radio_stats_task.cancel()
+        # Item 8: the radio's transmit statistics at stop, best effort.
+        try:
+            await asyncio.wait_for(self._poll_radio_stats("stop"), timeout=5.0)
+        except Exception:
+            pass
         if self._stats_task is not None:
             self._stats_task.cancel()
         if self._reassembly_cleanup_task is not None:

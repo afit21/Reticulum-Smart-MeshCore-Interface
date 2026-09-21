@@ -116,6 +116,7 @@ class SimRadio:
         self._push: Optional[Callable[[str, dict, dict], None]] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.counters = collections.Counter()
+        self.tx_air_ms = 0.0   # item 8: the fake's measured transmit time
         self.log = getattr(air, "log", None) or (lambda msg: None)
 
     # -- wiring --------------------------------------------------------------
@@ -162,6 +163,10 @@ class SimRadio:
         self.loop.call_later(delay, fn, *args)
 
     def _tx(self, packet: SimPacket) -> None:
+        # Item 8 (alpha 0.1.5): what the firmware's CMD_GET_STATS would report.
+        self.counters["packets_sent"] += 1
+        self.counters["flood_tx" if packet.route == ROUTE_FLOOD else "direct_tx"] += 1
+        self.tx_air_ms += self.air.airtime_s(packet.size) * 1000.0
         self.air.transmit(self.name, packet)
 
     # -- contact helpers -------------------------------------------------------

@@ -51,6 +51,8 @@ class EventType(enum.Enum):
     DISCONNECTED = "disconnected"
     DEVICE_INFO = "device_info"
     BATTERY = "battery_info"
+    STATS_RADIO = "stats_radio"        # item 8 (alpha 0.1.5): CMD_GET_STATS replies
+    STATS_PACKETS = "stats_packets"
 
 
 class SimEvent:
@@ -211,6 +213,24 @@ class SimCommands:
             timeout = result.payload["suggested_timeout"] / 800 if timeout == 0 else timeout
             timeout = timeout if timeout > min_timeout else min_timeout
             return await self._mc.dispatcher.wait_for_event(EventType.PATH_RESPONSE, timeout=timeout)
+
+    async def get_stats_radio(self) -> SimEvent:
+        """meshcore `get_stats_radio` (CMD_GET_STATS + STATS_TYPE_RADIO, v8+):
+        the firmware's measured transmit / receive airtime in whole seconds
+        (`Dispatcher::total_air_time`), noise floor, last RSSI / SNR."""
+        return SimEvent(EventType.STATS_RADIO, {
+            "noise_floor": -110, "last_rssi": -60, "last_snr": 8.0,
+            "tx_air_secs": int(self._radio.tx_air_ms // 1000), "rx_air_secs": 0,
+        })
+
+    async def get_stats_packets(self) -> SimEvent:
+        """meshcore `get_stats_packets` (STATS_TYPE_PACKETS): counts."""
+        c = self._radio.counters
+        return SimEvent(EventType.STATS_PACKETS, {
+            "recv": c.get("packets_recv", 0), "sent": c.get("packets_sent", 0),
+            "flood_tx": c.get("flood_tx", 0), "direct_tx": c.get("direct_tx", 0),
+            "flood_rx": 0, "direct_rx": 0, "recv_errors": 0,
+        })
 
     async def get_contacts(self, lastmod=0, timeout=5) -> SimEvent:
         contacts = self._radio.cmd_get_contacts()

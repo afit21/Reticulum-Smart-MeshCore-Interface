@@ -63,6 +63,12 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   `raw_fragment_sent`; `field_ab_compare.py` prints the A/B's safety signals per hop (gap used,
   round-1 fragments per part, round-0 re-sends per position, parity sent / reconstructed). MeshBench
   cannot judge this one. Tests: `tests/test_raw_gap_own_airtime_0921.py`.
+- **Radio transmit statistics for estimator calibration** (new key `radio_stats_interval = 300`).
+  Firmware v1.17.1's `CMD_GET_STATS` reports the radio's measured transmit airtime and packet counts
+  (`get_stats_radio` / `get_stats_packets` in the library); the interface records them at start,
+  stop and on the cadence as `radio_stats`, next to its own summed airtime estimate, and
+  `field_ab_compare.py` prints the estimate / firmware ratio per node. The estimator itself is
+  unchanged. Tests: `tests/test_radio_stats_0921.py`.
 
 ## alpha-0.1.4 (2026-09-21)
 

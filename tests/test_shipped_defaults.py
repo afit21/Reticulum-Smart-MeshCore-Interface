@@ -282,6 +282,7 @@ CONFIGURE_OBSERVABILITY = {
     'packet_capture_dir': None,
     'packet_capture_enabled': False,
     'packet_capture_label': '',
+    'radio_stats_interval_s': 300.0,
     'rx_log_observe_enabled': True,
     'stats_interval_s': 60.0,
 }

@@ -343,6 +343,19 @@ def analyse_set(recs: list, hop_filter=None) -> dict:
     out["parity_reconstructions_by_hop"] = dict(recon)
     out["parity_fragments_sent_by_hop"] = dict(collections.Counter(
         r.get("hop_count") for r in rf if r.get("parity_mask") is not None))
+    # Alpha 0.1.5 (item 8): estimator calibration -- the firmware's measured
+    # transmit time (CMD_GET_STATS, whole seconds) against the interface's
+    # summed airtime estimate, first to last `radio_stats` record per node.
+    calib = {}
+    for node in out["nodes"]:
+        rs = [r for r in recs if r.get("event") == "radio_stats" and r["_node"] == node and r.get("tx_air_secs") is not None]
+        if len(rs) >= 2:
+            fw = rs[-1]["tx_air_secs"] - rs[0]["tx_air_secs"]
+            est = (rs[-1].get("estimated_tx_air_s") or 0.0) - (rs[0].get("estimated_tx_air_s") or 0.0)
+            frames = (rs[-1].get("frames_keyed") or 0) - (rs[0].get("frames_keyed") or 0)
+            calib[node] = {"firmware_tx_air_s": fw, "estimated_tx_air_s": round(est, 1), "frames": frames,
+                           "estimate_over_firmware": (round(est / fw, 3) if fw else None), "records": len(rs)}
+    out["estimator_calibration"] = calib
     return out
 
 
@@ -412,6 +425,14 @@ def print_comparison(sets: dict, min_n: int) -> None:
         row(f"h{h} parity sent / reconstructed",
             [f"{a.get('parity_fragments_sent_by_hop', {}).get(h, 0)} / {a.get('parity_reconstructions_by_hop', {}).get(h, 0)}"
              for a in sets.values()])
+    print("\n  -- airtime estimator vs the radio's own transmit time (radio_stats, item 8) --")
+    nodes_seen = sorted({n for a in sets.values() for n in a.get("estimator_calibration", {})})
+    for node in nodes_seen:
+        row(f"{node}: estimate / firmware tx air s (frames)",
+            [(f"{c['estimated_tx_air_s']} / {c['firmware_tx_air_s']} = {fmt(c['estimate_over_firmware'], 2)} ({c['frames']})" if c else "-")
+             for c in (a.get("estimator_calibration", {}).get(node) for a in sets.values())])
+    if not nodes_seen:
+        print("  (no radio_stats records: a pre-0.1.5 capture, or a firmware without CMD_GET_STATS)")
     print("\n  -- airtime --")
     row("RNS bytes out / in", [f"{s['rns_bytes_out']} / {s['rns_bytes_in']}" for s in sets.values()])
     row("raw fragments (bytes)", [f"{s['raw_fragments']} ({s['raw_bytes']})" for s in sets.values()])

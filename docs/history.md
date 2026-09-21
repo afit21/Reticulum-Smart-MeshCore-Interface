@@ -3495,3 +3495,30 @@ update together; parity stays on; aim for no wire change.
     hops 0.56 with 6 of 9. Tests: `tests/test_raw_gap_own_airtime_0921.py`;
     shipped-default pin and golden config re-pinned for the new key.
     MeshBench: none, deliberately.
+
+ 8. **Airtime estimator calibration, instrumentation only** (`radio_stats_
+    interval`, 300 s, 0 = start and stop only; `_poll_radio_stats`,
+    `_radio_stats_record`, `_radio_stats_loop`; `_estimated_tx_air_total_s`
+    / `_frames_keyed_total` accumulated in `_note_radio_keyed`). The
+    statistic EXISTS: firmware v1.17.1's `CMD_GET_STATS` (56, companion
+    protocol v8+, `examples/companion_radio/MyMesh.cpp`) with STATS_TYPE_
+    RADIO returns `tx_air_secs` = `Dispatcher::getTotalAirTime() / 1000`
+    -- the wall-clock duration of every completed send, summed in
+    `Dispatcher::checkSend` (`total_air_time += millis - outbound_start`),
+    reported in whole seconds -- with `rx_air_secs`, the noise floor and
+    the last RSSI / SNR; STATS_TYPE_PACKETS returns the radio driver's
+    sent / received counts and the flood / direct tx / rx counts. The
+    `meshcore` library (2.3.9.1) exposes them as `get_stats_radio()` /
+    `get_stats_packets()` (`commands/device.py`, parsed in `reader.py`).
+    The interface reads both at start, at stop (best effort, in the
+    teardown) and on the cadence into a `radio_stats` capture record that
+    also carries its own summed airtime estimate and frame count since
+    start; a library without the commands or a firmware answering ERROR
+    is logged once and never asked again. `field_ab_compare.py` prints,
+    per node, estimate / firmware transmit seconds over the session
+    (first to last record) -- the calibration figure. The estimator is
+    NOT changed: the ratio is what decides whether it should be, and the
+    field has not produced one yet. The unit fake gained the two commands
+    (measured from its own air model) and the counters behind them.
+    Tests: `tests/test_radio_stats_0921.py`; shipped-default pin and
+    golden config re-pinned for the new key.

@@ -627,6 +627,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # radio needed ~14 s -- the window's burst end, the report wait,
         # the report estimator and `since_own_tx_s` all read this instead.
         self._radio_busy_until = 0.0
+        # Alpha 0.1.5 (item 8): the interface's own summed airtime estimate
+        # and frame count since start, written beside the firmware's measured
+        # transmit time in every `radio_stats` record.
+        self._estimated_tx_air_total_s = 0.0
+        self._frames_keyed_total = 0
+        self._radio_stats_task = None
+        self._radio_stats_unsupported = False
         # Step 2 (2026-09-18): per-peer measured ACK RTT -- peer_prefix ->
         # {"srtt", "rttvar", "samples", "last_rtt"}; see _record_ack_rtt/
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on
@@ -1471,6 +1478,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         await self._start_auto_message_fetching()
 
         self._stats_task = asyncio.ensure_future(self._stats_loop())
+        # Item 8 (alpha 0.1.5): the radio's own transmit statistics at start,
+        # then on the cadence.
+        await self._poll_radio_stats("start")
+        self._radio_stats_task = asyncio.ensure_future(self._radio_stats_loop())
         self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
         self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
         self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
@@ -1616,6 +1627,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         RNS.log(f"{self}: detached.", RNS.LOG_INFO)
 
     async def _async_teardown(self):
+        if self._radio_stats_task is not None:
+            self._radio_stats_task.cancel()
+        # Item 8: the radio's transmit statistics at stop, best effort.
+        try:
+            await asyncio.wait_for(self._poll_radio_stats("stop"), timeout=5.0)
+        except Exception:
+            pass
         if self._stats_task is not None:
             self._stats_task.cancel()
         if self._reassembly_cleanup_task is not None:
