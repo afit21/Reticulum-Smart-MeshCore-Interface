@@ -2,7 +2,7 @@
 
   <img width="450" height="110" alt="rnsmeshcoreinterface" src="https://github.com/user-attachments/assets/63093ecc-61b0-43d4-8db7-619bf3d7f8f3" />
 
-  <h1>Reticulum Smart MeshCore Interface</h1>
+  <h1>Smart MeshCore Interface for Reticulum</h1>
 
   <p>
     A <a href="https://reticulum.network/">Reticulum</a> (RNS) interface that lets RNS nodes communicate over a <a href="https://meshcore.co.uk/">MeshCore</a> LoRa mesh without nuking your local MeshCore network!
