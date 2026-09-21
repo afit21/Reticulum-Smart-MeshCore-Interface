@@ -6,7 +6,6 @@
 
   <p>
     A <a href="https://reticulum.network/">Reticulum</a> (RNS) interface that lets RNS nodes communicate over a <a href="https://meshcore.co.uk/">MeshCore</a> LoRa mesh without nuking your local MeshCore network!
-    <img src="https://shields.io" alt="GitHub stars">
   </p>
   
 </div>
