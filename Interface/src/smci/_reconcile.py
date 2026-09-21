@@ -434,9 +434,9 @@ class _ReconcileMixin:
             return
         if answered or any(i.get("acked") for i in infos):
             # An ANSWER proves the path even if the QUERY's own ACK was lost.
-            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True, path_sample=False)
         elif all(i.get("waited_full_timeout") for i in infos):
-            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True, path_sample=False)
 
     async def _raw_path_reset_mid_send(
         self, peer_prefix: str, path: bytes, pkt_id: int, rnd: int, acked: list, frag_total: int, remember,

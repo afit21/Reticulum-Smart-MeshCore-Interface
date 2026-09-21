@@ -5904,6 +5904,7 @@ class _PathDiscoveryMixin:
         rssi: Optional[float] = None,
         path_hex: Optional[str] = None,
         ack_latency_s: Optional[float] = None,
+        path_sample: bool = True,
     ) -> None:
         """docs/path_discovery_spec.md §8 / reliability_engine_design.md
         §8: call this after every DIRECT send attempt made against an
@@ -5942,11 +5943,16 @@ class _PathDiscoveryMixin:
         # candidate missed its last sends -> discovery -- replaces the
         # threshold detector below, whose min-age and healthy-patience
         # guards belong to a world with one path per peer.
+        # `path_sample=False` (item 1, second cut): the raw window's per-
+        # round QUERY evidence is not a sample of its own -- one failing
+        # window counted four or five misses (each QUERY round and the
+        # give-up), exhausting a path on one send; the window's outcome is
+        # the one sample.
         if self.path_selection_enabled:
             if path_hex is None:
                 resolved = self._resolved_paths.get(pubkey_prefix)
                 path_hex = resolved.out_path_hex if resolved is not None else None
-            if succeeded or waited_full_timeout:
+            if path_sample and (succeeded or waited_full_timeout):
                 self._note_path_result(pubkey_prefix, path_hex, succeeded, ack_latency_s=ack_latency_s)
             return
         if succeeded:
@@ -8326,9 +8332,9 @@ class _ReconcileMixin:
             return
         if answered or any(i.get("acked") for i in infos):
             # An ANSWER proves the path even if the QUERY's own ACK was lost.
-            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True, path_sample=False)
         elif all(i.get("waited_full_timeout") for i in infos):
-            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True, path_sample=False)
 
     async def _raw_path_reset_mid_send(
         self, peer_prefix: str, path: bytes, pkt_id: int, rnd: int, acked: list, frag_total: int, remember,

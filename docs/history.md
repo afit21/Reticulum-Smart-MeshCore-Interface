@@ -3979,3 +3979,14 @@ parity stays on.
     airtime model against the interface's, the raw and corrected ratios,
     the flood + direct counters as a stand-in, no counters -> raw only,
     never negative, several files summed).
+
+    Item 1, third cut (from `shortcut_appears` on the second cut, run 1,
+    PASS -- A trialled B's one-hop route 35 s after the move, confirmed
+    it by delivery and switched for good). The record showed a failing
+    raw window recording four or five misses on its path: each QUERY
+    round's evidence (`_record_query_path_evidence`) and the give-up each
+    called `record_direct_send_result`, so one failed window exhausted a
+    candidate and the board ping-ponged between two exhausted paths on
+    the cooldown alone. The per-round evidence now passes `path_sample=
+    False` -- the window's outcome is the one sample -- while the
+    threshold detector (selection off) still counts rounds as it did.

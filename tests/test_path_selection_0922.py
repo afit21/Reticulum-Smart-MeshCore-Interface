@@ -539,6 +539,28 @@ class ScoreboardOnTheInterface(_Scaffold):
         self.assertEqual(reasons, [("selected", "19"), ("trial", "1976")])
         self.assertEqual(iface._direct_path_failures.get(PEER, 0), 0, "the old stale-path detector did not count the misses")
 
+    def test_query_round_evidence_is_not_a_sample_of_its_own(self):
+        """Item 1, second cut (MeshBench shortcut_appears): a failing raw
+        window recorded four or five misses -- each QUERY round's evidence
+        plus the give-up -- and exhausted a path on one send. The window's
+        outcome is the one sample; the per-round evidence passes through
+        with `path_sample=False`."""
+        iface = self.iface
+        iface._add_path_candidate(PEER, "19", 1, 1, "flood")
+        sink, restore = self._capture()
+        try:
+            self._select()
+            miss = {"acked": False, "waited_full_timeout": True}
+            self.on_loop(iface._record_query_path_evidence, PEER, [miss, miss])
+            self.on_loop(iface._record_query_path_evidence, PEER, [miss, miss])
+            self.assertEqual(self._board().candidates["19"].consecutive_misses, 0, "QUERY rounds are not samples")
+            self.on_loop(iface.record_direct_send_result, PEER, False, True)
+            self.assertEqual(self._board().candidates["19"].consecutive_misses, 1, "the window's outcome is")
+            self.on_loop(lambda: iface.record_direct_send_result(PEER, False, True, path_sample=False))
+            self.assertEqual(self._board().candidates["19"].consecutive_misses, 1)
+        finally:
+            restore()
+
     def test_two_misses_on_the_only_candidate_exhaust_the_board_for_discovery(self):
         iface = self.iface
         iface._add_path_candidate(PEER, "19", 1, 1, "flood")
