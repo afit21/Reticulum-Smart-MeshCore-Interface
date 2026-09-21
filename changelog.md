@@ -9,7 +9,7 @@ nodes must run alpha 0.1.6.** The dated design record is `docs/history.md` ("Alp
 MeshBench results per item are at the end of this section. New config keys, all optional (defaults
 shown): `path_selection_enabled = yes` (the old `path_adopt_enabled` is accepted as an alias),
 `path_weak_snr_db = 3.0`, `path_switch_after_misses = 2`, `path_switch_margin = 0.25`,
-`path_switch_cooldown = 120`, `direct_raw_window_max_rounds = 2`. Removed: `path_adopt_window`. Every default is pinned by
+`path_switch_cooldown = 120`, `direct_raw_window_max_rounds = 2`, `connect_retry_min = 5`, `connect_retry_max = 60`, `serial_open_settle = 2`, `handshake_attempts = 5`, `handshake_timeout = 5`, `command_timeout = 15`, `serial_noise_warn_per_min = 5`; `max_reconnect_attempts` now defaults to 0 (forever). Removed: `path_adopt_window`. Every default is pinned by
 `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`; the wire golden gained the
 v5 cases (the v4 cases are byte-identical under their new names).
 
@@ -45,6 +45,20 @@ v5 cases (the v4 cases are byte-identical under their new names).
   50-125 s behind six LRPROOFs of four 11 s attempts each for links MeshChat had already re-requested.
   The window's between-parts yields and its release before every QUERY round were already
   hop-independent; they are now pinned at two hops. Tests: `tests/test_multihop_window_hold_0922.py`.
+- **A resilient serial connection** (new keys `connect_retry_min = 5`, `connect_retry_max = 60`,
+  `serial_open_settle = 2`, `handshake_attempts = 5`, `handshake_timeout = 5`, `command_timeout = 15`,
+  `serial_noise_warn_per_min = 5`; `max_reconnect_attempts` now defaults to 0 = forever). The
+  interface owns the connection: it opens the port, settles (opening a serial port resets a Heltec V3
+  through DTR/RTS), flushes the boot text, retries the handshake, runs the full device setup, and on a
+  disconnect tears down and reconnects with backoff forever -- the library sent one handshake right
+  after the reset and gave up, and after three one-second reconnect attempts stayed dead for good.
+  The constructor returns once the port is open (or could not be) instead of blocking rnsd's startup.
+  A garbled inbound frame no longer fails the in-flight command (the reader's own ERROR events are
+  counted as noise and the reply is still waited for); above five a minute it warns "serial stream
+  corrupted; is another process reading the port?", and before opening a serial port the interface
+  names any other process holding it (`/proc/*/fd`). Capture: `connection_state` records. Tests:
+  `tests/test_connection_supervisor_0922.py` against the fake `meshcore`, which now models the
+  library's connection lifecycle with fault injection.
 - **"Q" protocol v5.** Every QUERY, ANSWER and REPORT carries the sender's current path length to
   the receiver and its measured delivery rate on it (two header bytes, 0xFF unknown); the receiver
   adds a reported zero-hop path as a candidate and uses the reported rate as the prior for untried

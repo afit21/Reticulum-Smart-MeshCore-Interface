@@ -20,6 +20,18 @@ library-semantics bugs:
     (messaging.py, sic) for a PATH_RESPONSE that is not peer-filtered.
   - send_msg returns MSG_SENT with `expected_ack` (bytes) and
     `suggested_timeout` (ms); ERROR when the destination isn't a contact.
+  - The connection lifecycle (alpha 0.1.6 item 4): `MeshCore(cx, ...)` around
+    a `SerialConnection` / `TCPConnection` / `BLEConnection`, opened with
+    `dispatcher.start()` + `connection_manager.connect()` (the library's
+    `create_*` does that plus one `send_appstart`), `connection_manager.
+    disconnect()` / `is_connected`, and a DISCONNECTED event on an
+    unexpected drop. `FakeOptions` on the module inject the faults the
+    supervisor exists for: `connect_failures` (OSError from connect that
+    many times), `appstart_failures` (the handshake answers ERROR timeout
+    that many times), `noise_errors` (the next commands return the reader's
+    `invalid_frame_length` ERROR first, the real reply dispatched after --
+    the library returns the first ERROR it sees, `commands/base.py`), and
+    `mc.simulate_disconnect(reason)`.
 """
 import asyncio
 import enum
@@ -83,6 +95,13 @@ class SimDispatcher:
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
         self._subs: List[_Subscription] = []
+        self.started = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.started = False
 
     def subscribe(self, event_type, callback, attribute_filters=None) -> _Subscription:
         sub = _Subscription(event_type, callback, attribute_filters)
@@ -122,13 +141,44 @@ class SimDispatcher:
             self.unsubscribe(sub)
 
 
+class FakeOptions:
+    """Fault injection for the connection path (see the module docstring)."""
+
+    def __init__(self):
+        self.connect_failures = 0
+        self.appstart_failures = 0
+        self.noise_errors = 0
+        self.appstart_calls = 0
+        self.connect_calls = 0
+
+
 class SimCommands:
     def __init__(self, mc: "SimMeshCore"):
         self._mc = mc
         self._radio = mc.radio
         self._mesh_request_lock = asyncio.Lock()
+        self.default_timeout = 15.0
+
+    def _maybe_noise(self, result: SimEvent) -> SimEvent:
+        """`noise_errors` > 0: this command's real reply is dispatched a
+        moment later and a reader-noise ERROR is returned first, exactly
+        what `CommandHandlerBase.send` does when a garbled frame reaches
+        the reader before the reply."""
+        options = self._mc.options
+        if options is not None and options.noise_errors > 0:
+            options.noise_errors -= 1
+            self._mc.dispatcher.loop.call_later(0.05, self._mc.dispatcher.dispatch_soon, result)
+            return SimEvent(EventType.ERROR, {"reason": "invalid_frame_length"})
+        return result
 
     async def send_appstart(self) -> SimEvent:
+        options = self._mc.options
+        if options is not None:
+            options.appstart_calls += 1
+            if options.appstart_failures > 0:
+                options.appstart_failures -= 1
+                await asyncio.sleep(0.05)
+                return SimEvent(EventType.ERROR, {"reason": "timeout"})
         return SimEvent(EventType.SELF_INFO, {
             "name": self._radio.name, "public_key": self._radio.pubkey, "adv_type": 1,
             # SF8/BW250/CR5 (alpha 0.1.5, 2026-09-21): the interface prices its
@@ -166,7 +216,8 @@ class SimCommands:
         result = self._radio.cmd_send_msg(dst_hex, msg, attempt=int(attempt))
         if result is None:
             return SimEvent(EventType.ERROR, {"reason": "destination is not a known contact"})
-        return SimEvent(EventType.MSG_SENT, result, {"type": result["type"], "expected_ack": result["expected_ack"].hex()})
+        return self._maybe_noise(
+            SimEvent(EventType.MSG_SENT, result, {"type": result["type"], "expected_ack": result["expected_ack"].hex()}))
 
     async def send(self, data: bytes, expected_events=None) -> SimEvent:
         """`CommandHandlerBase.send(data, expected_events)` -- the raw
@@ -272,14 +323,65 @@ class SimCommands:
         return event
 
 
+class SimConnection:
+    """`SerialConnection` / `TCPConnection` / `BLEConnection`: a holder
+    of the endpoint, opened by the connection manager."""
+
+    def __init__(self, kind: str, **fields):
+        self.kind = kind
+        self.transport = None
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+
+class SimConnectionManager:
+    """`connection_manager`: `connect()` attaches the radio (and honours
+    `connect_failures`), `disconnect()` detaches it, `is_connected`."""
+
+    def __init__(self, mc: "SimMeshCore"):
+        self._mc = mc
+        self._is_connected = False
+
+    @property
+    def connection(self):
+        return self._mc.cx
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
+
+    async def connect(self):
+        options = self._mc.options
+        if options is not None:
+            options.connect_calls += 1
+            if options.connect_failures > 0:
+                options.connect_failures -= 1
+                raise OSError(f"could not open port {getattr(self._mc.cx, 'port', '?')}: [Errno 2] No such file or directory")
+        self._mc._attach_radio()
+        self._is_connected = True
+        self._mc.dispatcher.dispatch_soon(SimEvent(EventType.CONNECTED, {"connection_info": "sim"}))
+        return "sim"
+
+    async def disconnect(self):
+        if self._is_connected:
+            self._is_connected = False
+            self._mc.radio.detach()
+            self._mc.dispatcher.dispatch_soon(SimEvent(EventType.DISCONNECTED, {"reason": "manual_disconnect"}))
+
+
 class SimMeshCore:
     """Stand-in for a connected meshcore.MeshCore, bound to one SimRadio.
-    Must be created on the event loop the interface runs it from."""
+    Must be created on the event loop the interface runs it from. With
+    `cx` given (the library's constructor shape) the radio is attached by
+    `connection_manager.connect()`; `create_*` attaches it at once."""
 
-    def __init__(self, radio: SimRadio):
+    def __init__(self, radio: SimRadio, cx=None, options: Optional[FakeOptions] = None, attach: bool = True):
         self.radio = radio
+        self.cx = cx
+        self.options = options
         self.loop = asyncio.get_running_loop()
         self.dispatcher = SimDispatcher(self.loop)
+        self.connection_manager = SimConnectionManager(self)
         self.commands = SimCommands(self)
         self._contacts: Dict[str, dict] = {}
         self._contacts_dirty = True
@@ -289,8 +391,28 @@ class SimMeshCore:
         self.subscribe(EventType.CONTACTS, self._update_contacts)
         self.subscribe(EventType.ADVERTISEMENT, self._contact_change)
         self.subscribe(EventType.PATH_UPDATE, self._contact_change)
-        radio.set_push_handler(self._on_radio_push)
-        radio.attach(self.loop)
+        if attach:
+            self._attach_radio()
+            self.connection_manager._is_connected = True
+
+    def _attach_radio(self) -> None:
+        self.radio.set_push_handler(self._on_radio_push)
+        self.radio.attach(self.loop)
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connection_manager.is_connected
+
+    def simulate_disconnect(self, reason: str = "serial_disconnect") -> None:
+        """An unexpected drop: the radio goes away and, as the library does
+        with auto_reconnect off, DISCONNECTED is emitted at once."""
+        self.connection_manager._is_connected = False
+        self.radio.detach()
+        self.dispatcher.dispatch_soon(SimEvent(EventType.DISCONNECTED, {"reason": reason}))
+
+    def inject_error(self, reason: str = "invalid_frame_length") -> None:
+        """A reader-noise ERROR event, as a garbled inbound frame produces."""
+        self.dispatcher.dispatch_soon(SimEvent(EventType.ERROR, {"reason": reason}))
 
     # -- radio -> events --------------------------------------------------------
 
@@ -375,29 +497,45 @@ class SimMeshCore:
 
     async def disconnect(self) -> None:
         await self.stop_auto_message_fetching()
+        await self.connection_manager.disconnect()
         self.radio.detach()
 
 
-def make_fake_meshcore_module(radio_factory: Callable[[], SimRadio]) -> types.ModuleType:
+def make_fake_meshcore_module(radio_factory: Callable[[], SimRadio], options: Optional[FakeOptions] = None) -> types.ModuleType:
     """Builds a module object to install as sys.modules["meshcore"] for
     one interface construction. `radio_factory()` is called on the
-    interface's own event loop inside create_serial/ble/tcp."""
+    interface's own event loop when the connection is opened (inside
+    `MeshCore(cx)` / `connection_manager.connect()`, or create_serial/ble/tcp);
+    it must return the SAME radio for the same node on a reconnect."""
     module = types.ModuleType("meshcore")
     module.EventType = EventType
     module.Event = SimEvent
+    module.options = options if options is not None else FakeOptions()
+    module.SerialConnection = lambda port, baudrate=115200, **kw: SimConnection("serial", port=port, baudrate=baudrate)
+    module.TCPConnection = lambda host, port, **kw: SimConnection("tcp", host=host, port=port)
+    module.BLEConnection = lambda address=None, **kw: SimConnection("ble", address=address)
 
-    class MeshCore:
+    class MeshCore(SimMeshCore):
+        """The library's constructor shape: not connected until
+        `connection_manager.connect()`."""
+
+        def __init__(self, cx, debug=False, only_error=False, default_timeout=None,
+                     auto_reconnect=False, max_reconnect_attempts=3):
+            super().__init__(radio_factory(), cx=cx, options=module.options, attach=False)
+            if default_timeout is not None:
+                self.commands.default_timeout = default_timeout
+
         @staticmethod
         async def create_serial(port, baudrate=115200, auto_reconnect=False, max_reconnect_attempts=3, **kw):
-            return SimMeshCore(radio_factory())
+            return SimMeshCore(radio_factory(), options=module.options)
 
         @staticmethod
         async def create_ble(name=None, auto_reconnect=False, max_reconnect_attempts=3, **kw):
-            return SimMeshCore(radio_factory())
+            return SimMeshCore(radio_factory(), options=module.options)
 
         @staticmethod
         async def create_tcp(host, port, auto_reconnect=False, max_reconnect_attempts=3, **kw):
-            return SimMeshCore(radio_factory())
+            return SimMeshCore(radio_factory(), options=module.options)
 
     module.MeshCore = MeshCore
     return module

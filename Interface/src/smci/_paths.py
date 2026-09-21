@@ -976,11 +976,21 @@ class _PathDiscoveryMixin:
         from what the contact holds (text frames are routed by the contact's
         stored path; raw fragments carry theirs explicitly), or None when
         every candidate is exhausted (the caller runs discovery, exactly
-        where it did before) or nothing is known. Not while a raw window to
-        the peer is in flight -- its fragments are source-routed on the
-        current path and a change mid-send aborts it."""
+        where it did before) or nothing is known.
+
+        A raw window in flight to the peer does not hold the decision
+        (second cut, from MeshBench `shortcut_appears` on the first cut:
+        under continuous traffic the next part always arrived while the
+        previous window was still running, so a guard that stood aside
+        for an in-flight window never let a trial happen -- six missed
+        sends in a row on a dead three-hop path and no `path_selected`
+        at all). While the current path delivers nothing changes and the
+        window is untouched; when a trial or selection is due the
+        window on the failing path is aborted by its own mid-send check
+        (`_raw_path_reset_mid_send`, the parts remembered for resume) and
+        the next sends go on the chosen path."""
         resolved = self._resolved_paths.get(peer_prefix)
-        if not self.path_selection_enabled or peer_prefix in self._raw_windows:
+        if not self.path_selection_enabled:
             return resolved
         now = time.monotonic()
         board = self._path_board(peer_prefix)

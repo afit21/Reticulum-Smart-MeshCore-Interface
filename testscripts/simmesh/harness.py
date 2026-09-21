@@ -249,6 +249,7 @@ def create_node(
     name: str, air: Air, module: types.ModuleType, config: Optional[dict] = None, fast: bool = True,
     capture_dir: Optional[str] = None, debug: bool = False, radio_options: Optional[RadioOptions] = None,
     log: Optional[Callable] = None, state_dir: Optional[str] = None,
+    fake_options=None, online_wait_s: float = 10.0,
 ) -> SimNode:
     """Construct a real interface for `name` against `air`. Swaps
     sys.modules["meshcore"] for the duration of the constructor (that's
@@ -273,13 +274,18 @@ def create_node(
     radio_holder = {}
 
     def radio_factory() -> SimRadio:
-        radio = SimRadio(name, air, is_repeater=False, options=radio_options)
-        radio_holder["radio"] = radio
+        # One radio per node for the process's life: a reconnect (alpha
+        # 0.1.6 item 4's supervisor) re-attaches it, never a second one.
+        radio = radio_holder.get("radio")
+        if radio is None:
+            radio = SimRadio(name, air, is_repeater=False, options=radio_options)
+            radio_holder["radio"] = radio
         return radio
 
+    fake_module = make_fake_meshcore_module(radio_factory, options=fake_options)
     with _sys_modules_lock:
         original = sys.modules.get("meshcore")
-        sys.modules["meshcore"] = make_fake_meshcore_module(radio_factory)
+        sys.modules["meshcore"] = fake_module
         try:
             iface = module.SmartMeshCoreInterface(owner=owner, configuration=cfg)
         finally:
@@ -287,10 +293,17 @@ def create_node(
                 sys.modules["meshcore"] = original
             else:
                 sys.modules.pop("meshcore", None)
+    # The constructor returns once the connection is open (alpha 0.1.6
+    # item 4); the handshake and setup finish on the loop.
+    deadline = time.monotonic() + online_wait_s
+    while not iface.online and time.monotonic() < deadline and not iface.detached:
+        time.sleep(0.01)
     radio = radio_holder.get("radio")
     if radio is None:
         raise RuntimeError(f"interface for {name!r} never connected to its simulated radio")
-    return SimNode(name, radio, iface, owner, capture_dir)
+    node = SimNode(name, radio, iface, owner, capture_dir)
+    node.fake_module = fake_module
+    return node
 
 
 class SimMesh:
@@ -334,12 +347,14 @@ class SimMesh:
             radio.attach(None)
             self.repeaters[name] = radio
 
-    def add_node(self, name: str, config: Optional[dict] = None, radio_options: Optional[RadioOptions] = None) -> SimNode:
+    def add_node(self, name: str, config: Optional[dict] = None, radio_options: Optional[RadioOptions] = None,
+                 fake_options=None, require_online: bool = True) -> SimNode:
         node = create_node(
             name, self.air, self.module, config=config, fast=self.fast, capture_dir=self.capture_dir,
             debug=self.debug, radio_options=radio_options or self.radio_options, log=self.log, state_dir=self.state_dir,
+            fake_options=fake_options, online_wait_s=10.0 if require_online else 0.0,
         )
-        if not node.iface.online:
+        if require_online and not node.iface.online:
             raise RuntimeError(f"interface for {name!r} did not come online")
         self.nodes[name] = node
         # Real nodes never boot in the same millisecond; without this, every

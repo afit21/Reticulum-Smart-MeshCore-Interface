@@ -68,6 +68,11 @@ class _ObservabilityMixin:
             path = os.path.join(capture_dir, filename)
             self._packet_capture_file = open(path, "a", buffering=1)
             RNS.log(f"{self}: packet capture enabled -- writing to {path}", RNS.LOG_INFO)
+            # Alpha 0.1.6 (item 4): connection_state records from before
+            # the node had a name (the capture needs the handshake).
+            pending, self._pending_capture_events = self._pending_capture_events, []
+            for record in pending:
+                self._capture_event("out", record)
         except Exception as exc:
             RNS.log(f"{self}: failed to open packet capture file: {exc} -- capture disabled for this run.", RNS.LOG_WARNING)
             self._packet_capture_file = None

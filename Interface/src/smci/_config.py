@@ -31,7 +31,29 @@ class _ConfigMixin:
         # should try to recover from a USB re-enumeration or a brief BLE
         # range loss rather than sitting dead until rnsd is restarted.
         self.auto_reconnect = _cfg_bool(cfg.get("auto_reconnect", "yes"))
-        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 3))
+        # Alpha 0.1.6 (item 4, 2026-09-22): the interface's own connection
+        # supervisor replaces the library's reconnect (which retried three
+        # times a second apart and then stayed dead). `max_reconnect_
+        # attempts` is now the supervisor's cap, 0 = forever (was the
+        # library's 3); `auto_reconnect = no` stays offline after a drop.
+        # The retry delay starts at `connect_retry_min` and doubles to
+        # `connect_retry_max`. Opening a serial port asserts DTR / RTS,
+        # which resets a Heltec V3 (boot text on the UART for a second or
+        # two), so the handshake waits `serial_open_settle` after the open,
+        # flushes the input and tries `handshake_attempts` times at
+        # `handshake_timeout` each. `command_timeout` is how long a command
+        # is owed its reply while the reader's own ERROR events for garbled
+        # frames are ignored (the library's 15 s default); more than
+        # `serial_noise_warn_per_min` of those in a minute is logged as a
+        # corrupted stream (two processes on one port, typically).
+        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 0))
+        self.connect_retry_min_s = max(1.0, float(cfg.get("connect_retry_min", 5.0)))
+        self.connect_retry_max_s = max(self.connect_retry_min_s, float(cfg.get("connect_retry_max", 60.0)))
+        self.serial_open_settle_s = max(0.0, float(cfg.get("serial_open_settle", 2.0)))
+        self.handshake_attempts = max(1, int(cfg.get("handshake_attempts", 5)))
+        self.handshake_timeout_s = max(1.0, float(cfg.get("handshake_timeout", 5.0)))
+        self.command_timeout_s = max(1.0, float(cfg.get("command_timeout", 15.0)))
+        self.serial_noise_warn_per_min = max(1, int(cfg.get("serial_noise_warn_per_min", 5)))
 
         # RNS-facing nominal bitrate. Deliberately NOT the base class's
         # 62500 default (`reliability_engine_design.md`'s base-class

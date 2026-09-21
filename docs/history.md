@@ -3821,3 +3821,97 @@ parity stays on.
     default pin and golden config re-pinned for the new key. MeshBench:
     `link_setup`, `page_transfer_bidir`, `two_hop`, two runs each, in
     `changelog.md`.
+
+    Item 1, second cut (same night, from MeshBench `shortcut_appears` on
+    the first cut, two runs): no `path_selected` record at all in either
+    run -- A missed six sends in a row on its dead three-hop path (run 1)
+    and five on a two-hop one (run 2) and never trialled B's one-hop
+    route. The first cut's `_select_path` stood aside while a raw window
+    to the peer was in flight (as adoption had, so a change mid-send
+    would not abort the window), and under continuous traffic the next
+    part always arrives while the previous window is still running, so
+    the decision never ran. The guard is gone: while the current path
+    delivers nothing changes and the window is untouched; when a trial or
+    selection is due, the window on the failing path is aborted by its own
+    mid-send check (`_raw_path_reset_mid_send`, parts remembered for
+    resume) and the next sends go on the chosen path.
+
+ 4. **A resilient serial connection** (`interface.py`: `_connection_
+    supervisor`, `_build_connection`, `_open_connection`, `_flush_serial_
+    input`, `_handshake`, `_apply_self_info`, `_apply_device_settings`,
+    `_setup_connection`, `_close_connection`, `_port_holders` (pure) /
+    `_check_port_holders`, `_capture_connection_state`, `_error_is_noise`,
+    `_note_serial_noise`, `_wait_expected_reply`; new keys `connect_retry_
+    min` 5 s, `connect_retry_max` 60 s, `serial_open_settle` 2 s,
+    `handshake_attempts` 5, `handshake_timeout` 5 s, `command_timeout` 15 s,
+    `serial_noise_warn_per_min` 5; `max_reconnect_attempts` 3 -> 0 = forever,
+    now the supervisor's cap; `auto_reconnect = no` stays offline after a
+    drop). The owner's "event failed" errors on the laptop and rnsd stuck
+    connecting on restart (once or twice on the desktop too), read against
+    `meshcore` 2.3.9.1 in `~/.local/lib/python3.12/site-packages/meshcore/`:
+    (a) `MeshCore.connect()` sends the handshake (`send_appstart`) once,
+    right after `connection_manager.connect()` opens the port, with one
+    15 s timeout, and `create_serial` returns None after that -- but
+    pyserial asserts DTR and RTS on open (`serialposix.py` `open()`, the
+    library only drops RTS in `connection_made`), which resets the Heltec
+    V3's ESP32, so the handshake is often written to a rebooting radio
+    spewing boot text onto the UART, and the interface then stayed offline
+    for good while the constructor had blocked rnsd's startup for up to
+    SETUP_TIMEOUT_S; (b) on a USB drop `ConnectionManager._attempt_
+    reconnect` tries three times a second apart (flat) and then emits
+    DISCONNECTED{reconnect_failed} with `_reconnect_attempts` never reset,
+    `_is_connected` False for good and `SerialTransport.write` after close
+    silently ignored, so every command times out at 15 s; the interface's
+    `_on_mc_disconnected` only set `online = False`; (c) `CommandHandlerBase.
+    send` returns the first event of `[expected, ERROR]` by type only, and
+    `reader.py` emits `EventType.ERROR` of its own for a garbled frame
+    (`invalid_frame_length`, `binary_parse_error: ...`, `unknown_stats_
+    type`), so a corrupted inbound frame -- boot text, a serial hiccup, a
+    second process reading the same port, which Linux allows and the laptop
+    does (MeshChat's own RNS and at times a separate rnsd, both loading this
+    interface from one config) -- was reported as the in-flight command's
+    failure. Implemented in the interface, not the library: the supervisor
+    builds `SerialConnection` / `TCPConnection` / `BLEConnection` and
+    `MeshCore(cx, auto_reconnect=False)` itself (the library's public
+    exports), opens the port (`dispatcher.start()` + `connection_manager.
+    connect()`), releases the constructor (serial: as soon as the port is
+    open, or at once when it cannot be), settles `serial_open_settle`,
+    flushes the pyserial input buffer, runs `send_appstart` up to
+    `handshake_attempts` times at `handshake_timeout` each with a flush
+    before each, then the full device setup (radio override, channel,
+    telemetry mode, contacts, data subscriptions, message fetching; the
+    process-lifetime loops started once), and on the library's
+    DISCONNECTED tears the object down and retries with backoff 5, 10, 20,
+    40, 60 s -- forever. Before opening a serial port it scans
+    `/proc/*/fd` for another holder of the device and logs the PID and
+    command line unmistakably, then proceeds (the owner may want both).
+    `_run_command` keeps waiting for the expected reply after a reader-
+    noise ERROR (`_wait_expected_reply`, until `command_timeout`), counts
+    the noise, and warns once a minute above `serial_noise_warn_per_min`
+    ("serial stream corrupted; is another process reading the port?").
+    Every state change is a `connection_state` capture record (connecting,
+    open, open_failed, handshake_retry, setup_failed, online,
+    disconnected with the library's reason and the online time, retry_wait
+    with the delay, port_shared with the holders, serial_noise), buffered
+    until the capture file opens (it needs the node name from the
+    handshake). The unit fake (`testscripts/simmesh/fake_meshcore.py`)
+    gained the library's connection lifecycle -- `MeshCore(cx)`, the
+    connection classes, `dispatcher.start/stop`, `connection_manager.
+    connect/disconnect/is_connected`, DISCONNECTED on `simulate_
+    disconnect` -- and `FakeOptions` fault injection (connect failures,
+    handshake failures, reader-noise ERRORs before a reply); the harness
+    reuses one radio per node across reconnects and waits for the node to
+    come online after the now non-blocking constructor (`add_node(require_
+    online=)`); `testscripts/zero_hop_peer_discovery_test.py` waits for
+    online for 60 s the same way. Tests: `tests/test_connection_supervisor_
+    0922.py` (a handshake answered on the third attempt without reopening
+    the port; a handshake never answered closes, retries and comes up once
+    the radio answers; a port that cannot be opened is retried with the
+    backoff and the constructor returned; a drop followed by a full
+    re-setup on the same radio with fetching re-armed; the
+    `connection_state` sequence; `auto_reconnect = no`; reader noise during
+    a command does not fail it; what is and is not noise; the once-a-minute
+    warning; the /proc scan against a fake tree; the defaults). Shipped-
+    default pin and golden config re-pinned (seven keys added, one default
+    changed). MeshBench: none (the install-load check and the fast suite);
+    the hardware checks are the field test's.

@@ -275,6 +275,7 @@ class Scenario:
     min_bound_peers: Optional[int] = None    # hard check: the sender's capture shows at least this many bound peers
     duration_s: float = 0.0                  # unit loop runs for this long instead of a fixed count (soak)
     health_interval_s: float = 0.0           # nodes emit health events this often (soak)
+    link_margin: Optional[float] = None      # a must-link pair's minimum dB for THIS scenario (weak_direct: a deliberately weak link)
 
 
 def rep(name, east, north=0.0, mast=50.0, console=(), standby=False):
@@ -347,17 +348,18 @@ SCENARIOS = {
     ),
     "weak_direct": Scenario(
         "weak_direct", "A and B hear each other directly but weakly; R reaches both strongly: path selection by measured reliability (alpha 0.1.6 item 1) should settle on the one-hop path.",
-        nodes=[comp("A", -5), rep("R", 0), comp("B", 5.4)],
+        nodes=[comp("A", -5), rep("R", 0), comp("B", 6)],
         must_link=[("A", "R"), ("R", "B"), ("A", "B")], must_block=[], expected_hops=None, min_delivered=0.0,
-        probes=16, start_after_paths=True,
-        notes="Placements from `topology relay --place A=-5,0 --place B=5.4,0 --pair A-B` (2026-09-22): A-R +20.7 dB, "
-              "R-B +14.5 dB, A-B +7.2 dB both ways (10.4 km, terrain at 10.3 km sits on the line of sight; B's placement "
-              "matters at the 0.05 km level -- re-measure before nudging it). Hard check: the sender's last six DIRECT "
-              "sends are at one hop and a `path_selected` record exists. The direct link's loss rate under MeshBench's "
-              "channel model decides how the scoreboard gets there: the weak-SNR prior (below path_weak_snr_db) if the "
-              "firmware reports the direct frames that low, else two missed sends on the direct path and a trial of the "
-              "one-hop candidate; if the +7 dB link never loses a frame in MeshBench, a delivering direct path is kept "
-              "by design and this scenario reports that.",
+        probes=16, start_after_paths=True, link_margin=2.0,
+        notes="Placements from `topology relay --place A=-5,0 --place B=6,0 --pair A-B --link-margin 2` (2026-09-22): "
+              "A-R +20.7 dB, R-B +12.5 dB, A-B +3.0 dB both ways (11.0 km, terrain at 10.3 km sits 3 m above the line "
+              "of sight; the scenario's own gate margin is 2 dB). A first cut at B=5.4 (A-B +7.2 dB) delivered 16/16 "
+              "sends over the direct path in MeshBench, which has no fading at that margin, so the scoreboard rightly "
+              "kept it. Hard check: the sender's last six DIRECT sends are at one hop and a `path_selected` record "
+              "exists. MeshBench's firmware reports every frame at SNR 0.0, so the weak-SNR prior (below "
+              "path_weak_snr_db) applies to an untried zero-hop candidate here; a discovered direct path that "
+              "delivers is kept by design, so the scenario measures whether the +3 dB link loses enough frames for "
+              "two missed sends and a trial of the one-hop candidate.",
     ),
     "failover": Scenario(
         "failover", "A - R1 - B with R2 a cold standby; after --fail-after probes R1's firmware dies and R2's starts. "
@@ -747,6 +749,8 @@ def run_scenario(scenario: Scenario, args) -> int:
     duration = args.duration if args.duration is not None else scenario.duration_s
     if scenario.health_interval_s and not args.health_interval:
         args.health_interval = scenario.health_interval_s
+    if scenario.link_margin is not None:
+        args.link_margin = min(args.link_margin, scenario.link_margin)
     capture_dir = args.capture_dir
     if capture_dir:
         os.makedirs(capture_dir, exist_ok=True)
