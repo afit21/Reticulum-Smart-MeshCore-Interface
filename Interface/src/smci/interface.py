@@ -1299,7 +1299,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     async def _async_setup(self):
         self._command_lock_impl = asyncio.Lock()
         self._direct_exchange_lock_impl = _PriorityAsyncLock()
-        self._duty_cycle_impl = _DutyCycleLimiter(self.duty_cycle_window_s, self.duty_cycle_max_fraction)
+        self._duty_cycle_impl = _DutyCycleLimiter(
+            self.duty_cycle_window_s, self.duty_cycle_max_fraction, self.duty_cycle_max_fraction_zero_hop,
+        )
         MeshCore = self._mc_module.MeshCore
 
         try:

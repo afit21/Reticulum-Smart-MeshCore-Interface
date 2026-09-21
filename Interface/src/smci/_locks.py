@@ -319,37 +319,82 @@ class _DutyCycleLimiter:
     oldest sample is due to age out of the window (not a fixed poll
     interval), so it wakes only as often as actually necessary."""
 
-    def __init__(self, window_s: float, max_fraction: float):
+    def __init__(self, window_s: float, max_fraction: float, max_fraction_total: Optional[float] = None):
+        """`max_fraction` caps the RELAYED ledger -- every frame a repeater
+        will relay (any DIRECT frame with a routed path, every CHANNEL
+        flood); `max_fraction_total` caps the TOTAL ledger, which every
+        frame is charged to. Alpha 0.1.5 (2026-09-21, the owner's decision):
+        two budgets over the same window, 30% for what touches a
+        repeater and 85% for zero-hop DIRECT traffic -- the second
+        number is what the field's zero-hop page transfer was actually
+        limited by (109 of 147 s were duty-cycle waits), and a frame
+        between two adjacent radios costs nobody else's repeater any air.
+        Omitting `max_fraction_total` gives the pre-0.1.5 behaviour: one
+        cap for everything."""
         self._window_s = window_s
         self._max_busy_s = window_s * max_fraction
-        self._samples: "collections.deque" = collections.deque()
+        self._max_total_s = window_s * (max_fraction if max_fraction_total is None else max_fraction_total)
+        self._samples: "collections.deque" = collections.deque()          # every frame: (start, duration)
+        self._relayed: "collections.deque" = collections.deque()          # relayed frames only
+
+    @staticmethod
+    def _prune_deque(samples: "collections.deque", cutoff: float) -> None:
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._window_s
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
+        self._prune_deque(self._samples, cutoff)
+        self._prune_deque(self._relayed, cutoff)
 
     def _busy_s(self, now: float) -> float:
+        """Total busy time in the trailing window (every frame)."""
         self._prune(now)
         return sum(duration for _start, duration in self._samples)
 
-    async def wait_for_budget(self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None) -> float:
+    def _relayed_busy_s(self, now: float) -> float:
+        """Relayed busy time in the trailing window."""
+        self._prune(now)
+        return sum(duration for _start, duration in self._relayed)
+
+    def limiting_ledger(self, estimated_duration_s: float, relayed: bool, now: Optional[float] = None) -> Optional[str]:
+        """Which budget would hold `estimated_duration_s` of airtime back
+        right now: "relayed" (the 30% cap, checked first because it is the
+        stricter one and the one the frame class exists for), "total" (the
+        zero-hop cap), or None when the frame may go. Pure: no waiting."""
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        if relayed and self._relayed and self._relayed_busy_s(now) + estimated_duration_s > self._max_busy_s:
+            return "relayed"
+        if self._samples and self._busy_s(now) + estimated_duration_s > self._max_total_s:
+            return "total"
+        return None
+
+    async def wait_for_budget(
+        self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None, relayed: bool = True,
+    ) -> "tuple[float, Optional[str]]":
         """Sleeps until sending for `estimated_duration_s` would not push
-        the trailing window's cumulative busy time over the cap. Returns
-        the total delay actually applied (0.0 if none was needed) --
-        capture/debug-only, never affects whether the send itself
-        proceeds. A single transmission longer than the entire cap on its
-        own (shouldn't happen in practice -- every real frame this
-        interface sends is small) is let through once the window is
-        otherwise empty, rather than waiting forever for room that will
-        never exist."""
+        the trailing window's cumulative busy time over the cap -- the
+        relayed cap when `relayed`, and the total cap always. Returns
+        `(delay, ledger)`: the total delay actually applied (0.0 if none
+        was needed) and which ledger held the frame back longest-ago
+        ("relayed" / "total" / None) -- capture/debug-only, never affects
+        whether the send itself proceeds. A single transmission longer than
+        the entire cap on its own (shouldn't happen in practice -- every
+        real frame this interface sends is small) is let through once the
+        window is otherwise empty, rather than waiting forever for room
+        that will never exist."""
         total_wait = 0.0
+        charged_to: Optional[str] = None
         while True:
             now = time.monotonic()
-            self._prune(now)
-            if self._busy_s(now) + estimated_duration_s <= self._max_busy_s or not self._samples:
-                return total_wait
-            oldest_start, _oldest_duration = self._samples[0]
+            ledger = self.limiting_ledger(estimated_duration_s, relayed, now)
+            if ledger is None:
+                return total_wait, charged_to
+            if charged_to is None:
+                charged_to = ledger
+            samples = self._relayed if ledger == "relayed" else self._samples
+            oldest_start, _oldest_duration = samples[0]
             wait_s = max(0.01, (oldest_start + self._window_s) - now)
             if interrupt is not None:
                 # Phase 1 (2026-09-20): a raw burst's throttle wait is the
@@ -369,5 +414,10 @@ class _DutyCycleLimiter:
             await asyncio.sleep(wait_s)
             total_wait += wait_s
 
-    def record(self, duration_s: float) -> None:
-        self._samples.append((time.monotonic(), duration_s))
+    def record(self, duration_s: float, relayed: bool = True) -> None:
+        """Charge `duration_s` of airtime: to the total ledger always, and
+        to the relayed ledger when a repeater will relay the frame."""
+        now = time.monotonic()
+        self._samples.append((now, duration_s))
+        if relayed:
+            self._relayed.append((now, duration_s))

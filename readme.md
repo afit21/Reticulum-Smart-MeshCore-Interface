@@ -14,9 +14,14 @@ This diagram isn't 100% accurate to how the interface works but should give you 
 
 ## TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
 
-This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.2) I have airtime capped at 30% which in my field tests is the minimum which allows for a usable Nomadnet experience.
+This project intentionally caps performance out of respect for the regular MeshCore users. Airtime is capped over a rolling 60 second window, with two numbers since alpha 0.1.5:
 
-As more data is collected, we can move this to a dynamic cap to automically increase this based on other factors such as MeshCore hop count, the Mesh's radio settings, etc.
+- **30%** for anything a repeater relays: multi-hop direct traffic and every channel broadcast (announces, path requests, peer discovery). This is the number that matters to everyone else on the mesh, and it is not going up.
+- **85%** for zero-hop direct traffic between two adjacent radios. A frame that no repeater carries costs nobody else's infrastructure any air, and the field tests showed the 30% cap, not the radio, was the ceiling there (a zero-hop page transfer spent 109 of 147 seconds waiting on it).
+
+The 30% is `duty_cycle_max_fraction`, the 85% is `duty_cycle_max_fraction_zero_hop`; both are counted against the same window, and multi-hop traffic counts against both.
+
+As more data is collected, this can become more dynamic, based on factors such as the mesh's radio settings.
 
 As this project is under a GPL license, there is nothing stopping you from lifting the caps in your own fork, however I would consider doing this on an established MeshCore Mesh for the sake of personal performance without testing wreckless and disrespectful to those who contribute to the infrustrucure you're using.
 
@@ -54,7 +59,7 @@ New in alpha 0.1.4:
 | Adaptive ACK Timing | Working | Measures the real round trip to each peer and shortens ACK waits to match, never waiting longer than the hop-scaled ceiling. A missed ACK doubles the next wait rather than discarding the measurement. |
 | Fragment Reconciliation | Experimental | After sending a fragmented packet, the receiver reports which fragments it holds (or the sender asks), and only the missing ones are re-sent. Both nodes must run alpha 0.1.4 or later (the wire format changed in 0.1.4). |
 | Dead Hop Detection | Experimental | If the first repeater never echoes our frame, the attempt is abandoned early and a stale path is re-discovered in about 30 seconds instead of 4 minutes. |
-| Airtime Duty Cycle | Working | Caps the interface at 30% airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings. Link keepalives skip the wait but still count against the cap. |
+| Airtime Duty Cycle | Working | Caps the interface's airtime over a rolling 60 seconds, using real LoRa time-on-air at your radio's settings: 30% for anything a repeater relays (`duty_cycle_max_fraction`), 85% for zero-hop direct traffic (`duty_cycle_max_fraction_zero_hop`). Link keepalives skip the wait but still count against the cap. |
 | Queue Hygiene | Working | Drops duplicate, stale and closed-link packets from the queue so a backlog isn't dumped onto the mesh when a path comes back, and forwards at most one spontaneous announce per destination every 5 minutes. |
 | Predictive Transmit Holds | Basic | Uses overheard traffic to predict how long the channel stays busy and waits for it to clear. Off by default. |
 | Raw Binary Fragments | Experimental | On by default. Packets too large for one text message go to a capable peer as MeshCore raw binary packets: no Z85, no text framing, no per-fragment ACK (about 43% less sender airtime). Reliability comes from Fragment Reconciliation; if raw never arrives on a path but text does, that path falls back to text for a while. Older peers still get text fragments. **Privacy note:** MeshCore raw packets are not encrypted or authenticated by the firmware. Your contents are still end-to-end encrypted by Reticulum, but the RNS packet header and both nodes' key prefixes are visible on air, and a third party could inject a fragment (Reticulum rejects it, but the transfer has to be re-sent). Set `direct_raw_fragments_enabled = no` to stay fully inside MeshCore's encryption. |
@@ -106,7 +111,7 @@ Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The f
 ## Field Testing
 
 This table summarizes the real world scenarios that I've tested the interface against.
-Hops in this table refer to MeshCore Hops. Note - This is the results with airtime useage capped at 30% as is hard-coded and not configurable by design. A dynamic airtime usage cap is in the roadmap.
+Hops in this table refer to MeshCore Hops. Note - These results were measured with airtime capped at 30% for everything (the alpha 0.1.4 cap); since alpha 0.1.5 zero-hop direct traffic may use 85% while anything a repeater relays stays at 30% (see the airtime section above).
 
 All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet MeshCore network.
 

@@ -339,11 +339,14 @@ class DutyCycleTests(unittest.TestCase):
 
         async def scenario():
             limiter = module._DutyCycleLimiter(window_s=0.6, max_fraction=0.5)
-            self.assertEqual(await limiter.wait_for_budget(0.1), 0.0)
+            # Alpha 0.1.5: wait_for_budget returns (delay, ledger); one cap
+            # given means both ledgers share it (the pre-0.1.5 behaviour).
+            self.assertEqual(await limiter.wait_for_budget(0.1), (0.0, None))
             limiter.record(0.3)
             t0 = time.monotonic()
-            waited = await limiter.wait_for_budget(0.1)
+            waited, ledger = await limiter.wait_for_budget(0.1)
             self.assertGreater(waited, 0.0)
+            self.assertEqual(ledger, "relayed")
             self.assertGreater(time.monotonic() - t0, 0.05)
             self.assertLess(time.monotonic() - t0, 1.0)
 

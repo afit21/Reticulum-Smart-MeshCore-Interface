@@ -70,6 +70,18 @@ class _ConfigMixin:
         self.duty_cycle_enabled = _cfg_bool(cfg.get("duty_cycle_enabled", "yes"))
         self.duty_cycle_window_s = float(cfg.get("duty_cycle_window", 60.0))
         self.duty_cycle_max_fraction = float(cfg.get("duty_cycle_max_fraction", 0.30))
+        # Alpha 0.1.5 (2026-09-21, the owner's decision after the alpha
+        # 0.1.4 field session): two ledgers over the same window. Every
+        # frame a repeater will relay -- any DIRECT frame with a routed
+        # path, every CHANNEL flood (announces, path requests, bind frames)
+        # -- is charged to both and waits on both budgets, so what touches
+        # a repeater stays at `duty_cycle_max_fraction` (30%). A zero-hop
+        # DIRECT frame (the target's out_path_len is 0) is charged to the
+        # total ledger only and waits on this cap: 85%, because the
+        # zero-hop 12-part page of that session took 147 s of which 109 s
+        # were waits at 30%, and a frame between two adjacent radios costs
+        # nobody else's repeater any air. Never loosen the 30%.
+        self.duty_cycle_max_fraction_zero_hop = float(cfg.get("duty_cycle_max_fraction_zero_hop", 0.85))
         # User-requested (2026-09-18 evening, see module docstring): link-
         # maintenance traffic (PRIORITY_HANDSHAKE -- LINKREQUEST, PROOF,
         # KEEPALIVE..LRPROOF, RESOURCE_PRF/ICL/RCL) never waits for budget;

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (alpha 0.1.5, 2026-09-21)
+
+The items of the alpha 0.1.5 pass, each from the alpha 0.1.4 field session's captures
+(`fieldtests/raw/Alpha0.1.4/`, desktop `afipc_` + laptop). No wire change so far. The dated design
+record is `docs/history.md` ("Alpha 0.1.5 pass").
+
+- **Hop-aware airtime cap** (new key `duty_cycle_max_fraction_zero_hop = 0.85`; `duty_cycle_max_fraction`
+  stays 0.30). Two ledgers over the same 60 s window: everything a repeater relays (multi-hop DIRECT,
+  every CHANNEL flood) is charged to both and waits on both, so it stays at 30%; a zero-hop DIRECT
+  frame is charged to the total ledger only and waits on 85%. Field motivation: the zero-hop 12-part
+  page of 2026-09-21 spent 109 of its 147 s in duty-cycle waits at 30%. Capture: `duty_cycle_ledger`
+  on `direct_attempt_result` / `raw_fragment_sent`. Tests: `tests/test_duty_cycle_hop_aware_0921.py`;
+  shipped-default pin and `tests/golden/config_defaults.json` re-pinned for the new key.
+
 ## alpha-0.1.4 (2026-09-21)
 
 Everything since alpha-0.1.1 (2026-09-18 night), released as one version: the raw binary DIRECT

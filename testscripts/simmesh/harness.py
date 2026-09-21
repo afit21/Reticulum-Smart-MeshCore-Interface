@@ -76,6 +76,7 @@ FAST_TIMING = {
     "direct_path_reset_min_age": 5.0,
     "duty_cycle_window": 10.0,
     "duty_cycle_max_fraction": 0.9,
+    "duty_cycle_max_fraction_zero_hop": 0.95,
     "stats_interval": 3600,
 }
 

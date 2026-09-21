@@ -190,6 +190,14 @@ def analyse_capture(recs: list) -> dict:
         if r.get("duty_cycle_wait_s"):
             waits["duty_cycle_wait_s"] += r["duty_cycle_wait_s"]
     n["duty_cycle_waits"] = dist([r.get("duty_cycle_wait_s") for r in rf if r.get("duty_cycle_wait_s")])
+    # Alpha 0.1.5: which ledger held each wait ("relayed" = the 30% cap for
+    # anything a repeater relays, "total" = the 85% zero-hop cap), summed
+    # over raw fragments and DIRECT attempts alike.
+    ledger_sums: dict = collections.defaultdict(float)
+    for r in rf + att_all:
+        if r.get("duty_cycle_wait_s") and r.get("duty_cycle_ledger"):
+            ledger_sums[r["duty_cycle_ledger"]] += r["duty_cycle_wait_s"]
+    n["duty_cycle_wait_by_ledger"] = dict(ledger_sums)
     fr = [r for r in recs if r.get("event") == "fragment_received"]
     n["frag_recv"] = len(fr)
     n["frag_recv_raw"] = sum(1 for r in fr if r.get("raw"))
@@ -473,7 +481,8 @@ def print_block(r: dict) -> None:
         print(f"    completion checks {n['completion_n']} {n['completion']}; reports sent {n['reports_sent']} "
               f"(complete {n['reports_sent_complete']}); queries received {n['queries_received']}")
         print(f"    raw fragments sent {n['raw_sent']} ({n['raw_bytes']} B) rounds {n['raw_rounds']}; fragments received {n['frag_recv']} (raw {n['frag_recv_raw']}); "
-              f"duty-cycle waits {dist_str(n['duty_cycle_waits'])}")
+              f"duty-cycle waits {dist_str(n['duty_cycle_waits'])}"
+              + (f" by ledger {n['duty_cycle_wait_by_ledger']}" if n.get("duty_cycle_wait_by_ledger") else ""))
         print(f"    direct sends {n['send_results']} methods {n['send_methods']} text fallbacks {n['text_fallbacks']}; slot waits {dist_str(n['slot_waits'])}")
         print(f"    waits (s, summed): {n['waits_s']}")
         if n["linkrequest_out"] or n["lrproof_in"]:

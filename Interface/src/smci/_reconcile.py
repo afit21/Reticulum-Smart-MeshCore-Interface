@@ -140,9 +140,11 @@ class _ReconcileMixin:
         receiver's reassembly clock), then CMD_SEND_RAW_DATA. Returns
         whether the firmware accepted it; never waits for anything after."""
         on_air = 2 + len(path) + len(frame)
+        # A source-routed raw fragment is relayed once per path byte; an
+        # empty path is the zero-hop class (alpha 0.1.5 duty-cycle ledgers).
         gate = await self._pre_transmit_gate(
             "", skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority), on_air_bytes=on_air,
-            interrupt=interrupt,
+            interrupt=interrupt, relayed=len(path) > 0, telemetry=telemetry,
         )
         if telemetry is not None:
             telemetry["quiet_defer_wait_s"], telemetry["duty_cycle_wait_s"], telemetry["medium_hold_wait_s"] = gate
@@ -324,7 +326,7 @@ class _ReconcileMixin:
                 )
                 continue
             break
-        waited_s = time.monotonic() - started
+        waited_s = max(0.0, time.monotonic() - started)
         is_provisional = got is provisional
         self._debug(
             f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "

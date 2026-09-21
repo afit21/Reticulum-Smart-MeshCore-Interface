@@ -300,7 +300,7 @@ class NightSessionFixes(SingleNodeCase):
         iface = self.iface
         captured = []
 
-        async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False):
+        async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False, **_kw):
             return {}
 
         async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=None, preemptible=False):

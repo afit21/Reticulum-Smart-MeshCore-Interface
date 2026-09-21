@@ -143,6 +143,7 @@
     "duty_cycle_estimate_bitrate": 1200,
     "duty_cycle_exempt_handshake": true,
     "duty_cycle_max_fraction": 0.3,
+    "duty_cycle_max_fraction_zero_hop": 0.85,
     "duty_cycle_window_s": 60.0,
     "host": "127.0.0.1",
     "incoming_quiet_defer_enabled": true,

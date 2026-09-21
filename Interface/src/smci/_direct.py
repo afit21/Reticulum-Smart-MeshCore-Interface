@@ -16,10 +16,25 @@ class _DirectSendMixin:
         (see duty_cycle_exempt_handshake). Its airtime is still recorded."""
         return self.duty_cycle_exempt_handshake and priority == self.PRIORITY_HANDSHAKE
 
+    def _relayed_frame(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> bool:
+        """Whether a DIRECT frame will be relayed by a repeater -- the hop
+        class the duty-cycle limiter's two ledgers key on (alpha 0.1.5,
+        2026-09-21). `hop_count` is the target's `out_path_len` when the
+        caller has it; otherwise the peer's resolved path is consulted; a
+        frame whose route is unknown is charged as relayed (the stricter
+        budget), never the other way round."""
+        if hop_count is not None:
+            return hop_count > 0
+        if peer_prefix is not None:
+            resolved = self._resolved_paths.get(peer_prefix)
+            if resolved is not None:
+                return resolved.out_path_len > 0
+        return True
+
     async def _throttle_for_duty_cycle(
         self, frame: str, exempt: bool = False, on_air_bytes: Optional[int] = None,
-        interrupt: "Optional[asyncio.Event]" = None,
-    ) -> float:
+        interrupt: "Optional[asyncio.Event]" = None, relayed: bool = True,
+    ) -> "tuple[float, Optional[str]]":
         """User-requested fix (2026-09-16): called at every actual radio-
         keying call site (`_send_channel_fastpath_frame`, one iteration
         of `_send_channel_multifragment_pass`'s per-fragment loop,
@@ -31,15 +46,26 @@ class _DirectSendMixin:
         shipped -- reusing `bitrate` massively overestimated real per-
         frame airtime and forced an artificial ~10s wait on every single
         exchange), waits out whatever `_DutyCycleLimiter` says is needed,
-        then records the estimate as consumed. Returns the delay actually
-        applied -- logged at debug level and available to the caller for
-        capture, never gates *whether* the send proceeds, only *when*
-        it's allowed to start. A no-op returning 0.0 immediately when
-        `duty_cycle_enabled` is off."""
+        then records the estimate as consumed. Returns `(delay, ledger)`:
+        the delay actually applied and the ledger that held the frame
+        ("relayed" / "total" / None) -- logged at debug level and available
+        to the caller for capture, never gates *whether* the send
+        proceeds, only *when* it's allowed to start. `(0.0, None)`
+        immediately when `duty_cycle_enabled` is off.
+
+        Alpha 0.1.5 (2026-09-21): `relayed` is the frame's hop class. A
+        frame a repeater will relay -- any DIRECT frame with a routed path,
+        every CHANNEL flood -- is charged to both ledgers and waits on both
+        budgets (`duty_cycle_max_fraction`, 30%, and the total cap); a
+        zero-hop DIRECT frame is charged to the total ledger only and waits
+        on `duty_cycle_max_fraction_zero_hop` (85%). The owner's rule: what
+        touches a repeater stays at 30%, two adjacent radios may use the
+        channel between them."""
         if not self.duty_cycle_enabled or self.duty_cycle_estimate_bitrate <= 0:
-            return 0.0
+            return 0.0, None
         estimated_s = self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes)
-        budget_s = self.duty_cycle_window_s * self.duty_cycle_max_fraction
+        budget_s = self.duty_cycle_window_s * (
+            self.duty_cycle_max_fraction if relayed else self.duty_cycle_max_fraction_zero_hop)
         if estimated_s > budget_s and not getattr(self, "_duty_cycle_overrun_warned", False):
             # MeshBench finding 1 (2026-09-20): one absurd radio parameter
             # turned into one frame per window with nothing in the log.
@@ -53,22 +79,22 @@ class _DirectSendMixin:
             )
         if exempt:
             # Link-maintenance traffic: charged, never delayed.
-            self._duty_cycle.record(estimated_s)
+            self._duty_cycle.record(estimated_s, relayed=relayed)
             self._debug(
                 f"duty-cycle: handshake-class {len(frame)}-char frame sent without waiting "
-                f"for budget ({estimated_s:.2f}s airtime still charged to the window)."
+                f"for budget ({estimated_s:.2f}s airtime still charged to the {'relayed and total' if relayed else 'total'} ledger)."
             )
-            return 0.0
-        delay = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt)
-        self._duty_cycle.record(estimated_s)
+            return 0.0, None
+        delay, ledger = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt, relayed=relayed)
+        self._duty_cycle.record(estimated_s, relayed=relayed)
         if delay > 0:
             self._debug(
-                f"duty-cycle throttle: waited {delay:.2f}s before this "
-                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} frame "
-                f"(estimated {estimated_s:.2f}s airtime, "
+                f"duty-cycle throttle: waited {delay:.2f}s on the {ledger} ledger before this "
+                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} "
+                f"{'relayed' if relayed else 'zero-hop'} frame (estimated {estimated_s:.2f}s airtime, "
                 f"{'LoRa model' if self._radio_params is not None else f'duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps'})."
             )
-        return delay
+        return delay, ledger
 
     async def _wait_for_incoming_quiet(self) -> float:
         """User-requested fix (2026-09-16): "if we hear a message come in
@@ -141,6 +167,7 @@ class _DirectSendMixin:
     async def _pre_transmit_gate(
         self, frame: str, skip_quiet_defer: bool = False, duty_cycle_exempt: bool = False,
         on_air_bytes: Optional[int] = None, interrupt: "Optional[asyncio.Event]" = None,
+        relayed: bool = True, telemetry: Optional[dict] = None,
     ) -> "tuple[float, float, float]":
         """Code-review fix: `await self._wait_for_incoming_quiet()` then
         `await self._throttle_for_duty_cycle(frame)`, in that order, used
@@ -190,9 +217,14 @@ class _DirectSendMixin:
         quiet_defer_wait_s = 0.0
         if not skip_quiet_defer:
             quiet_defer_wait_s = await self._wait_for_incoming_quiet()
-        duty_cycle_wait_s = await self._throttle_for_duty_cycle(
-            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt,
+        duty_cycle_wait_s, duty_cycle_ledger = await self._throttle_for_duty_cycle(
+            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt, relayed=relayed,
         )
+        if telemetry is not None:
+            # Alpha 0.1.5: which ledger a wait was charged to ("relayed" /
+            # "total" / None), and the frame's hop class, for the capture.
+            telemetry["duty_cycle_ledger"] = duty_cycle_ledger
+            telemetry["duty_cycle_relayed"] = relayed
         # Step 4 (2026-09-18): last, so it reflects whatever was overheard
         # during the two waits above. A no-op unless rx_log_holds_enabled.
         medium_hold_wait_s = await self._wait_for_medium_clear()
@@ -1366,6 +1398,7 @@ class _DirectSendMixin:
                     sent = await self._send_direct_frame(
                         target, frame, attempt, time_critical=time_critical, gate_telemetry=gate_telemetry,
                         duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                        hop_count=hop_count, peer_prefix=peer_prefix,
                     )
                     ack_wait_start = time.monotonic()
                     rx_window["tx_at"] = ack_wait_start
@@ -1523,6 +1556,7 @@ class _DirectSendMixin:
                     hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
                     quiet_defer_wait_s=gate_telemetry.get("quiet_defer_wait_s"),
                     duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
+                    duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
                     ack_timeout_source=ack_timeout_source, ack_latency_s=ack_latency_s,
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
@@ -1585,10 +1619,12 @@ class _DirectSendMixin:
                 send_exc = None
                 hold_s = 0.0
                 try:
-                    await self._pre_transmit_gate(
+                    _q, duty_cycle_wait_s, _m = await self._pre_transmit_gate(
                         frame, skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                        on_air_bytes=on_air_bytes, relayed=hop_count > 0, telemetry=gate_telemetry,
                     )
                     gate_telemetry["duty_cycle_exempt"] = self._duty_cycle_exempt(priority)
+                    gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
                     dst = bytes.fromhex(str(target)[:12])
                     data = (
                         bytes([0x02, self.TXT_TYPE_CLI_DATA, attempt & 0xFF])
@@ -1617,6 +1653,8 @@ class _DirectSendMixin:
                     hop_count=hop_count, time_critical=True, listen_delay_s=hold_s,
                     ack_timeout_source="noack", kind=kind,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
+                    duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
+                    duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
                     on_air_bytes=on_air_bytes if ok else None,
                 )
                 return ok
@@ -1645,6 +1683,7 @@ class _DirectSendMixin:
     async def _send_direct_frame(
         self, target, frame: str, attempt: int = 0, time_critical: bool = False,
         gate_telemetry: Optional[dict] = None, duty_cycle_exempt: bool = False,
+        hop_count: Optional[int] = None, peer_prefix: Optional[str] = None,
     ):
         """Sends one already-encoded DIRECT frame string (bare or
         multi-fragment shape -- this method doesn't care which) via
@@ -1679,11 +1718,17 @@ class _DirectSendMixin:
         below then raises -- the gate already ran and cost real time
         either way, and that's exactly the case a field-tuning analysis
         most wants visible."""
+        # Alpha 0.1.5: the frame's hop class for the duty-cycle ledgers --
+        # `hop_count` from the caller (the target's out_path_len) or the
+        # peer's resolved path; unknown counts as relayed.
+        gate_info: dict = {}
         quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s = await self._pre_transmit_gate(
             frame, skip_quiet_defer=time_critical, duty_cycle_exempt=duty_cycle_exempt,
+            relayed=self._relayed_frame(hop_count, peer_prefix), telemetry=gate_info,
         )
         if gate_telemetry is not None:
             gate_telemetry["duty_cycle_exempt"] = duty_cycle_exempt
+            gate_telemetry["duty_cycle_ledger"] = gate_info.get("duty_cycle_ledger")
             gate_telemetry["quiet_defer_wait_s"] = quiet_defer_wait_s
             gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
             gate_telemetry["medium_hold_wait_s"] = medium_hold_wait_s

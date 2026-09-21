@@ -235,6 +235,7 @@ class _ObservabilityMixin:
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
+        duty_cycle_ledger: Optional[str] = None,
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
@@ -351,6 +352,10 @@ class _ObservabilityMixin:
             # User-requested (2026-09-18 evening): handshake-class frames
             # skip the duty-cycle wait (airtime still charged).
             "duty_cycle_exempt": duty_cycle_exempt,
+            # Alpha 0.1.5: the ledger a duty-cycle wait was charged to
+            # ("relayed" = the 30% cap, "total" = the zero-hop cap, None =
+            # no wait / not gated).
+            "duty_cycle_ledger": duty_cycle_ledger,
             # Field fix (2026-09-19 night): how long this attempt kept the
             # radio lock AFTER its listen delay waiting for the answer it
             # asked for -- the hidden-node quiet window, non-null only on a

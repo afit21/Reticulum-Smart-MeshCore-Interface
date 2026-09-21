@@ -3217,3 +3217,47 @@ from. Milestones in order, each gated on the full suite and MeshBench
      one-hop raw-send fixture (`tests/test_completion_report_one_hop_
      0920.py`) still turns parity off for its burst-shape pins.
 
+
+**Alpha 0.1.5 pass (2026-09-21, from the alpha 0.1.4 field session's
+captures in `fieldtests/raw/Alpha0.1.4/`).** The metric is unchanged:
+on-air bytes per delivered RNS byte, read with the delivery rate and the
+per-part completion time, per hop count; for zero hop, also the share of a
+transfer's time spent in duty-cycle waits, because that is what the cap
+change below moves. The owner's decisions in force for the pass: zero-hop
+DIRECT traffic may use up to 85% of channel time, everything a repeater
+relays stays at 30% and that number is never loosened; both field nodes
+update together; parity stays on; aim for no wire change.
+
+ 1. **Hop-aware airtime cap** (`duty_cycle_max_fraction_zero_hop`, new,
+    0.85; `duty_cycle_max_fraction` 0.30 unchanged in meaning). The field:
+    the zero-hop 12-part page of 08:37-08:40 took 147 s, of which 109 s
+    were duty-cycle waits at the single 30% cap -- the cap, not the
+    radio, was the zero-hop ceiling, while two adjacent radios cost no
+    repeater any air. `_DutyCycleLimiter` is now two ledgers over the
+    same 60 s window: every frame is charged to the TOTAL ledger, capped
+    at 85%; every frame a repeater will relay -- any DIRECT frame whose
+    target has `out_path_len >= 1`, and every CHANNEL flood (announces,
+    path requests, bind frames, channel fragments) -- is also charged to
+    the RELAYED ledger, capped at 30%, and waits on both. A zero-hop
+    DIRECT frame waits on the total budget only. The hop class travels
+    through `_pre_transmit_gate(relayed=)` from every keying site: the
+    raw fragment knows its path (`len(path) > 0`), the ACKed and no-ACK
+    text frames carry the target's `hop_count` (`_relayed_frame`: the
+    caller's out_path_len, else the peer's resolved path, else relayed --
+    an unknown route is charged the stricter way, never the other), the
+    CHANNEL and bind sites are always relayed. Handshake-class frames
+    stay charged and never delayed, in whichever ledgers their class
+    dictates. `wait_for_budget` now returns `(delay, ledger)` and the
+    capture writes `duty_cycle_ledger` ("relayed" / "total" / None) on
+    `direct_attempt_result` and `raw_fragment_sent` (the no-ACK frame's
+    record now also carries its `duty_cycle_wait_s`, which it never did);
+    `meshbench_report.py` sums the waits by ledger. Not gated, as before:
+    the MeshCore path-discovery flood (`send_path_discovery_sync`, outside
+    the gate by the M4 design) -- a few frames per hour, left alone.
+    Tests: `tests/test_duty_cycle_hop_aware_0921.py` (both budgets, the
+    mixed case, the one-cap compatibility, `_relayed_frame`, the gate's
+    telemetry, the shipped pair); shipped-default pin and golden config
+    re-pinned for the new key; the fast test profile adds the key at
+    0.95 so the unit scenarios are not slowed. MeshBench gate in
+    `changelog.md`: `zero_hop` and `duty_cycle_pages` should move,
+    `large_payload` and `relay` must not (relayed traffic).
