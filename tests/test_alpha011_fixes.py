@@ -72,7 +72,7 @@ class FragmentedFinishAndResume(SingleNodeCase):
             self.calls.append((pass_number, frag_idx, attempts_override))
             return self.script.get((pass_number, frag_idx), False)
 
-        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=M.SmartMeshCoreInterface.PRIORITY_NORMAL, hop_count=None):
+        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=M.SmartMeshCoreInterface.PRIORITY_NORMAL, hop_count=None, send_info=None, entries=None):
             self.queries.append((stage, pkt_id))
             held = self.answers.pop(0) if self.answers else None
             if held is None:

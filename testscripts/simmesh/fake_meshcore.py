@@ -158,6 +158,25 @@ class SimCommands:
             return SimEvent(EventType.ERROR, {"reason": "destination is not a known contact"})
         return SimEvent(EventType.MSG_SENT, result, {"type": result["type"], "expected_ack": result["expected_ack"].hex()})
 
+    async def send(self, data: bytes, expected_events=None) -> SimEvent:
+        """`CommandHandlerBase.send(data, expected_events)` -- the raw
+        command frame the library's own `send_msg`/`send_cmd` build
+        (2026-09-20). Only CMD_SEND_TXT_MSG (0x02) is modelled:
+        `[0x02][txt_type][attempt][timestamp:4 LE][dst_prefix:6][text]`,
+        the frame `MyMesh::onSerialFrame` parses; txt_type 0 (PLAIN) is
+        ACKed, 1 (CLI_DATA) is delivered and never ACKed, anything else
+        errors as the firmware does (`recipient && (PLAIN || CLI_DATA)`)."""
+        data = bytes(data)
+        if not data or data[0] != 0x02 or len(data) < 13:
+            return SimEvent(EventType.ERROR, {"reason": "unsupported command frame in the fake"})
+        txt_type, attempt = data[1], data[2]
+        dst_hex = data[7:13].hex()
+        text = data[13:].decode("utf-8", "ignore")
+        result = self._radio.cmd_send_msg(dst_hex, text, attempt=int(attempt), txt_type=int(txt_type))
+        if result is None:
+            return SimEvent(EventType.ERROR, {"reason": "destination is not a known contact or unsupported txt_type"})
+        return SimEvent(EventType.MSG_SENT, result, {"type": result["type"], "expected_ack": result["expected_ack"].hex()})
+
     async def send_raw_data(self, payload: bytes, path: bytes = b"") -> SimEvent:
         """meshcore 2.3.9.1 commands/messaging.py send_raw_data: payload
         bytes (>= 4) and optional path bytes; resolves OK or ERROR."""

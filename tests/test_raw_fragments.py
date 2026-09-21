@@ -28,8 +28,10 @@ class RawCodecAndGate(SingleNodeCase):
         payload = os.urandom(150)
         frame = iface._encode_raw_fragment(payload, "ab" * 32, "cd" * 6, pkt_id=0x1234, frag_idx=2, frag_total=4, attempt=3)
         self.assertEqual(len(frame), iface.RAW_HEADER_SIZE + 150)
+        self.assertEqual(iface.RAW_HEADER_SIZE, 9, "M3 (2026-09-20): 9-byte header, 2-byte source prefix")
         header, out, src, dst = iface._decode_raw_fragment(frame)
-        self.assertEqual((out, src, dst), (payload, "cd" * 6, bytes.fromhex("abab")))
+        # M3: the source prefix on the wire is RAW_SRC_PREFIX_BYTES (2) bytes.
+        self.assertEqual((out, src, dst), (payload, "cd" * iface.RAW_SRC_PREFIX_BYTES, bytes.fromhex("abab")))
         self.assertEqual((header.pkt_id, header.frag_idx, header.frag_total, header.attempt), (0x1234, 2, 4, 3))
         self.assertTrue(header.multi_fragment)
 
@@ -45,12 +47,17 @@ class RawCodecAndGate(SingleNodeCase):
 
     def test_budget_follows_firmware_limits(self):
         iface = self.iface
-        self.assertEqual(iface._direct_raw_payload_budget(0), 170 - 13)      # config cap (170) wins at zero hop
-        self.assertEqual(iface._direct_raw_payload_budget(3), 170 - 13)      # still the cap: 174 - 3 = 171 > 170
-        self.assertEqual(iface._direct_raw_payload_budget(5), 169 - 13)      # 174 - path_len wins from 5 hops
-        self.assertEqual(iface._direct_raw_payload_budget(10), 164 - 13)
-        # a 483-byte Resource part is 4 raw fragments (5 text ones today)
-        self.assertEqual(len(iface._chunk_payload(bytes(483), iface._direct_raw_payload_budget(0))), 4)
+        h = iface.RAW_HEADER_SIZE   # 9 since M3 (2026-09-20); was 13
+        self.assertEqual(iface._direct_raw_payload_budget(0), 170 - h)      # config cap (170) wins at zero hop
+        self.assertEqual(iface._direct_raw_payload_budget(3), 170 - h)      # still the cap: 174 - 3 = 171 > 170
+        self.assertEqual(iface._direct_raw_payload_budget(5), 169 - h)      # 174 - path_len wins from 5 hops
+        self.assertEqual(iface._direct_raw_payload_budget(10), 164 - h)
+        # a 483-byte Resource part is 3 raw fragments since M3 (4 with the
+        # 13-byte header; 5 text ones): 3 x 161 = 483 exactly, up to four hops
+        self.assertEqual(iface._direct_raw_payload_budget(0), 161)
+        for path_len in range(0, 5):
+            self.assertEqual(len(iface._chunk_payload(bytes(483), iface._direct_raw_payload_budget(path_len))), 3, f"path_len {path_len}")
+        self.assertEqual(len(iface._chunk_payload(bytes(483), iface._direct_raw_payload_budget(5))), 4)
         self.assertEqual(len(iface._fragment_direct_payload(bytes(483))), 5)
 
     def test_eligibility_gate(self):
@@ -296,7 +303,7 @@ class NightSessionFixes(SingleNodeCase):
         async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False):
             return {}
 
-        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start):
+        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=None, preemptible=False):
             await asyncio.sleep(0.05)      # a (short) ACK latency, so the window is measured from MSG_SENT
             return True, False, 1.0, "test", 0.05, None
 
@@ -476,10 +483,10 @@ class NightSessionFixes(SingleNodeCase):
         iface, M = self.iface, self.module
         rounds = iter(held_per_round)
 
-        async def fake_raw(path, frame, priority, telemetry=None):
+        async def fake_raw(path, frame, priority, telemetry=None, interrupt=None):
             return True
 
-        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=2, hop_count=None, send_info=None):
+        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=2, hop_count=None, send_info=None, entries=None):
             if send_info is not None:
                 send_info["acked"] = True
                 send_info["waited_full_timeout"] = True
@@ -495,7 +502,9 @@ class NightSessionFixes(SingleNodeCase):
         iface._query_remote_fragments = fake_query
         iface._raw_path_reset_mid_send = no_reset
         iface.direct_raw_zero_hop_gap_s = 0.0
-        payload = os.urandom(483)
+        # Four fragments whatever the header size (483 B was four with the
+        # 13-byte header; it is three since M3's 9-byte header, 2026-09-20).
+        payload = os.urandom(iface._direct_raw_payload_budget(0) * 3 + 10)
         return self.node.run_on_loop(
             iface._send_direct_raw_fragmented("ab" * 32, self.PEER, payload, iface._next_pkt_id(),
                                               priority=iface.PRIORITY_NORMAL, hop_count=0),
@@ -627,7 +636,7 @@ class RawFragmentScenarios(unittest.TestCase):
         a.send(big)
         self.assertTrue(wait_until(lambda: big in b.owner.received, 40.0), "raw transfer never delivered")
         sent = _events(a, "raw_fragment_sent")
-        self.assertGreaterEqual(len(sent), 4)
+        self.assertGreaterEqual(len(sent), 3)   # 9-byte raw header (M3, 2026-09-20): 161 B per fragment, three for this payload
         self.assertEqual(sum(1 for r in _events(a, "direct_attempt_result") if r.get("frag_total")), 0, "no text fragments should have been sent")
         self.assertTrue(any(r.get("transport") == "direct_raw_multifragment" for r in b.capture_records() if r["direction"] == "in"))
 
@@ -652,8 +661,8 @@ class RawFragmentScenarios(unittest.TestCase):
         big = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"raw-hop-" + os.urandom(440))
         a.send(big)
         self.assertTrue(wait_until(lambda: big in b.owner.received, 60.0), "raw transfer through a repeater never delivered")
-        self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 4)
-        self.assertGreaterEqual(len(_events(a, "raw_fragment_sent")), 4)
+        self.assertGreaterEqual(self.mesh.repeaters["R"].counters["direct_forwarded"], 3)   # three fragments since M3
+        self.assertGreaterEqual(len(_events(a, "raw_fragment_sent")), 3)
 
         # Phase 2's premise is "raw is enabled for this peer and the chain
         # drops it", so establish that premise rather than inheriting phase
@@ -818,7 +827,12 @@ class ZeroHopBidirectionalPageTransfer(unittest.TestCase):
         self.assertEqual(sa["text_fallbacks"] + sb["text_fallbacks"], 0, (sa, sb))
         waits = [w for w in sa["answer_lock_waits"] + sb["answer_lock_waits"] if w is not None]
         if waits:
-            self.assertLessEqual(max(waits), 10.0, f"an ANSWER/REPORT waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
+            # Phase 3 M2 (2026-09-20): a node's REPORT waits behind its own
+            # outgoing raw window (up to 6 parts x 3 fragments at zero hop,
+            # 12-15 s observed under both-ways load) -- one window, bounded,
+            # not starvation. MeshBench page_transfer_bidir measures the
+            # cost against the real firmware.
+            self.assertLessEqual(max(waits), 20.0, f"an ANSWER/REPORT waited {max(waits):.1f}s for the lock (all: {sorted(waits)[-5:]})")
         checks = sa["checks"] + sb["checks"]
         self.assertGreater(checks, 0, "no completion checks recorded")
 

@@ -107,7 +107,13 @@ class ReceiverReportsOnTheFlaggedSecondLastFragment(SingleNodeCase):
                 )
                 for _ in range(3):
                     await asyncio.sleep(0)   # let the spawned answer task run
-            self.node.run_on_loop(scenario(), timeout=10.0)
+                # Phase 3 M1 (2026-09-20): the gaps report is held for one
+                # fragment airtime plus the one-hop relay gap first.
+                assert answers == [], "the gaps report is not sent at once (M1 debounce)"
+                await asyncio.sleep(iface._report_hold_s(10 + iface.RAW_HEADER_SIZE, 1) + 0.5)
+                for _ in range(3):
+                    await asyncio.sleep(0)
+            self.node.run_on_loop(scenario(), timeout=15.0)
 
             self.assertEqual(len(answers), 1, "exactly one report for the flagged second-last fragment")
             sender_token, got_pkt_id, got_total, complete, kwargs = answers[0]
@@ -184,11 +190,12 @@ class _OneHopRawSend(SingleNodeCase):
             "_send_raw_fragment", "_query_remote_fragments", "_canonical_peer_prefix",
             "direct_raw_report_wait_base_s", "direct_raw_report_wait_per_hop_s",
             "direct_raw_hop_gap_factor", "direct_raw_report_enabled", "direct_raw_reconcile_rounds",
+            "direct_raw_parity_enabled",
         )}
         saved_path = iface._resolved_paths.get(PEER)
         sent = []
 
-        async def fake_send_raw_fragment(path, frame, priority, telemetry=None):
+        async def fake_send_raw_fragment(path, frame, priority, telemetry=None, interrupt=None):
             header, payload, src, dst = iface._decode_raw_fragment(frame)
             flagged = iface._raw_fragment_report_requested(frame)
             sent.append({"t": time.monotonic(), "frag_idx": header.frag_idx, "round": header.attempt,
@@ -196,7 +203,7 @@ class _OneHopRawSend(SingleNodeCase):
             on_fragment(header, flagged, len(frame))
             return True
 
-        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=0, hop_count=None, send_info=None):
+        async def fake_query(target, peer_prefix, pkt_id, frag_total, stage, priority=0, hop_count=None, send_info=None, entries=None):
             return on_query({"t": time.monotonic(), "stage": stage, "hop_count": hop_count,
                              "pkt_id": pkt_id, "frag_total": frag_total})
 
@@ -208,6 +215,10 @@ class _OneHopRawSend(SingleNodeCase):
         iface.direct_raw_hop_gap_factor = 0.0
         iface.direct_raw_report_enabled = True
         iface.direct_raw_reconcile_rounds = 3
+        # These scenarios pin the data-fragment burst shape (which fragments
+        # carry the flag, how many go out); M4's parity fragment (2026-09-20)
+        # has its own tests and is off here.
+        iface.direct_raw_parity_enabled = False
         iface._resolved_paths[PEER] = self.module._ResolvedPath(ONE_HOP_PATH_HEX, 1, 1, time.monotonic())
         iface._query_rtt.pop(PEER, None)
         iface._last_firmware_ack_timeout_s.pop(PEER, None)
@@ -394,20 +405,24 @@ class ReportLostFallsBackToTheQueryAfterTheHopScaledWait(_OneHopRawSend):
 
 
 class OneHopReportWaitFromShippedDefaults(SingleNodeCase):
-    def test_shipped_one_hop_wait_is_five_seconds_under_a_seven_and_a_half_second_budget(self):
+    def test_shipped_one_hop_wait_is_under_the_answer_budget_at_every_depth(self):
         """The values the interface ships (an empty config block): report
-        wait 2.0 s + 3.0 s x hops, completion budget floor 5.0 s + 2.5 s x
-        hops capped at 15 s. So a lost report costs 2.0 s at zero hop,
-        5.0 s at one hop (the `relay` case) and 8.0 s at two -- every one
-        under the QUERY budget of the same depth -- and the first depth at
-        which the budget clamps the window is three hops (11.0 s vs 12.5 s
-        floor, still under the 15 s cap)."""
+        wait 4.0 s + 2.5 s x hops (phase 1, 2026-09-20: was 2.0 + 3.0 x
+        hops; the zero-hop receiver's report waited p90 4-5 s for its own
+        lock, so a 2 s window sent 29 of 77 hop-0 rounds to a QUERY),
+        completion budget floor 5.0 s + 2.5 s x hops capped at 15 s. So a
+        lost report costs 4.0 s at zero hop, 6.5 s at one hop (the `relay`
+        case), 9.0 s at two and 11.5 s at three -- every one strictly under
+        the QUERY budget of the same depth, which the window's per-hop slope
+        now matches. With no report ever measured the window IS the floor;
+        `ReportWindowGrowsWithMeasuredLatency` (tests/test_report_window_
+        0920.py) covers the estimator."""
         module = self.module
         bare = module.SmartMeshCoreInterface.__new__(module.SmartMeshCoreInterface)
         bare._configure_retry({})
         self.assertTrue(bare.direct_raw_report_enabled)
-        self.assertEqual(bare.direct_raw_report_wait_base_s, 2.0)
-        self.assertEqual(bare.direct_raw_report_wait_per_hop_s, 3.0)
+        self.assertEqual(bare.direct_raw_report_wait_base_s, 4.0)
+        self.assertEqual(bare.direct_raw_report_wait_per_hop_s, 2.5)
         self.assertEqual(bare.direct_completion_check_timeout_s, 5.0)
         self.assertEqual(bare.direct_completion_check_timeout_per_hop_s, 2.5)
         self.assertEqual(bare.direct_completion_check_timeout_max_s, 15.0)
@@ -420,9 +435,10 @@ class OneHopReportWaitFromShippedDefaults(SingleNodeCase):
         for k in keys:
             setattr(iface, k, getattr(bare, k))
         iface._query_rtt.pop(PEER, None)
+        iface._report_rtt.pop(PEER, None)
         iface._last_firmware_ack_timeout_s.pop(PEER, None)
         try:
-            for hops, want_wait, want_budget in ((0, 2.0, 5.0), (1, 5.0, 7.5), (2, 8.0, 10.0), (3, 11.0, 12.5)):
+            for hops, want_wait, want_budget in ((0, 4.0, 5.0), (1, 6.5, 7.5), (2, 9.0, 10.0), (3, 11.5, 12.5)):
                 self.assertAlmostEqual(iface._completion_query_timeout_s(PEER, hops), want_budget, msg=f"hops={hops}")
                 self.assertAlmostEqual(iface._completion_report_wait_s(hops, PEER), want_wait, msg=f"hops={hops}")
                 self.assertLess(iface._completion_report_wait_s(hops, PEER), iface._completion_query_timeout_s(PEER, hops))

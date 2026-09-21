@@ -136,7 +136,15 @@ def capture_files(run_dir: str) -> dict:
 
 def analyse_capture(recs: list) -> dict:
     n = {"records": len(recs)}
-    att = [r for r in recs if r.get("event") == "direct_attempt_result"]
+    att_all = [r for r in recs if r.get("event") == "direct_attempt_result"]
+    # Attempts that never keyed the radio (expired in the lock wait, cancelled
+    # by the reply, not sent because the answer was already in) or whose wait
+    # was cut for a Link handshake (phase 1, 2026-09-20) are neither a success
+    # nor a failure of the path; they are counted separately.
+    NON_ATTEMPTS = ("expired", "answered", "answered_before_send", "preempted")
+    att = [r for r in att_all if r.get("ack_timeout_source") not in NON_ATTEMPTS]
+    n["attempts_not_on_air"] = dict(collections.Counter(
+        r.get("ack_timeout_source") for r in att_all if r.get("ack_timeout_source") in NON_ATTEMPTS))
     by_hop = collections.defaultdict(lambda: {"ok": 0, "fail": 0, "ack": [], "lock": [], "quiet_hold": [], "timeout": []})
     waits = {"lock_wait_s": 0.0, "ack_latency_s": 0.0, "listen_delay_s": 0.0, "quiet_hold_s": 0.0,
              "quiet_defer_wait_s": 0.0, "duty_cycle_wait_s": 0.0, "medium_hold_wait_s": 0.0, "missed_ack_timeout_s": 0.0}

@@ -172,7 +172,9 @@ class RawFragmentFirmwareLimits(SingleNodeCase):
 
     def test_default_budget_unchanged_at_zero_hop(self):
         self.assertEqual(self.iface.direct_raw_payload_cap, 170)
-        self.assertEqual(self.iface._direct_raw_payload_budget(0), 157)
+        # 157 with the 13-byte header; 161 since the 9-byte header (M3, 2026-09-20).
+        self.assertEqual(self.iface._direct_raw_payload_budget(0), 170 - self.iface.RAW_HEADER_SIZE)
+        self.assertEqual(self.iface._direct_raw_payload_budget(0), 161)
 
 
 class RawReconcileRoundsFitTheAttemptNibble(SingleNodeCase):

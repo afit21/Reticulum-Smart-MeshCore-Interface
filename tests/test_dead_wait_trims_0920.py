@@ -120,16 +120,21 @@ class CompletionAnswerAckWaitIsHopAware(SingleNodeCase):
         original_send = iface._send_direct_frame_and_wait_for_ack
         original_contact = iface._resolve_contact
         original_canon = iface._canonical_peer_prefix
+        original_noack = iface.direct_report_noack
         iface._send_direct_frame_and_wait_for_ack = fake_send
         iface._resolve_contact = lambda token: {"public_key": "ab" * 32, "out_path_len": 2}
         iface._canonical_peer_prefix = lambda token: PEER
         iface._resolved_paths.pop(PEER, None)
+        # Phase 3 M1 (2026-09-20): answers go out without a firmware ACK by
+        # default; this pins the ACKed path, so select it explicitly.
+        iface.direct_report_noack = False
         try:
             self.node.run_on_loop(iface._send_completion_answer(PEER, 5, 3, True, held={0, 1, 2}, version=3, nonce=9), timeout=20.0)
         finally:
             iface._send_direct_frame_and_wait_for_ack = original_send
             iface._resolve_contact = original_contact
             iface._canonical_peer_prefix = original_canon
+            iface.direct_report_noack = original_noack
         self.assertEqual(seen.get("hop_count"), 2)
         self.assertEqual(seen.get("kind"), "completion_answer")
 

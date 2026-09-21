@@ -1,0 +1,613 @@
+{
+ "scenario": "link_setup",
+ "informational": false,
+ "failures": [],
+ "exit_code": 0,
+ "measurements": {
+  "unit": "link",
+  "traffic": "link",
+  "sim_pacing": 0.997,
+  "start_gate": {
+   "used": false
+  },
+  "rns_path_time_s": 106.2,
+  "sent": 8,
+  "delivered": 6,
+  "rtts": [
+   26.388,
+   13.659,
+   7.94,
+   7.829,
+   37.401,
+   18.269
+  ],
+  "resolved": {
+   "53fef2c97f3b": 1
+  },
+  "background_msgs": 0,
+  "late": 0,
+  "late_rtts": [],
+  "link_times_s": [
+   26.39,
+   90.0,
+   13.66,
+   7.94,
+   7.83,
+   37.4,
+   90.0,
+   18.27
+  ],
+  "resources": [],
+  "traffic_elapsed_s": 338.5,
+  "links_within_deadline": 3,
+  "link_deadline_s": 15.0,
+  "time_to_direct_path": {
+   "A": 142.0,
+   "B": 54.0
+  },
+  "path_requests": 3,
+  "health": [
+   {
+    "name": "A",
+    "final": true,
+    "rss_kb": 59400,
+    "threads": 9,
+    "sizes": {
+     "_peers": 1,
+     "_resolved_paths": 1,
+     "_rns_token_peer": 7,
+     "_unknown_dest_attempts": 0,
+     "_unknown_dest_backoff_until": 0,
+     "_reassembly": 1,
+     "_fragmented_send_slots": 0
+    },
+    "uptime_s": 444.7
+   }
+  ],
+  "direct_receptions": {
+   "A->B miss": 2,
+   "B->A miss": 1
+  },
+  "miss_causes": {
+   "B|half-duplex at receiver": 13,
+   "R|half-duplex at receiver": 25,
+   "A|half-duplex at receiver": 14,
+   "R|demodulator locked to another frame": 15,
+   "R|header decoded, then lost (collision)": 16,
+   "B|SNR below threshold": 1,
+   "A|SNR below threshold": 1
+  },
+  "capture_A": {
+   "direct_attempts_ok": 18,
+   "direct_attempts_failed": 21,
+   "by_hop": {
+    "1": [
+     18,
+     21
+    ]
+   },
+   "ack_latency_s": [
+    1.95,
+    1.821,
+    2.78,
+    2.07,
+    3.321,
+    3.05,
+    3.67,
+    2.88,
+    3.31,
+    3.25,
+    3.43,
+    2.82,
+    3.86,
+    3.27,
+    2.46,
+    3.411,
+    2.72,
+    3.7
+   ],
+   "completion_checks": {},
+   "routing_decisions": {
+    "broadcast_path_request_supplement": 1,
+    "small_mesh_direct_all_path_request": 4,
+    "direct_primary": 20,
+    "direct_unresolved_channel_fallback": 3
+   }
+  },
+  "capture_B": {
+   "direct_attempts_ok": 17,
+   "direct_attempts_failed": 21,
+   "by_hop": {
+    "1": [
+     17,
+     21
+    ]
+   },
+   "ack_latency_s": [
+    1.75,
+    1.52,
+    4.2,
+    2.981,
+    3.14,
+    4.25,
+    3.26,
+    2.561,
+    5.14,
+    5.199,
+    4.75,
+    1.39,
+    4.54,
+    1.54,
+    4.07,
+    3.07,
+    4.711
+   ],
+   "completion_checks": {
+    "answered": 5,
+    "timeout": 7
+   },
+   "routing_decisions": {
+    "broadcast_announce_only": 1,
+    "announce_rate_limited": 14,
+    "small_mesh_direct_all_announce": 5,
+    "lrproof_delayed": 7,
+    "small_mesh_direct_all_unknown_dest": 2,
+    "direct_primary": 9
+   }
+  }
+ },
+ "args": {
+  "mode": "run",
+  "scenario": "link_setup",
+  "meshbench_binary": null,
+  "seed": 11,
+  "preset": "Australia (Narrow)",
+  "radio": "916.575,62.5,7,8",
+  "firmware_version": "v1.17.1",
+  "firmware_wait": 300.0,
+  "link_timeout": 90.0,
+  "link_margin": 6.0,
+  "block_margin": -4.0,
+  "ignore_topology": false,
+  "events_out": null,
+  "probes": null,
+  "size": null,
+  "wait": 5.0,
+  "fast_timing": false,
+  "iface_option": [
+   "freq=916.575",
+   "bw=62.5",
+   "sf=7",
+   "cr=8"
+  ],
+  "capture_dir": "/tmp/mb/alpha-0.1.3/link_setup-s11-1",
+  "announce_interval": 30.0,
+  "advert_interval": 60.0,
+  "settle": 15.0,
+  "rns_start_timeout": 120.0,
+  "path_timeout": 420.0,
+  "path_request_interval": 40.0,
+  "probe_timeout": 60.0,
+  "min_delivered": null,
+  "fail_after": 3,
+  "outage_probes": 3,
+  "recover_probes": 1,
+  "traffic_interval": 8.0,
+  "loglevel": 4,
+  "quiet_nodes": true,
+  "unit": null,
+  "resource_size": null,
+  "resource_timeout": 600.0,
+  "respond_resource_size": null,
+  "rns_link_timeout": 90.0,
+  "link_deadline": 15.0,
+  "late_grace": 90.0,
+  "start_after_paths": false,
+  "gate_timeout": 600.0,
+  "responder_interface": null,
+  "duration": null,
+  "health_interval": 0.0
+ },
+ "interface_path": "/home/afi/Documents/Reticulum-Smart-MeshCore-Interface/Reticulum-Smart-MeshCore-Interface/Interface/SmartMeshCoreInterface.py",
+ "git_head": "0733f91",
+ "analysis": {
+  "dir": "/tmp/mb/alpha-0.1.3/link_setup-s11-1",
+  "name": "link_setup-s11-1",
+  "scenario": "link_setup",
+  "seed": 11,
+  "informational": false,
+  "checks": [
+   [
+    "ok",
+    "topology gate: must-link pairs clear, must-block pairs blocked (link budget)"
+   ],
+   [
+    "ok",
+    "R firmware radio 916.580017,62.5,7,8 matches 916.575,62.5,7,8"
+   ],
+   [
+    "ok",
+    "delivered 6/8 >= 50% floor"
+   ],
+   [
+    "ok",
+    "interface's resolved DIRECT path is 1 hop(s) (firmware path discovery): {'53fef2c97f3b': 1}"
+   ],
+   [
+    "ok",
+    "R relayed on air (sent 0 -> 120)"
+   ]
+  ],
+  "failures": [],
+  "passed": true,
+  "sent": 8,
+  "delivered": 6,
+  "traffic": "link",
+  "rtt": {
+   "n": 6,
+   "min": 7.829,
+   "med": 15.963999999999999,
+   "p90": 26.388,
+   "max": 37.401,
+   "mean": 18.581
+  },
+  "rtt_str": "min=7.83s avg=18.58s max=37.40s",
+  "late": 0,
+  "late_rtts": [],
+  "rns_path_sender_s": 106.2,
+  "time_to_direct_path": {
+   "A": 142.0,
+   "B": 54.0
+  },
+  "gate": {
+   "used": false
+  },
+  "link_times_s": [
+   26.39,
+   90.0,
+   13.66,
+   7.94,
+   7.83,
+   37.4,
+   90.0,
+   18.27
+  ],
+  "links": {
+   "n": 8,
+   "min": 7.83,
+   "med": 22.33,
+   "p90": 90.0,
+   "max": 90.0,
+   "mean": 36.43625
+  },
+  "links_within_deadline": 3,
+  "link_deadline_s": 15.0,
+  "resources": [],
+  "resources_back": [],
+  "health": [
+   {
+    "name": "A",
+    "final": true,
+    "rss_kb": 59400,
+    "threads": 9,
+    "sizes": {
+     "_peers": 1,
+     "_resolved_paths": 1,
+     "_rns_token_peer": 7,
+     "_unknown_dest_attempts": 0,
+     "_unknown_dest_backoff_until": 0,
+     "_reassembly": 1,
+     "_fragmented_send_slots": 0
+    },
+    "uptime_s": 444.7
+   }
+  ],
+  "nodes": {
+   "A": {
+    "records": 210,
+    "by_hop": {
+     "1": {
+      "attempts": 39,
+      "ok": 18,
+      "rate": 0.46153846153846156,
+      "ack_med": 3.15,
+      "ack_p90": 3.67,
+      "ack_max": 3.86,
+      "lock_med": 0.0,
+      "quiet_hold_sum": 0,
+      "missed_timeout_max": 8.0
+     }
+    },
+    "attempt_kinds": {
+     "completion_report": 2,
+     "completion_answer": 5,
+     "null": 32
+    },
+    "attempt_kinds_failed": {
+     "completion_report": 2,
+     "null": 19
+    },
+    "miss_diagnosis": {
+     "hop1_loss": 16,
+     "target_busy": 2,
+     "downstream_loss": 3
+    },
+    "completion": {},
+    "completion_n": 0,
+    "completion_timeout_s": {
+     "n": 0,
+     "min": null,
+     "med": null,
+     "p90": null,
+     "max": null,
+     "mean": null
+    },
+    "raw_sent": 0,
+    "raw_rounds": {},
+    "raw_bytes": 0,
+    "duty_cycle_waits": {
+     "n": 0,
+     "min": null,
+     "med": null,
+     "p90": null,
+     "max": null,
+     "mean": null
+    },
+    "frag_recv": 9,
+    "frag_recv_raw": 2,
+    "send_results": {
+     "fail": 3,
+     "ok": 12
+    },
+    "send_methods": {
+     "z85_bare": 15
+    },
+    "text_fallbacks": 0,
+    "slot_waits": {
+     "n": 0,
+     "min": null,
+     "med": null,
+     "p90": null,
+     "max": null,
+     "mean": null
+    },
+    "waits_s": {
+     "lock_wait_s": 87.6,
+     "ack_latency_s": 53.8,
+     "listen_delay_s": 18.5,
+     "quiet_hold_s": 0.0,
+     "quiet_defer_wait_s": 0.0,
+     "duty_cycle_wait_s": 0.0,
+     "medium_hold_wait_s": 0.0,
+     "missed_ack_timeout_s": 147.0,
+     "slot_wait_s": 0
+    },
+    "routing": {
+     "broadcast_path_request_supplement": 1,
+     "small_mesh_direct_all_path_request": 4,
+     "direct_primary": 20,
+     "direct_unresolved_channel_fallback": 3
+    },
+    "out_bytes_rns": 2303,
+    "out_types": {
+     "DATA": 19,
+     "LINKREQUEST": 9
+    },
+    "backoff_drops": 0,
+    "in_transport": {
+     "direct_multifragment": 3,
+     "direct_bare": 6
+    },
+    "in_bytes_rns": 1209,
+    "in_types": {
+     "ANNOUNCE": 3,
+     "PROOF": 6
+    },
+    "reports_sent": 2,
+    "reports_sent_complete": 0,
+    "queries_received": 5,
+    "small_mesh_mode": {
+     "False": 1,
+     "True": 27
+    },
+    "bound_peers_max": 1,
+    "other_events": {},
+    "linkrequest_out": 9,
+    "lrproof_in": 6,
+    "handshake_s": {
+     "n": 6,
+     "min": 26.39,
+     "med": 95.38499999999999,
+     "p90": 131.95,
+     "max": 172.5,
+     "mean": 94.17333333333333
+    }
+   },
+   "B": {
+    "records": 231,
+    "by_hop": {
+     "1": {
+      "attempts": 38,
+      "ok": 17,
+      "rate": 0.4473684210526316,
+      "ack_med": 3.26,
+      "ack_p90": 4.75,
+      "ack_max": 5.199,
+      "lock_med": 0.0,
+      "quiet_hold_sum": 5.246,
+      "missed_timeout_max": 8.0
+     }
+    },
+    "attempt_kinds": {
+     "completion_query": 12,
+     "null": 26
+    },
+    "attempt_kinds_failed": {
+     "completion_query": 8,
+     "null": 13
+    },
+    "miss_diagnosis": {
+     "target_busy": 2,
+     "hop1_loss": 15,
+     "downstream_loss": 4
+    },
+    "completion": {
+     "answered": 5,
+     "timeout": 7
+    },
+    "completion_n": 12,
+    "completion_timeout_s": {
+     "n": 7,
+     "min": 7.5,
+     "med": 7.5,
+     "p90": 7.5,
+     "max": 7.5,
+     "mean": 7.5
+    },
+    "raw_sent": 7,
+    "raw_rounds": {
+     "0": 4,
+     "1": 1,
+     "2": 2
+    },
+    "raw_bytes": 602,
+    "duty_cycle_waits": {
+     "n": 0,
+     "min": null,
+     "med": null,
+     "p90": null,
+     "max": null,
+     "mean": null
+    },
+    "frag_recv": 0,
+    "frag_recv_raw": 0,
+    "send_results": {
+     "ok": 5,
+     "fail": 1
+    },
+    "send_methods": {
+     "z85_bare": 6
+    },
+    "text_fallbacks": 0,
+    "slot_waits": {
+     "n": 0,
+     "min": null,
+     "med": null,
+     "p90": null,
+     "max": null,
+     "mean": null
+    },
+    "waits_s": {
+     "lock_wait_s": 53.3,
+     "ack_latency_s": 58.1,
+     "listen_delay_s": 15.5,
+     "quiet_hold_s": 5.2,
+     "quiet_defer_wait_s": 0.0,
+     "duty_cycle_wait_s": 0.0,
+     "medium_hold_wait_s": 0.0,
+     "missed_ack_timeout_s": 144.8,
+     "slot_wait_s": 0
+    },
+    "routing": {
+     "broadcast_announce_only": 1,
+     "announce_rate_limited": 14,
+     "small_mesh_direct_all_announce": 5,
+     "lrproof_delayed": 7,
+     "small_mesh_direct_all_unknown_dest": 2,
+     "direct_primary": 9
+    },
+    "out_bytes_rns": 5388,
+    "out_types": {
+     "ANNOUNCE": 20,
+     "PROOF": 14,
+     "DATA": 4
+    },
+    "backoff_drops": 0,
+    "in_transport": {
+     "channel_bare": 5,
+     "direct_bare": 13
+    },
+    "in_bytes_rns": 1435,
+    "in_types": {
+     "DATA": 11,
+     "LINKREQUEST": 7
+    },
+    "reports_sent": 0,
+    "reports_sent_complete": 0,
+    "queries_received": 0,
+    "small_mesh_mode": {
+     "False": 1,
+     "True": 37
+    },
+    "bound_peers_max": 1,
+    "other_events": {
+     "channel_fragment_sent": 4
+    },
+    "linkrequest_out": 0,
+    "lrproof_in": 0,
+    "handshake_s": {
+     "n": 0,
+     "min": null,
+     "med": null,
+     "p90": null,
+     "max": null,
+     "mean": null
+    }
+   }
+  },
+  "air": {
+   "B": {
+    "tx": 87,
+    "bytes": 6939,
+    "ms": 58818
+   },
+   "R": {
+    "tx": 120,
+    "bytes": 8525,
+    "ms": 73413
+   },
+   "A": {
+    "tx": 90,
+    "bytes": 7062,
+    "ms": 60242
+   }
+  },
+  "miss": {
+   "B|half-duplex": 13,
+   "R|half-duplex": 25,
+   "A|half-duplex": 14,
+   "R|locked": 15,
+   "R|collision": 16,
+   "B|snr": 1,
+   "A|snr": 1
+  },
+  "lbt": {
+   "half_duplex": 52,
+   "lbt_preventable": 24,
+   "keyed_into_frame_ms": {
+    "n": 24,
+    "min": 10,
+    "med": 350.0,
+    "p90": 820,
+    "max": 1250,
+    "mean": 406.6666666666667
+   }
+  },
+  "lbt_preventable_by_node": {
+   "R": 9,
+   "B": 8,
+   "A": 7
+  },
+  "channel_busy_fraction": 0.41816502998175026,
+  "ledger": {
+   "on_air_bytes": 22526,
+   "on_air_s": 192.473,
+   "rns_bytes_accepted": 2644,
+   "on_air_bytes_per_rns_byte": 8.5196671709531,
+   "on_air_bytes_per_delivered_unit": 3754.3333333333335
+  },
+  "sender": "A",
+  "responder": "B",
+  "bursts": []
+ }
+}

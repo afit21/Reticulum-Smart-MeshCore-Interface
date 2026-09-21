@@ -1,11 +1,205 @@
 # Changelog
 
-## unreleased (since alpha-0.1.1, 2026-09-18 night)
+## alpha-0.1.4 (2026-09-21)
+
+Everything since alpha-0.1.1 (2026-09-18 night), released as one version: the raw binary DIRECT
+fragments that alpha 0.1.2 introduced, the one-hop and multi-hop field fixes of alpha 0.1.3, the
+MeshBench real-firmware test tier, and the 2026-09-20 airtime / throughput pass (phases 1-3 below)
+that rebuilt the fragment reconcile. In short:
+
+- **Less airtime per delivered byte, more of the large packets delivered.** MeshBench
+  `large_payload` (483-byte parts through one repeater), medians over three seeds: delivered 17 % ->
+  83 %, on-air bytes per RNS byte 12.76 -> 5.11 (`tests/baselines/2026-09-20-meshbench-6cf0876.md`
+  against the frozen alpha 0.1.3 suite). Every other scenario inside its run-to-run spread. No field
+  numbers for this build yet; the field A/B is the next step.
+- **How:** fragment reports and answers no longer wait for a MeshCore ACK (M1); one report covers a
+  whole window of parts ("Q" protocol v4, M2); a 483-byte part is three raw fragments instead of
+  four (9-byte raw header, M3); from one hop up each burst carries an XOR parity fragment so a
+  single lost fragment is rebuilt without a retry round (M4, on by default); a DIRECT send stops
+  retrying once its reply is seen, stale PROOFs never go on air, RNS path re-requests are answered
+  from a local announce cache, link handshakes pre-empt idle radio holds, and the report window is
+  sized from measured report latency (phase 1).
+- **Both nodes must run alpha 0.1.4 or later.** The "Q" completion frames (v4) and the raw fragment
+  header (version 2) are not decoded by earlier builds; compatibility with earlier builds is not a
+  goal while the project is in alpha.
+- **Install is unchanged**: copy `Interface/SmartMeshCoreInterface.py` into `~/.reticulum/interfaces/`.
+  The file is now assembled from `Interface/src/smci/` by `python3 Interface/build_interface.py`
+  (edit the sources, run the build, commit both).
+- **New config keys, all optional** (defaults shown): `direct_report_noack = yes`,
+  `direct_report_debounce = yes`, `direct_raw_window_enabled = yes`, `direct_raw_window_collect = 0.75`,
+  `direct_raw_window_max_parts = 6`, `direct_raw_parity_enabled = yes`, `direct_raw_parity_min_hops = 1`,
+  `proof_max_age = 45`, `announce_cache_ttl = 3600`, `path_request_local_answer_min_interval = 120`;
+  `direct_raw_report_wait_base` is now 4 s and `direct_raw_report_wait_per_hop` 2.5 s. Every default
+  is pinned by `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`, every wire
+  byte by `tests/golden/wire_format.json`.
+- **Tests:** 288 unit tests (`python3 -m unittest discover -s tests`), the MeshBench scenario suite
+  (`testscripts/meshbench_scenarios.py`, nineteen scenarios against real MeshCore v1.17.1 firmware),
+  and the dated history in `docs/history.md`.
+
+The dated sections below are the record, newest first.
+
 
 Field evidence: `fieldtests/raw/Alpha0.1.1/` -- a zero-hop NomadNet page
 session and an evening drive through 1-3 repeater hops, both sides
 captured. The module docstring's "Alpha 0.1.1 captures" and "Raw binary
 DIRECT fragments" entries carry the packet-level detail.
+
+### Changed: airtime / throughput pass, phase 3 -- the reconcile redesign (2026-09-20 night)
+
+Design: `docs/reconcile_redesign.md`. One module owns the burst-and-report state machine; each
+timing decision is a pure function with a test pinned to its field number. Each milestone is gated
+on the full suite and MeshBench `large_payload` + `relay` (two runs) against the previous milestone.
+
+- **M1: reports without a firmware ACK, debounced** (new keys `direct_report_noack`,
+  `direct_report_debounce`, both yes). REPORTs and QUERY ANSWERs go out as MeshCore
+  `TXT_TYPE_CLI_DATA`: encrypted and relayed like any text message, delivered as CONTACT_MSG_RECV
+  with txt_type 1, never ACKed by the firmware (`BaseChatMesh::onPeerDataRecv`). The "Q" bytes are
+  unchanged; the reporting node's lock is held for the frame's airtime and relay gap instead of an
+  ACK wait. A gaps report is held one fragment airtime (plus the relay gap) and dropped if the
+  bucket completes first -- the second-last fragment's report and the duplicate last fragment it
+  caused (20 of 43 zero-hop rounds) are gone. Tests: `tests/test_reconcile_m1_noack_reports_0920.py`.
+- **M2: one report per window** (new keys `direct_raw_window_enabled` yes, `direct_raw_window_collect`
+  0.75 s, `direct_raw_window_max_parts` 6; "Q" protocol v4, `COMPLETION_PROTOCOL_VERSION` 3 -> 4 --
+  both nodes must run this build). Parts to one peer arriving within the collect window burst as one,
+  the last two fragments flagged, one quiet period, one v4 multi-entry report (a bitmap per part,
+  the receiver's recent packets listed newest first); re-drives are batched the same way and the v4
+  QUERY asks about the whole window. The window takes the in-flight slot. Golden wire snapshot
+  regenerated: v1-v3 bytes unchanged (pinned under `v3` names), 96 v4 cases added. Tests:
+  `tests/test_reconcile_m2_window_0920.py`.
+- **M3: three fragments per 483-byte part** (raw header version 2, 9 bytes: a 2-byte source prefix
+  resolved to the unique bound peer, `RAW_HEADER_SIZE` 13 -> 9; both nodes must run this build). The
+  per-fragment payload at the shipped cap is 161 up to four hops and 3 x 161 = 483, so a Link MDU
+  part is three raw fragments (510 B on air) instead of four (688 B). Raw is not used where the
+  short prefix would be ambiguous. Golden wire snapshot regenerated (31 raw/budget cases). Tests:
+  `tests/test_reconcile_m3_short_header_0920.py`.
+- **M4: hop-adaptive XOR parity** (`RAW_FLAG_PARITY` 0x08; new keys `direct_raw_parity_enabled`
+  **yes** -- shipped off by the M4 gate on 2026-09-20, switched on by the owner's decision on
+  2026-09-21; the baseline below was taken with it off -- `direct_raw_parity_min_hops` 1). From one hop up
+  a part's burst of two or more fragments ends with one parity fragment (coverage mask in frag_idx,
+  payload = last covered length + XOR of the covered fragments); a receiver missing exactly one
+  covered fragment reconstructs it and completes without a report round. Its gate (large_payload x3:
+  4/6, 5/6, 1/6 against M3's 2/6, 6/6, 6/6) showed no benefit and a cost, because MeshBench's
+  repeater loses fragments in an alternating pattern (its ~1.3 s frames against a gap sized for the
+  real ~0.9 s) that no single parity repairs; reconstruction itself worked (1, 3 and 4 per run). The
+  field's random loss is the case it is for; `direct_raw_parity_enabled = no` is the field A/B's
+  other arm. Golden wire snapshot: parity cases added. Tests: `tests/test_reconcile_m4_parity_0920.py`.
+- **Phase 4:** version alpha 0.1.4; full suite 288 tests OK (three `@slow` raw scenarios re-pinned
+  to M2/M3: three fragments per 446-byte payload, and a REPORT under both-ways zero-hop load waits
+  behind one outgoing window, 12-15 s observed, bound 20 s); baseline
+  `tests/baselines/2026-09-20-meshbench-6cf0876.md` (seven scenarios x seeds 7/11/17) against the
+  frozen alpha 0.1.3 suite: large_payload 17 % -> 83 % delivered at 12.76 -> 5.11 on-air B per RNS B
+  (outside the frozen spread both ways); everything else inside its spread; two_hop's RTT median
+  worse on one run (re-run before reading it). `mixed_builds` against an alpha-0.1.3-era responder
+  delivered 0/6 (alpha 0.1.3: 3/6, 5/6, 0/6): both nodes must run this build. By the owner's
+  decision (2026-09-21) compatibility with earlier builds is not a goal during alpha.
+
+### Changed: airtime / throughput pass, phase 2 -- the module split, no behaviour change (2026-09-20)
+
+- **The dated design history moved out of the module docstring into `docs/history.md`**, verbatim
+  (the alpha 0.1.0 STATUS snapshot, M0-M6 and every dated entry since, ~2900 lines). The docstring
+  keeps the rationale, the design invariants and a new WIRE FORMAT section written from the code
+  ("R" / "P" / "Q" text frames and the 13-byte raw header, byte for byte, pinned by
+  `tests/golden/wire_format.json`). New entries go at the end of `docs/history.md`. CLAUDE.md's
+  "Missing design docs" note lists the documents the history cites that never existed; none was
+  created.
+- **The interface is assembled from a source package.** RNS `exec()`s a custom interface as one text
+  file (no `__file__`, no package machinery -- `RNS/Reticulum.py`, checked by
+  `testscripts/check_install_load.py`), so the split lives in `Interface/src/smci/` (`_common`,
+  `_locks`, `_config`, `_observability`, `_wire`, `_peers`, `_paths`, `_direct`, `_reconcile`,
+  `_routing` as mixins, `interface.py` the class) and `python3 Interface/build_interface.py`
+  concatenates it into `Interface/SmartMeshCoreInterface.py`, which is still the file that is
+  installed. Ten pure-move commits, one module each, each audited function by function against the
+  previous deliverable (`testscripts/audit_split.py`: same bodies, same constants; the only addition
+  is the module-level `PRIORITY_*` mirrors of the class constants that mixin methods use as default
+  arguments) and pinned by `tests/test_module_split_0920.py`. Edit the sources, rebuild, commit both;
+  the pre-commit hook refuses a stale deliverable. The install method and `update-interface.sh` are
+  unchanged.
+
+### Changed: airtime / throughput pass, phase 1 (2026-09-20 evening)
+
+Small wins on the existing code before the module split; one commit, one regression test, one
+docstring entry each. The metric is on-air bytes per delivered RNS byte, read with delivery rate and
+per-part completion time, against `fieldtests/raw/Alpha0.1.3/` and the `alpha-0.1.3` MeshBench
+baseline. Phase 0 first added `tests/test_golden_config_defaults.py` / `tests/test_golden_wire_format.py`
+(snapshots of every default and every encoded frame, generated from the frozen alpha 0.1.3 build) and
+`testscripts/check_install_load.py` (loads the file exactly as `RNS.Reticulum` does: `exec()` of the
+text, so the deliverable must stay one self-contained file).
+
+LXMF finding (phase 0, verified in `RNS/Resource.py` and LXMF 1.1.1; MeshChat v2.4.0 bundles the same
+rules): neither LXMF nor MeshChat times a transfer. The binding timer is RNS.Resource's sender proof
+wait once the last part has been sent once -- four intervals of `3 x rtt_r + 10 s` (56-112 s at
+rtt_r 1.3-6 s) with no part request cancel the resource, LXMF tears the link down and restarts the
+message from scratch (up to four times). With a 4-part window a lost tail part is only recoverable
+above `240 / (6 x rtt_r + 20)` parts per minute (7.5/min at rtt 2 s, 5.5/min at 4 s).
+
+- **The metric is in the capture.** `on_air_bytes` on every `direct_attempt_result`,
+  `raw_fragment_sent` and `channel_fragment_sent` record (the single-frame CHANNEL send now writes
+  one too), and `testscripts/field_ab_compare.py` reports on-air bytes per delivered RNS byte. The
+  2026-09-20 session, estimated from frame sizes: desktop 2.59 B/B, laptop 1.43 B/B at zero hop.
+- **A bare DIRECT send stops retrying once its reply is seen.** A LINKREQUEST whose attempt 0 lost
+  its firmware ACK was re-sent 8 s after its LRPROOF had arrived (laptop `*144922`, two hops:
+  99 B + 3.4 s ACK, LRRTT queued 3.8 s behind). The three receipt paths that correlate an LRPROOF
+  / plain-DATA PROOF now signal the send (`_signal_send_answered`; the key is a LINKREQUEST's link_id
+  or a SINGLE-destination DATA's truncated hash); the retry loop makes no further attempt and an ACK
+  wait in progress ends as `ack_timeout_source="answered"` (no RTT sample, no backoff). Path evidence
+  is recorded only when the reply came DIRECT from the addressed peer. Tests:
+  `tests/test_answered_sends_0920.py`.
+- **Completion-report window sized from measured report latency** (default change:
+  `direct_raw_report_wait_base` 2.0 -> 4.0 s, `direct_raw_report_wait_per_hop` 3.0 -> 2.5 s). Zero
+  hop: the receiver's report waited p90 4-5 s for its own radio lock, so a 2 s window sent 29 of the
+  desktop's 77 hop-0 rounds to a QUERY round trip for a report that was merely late. The window is
+  now max(floor 4 + 2.5 x hops, per-peer srtt + 2 x rttvar of burst-end -> complete-report arrival,
+  late reports included), capped by the answer budget. From the review of the same capture: a
+  report missing only the last fragment sent (the second-last fragment's, which 20 of 43 hop-0
+  rounds had acted on, re-driving that fragment as a duplicate) is provisional for up to half the
+  window; a QUERY whose answer future a late report already resolved is not transmitted
+  (`answered_before_send`, 24 of 29 hop-0 "answered" rounds) and no longer shrinks `_query_rtt`.
+  Tests: `tests/test_report_window_0920.py`; `tests/test_shipped_defaults.py` and
+  `tests/golden/config_defaults.json` re-pinned.
+- **Stale plain PROOFs age out** (new key `proof_max_age`, 45 s; 0 = off). The sender's RNS receipt
+  for a non-Link packet over this interface fails at 62 s (`first_hop_timeout` from `bitrate` 80 +
+  6 s/hop); the desktop's 2-hop phase transmitted 12 proofs aged 45-105 s after a 13-deep proof
+  queue. Replayed, 45 s skips 16 attempts (~76 s of lock) and loses 3 proofs that still landed in
+  time (60 s: 12 / 0; 30 s: 24 / 4). Checked before every attempt (one bare frame, nothing spent),
+  never a path failure; link-class proofs exempt. Also closed: an attempt-0 expiry during the lock
+  wait fell through to a transmitted attempt 1. Tests: `tests/test_proof_max_age_0920.py`.
+- **An RNS path re-request is answered from the cached announce** (new keys `announce_cache_ttl`
+  3600 s, `path_request_local_answer_min_interval` 120 s; 0 = off). A closed pending Link makes a
+  non-transport RNS node expire the path and ask again, and the far side replays the same cached
+  announce bytes: the laptop received one destination's 235-byte announce six times in an hour at two
+  hops (2-3 raw fragments plus reports each, after a 2-hop DIRECT request each). Announces a bound
+  peer delivered DIRECT are cached; a re-request for a cached, still-bound destination is answered
+  by handing the bytes back to RNS (context PATH_RESPONSE, so a transport node does not re-flood it)
+  and not transmitted; the next request inside the interval goes on air to verify. Path-request
+  records carry `requested_hash`. Tests: `tests/test_local_announce_cache_0920.py` (including the
+  real `RNS.Transport` accept / ignore / re-accept sequence).
+- **Link handshakes pre-empt idle holds of the radio lock.** LINKREQUEST / LRPROOF / LRRTT /
+  LINKIDENTIFY / LINKPROOF (not KEEPALIVE or LINKCLOSE, which share the tier) set the lock's pre-empt
+  event; a raw burst yields during a fragment's duty-cycle throttle wait (the session's longest idle
+  hold, 26 s) and after a fragment's gap, resuming ahead of ordinary waiters; the report wait
+  releases the lock and keeps listening; a QUERY's quiet window and the post-miss listen end early;
+  a completion ANSWER/REPORT's ACK wait is cut once the expected ACK time has passed
+  (`ack_timeout_source="preempted"`, no backoff). Evidence: link-critical attempts waited ~33 s for
+  the lock over 26 attempts (median 1-3 s), a 2-hop LINKREQUEST 3.2 s behind an answer's 8 s ACK
+  miss inside a 17.4 s link. Tests: `tests/test_handshake_preemption_0920.py`.
+
+### Added: alpha-0.1.3 simulated benchmark (2026-09-20, evening)
+
+`tests/baselines/alpha-0.1.3-simulatedbenchmark/` -- the development branch (interface at 1b69fa7, the
+build the day's field session ran on) through all twelve MeshBench scenarios over seeds 7, 11 and 17,
+36 runs, produced by `meshbench_scenarios.py suite` in one command (`summary.md` generated,
+`README.md` the commentary, `runs/*/result.json` the evidence). It supersedes
+`2026-09-20-meshbench-1b69fa7.md`. Headlines: zero_hop and relay unchanged (100 % [88-100 %]
+delivered, 86 % / 73 % of completion checks ending on a report); two_hop now measures the two-hop
+DIRECT path behind the start gate (75 % [62-88 %], attempts 67 / 76 %); three_hop reached three hops
+in two of three runs (attempts 39-47 %, ACK 3.7-4.0 s -- the field's 42 % / 5.6 s); one-hop pages,
+bidirectional pages and one-hop handshakes are dominated by MeshBench's missing listen-before-talk
+(pages 464 s or timed out, handshakes median 22 s vs 3-9 s zero-hop / 14-17 s two-hop in the field),
+so their floors are unreachable here and are read relatively. Two findings: `many_peers` never bound
+more than 3 of 4 peers in 7-12 minutes (five zero-hop nodes' bind/announce traffic colliding; the
+>3-peer routing has still never run against firmware), and seed 13 gives node A a reserved 0x00
+identity (eleven runs discarded, guarded since). Timing mechanics held in every run (missed-attempt
+timeouts 5 / 8 / 11 / 14 s at 0-3 hops, post-miss listen <= 1 s, no backoff drops).
 
 ### Added: test-suite coverage pass (2026-09-20, evening) -- no interface change
 

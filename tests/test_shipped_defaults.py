@@ -204,19 +204,28 @@ CONFIGURE_RETRY = {
     'direct_raw_reburst_after_unanswered': 2,
     'direct_raw_reconcile_rounds': 3,
     'direct_raw_report_enabled': True,
-    'direct_raw_report_wait_base_s': 2.0,
-    'direct_raw_report_wait_per_hop_s': 3.0,
+    'direct_raw_report_wait_base_s': 4.0,
+    'direct_raw_report_wait_per_hop_s': 2.5,
+    'direct_raw_window_collect_s': 0.75,
+    'direct_raw_window_enabled': True,
+    'direct_raw_parity_enabled': True,
+    'direct_raw_parity_min_hops': 1,
+    'direct_raw_window_max_parts': 6,
     'direct_raw_zero_hop_gap_s': 0.15,
+    'direct_report_debounce': True,
+    'direct_report_noack': True,
     'ordinary_data_bare_retransmit_extra': 1,
     'ordinary_data_link_retransmit_extra': 0,
     'outgoing_duplicate_suppress_limit': 3,
     'outgoing_max_age_s': 120.0,
     'path_req_retransmit_extra': 1,
+    'proof_max_age_s': 45.0,
     'retransmit_jitter_max_s': 20.0,
     'retransmit_jitter_min_s': 8.0,
 }
 
 CONFIGURE_PATH_DISCOVERY = {
+    'announce_cache_ttl_s': 3600.0,
     'contact_refresh_interval_s': 30.0,
     'direct_path_reset_min_age_s': 60.0,
     'direct_path_reset_patience_multiplier': 3.0,
@@ -226,6 +235,7 @@ CONFIGURE_PATH_DISCOVERY = {
     'path_discovery_base_cooldown_s': 20.0,
     'path_discovery_max_cooldown_s': 900.0,
     'path_discovery_quick_attempts': 2,
+    'path_request_local_answer_min_interval_s': 120.0,
     'telemetry_grant_all_contacts': False,
 }
 

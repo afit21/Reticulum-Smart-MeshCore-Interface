@@ -214,6 +214,11 @@ class LinkRequestsArmTheBackoffLikeData(_BootstrapSandbox):
                 self.assertEqual(len(got["candidate_peers"]), min(len(peers), iface.bootstrap_direct_supplement_cap))
                 self.assertEqual(iface._unknown_dest_attempts.get(dest), n)
             self.assertTrue(iface._unknown_dest_in_backoff(dest))
+            # The three sends' supplement tasks are spawned, not awaited: let
+            # them all land before sampling the count (2026-09-20: under two
+            # concurrent MeshBench runs the sample raced the last task).
+            expected = 3 * min(len(peers), iface.bootstrap_direct_supplement_cap)
+            self.assertTrue(wait_until(lambda: len(supplements) == expected, 5.0), f"{len(supplements)} of {expected} supplements")
             sent_supplements = len(supplements)
             dropped_before = iface._outgoing_dropped_total
             got = self._send(_link_request(dest), decisions)

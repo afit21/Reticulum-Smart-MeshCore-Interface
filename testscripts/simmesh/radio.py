@@ -250,11 +250,19 @@ class SimRadio:
         self._seen.append(pkt.pkt_id)
         self._tx(pkt)
 
-    def cmd_send_msg(self, dst_pubkey_hex: str, text: str, attempt: int = 0) -> Optional[dict]:
+    def cmd_send_msg(self, dst_pubkey_hex: str, text: str, attempt: int = 0, txt_type: int = 0) -> Optional[dict]:
         """Returns the MSG_SENT payload, or None when `dst` isn't a contact
-        (the real command errors: no contact, no shared secret)."""
+        (the real command errors: no contact, no shared secret).
+
+        `txt_type` (2026-09-20): the companion's CMD_SEND_TXT_MSG accepts
+        TXT_TYPE_PLAIN (0) and TXT_TYPE_CLI_DATA (1). CLI_DATA is the same
+        encrypted TXT_MSG datagram (`BaseChatMesh::sendCommandData`) but
+        `expected_ack` is 0 -- "no ack expected for CLI_DATA replies"
+        (`onPeerDataRecv`), and the receiver hands it up with txt_type 1."""
         contact = self._contact_for_prefix(dst_pubkey_hex)
         if contact is None:
+            return None
+        if txt_type not in (0, 1):
             return None
         dst_name = contact["adv_name"]
         ts = int(time.time())
@@ -263,15 +271,17 @@ class SimRadio:
         pkt = SimPacket(
             route=route, ptype=PTYPE_TXT_MSG, src=self.name, src_hash=self.hash_byte,
             dst=dst_name, dst_hash=int(contact["public_key"][:2], 16),
-            body={"text": text, "ts": ts, "attempt": attempt, "ack": ack}, path=path,
+            body={"text": text, "ts": ts, "attempt": attempt, "ack": ack if txt_type == 0 else None, "txt_type": txt_type},
+            path=path,
         )
         self._seen.append(pkt.pkt_id)
-        self._pending_acks[ack] = time.monotonic()
+        if txt_type == 0:
+            self._pending_acks[ack] = time.monotonic()
         self._tx(pkt)
         self.counters["txt_sent_" + route.lower()] += 1
         return {
             "type": 1 if route == ROUTE_DIRECT else 0,
-            "expected_ack": bytes.fromhex(ack),
+            "expected_ack": bytes.fromhex(ack) if txt_type == 0 else b"\x00\x00\x00\x00",
             "suggested_timeout": self._suggested_timeout_ms(route, len(path), pkt.size),
         }
 
@@ -423,11 +433,16 @@ class SimRadio:
             self._set_contact_path(sender, reversed(packet.path))
             self._push_event("PATH_UPDATE", {"public_key": sender["public_key"], "out_path_len": sender["out_path_len"]})
         self.counters["txt_received"] += 1
+        txt_type = int(packet.body.get("txt_type", 0))
         self._enqueue("CONTACT", {
             "type": "PRIV", "pubkey_prefix": sender["public_key"][:12], "path_len": len(packet.path) if packet.route == ROUTE_FLOOD else 255,
-            "path_hash_mode": 0 if packet.route == ROUTE_FLOOD else -1, "txt_type": 0,
+            "path_hash_mode": 0 if packet.route == ROUTE_FLOOD else -1, "txt_type": txt_type,
             "sender_timestamp": packet.body["ts"], "text": packet.body["text"],
         })
+        if txt_type == 1:
+            # TXT_TYPE_CLI_DATA: delivered, never ACKed (BaseChatMesh::onPeerDataRecv).
+            self.counters["cli_data_received"] += 1
+            return
         route, path = self._contact_route(sender)
         ack = SimPacket(
             route=route, ptype=PTYPE_ACK, src=self.name, src_hash=self.hash_byte,
