@@ -499,6 +499,19 @@ class _ConfigMixin:
         # _raw_fragment_gap_s for the 2026-09-19 field evidence.
         self.direct_raw_zero_hop_gap_s = float(cfg.get("direct_raw_zero_hop_gap", 0.15))
         self.direct_raw_hop_gap_factor = float(cfg.get("direct_raw_hop_gap_factor", 2.0))
+        # Alpha 0.1.5 (item 4, 2026-09-21): the field A/B knob for the one-hop
+        # gap. MeshBench finding 2 (2026-09-20) added the frame's own airtime
+        # to the hop-scaled gap -- `(1 + factor x hops) x airtime` -- because
+        # `send_raw_data` returns when the frame is queued, not sent. At one
+        # hop that gap is two thirds of a three-fragment part's time, and
+        # MeshBench cannot judge it (its frames are ~30% slower than the
+        # field's, so its one-hop loss alternates at any gap; and it has no
+        # listen-before-talk, which is what would let a real radio drop the
+        # `+1` -- the repeater's relay is audible to the sender). `no` drops
+        # the `+1 x airtime` term through repeaters (zero hop is untouched);
+        # every `raw_fragment_sent` record carries the `gap_s` actually used.
+        # DEFAULT UNCHANGED: `fieldtests/AB_PROTOCOL.md` decides.
+        self.direct_raw_gap_own_airtime = _cfg_bool(cfg.get("direct_raw_gap_own_airtime", "yes"))
         # Burst-then-ask rounds per packet, and QUERY tries per round.
         # Audit fix (2026-09-19): clamped to 4. The raw header carries the
         # round in 2 bits (`attempt & 0x03`), and the firmware dedups

@@ -1363,6 +1363,19 @@ class _ConfigMixin:
         # _raw_fragment_gap_s for the 2026-09-19 field evidence.
         self.direct_raw_zero_hop_gap_s = float(cfg.get("direct_raw_zero_hop_gap", 0.15))
         self.direct_raw_hop_gap_factor = float(cfg.get("direct_raw_hop_gap_factor", 2.0))
+        # Alpha 0.1.5 (item 4, 2026-09-21): the field A/B knob for the one-hop
+        # gap. MeshBench finding 2 (2026-09-20) added the frame's own airtime
+        # to the hop-scaled gap -- `(1 + factor x hops) x airtime` -- because
+        # `send_raw_data` returns when the frame is queued, not sent. At one
+        # hop that gap is two thirds of a three-fragment part's time, and
+        # MeshBench cannot judge it (its frames are ~30% slower than the
+        # field's, so its one-hop loss alternates at any gap; and it has no
+        # listen-before-talk, which is what would let a real radio drop the
+        # `+1` -- the repeater's relay is audible to the sender). `no` drops
+        # the `+1 x airtime` term through repeaters (zero hop is untouched);
+        # every `raw_fragment_sent` record carries the `gap_s` actually used.
+        # DEFAULT UNCHANGED: `fieldtests/AB_PROTOCOL.md` decides.
+        self.direct_raw_gap_own_airtime = _cfg_bool(cfg.get("direct_raw_gap_own_airtime", "yes"))
         # Burst-then-ask rounds per packet, and QUERY tries per round.
         # Audit fix (2026-09-19): clamped to 4. The raw header carries the
         # round in 2 bits (`attempt & 0x03`), and the firmware dedups
@@ -7403,7 +7416,10 @@ class _ReconcileMixin:
         # in large_payload, 7/9 QUERYs in relay. The frame's own airtime is
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-        return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
+        # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
+        # airtime from the gap through repeaters; the default keeps it.
+        own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
+        return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
 
     def _raw_burst_next_send_wait_s(self, hops: int, gap_s: float, airtime_s: float, now: float,
                                     busy_until: float, queue_ahead: Optional[int] = None) -> float:
@@ -8044,6 +8060,7 @@ class _ReconcileMixin:
                                 "frag_idx": frag_idx, "frag_total": part.frag_total, "round": rnd, "ok": sent_ok,
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
+                                "gap_s": round(self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame)), 3),
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),

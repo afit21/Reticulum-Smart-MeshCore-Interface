@@ -3472,3 +3472,26 @@ update together; parity stays on; aim for no wire change.
     failed`; the post-move `resolved` per probe is reported). Tests:
     `tests/test_shorter_path_adoption_0921.py`; shipped-default pin and
     golden config re-pinned for the two keys.
+
+ 4. **The one-hop fragment gap: the field A/B made possible** (`direct_
+    raw_gap_own_airtime`, yes/no, default yes -- DEFAULT UNCHANGED; `gap_s`
+    on every `raw_fragment_sent` record; `field_ab_compare.py` rows). The
+    gap through repeaters is `(1 + factor x hops) x airtime` since MeshBench
+    finding 2; at one hop it is two thirds of a three-fragment part's time.
+    MeshBench cannot judge it (its frames are ~30% slower than the field's,
+    so its one-hop loss alternates at any gap, and it has no listen-before-
+    talk -- the mechanism that would let a real sender drop the `+1`,
+    since the repeater's relay is audible to it); the field can. `no`
+    drops the `+1 x airtime` term through repeaters, zero hop untouched.
+    The receiver's holds (`_report_hold_s`, `_noack_frame_hold_s`) follow
+    the sender's gap rule, as they always did. `field_ab_compare.py` now
+    prints, per hop, the A/B's safety signals: the gap actually used,
+    round-1 data fragments per part, round-0 re-sends per fragment
+    position (the sender's view of loss), parity fragments sent and
+    reconstructed (the receiver's view, when both captures are in the
+    set). On the alpha 0.1.4 captures: zero hop 0.47 round-1 fragments per
+    part with fragment 2 re-sent in 47% of its parts (the item-2 collision
+    seen from this side), one hop 0.09 with parity repairing 2 of 15, two
+    hops 0.56 with 6 of 9. Tests: `tests/test_raw_gap_own_airtime_0921.py`;
+    shipped-default pin and golden config re-pinned for the new key.
+    MeshBench: none, deliberately.

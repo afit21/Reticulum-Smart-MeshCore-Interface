@@ -184,7 +184,10 @@ class _ReconcileMixin:
         # in large_payload, 7/9 QUERYs in relay. The frame's own airtime is
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-        return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
+        # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
+        # airtime from the gap through repeaters; the default keeps it.
+        own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
+        return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
 
     def _raw_burst_next_send_wait_s(self, hops: int, gap_s: float, airtime_s: float, now: float,
                                     busy_until: float, queue_ahead: Optional[int] = None) -> float:
@@ -825,6 +828,7 @@ class _ReconcileMixin:
                                 "frag_idx": frag_idx, "frag_total": part.frag_total, "round": rnd, "ok": sent_ok,
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
+                                "gap_s": round(self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame)), 3),
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),

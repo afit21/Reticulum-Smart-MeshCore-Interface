@@ -85,6 +85,18 @@ report's section 5):
 8. **Airtime**: RNS bytes out / in, raw fragment bytes, `channel_fragment_sent`, and the other
    node's `rx_log` TEXT_MSG frames of 38–40 B (QUERY / ANSWER / REPORT class) per raw send.
 
+## The one-hop gap arm (alpha 0.1.5)
+
+The first A/B this procedure is for: **A** = both nodes on the same build with
+`direct_raw_gap_own_airtime = yes` (the default: the raw gap through repeaters is
+`(1 + 2 x hops) x airtime`), **B** = both nodes with `direct_raw_gap_own_airtime = no` (the
+`+1 x airtime` term dropped). Zero hop is unaffected, so the verdict is at one hop and above;
+MeshBench cannot judge it (no listen-before-talk, slower frames). Read, from the script's "one-hop
+gap A/B safety signals" block per hop: the gap actually used (`gap_s`), round-1 data fragments per
+part, round-0 re-sends per fragment position (fragment 1 re-sent more often than fragment 0 is the
+signature of the next fragment leaving inside the repeater's relay), and parity fragments sent /
+reconstructed. The primary number stays the DIRECT attempt success and the part time.
+
 ## Reading it
 
 - A difference inside the run-to-run spread of the same build is not evidence; the MeshBench

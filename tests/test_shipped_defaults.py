@@ -198,6 +198,7 @@ CONFIGURE_RETRY = {
     'direct_raw_fallback_cooldown_s': 120.0,
     'direct_raw_fallback_strikes': 2,
     'direct_raw_fragments_enabled': True,
+    'direct_raw_gap_own_airtime': True,
     'direct_raw_hop_gap_factor': 2.0,
     'direct_raw_incomplete_strikes': 2,
     'direct_raw_path_unsupported_ttl_s': 86400.0,

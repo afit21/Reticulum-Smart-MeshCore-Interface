@@ -286,6 +286,63 @@ def analyse_set(recs: list, hop_filter=None) -> dict:
     out["control_frames_per_raw_send"] = (control / len(raw_sends)) if raw_sends and control else None
     out["routing"] = dict(collections.Counter(r.get("routing_decision") for r in pk if r.get("direction") == "out"))
     out["in_transport"] = dict(collections.Counter(r.get("transport") for r in pk if r.get("direction") == "in"))
+    # Alpha 0.1.5 (item 4): the safety signals of the one-hop gap A/B
+    # (`direct_raw_gap_own_airtime`), per hop. Round-0 loss per fragment
+    # position is the sender's view -- a data fragment re-sent in round 1
+    # -- since a sender's capture does not see what landed except through
+    # the report. Round-1 data fragments per part, and the receiver-side
+    # parity reconstructions (both nodes' captures in one set give both
+    # views). `gap_s` is the gap the sender actually used, by hop.
+    rf = [r for r in recs if r.get("event") == "raw_fragment_sent" and r.get("ok", True)]
+    if hop_filter is not None:
+        rf = [r for r in rf if r.get("hop_count") == hop_filter]
+    parts = collections.defaultdict(lambda: {"r0": set(), "r1": [], "hop": None})
+    gaps = collections.defaultdict(list)
+    for r in rf:
+        key = (r["_node"], r.get("pkt_id"))
+        p = parts[key]
+        p["hop"] = r.get("hop_count")
+        if r.get("parity_mask") is not None:
+            continue   # parity frames are not positions
+        if r.get("round") == 0:
+            p["r0"].add(r.get("frag_idx"))
+        elif r.get("round") == 1:
+            p["r1"].append(r.get("frag_idx"))
+        if r.get("gap_s") is not None:
+            gaps[r.get("hop_count")].append(r["gap_s"])
+    pos = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0]))   # hop -> idx -> [resent, sent]
+    r1_per_part = collections.defaultdict(list)
+    for p in parts.values():
+        if not p["r0"]:
+            continue
+        r1 = set(p["r1"])
+        for idx in p["r0"]:
+            pos[p["hop"]][idx][1] += 1
+            if idx in r1:
+                pos[p["hop"]][idx][0] += 1
+        r1_per_part[p["hop"]].append(len(p["r1"]))
+    out["round0_resent_by_position"] = {
+        h: {idx: (v[0] / v[1] if v[1] else None, v[1]) for idx, v in sorted(d.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))}
+        for h, d in sorted(pos.items(), key=lambda kv: (kv[0] is None, kv[0] if kv[0] is not None else -1))}
+    out["round1_fragments_per_part"] = {
+        h: (sum(v) / len(v) if v else None, len(v)) for h, v in sorted(r1_per_part.items(), key=lambda kv: (kv[0] is None, kv[0] if kv[0] is not None else -1))}
+    out["gap_s_by_hop"] = {h: dist(v) for h, v in sorted(gaps.items(), key=lambda kv: (kv[0] is None, kv[0] if kv[0] is not None else -1))}
+    # Receiver side: reconstructions by the receiver's hop count to the sender
+    # (its `fragment_received` records do not carry hops; use the sender node's
+    # hop count for that (node, pkt) when both captures are in the set, else
+    # count them unstratified).
+    sender_hop = {}
+    for r in recs:
+        if r.get("event") == "raw_fragment_sent":
+            sender_hop[(r["_node"], r.get("pkt_id"))] = r.get("hop_count")
+    recon = collections.Counter()
+    for r in recs:
+        if r.get("event") == "raw_parity_reconstructed":
+            hop = next((h for (node, pkt), h in sender_hop.items() if pkt == r.get("pkt_id") and node != r["_node"]), None)
+            recon[hop] += 1
+    out["parity_reconstructions_by_hop"] = dict(recon)
+    out["parity_fragments_sent_by_hop"] = dict(collections.Counter(
+        r.get("hop_count") for r in rf if r.get("parity_mask") is not None))
     return out
 
 
@@ -339,6 +396,22 @@ def print_comparison(sets: dict, min_n: int) -> None:
     row("unknown_dest_backoff_drop (near PROOFs)", [f"{s['backoff_drops']} ({s['backoff_drops_near_proofs']})" for s in sets.values()])
     row("direct sends ok / failed", [f"{s['send_ok']} / {s['send_fail']}" for s in sets.values()])
     row("failure triples (stale-path reset trigger)", [s["fail_triples"] for s in sets.values()])
+    print("\n  -- one-hop gap A/B safety signals (direct_raw_gap_own_airtime) --")
+    hops_seen = sorted({h for a in sets.values() for k in ("gap_s_by_hop", "round1_fragments_per_part") for h in a.get(k, {})},
+                       key=lambda h: (h is None, h if h is not None else -1))
+    for h in hops_seen:
+        row(f"h{h} gap used med/p90/max s", [d_str(a.get("gap_s_by_hop", {}).get(h), 2) for a in sets.values()])
+        row(f"h{h} round-1 data frags per part (parts)",
+            [(f"{fmt(v[0], 2)} ({v[1]})" if v and v[0] is not None else "-")
+             for v in (a.get("round1_fragments_per_part", {}).get(h) for a in sets.values())])
+        idxs = sorted({i for a in sets.values() for i in a.get("round0_resent_by_position", {}).get(h, {})}, key=lambda i: (i is None, i or 0))
+        for idx in idxs:
+            row(f"h{h} round-0 frag {idx} re-sent (sent)",
+                [(f"{fmt(v[0] * 100, 0)}% ({v[1]})" if v and v[0] is not None else "-")
+                 for v in (a.get("round0_resent_by_position", {}).get(h, {}).get(idx) for a in sets.values())])
+        row(f"h{h} parity sent / reconstructed",
+            [f"{a.get('parity_fragments_sent_by_hop', {}).get(h, 0)} / {a.get('parity_reconstructions_by_hop', {}).get(h, 0)}"
+             for a in sets.values()])
     print("\n  -- airtime --")
     row("RNS bytes out / in", [f"{s['rns_bytes_out']} / {s['rns_bytes_in']}" for s in sets.values()])
     row("raw fragments (bytes)", [f"{s['raw_fragments']} ({s['raw_bytes']})" for s in sets.values()])

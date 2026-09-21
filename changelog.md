@@ -58,6 +58,11 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   path while the peer's floods arrived over two. Capture: `path_adopted`, `path_adoption_confirmed`,
   `path_adoption_failed`. MeshBench: new scenario `shortcut_appears`. Tests:
   `tests/test_shorter_path_adoption_0921.py`.
+- **One-hop gap A/B knob** (new key `direct_raw_gap_own_airtime = yes`, default unchanged): `no` drops
+  the frame's own airtime from the raw gap through repeaters for the field A/B; `gap_s` on every
+  `raw_fragment_sent`; `field_ab_compare.py` prints the A/B's safety signals per hop (gap used,
+  round-1 fragments per part, round-0 re-sends per position, parity sent / reconstructed). MeshBench
+  cannot judge this one. Tests: `tests/test_raw_gap_own_airtime_0921.py`.
 
 ## alpha-0.1.4 (2026-09-21)
 
