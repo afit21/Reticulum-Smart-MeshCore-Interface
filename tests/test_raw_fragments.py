@@ -704,8 +704,12 @@ class RawFragmentScenarios(unittest.TestCase):
         """2026-09-19 morning field test: the desktop burst three whole raw
         sends down a dead zero-hop path before its stale-path reset fired,
         because the reconcile QUERYs recorded no evidence. Now each
-        unanswered round counts, and the send stops once the path is gone."""
-        _, a, b = _raw_mesh(self, ["A-B"], seed=61, config={"direct_path_reset_threshold": "2"})
+        unanswered round counts, and the send stops once the path is gone.
+        The threshold detector's regression: with path selection on (alpha
+        0.1.6 item 1) a window is one sample and a dead path is abandoned
+        after `path_switch_after_misses` windows for discovery (pinned in
+        tests/test_path_selection_0922.py), so this runs with it off."""
+        _, a, b = _raw_mesh(self, ["A-B"], seed=61, config={"direct_path_reset_threshold": "2", "path_selection_enabled": "no"})
         iface = a.iface
         time.sleep(max(0.0, iface.direct_path_reset_min_age_s - (time.monotonic() - iface._resolved_paths[b.prefix].resolved_at)))
         self.mesh.air.link_loss[("A", "B")] = 1.0
