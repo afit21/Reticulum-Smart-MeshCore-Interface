@@ -4856,6 +4856,14 @@ class _PeerStateMixin:
 
 
 
+# Alpha 0.1.6 (item 1, fourth cut): a candidate whose weighted delivery rate
+# is at least PATH_HEALTHY_RATE stays eligible (a trial target and, alone,
+# the path still used) until PATH_EXHAUST_MISSES consecutive missed sends;
+# below the rate, `path_switch_after_misses` misses exhaust it as before.
+PATH_HEALTHY_RATE = 0.5
+PATH_EXHAUST_MISSES = 4
+
+
 class _PathDiscoveryMixin:
     def _rtt_sample(self, table: dict, peer_prefix: Optional[str], rtt_s: float, keep_last: bool = False) -> None:
         """One Jacobson/Karels update (srtt alpha 1/8, rttvar beta 1/4;
@@ -5619,8 +5627,11 @@ class _PathDiscoveryMixin:
                      weak_snr_db: float, window_s: float, half_life_s: float, **kw) -> "tuple[Optional[str], str, list]":
         """The switching rule (pure): (path hex or None, reason, ranked).
         A candidate is eligible while it has missed fewer than
-        `switch_after_misses` consecutive sends, or again once its last
-        miss is older than `cooldown_s` (the re-try the field lacked). With
+        `switch_after_misses` consecutive sends, while its measured
+        delivery rate is at least PATH_HEALTHY_RATE and it has missed fewer
+        than PATH_EXHAUST_MISSES (a delivering path is not abandoned on two
+        misses at 50 % attempt success), or again once its last miss is
+        older than `cooldown_s` (the re-try the field lacked). With
         no current path the best eligible candidate is "selected"; a current
         path still under the miss threshold is kept ("current", whatever the
         alternatives score -- a delivering path is not abandoned on hop
@@ -5632,9 +5643,20 @@ class _PathDiscoveryMixin:
         if not views:
             return None, "none", []
         ranked = cls._rank_paths(views, now, weak_snr_db, window_s, half_life_s, **kw)
+        measured = {id(v): (rate if m else None) for _s, v, rate, m in ranked}
 
         def eligible(v) -> bool:
-            if int(v.get("consecutive_misses") or 0) < switch_after_misses:
+            misses = int(v.get("consecutive_misses") or 0)
+            if misses < switch_after_misses:
+                return True
+            # Fourth cut (2026-09-22, the baseline suite): a path with a
+            # healthy measured record keeps its eligibility for a while
+            # longer -- at one hop's ~50 % attempt success two consecutive
+            # missed sends are common, and exhausting a delivering path on
+            # them meant a relayed discovery flood where alpha 0.1.5's
+            # detector had shown patience (its healthy-path multiplier).
+            rate = measured.get(id(v))
+            if rate is not None and rate >= PATH_HEALTHY_RATE and misses < PATH_EXHAUST_MISSES:
                 return True
             last = v.get("last_failure_at")
             return last is not None and now - float(last) >= cooldown_s

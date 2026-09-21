@@ -4036,3 +4036,18 @@ parity stays on.
     (raw 0.99; 54 radio frames against 52 keyed, corrected 1.00),
     receiver 6.2 s against 7 s (raw 0.89; 22 against 16, six ACKs,
     corrected 1.01). About 45 s of transmit time per radio for the night.
+
+    Item 1, fourth cut (from the close-out baseline suite on 9aa4b7d,
+    `link_setup` handshakes inside 15 s 38 % on all three seeds against
+    62 % [25-75], the responder's one-hop attempt success 35 % against
+    53 %, and one exhaustion-and-rediscovery per run in several runs):
+    "discovery when every candidate has missed its last two sends" read
+    literally exhausts a delivering path -- at one hop's ~50 % attempt
+    success two consecutive missed sends are common -- and spends a
+    relayed discovery flood where alpha 0.1.5's detector had its healthy-
+    path patience. A candidate whose weighted delivery rate is at least
+    PATH_HEALTHY_RATE (0.5) now stays eligible until PATH_EXHAUST_MISSES
+    (4) consecutive misses: a better-scoring alternative is still trialled
+    after two, but alone it stays in use and no discovery runs; a path
+    with no successes behind its misses is exhausted on two as before.
+    Pinned in `tests/test_path_selection_0922.py`.

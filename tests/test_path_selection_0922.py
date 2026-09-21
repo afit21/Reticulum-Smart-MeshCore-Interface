@@ -178,6 +178,28 @@ class PureChoose(_Pure):
         hex_, reason, _ = _choose(self.Iface, [current, _view("1976", 2)], "19", now)
         self.assertEqual((hex_, reason), ("19", "current_best"))
 
+    def test_a_healthy_current_is_not_exhausted_on_two_misses(self):
+        """Fourth cut (the 2026-09-22 baseline suite): at one hop's ~50 %
+        attempt success two consecutive missed sends are common; a path
+        with a measured rate of at least PATH_HEALTHY_RATE stays in use
+        (no discovery flood) until PATH_EXHAUST_MISSES misses."""
+        now = time.monotonic()
+        healthy = [(now - 60 + i, True) for i in range(6)] + [(now - 10, False), (now - 5, False)]
+        current = _view("19", 1, samples=healthy, consecutive_misses=2, last_failure_at=now - 5)
+        hex_, reason, _ = _choose(self.Iface, [current], "19", now)
+        self.assertEqual((hex_, reason), ("19", "current_best"))
+        # a better-scoring alternative is still trialled after the two misses
+        hex_, reason, _ = _choose(self.Iface, [current, _view("", 0, snr=12.0)], "19", now)
+        self.assertEqual((hex_, reason), ("", "trial"))
+        # four misses exhaust it even with the good record
+        four = healthy + [(now - 3, False), (now - 1, False)]
+        exhausted = _view("19", 1, samples=four, consecutive_misses=4, last_failure_at=now - 1)
+        self.assertEqual(_choose(self.Iface, [exhausted], "19", now)[1], "exhausted")
+        # an unhealthy one (no successes) is exhausted on two, as before
+        fresh = _view("19", 1, samples=[(now - 10, False), (now - 5, False)], consecutive_misses=2, last_failure_at=now - 5)
+        self.assertEqual(_choose(self.Iface, [fresh], "19", now)[1], "exhausted")
+        self.assertEqual((self.module.PATH_HEALTHY_RATE, self.module.PATH_EXHAUST_MISSES), (0.5, 4))
+
     def test_trial_on_the_best_alternative_after_the_misses(self):
         now = time.monotonic()
         current = _view("1976", 2, samples=[(now - 12, False), (now, False)], consecutive_misses=2, last_failure_at=now)
