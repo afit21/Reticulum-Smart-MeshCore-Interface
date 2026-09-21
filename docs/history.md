@@ -3990,3 +3990,49 @@ parity stays on.
     the cooldown alone. The per-round evidence now passes `path_sample=
     False` -- the window's outcome is the one sample -- while the
     threshold detector (selection off) still counts rounds as it did.
+
+    Item 1, MeshBench (build 24181c1 = the second cut, `/tmp/mb/016/item1/`):
+    `shortcut_appears` PASSED its hard check in both runs -- run 1: A
+    trialled B's one-hop route 35 s after the move, the trial delivered,
+    the switch was made for good (selection sequence trial / trial /
+    switch, 2 of 3 shorter selections confirmed by the next delivery,
+    probes 7-10 at one hop); run 2: A had started on a two-hop route
+    from a flood copy, trialled and switched to three hops when it
+    failed, then trialled and switched to B's one-hop route after the
+    move (probes 8-10 at one hop). `weak_direct` (A-B +3.0 dB): both runs
+    delivered 16 of 16 sends over the direct path -- MeshBench's channel
+    loses nothing on a +3 dB link and reports every frame at SNR 0.0, so
+    neither route to the one-hop path (two misses, or the weak-SNR prior
+    on an untried direct candidate) can occur there, and a delivering
+    path is kept by design; the scenario's one-hop expectation is
+    informational while the direct path delivers 90 % or more (the
+    `path_selected` check stays hard, 1 and 2 records). The weak-direct
+    decision is the field's, where the SNR is real. `two_hop`: PASS 5/8.
+    Also from these runs: `discover_path` now writes a `path_selected`
+    record (reason "discovered") when it sets or refreshes the path, so a
+    session that never switches still shows how the board stood.
+
+ Hardware, on the bench (2026-09-22 00:44-00:51, both radios side by side,
+    the private channel, capture files under `fieldtests/raw/Alpha0.1.6-
+    bench/`). Item 4 on the desktop's real port: the constructor returned
+    0.07 s after the port opened, the handshake was answered on the first
+    attempt after the 2 s settle, online 2.5 s after construction with
+    the radio block (7, 62.5, 8) and no stream noise, three times over;
+    closing the process's own serial transport underneath the library
+    produced DISCONNECTED (`serial_disconnect`) within 0.1 s, the
+    supervisor's 5 s backoff, a reopen, a second handshake and online
+    again 7.7 s after the drop on a fresh MeshCore object
+    (`afipc-bench-item4_capture_*`, `afipc_item4_*.log`); the
+    second-reader and port-holder checks against a deliberately started
+    second process were not run (the session's tooling refused the
+    second reader on the port; the /proc scan is pinned against a fake
+    tree in the unit test). Items 3 and 5 at zero hop (`zero_hop_peer_
+    discovery_test.py`, laptop listener, desktop sender, 12 x 495-byte
+    packets = 48 raw fragments in 12 windows): 12 of 12 delivered in
+    round 0 with no re-sent fragment, 12 receiver reports for 12 packets
+    (1.00 per reported packet, every one immediate on the flagged last
+    fragment), every sender window `reported` with a 0.45-0.74 s report
+    wait; calibration: sender 36.6 s estimated against 37 s firmware
+    (raw 0.99; 54 radio frames against 52 keyed, corrected 1.00),
+    receiver 6.2 s against 7 s (raw 0.89; 22 against 16, six ACKs,
+    corrected 1.01). About 45 s of transmit time per radio for the night.

@@ -5349,10 +5349,18 @@ class _PathDiscoveryMixin:
                         cand.consecutive_misses = 0
                         cand.samples.append((resolved.resolved_at, True))
                         cand.last_success_at = resolved.resolved_at
+                        previous = board.candidates.get(board.current) if board.current is not None else None
                         if board.current is None or board.current not in board.candidates \
                                 or board.candidates[board.current].consecutive_misses >= self.path_switch_after_misses:
                             board.current = cand.path_hex
                         board.last_reason = "discovered"
+                        # A `path_selected` record for the field: how the
+                        # scoreboard stood when discovery set (or refreshed)
+                        # the path.
+                        self._capture_path_selected(
+                            pubkey_prefix, "discovered", cand, previous if previous is not cand else None,
+                            self._rank_paths([self._path_view(c) for c in board.candidates.values()],
+                                             resolved.resolved_at, **self._path_rank_kwargs()))
                     RNS.log(
                         f"{self}: path discovered to {pubkey_prefix!r} in "
                         f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
