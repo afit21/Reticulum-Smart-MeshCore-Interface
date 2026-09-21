@@ -113,9 +113,9 @@ All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet Me
 |                 | LXMF Messages (MeshChat) | Nomad Network |
 | --------------- | ------------------------ | ------------- |
 | 0 Hops (direct) | Works Well               | Works Well    |
-| 1 Hop           | Works Well               | Slow          |
-| 2 Hops          | Works Well               | Slow          |
-| 3 Hops          | Works Well               | Slow          |
+| 1 Hop           | Works Well               | Works Well    |
+| 2 Hops          | Works Well               | Works Well    |
+| 3 Hops          | Works Well               | Not tested    |
 
 
 Reference speeds - SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz:
