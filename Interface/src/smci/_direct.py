@@ -1616,7 +1616,10 @@ class _DirectSendMixin:
         self._direct_exchange_queue_depth += 1
         wait_start = time.monotonic()
         try:
-            async with self._direct_exchange_lock(priority):
+            # Item 6 (alpha 0.1.5): a completion REPORT queues as the report
+            # class, which a raw window this node is sending yields to
+            # between two of its parts (`_run_raw_window_rounds`).
+            async with self._direct_exchange_lock(priority, report=(kind == "completion_report")):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 gate_telemetry: dict = {}

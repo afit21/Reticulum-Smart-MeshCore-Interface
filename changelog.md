@@ -45,6 +45,11 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   transfer's observed inter-part spacing (floor 40 ms). A lone packet starts within 50 ms instead
   of 0.75 s; a window of parts still batches. Capture: `raw_window_collect`. Tests:
   `tests/test_adaptive_window_collect_0921.py`.
+- **A raw window yields to a pending completion report between its parts.** Under both-ways load a
+  node's own report queued behind its whole outgoing window (12-15 s); reports now have their own
+  pre-emption class on the radio lock and the window lets one out between two parts (never inside a
+  part), resuming ahead of ordinary waiters. Capture: `report_yields` on `raw_fragment_sent`. Tests:
+  `tests/test_report_yield_between_parts_0921.py`.
 
 ## alpha-0.1.4 (2026-09-21)
 

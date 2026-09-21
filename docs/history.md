@@ -3404,3 +3404,24 @@ update together; parity stays on; aim for no wire change.
     (parts, collect_s, spacing_s, max_s). Tests: `tests/test_adaptive_
     window_collect_0921.py` (the two pure rules, the maximum, a lone part
     within 50 ms, four parts one window).
+
+ 6. **A raw window yields to a pending completion REPORT between its
+    parts** (`_PriorityAsyncLock.acquire(report=True)`, `report_
+    requested`, `yield_to_preempt(resume_priority)`, `REPORT_YIELDED_
+    PRIORITY` 1.5). Phase 4 measured the cost under both-ways zero-hop
+    load: a node's REPORT for the far sender's window waited behind its
+    own outgoing window for the whole burst (12-15 s, pinned at 20 s),
+    while the far sender's report wait expired and it re-queried. A
+    completion report now queues for the radio lock as its own class
+    (`_send_direct_noack_frame`, kind `completion_report`; a QUERY ANSWER
+    does not), and the burst loop yields to it between two PARTS of the
+    window -- never inside a part's burst, and not at the other idle
+    points a Link handshake pre-empts -- the way handshakes pre-empt
+    (phase 1.4), resuming behind the report's ANSWER tier and ahead of
+    every ordinary waiter, with the mid-send path-reset check after the
+    yield as for a handshake. Captured as `report_yields` on
+    `raw_fragment_sent`. Tests: `tests/test_report_yield_between_parts_
+    0921.py` (the lock's ordering with a report and with a handshake and
+    a report, the no-ACK frame's class by kind, a report queued during
+    part one out before part two, a report queued inside part two waits
+    for that part).

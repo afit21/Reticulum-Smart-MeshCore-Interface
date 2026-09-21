@@ -766,6 +766,7 @@ class _ReconcileMixin:
                 await lock.acquire(priority)
                 lock_held = True
                 yields = 0
+                report_yields = 0
 
                 def release_for_handshake() -> None:
                     nonlocal lock_held
@@ -827,7 +828,7 @@ class _ReconcileMixin:
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
-                                "handshake_yields": yields, "window_parts": len(parts),
+                                "handshake_yields": yields, "report_yields": report_yields, "window_parts": len(parts),
                                 "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
                         on_air_bytes = 2 + len(path) + len(frame)
@@ -846,8 +847,24 @@ class _ReconcileMixin:
                             if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
                                 fail_rest(False)
                                 return
-                    if yields:
-                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
+                        elif n < len(burst) - 1 and burst[n + 1][0] is not part and lock.report_requested():
+                            # Item 6 (alpha 0.1.5): between two PARTS of the
+                            # window (never inside a part's burst) a
+                            # completion REPORT this node owes the far
+                            # sender goes out first -- under both-ways load
+                            # its report otherwise waits behind the whole
+                            # window (12-15 s observed in the phase-4 slow
+                            # scenario) while the far sender's report wait
+                            # expires and it re-queries. Resumes behind the
+                            # report's tier, ahead of ordinary waiters.
+                            report_yields += 1
+                            await lock.yield_to_preempt(lock.REPORT_YIELDED_PRIORITY)
+                            if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
+                                fail_rest(False)
+                                return
+                    if yields or report_yields:
+                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake "
+                                    f"{yields} time(s) and to a completion report {report_yields} time(s).")
                     if report_fut is not None:
                         # 2a: the burst ends when the radio is estimated to
                         # have finished the last queued fragment, not when

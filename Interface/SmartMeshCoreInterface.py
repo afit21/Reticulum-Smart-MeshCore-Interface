@@ -470,6 +470,11 @@ class _PriorityAsyncLock:
     # the yielded exchange resumes ahead of everything but the handshakes
     # that pre-empted it (tiers are compared numerically; a float sorts).
     YIELDED_PRIORITY = 0.5
+    # Alpha 0.1.5 (item 6): the tier a raw window resumes at after yielding
+    # between two of its parts to a queued completion REPORT -- behind the
+    # report's own ANSWER tier (1), ahead of every ordinary waiter (2), so
+    # the report goes out and the window continues before anything else.
+    REPORT_YIELDED_PRIORITY = 1.5
 
     def __init__(self):
         self._locked = False
@@ -478,6 +483,11 @@ class _PriorityAsyncLock:
         # to pre-empt an idle holder, and the event an idle holder watches.
         self._preempt_waiters: set = set()
         self._preempt_event: "Optional[asyncio.Event]" = None
+        # Alpha 0.1.5 (item 6): a second class -- completion REPORTs this
+        # node owes the far sender -- that a raw window yields to between
+        # its parts (never inside a part's burst, never at the other idle
+        # points a handshake pre-empts).
+        self._report_waiters: set = set()
 
     def locked(self) -> bool:
         return self._locked
@@ -505,17 +515,23 @@ class _PriorityAsyncLock:
         if not self._preempt_waiters and self._preempt_event is not None:
             self._preempt_event.clear()
 
-    async def yield_to_preempt(self) -> None:
+    def report_requested(self) -> bool:
+        """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
+        return bool(self._report_waiters)
+
+    async def yield_to_preempt(self, resume_priority: Optional[float] = None) -> None:
         """Called by a holder at an idle point when `preempt_requested()`:
         hands the lock over and re-acquires it at YIELDED_PRIORITY, so
         the pre-empting handshake goes first and this exchange resumes
         before any ordinary waiter that queued meanwhile (review,
         2026-09-20: a plain release + re-acquire at NORMAL would splice a
-        whole other exchange into a raw burst)."""
+        whole other exchange into a raw burst). `resume_priority` lets a
+        holder yielding to a REPORT (item 6) resume behind the report's
+        tier instead."""
         self.release()
-        await self.acquire(self.YIELDED_PRIORITY)
+        await self.acquire(self.YIELDED_PRIORITY if resume_priority is None else resume_priority)
 
-    async def acquire(self, priority: int, preempt: bool = False) -> None:
+    async def acquire(self, priority: int, preempt: bool = False, report: bool = False) -> None:
         if not self._locked:
             self._locked = True
             return
@@ -523,6 +539,8 @@ class _PriorityAsyncLock:
         self._waiters.setdefault(priority, collections.deque()).append(fut)
         if preempt:
             self._preempt_add(fut)
+        if report:
+            self._report_waiters.add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -551,6 +569,8 @@ class _PriorityAsyncLock:
         finally:
             if preempt:
                 self._preempt_remove(fut)
+            if report:
+                self._report_waiters.discard(fut)
 
     def release(self) -> None:
         if not self._wake_next():
@@ -572,8 +592,8 @@ class _PriorityAsyncLock:
             del self._waiters[tier]
         return False
 
-    def __call__(self, priority: int, preempt: bool = False) -> "_PriorityLockContext":
-        return _PriorityLockContext(self, priority, preempt)
+    def __call__(self, priority: int, preempt: bool = False, report: bool = False) -> "_PriorityLockContext":
+        return _PriorityLockContext(self, priority, preempt, report)
 
 
 class _PriorityLockContext:
@@ -584,15 +604,16 @@ class _PriorityLockContext:
     `async with` block despite `acquire`/`release` being its own real
     methods."""
 
-    __slots__ = ("_lock", "_priority", "_preempt")
+    __slots__ = ("_lock", "_priority", "_preempt", "_report")
 
-    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False):
+    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False, report: bool = False):
         self._lock = lock
         self._priority = priority
         self._preempt = preempt
+        self._report = report
 
     async def __aenter__(self) -> None:
-        await self._lock.acquire(self._priority, preempt=self._preempt)
+        await self._lock.acquire(self._priority, preempt=self._preempt, report=self._report)
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._lock.release()
@@ -6845,7 +6866,10 @@ class _DirectSendMixin:
         self._direct_exchange_queue_depth += 1
         wait_start = time.monotonic()
         try:
-            async with self._direct_exchange_lock(priority):
+            # Item 6 (alpha 0.1.5): a completion REPORT queues as the report
+            # class, which a raw window this node is sending yields to
+            # between two of its parts (`_run_raw_window_rounds`).
+            async with self._direct_exchange_lock(priority, report=(kind == "completion_report")):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 gate_telemetry: dict = {}
@@ -7739,6 +7763,7 @@ class _ReconcileMixin:
                 await lock.acquire(priority)
                 lock_held = True
                 yields = 0
+                report_yields = 0
 
                 def release_for_handshake() -> None:
                     nonlocal lock_held
@@ -7800,7 +7825,7 @@ class _ReconcileMixin:
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
                                 "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
-                                "handshake_yields": yields, "window_parts": len(parts),
+                                "handshake_yields": yields, "report_yields": report_yields, "window_parts": len(parts),
                                 "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
                         on_air_bytes = 2 + len(path) + len(frame)
@@ -7819,8 +7844,24 @@ class _ReconcileMixin:
                             if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
                                 fail_rest(False)
                                 return
-                    if yields:
-                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
+                        elif n < len(burst) - 1 and burst[n + 1][0] is not part and lock.report_requested():
+                            # Item 6 (alpha 0.1.5): between two PARTS of the
+                            # window (never inside a part's burst) a
+                            # completion REPORT this node owes the far
+                            # sender goes out first -- under both-ways load
+                            # its report otherwise waits behind the whole
+                            # window (12-15 s observed in the phase-4 slow
+                            # scenario) while the far sender's report wait
+                            # expires and it re-queries. Resumes behind the
+                            # report's tier, ahead of ordinary waiters.
+                            report_yields += 1
+                            await lock.yield_to_preempt(lock.REPORT_YIELDED_PRIORITY)
+                            if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
+                                fail_rest(False)
+                                return
+                    if yields or report_yields:
+                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake "
+                                    f"{yields} time(s) and to a completion report {report_yields} time(s).")
                     if report_fut is not None:
                         # 2a: the burst ends when the radio is estimated to
                         # have finished the last queued fragment, not when

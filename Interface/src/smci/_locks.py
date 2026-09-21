@@ -52,6 +52,11 @@ class _PriorityAsyncLock:
     # the yielded exchange resumes ahead of everything but the handshakes
     # that pre-empted it (tiers are compared numerically; a float sorts).
     YIELDED_PRIORITY = 0.5
+    # Alpha 0.1.5 (item 6): the tier a raw window resumes at after yielding
+    # between two of its parts to a queued completion REPORT -- behind the
+    # report's own ANSWER tier (1), ahead of every ordinary waiter (2), so
+    # the report goes out and the window continues before anything else.
+    REPORT_YIELDED_PRIORITY = 1.5
 
     def __init__(self):
         self._locked = False
@@ -60,6 +65,11 @@ class _PriorityAsyncLock:
         # to pre-empt an idle holder, and the event an idle holder watches.
         self._preempt_waiters: set = set()
         self._preempt_event: "Optional[asyncio.Event]" = None
+        # Alpha 0.1.5 (item 6): a second class -- completion REPORTs this
+        # node owes the far sender -- that a raw window yields to between
+        # its parts (never inside a part's burst, never at the other idle
+        # points a handshake pre-empts).
+        self._report_waiters: set = set()
 
     def locked(self) -> bool:
         return self._locked
@@ -87,17 +97,23 @@ class _PriorityAsyncLock:
         if not self._preempt_waiters and self._preempt_event is not None:
             self._preempt_event.clear()
 
-    async def yield_to_preempt(self) -> None:
+    def report_requested(self) -> bool:
+        """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
+        return bool(self._report_waiters)
+
+    async def yield_to_preempt(self, resume_priority: Optional[float] = None) -> None:
         """Called by a holder at an idle point when `preempt_requested()`:
         hands the lock over and re-acquires it at YIELDED_PRIORITY, so
         the pre-empting handshake goes first and this exchange resumes
         before any ordinary waiter that queued meanwhile (review,
         2026-09-20: a plain release + re-acquire at NORMAL would splice a
-        whole other exchange into a raw burst)."""
+        whole other exchange into a raw burst). `resume_priority` lets a
+        holder yielding to a REPORT (item 6) resume behind the report's
+        tier instead."""
         self.release()
-        await self.acquire(self.YIELDED_PRIORITY)
+        await self.acquire(self.YIELDED_PRIORITY if resume_priority is None else resume_priority)
 
-    async def acquire(self, priority: int, preempt: bool = False) -> None:
+    async def acquire(self, priority: int, preempt: bool = False, report: bool = False) -> None:
         if not self._locked:
             self._locked = True
             return
@@ -105,6 +121,8 @@ class _PriorityAsyncLock:
         self._waiters.setdefault(priority, collections.deque()).append(fut)
         if preempt:
             self._preempt_add(fut)
+        if report:
+            self._report_waiters.add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -133,6 +151,8 @@ class _PriorityAsyncLock:
         finally:
             if preempt:
                 self._preempt_remove(fut)
+            if report:
+                self._report_waiters.discard(fut)
 
     def release(self) -> None:
         if not self._wake_next():
@@ -154,8 +174,8 @@ class _PriorityAsyncLock:
             del self._waiters[tier]
         return False
 
-    def __call__(self, priority: int, preempt: bool = False) -> "_PriorityLockContext":
-        return _PriorityLockContext(self, priority, preempt)
+    def __call__(self, priority: int, preempt: bool = False, report: bool = False) -> "_PriorityLockContext":
+        return _PriorityLockContext(self, priority, preempt, report)
 
 
 class _PriorityLockContext:
@@ -166,15 +186,16 @@ class _PriorityLockContext:
     `async with` block despite `acquire`/`release` being its own real
     methods."""
 
-    __slots__ = ("_lock", "_priority", "_preempt")
+    __slots__ = ("_lock", "_priority", "_preempt", "_report")
 
-    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False):
+    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False, report: bool = False):
         self._lock = lock
         self._priority = priority
         self._preempt = preempt
+        self._report = report
 
     async def __aenter__(self) -> None:
-        await self._lock.acquire(self._priority, preempt=self._preempt)
+        await self._lock.acquire(self._priority, preempt=self._preempt, report=self._report)
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._lock.release()
