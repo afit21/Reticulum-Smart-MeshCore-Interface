@@ -78,7 +78,7 @@ class _Scaffold(SingleNodeCase):
             self.node.radio.contacts.pop(k, None)
         self._refresh_contacts()
         for d in (iface._flood_routes_seen, iface._adopted_paths, iface._adoption_cooldown, iface._resolved_paths,
-                  iface._raw_windows, iface._direct_path_failures):
+                  iface._raw_windows, iface._direct_path_failures, iface._path_reset_at):
             d.pop(PEER, None)
 
     def _flood(self, ptype, path_hex, src=None, dst=None, adv_key=None, route=1):
@@ -211,6 +211,28 @@ class AdoptionScenario(_Scaffold):
         ev = [f for f in sink if f.get("event") == "path_adopted"]
         self.assertEqual((ev[0]["old_path_len"], ev[0]["new_path_len"]), (None, 1))
         self.assertEqual(self.node.radio.contacts[PEER_KEY]["out_path"], "6a")
+
+    def test_after_a_reset_only_routes_seen_since_the_reset_count(self):
+        # shortcut_appears, second run: a 571 s old two-hop route from before
+        # the topology changed was adopted after the reset and missed twice.
+        iface = self.iface
+        now = time.monotonic()
+        iface._note_flood_route(*self._flood(0, "e38b", src="34", dst="7b"), now - 300)
+        iface._path_reset_at[PEER] = now - 10
+        self.assertIsNone(self.node.run_on_loop(iface._maybe_adopt_shorter_path(PEER, None), timeout=10),
+                          "evidence from before the reset describes the topology that just failed")
+        iface._note_flood_route(*self._flood(0, "6a", src="34", dst="7b"), now - 5)
+        adopted = self.node.run_on_loop(iface._maybe_adopt_shorter_path(PEER, None), timeout=10)
+        self.assertEqual((adopted.out_path_hex, adopted.out_path_len), ("6a", 1))
+        iface._adopted_paths.pop(PEER, None)
+        # With a path still resolved, older evidence counts (the field case:
+        # the two-hop floods were three minutes older than the four-hop path).
+        iface._resolved_paths[PEER] = self._resolved("1976bed6")
+        iface._flood_routes_seen.pop(PEER, None)
+        iface._note_flood_route(*self._flood(0, "d619", src="34", dst="7b"), now - 200)
+        adopted = self.node.run_on_loop(iface._maybe_adopt_shorter_path(PEER, iface._resolved_paths[PEER]), timeout=10)
+        self.assertEqual(adopted.out_path_hex, "19d6")
+        iface._path_reset_at.pop(PEER, None)
 
     def _adopt(self):
         iface = self.iface

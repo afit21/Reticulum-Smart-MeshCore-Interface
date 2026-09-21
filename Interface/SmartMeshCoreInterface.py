@@ -4451,6 +4451,7 @@ class _PeerStateMixin:
         self._flood_routes_seen.pop(pubkey_prefix, None)   # item 3
         self._adopted_paths.pop(pubkey_prefix, None)
         self._adoption_cooldown.pop(pubkey_prefix, None)
+        self._path_reset_at.pop(pubkey_prefix, None)
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 
@@ -5340,16 +5341,19 @@ class _PathDiscoveryMixin:
         except Exception as exc:
             self._debug(f"flood route observer: ignored an rx-log record: {exc}")
 
-    def _shortest_flood_route(self, peer_prefix: str, now: float) -> "Optional[tuple]":
+    def _shortest_flood_route(self, peer_prefix: str, now: float, since: Optional[float] = None) -> "Optional[tuple]":
         """The shortest route seen on this peer's floods within
         `path_adopt_window` (pure over the recorded routes): (hops,
         reversed path hex, hash size, source, seen at), the most recent
-        among equals, excluding routes on adoption cooldown."""
+        among equals, excluding routes on adoption cooldown and, with
+        `since`, routes seen before that time."""
         window_s = max(0.0, self.path_adopt_window_s)
         cooldown = self._adoption_cooldown.get(peer_prefix, {})
         best = None
         for seen_at, hops, reversed_hex, hash_size, source in self._flood_routes_seen.get(peer_prefix, ()):
             if now - seen_at > window_s:
+                continue
+            if since is not None and seen_at < since:
                 continue
             if cooldown.get(reversed_hex, 0.0) > now:
                 continue
@@ -5372,13 +5376,21 @@ class _PathDiscoveryMixin:
         The no-path case is from MeshBench `shortcut_appears` (2026-09-21,
         first run): B's one-hop floods reached A 10 s AFTER A's own stale-
         path reset had forgotten the three-hop path, so the first cut stood
-        aside for discovery, which took 220 s more under its backoff."""
+        aside for discovery, which took 220 s more under its backoff. In
+        that case only routes seen AFTER the reset count (`_path_reset_at`):
+        the second run adopted a 571 s old two-hop route from before the
+        topology changed, missed twice and dropped it -- evidence older than
+        the failure describes the topology that just failed. With a path
+        still resolved, older evidence does count: the field's two-hop
+        floods were three minutes old when the four-hop path was
+        discovered, and were never refreshed in the 35 minutes after."""
         if not self.path_adopt_enabled:
             return resolved
         if peer_prefix in self._adopted_paths or peer_prefix in self._raw_windows:
             return resolved
         now = time.monotonic()
-        best = self._shortest_flood_route(peer_prefix, now)
+        since = self._path_reset_at.get(peer_prefix) if resolved is None else None
+        best = self._shortest_flood_route(peer_prefix, now, since=since)
         if best is None:
             return resolved
         hops, reversed_hex, hash_size, source, seen_at = best
@@ -5445,6 +5457,7 @@ class _PathDiscoveryMixin:
         now = time.monotonic()
         self._adoption_cooldown.setdefault(pubkey_prefix, {})[entry["path_hex"]] = now + max(0.0, self.path_adopt_window_s)
         self._resolved_paths.pop(pubkey_prefix, None)
+        self._path_reset_at[pubkey_prefix] = now
         self._direct_path_failures.pop(pubkey_prefix, None)
         self._invalidate_ack_rtt(pubkey_prefix, "adopted path dropped")
         RNS.log(
@@ -5583,6 +5596,7 @@ class _PathDiscoveryMixin:
         # again rather than retry a path already known to be dead.
         self._direct_path_failures.pop(pubkey_prefix, None)
         self._resolved_paths.pop(pubkey_prefix, None)
+        self._path_reset_at[pubkey_prefix] = time.monotonic()   # item 3: older flood routes describe the dead topology
         self._invalidate_ack_rtt(pubkey_prefix, "stale path reset")
 
         contact = self._resolve_contact(pubkey_prefix)
@@ -12178,6 +12192,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         self._flood_routes_seen = {}
         self._adopted_paths = {}
         self._adoption_cooldown = {}
+        self._path_reset_at = {}     # peer prefix -> when its path was last reset / dropped
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 

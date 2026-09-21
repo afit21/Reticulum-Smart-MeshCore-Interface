@@ -3576,3 +3576,12 @@ update together; parity stays on; aim for no wire change.
     route, the route is adopted (provisional, the same two-miss fallback)
     and discovery is skipped; `path_adopted` then carries `old_path_len`
     None. The scenario's check accepts that form.
+    Third cut, from the second run: A adopted a two-hop route (8be3) seen
+    571 s earlier, before B moved, missed twice and dropped it (the
+    fallback worked, at ~60 s), then discovery found the one-hop path. In
+    the no-path case only routes seen since the peer's last reset or drop
+    count (`_path_reset_at`): evidence older than the failure describes
+    the topology that just failed. With a path still resolved, older
+    evidence still counts -- the field's two-hop floods (11:02) were three
+    minutes older than the four-hop path (11:05) and never refreshed in
+    the 35 minutes after, which is the case the item exists for.

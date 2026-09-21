@@ -496,6 +496,7 @@ class _PeerStateMixin:
         self._flood_routes_seen.pop(pubkey_prefix, None)   # item 3
         self._adopted_paths.pop(pubkey_prefix, None)
         self._adoption_cooldown.pop(pubkey_prefix, None)
+        self._path_reset_at.pop(pubkey_prefix, None)
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 

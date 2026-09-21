@@ -864,6 +864,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         self._flood_routes_seen = {}
         self._adopted_paths = {}
         self._adoption_cooldown = {}
+        self._path_reset_at = {}     # peer prefix -> when its path was last reset / dropped
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 
