@@ -234,6 +234,8 @@ CONFIGURE_PATH_DISCOVERY = {
     'direct_path_reset_patience_multiplier': 3.0,
     'direct_path_reset_rssi_floor': -105.0,
     'direct_path_reset_threshold': 3,
+    'path_adopt_enabled': True,
+    'path_adopt_window_s': 600.0,
     'path_discovery_backoff_factor': 1.8,
     'path_discovery_base_cooldown_s': 20.0,
     'path_discovery_max_cooldown_s': 900.0,

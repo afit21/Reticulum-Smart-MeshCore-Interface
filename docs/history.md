@@ -3425,3 +3425,50 @@ update together; parity stays on; aim for no wire change.
     a report, the no-ACK frame's class by kind, a report queued during
     part one out before part two, a report queued inside part two waits
     for that part).
+
+ 3. **Shorter-path adoption from a peer's own floods** (`path_adopt_
+    enabled` yes, `path_adopt_window` 600 s, `PATH_ADOPT_MISS_LIMIT` 2;
+    `_reverse_flood_path`, `_attribute_flood_to_peer`, `_note_flood_route`,
+    `_shortest_flood_route`, `_maybe_adopt_shorter_path`, `_note_adopted_
+    path_result`; no wire change). The field, from 11:05: the desktop's
+    discovery returned a four-hop path (19 76 be d6) to the laptop while
+    the laptop reached the desktop in two (d6 19); three stale-path
+    resets rediscovered the same four hops; 35 minutes of proofs at 17 s
+    ACK timeouts and 50% success; and the desktop's radio log had the
+    laptop's floods arriving over the two-hop route the whole time
+    (`rx_log` FLOOD REQ from 34, `path` d619, 17 copies). Firmware
+    ground truth (`Mesh::routeRecvPacket`, `sendDirect`, `createPath
+    Return`): each relaying repeater appends its hash at the END of a
+    flood's path, a DIRECT frame consumes `path[0]` first, and the
+    firmware never reverses a path -- so the reverse of a received flood
+    path, same hash size, is a valid out_path to the originator (links
+    assumed symmetric, which is what the field asymmetry violates from
+    the other side). The rx-log tap now records, per bound peer, the
+    routes its floods took (an ADVERT by its full `adv_key`; a REQ /
+    RESPONSE / TEXT_MSG / PATH flood only when addressed to us and its
+    1-byte source hash matches exactly one bound peer and no other device
+    contact -- the rx-log window's own warning about promoting 1-byte
+    hashes to routing decisions is honoured with that stronger check).
+    In `_send_direct_packet`, the one resolved-vs-discover decision, a
+    route within the window at least one hop shorter than the resolved
+    path is adopted: set on the device contact with `change_contact_
+    path` (the library call discovery persists with, hash mode carried
+    from the flood), made the resolved path, RTT invalidated, captured
+    as `path_adopted` (old and new lengths, source). Not while a raw
+    window to the peer is in flight (its fragments are source-routed on
+    the old path). The adopted path is provisional: `record_direct_send_
+    result` confirms it on the first success (`path_adoption_confirmed`)
+    or, after two consecutive full-timeout send failures with no success,
+    drops it -- resolved path forgotten so the next send runs discovery
+    exactly as before, the route on cooldown for the window (`path_
+    adoption_failed`) -- without those failures counting towards the
+    ordinary stale-path detector, whose min-age and healthy-patience
+    guards would otherwise protect a fresh path far longer. Unit fake:
+    the ADVERT rx-log record now carries `adv_key` as the library's does.
+    MeshBench: new scenario `shortcut_appears` (`three_hop`'s chain,
+    probes from three hops, then B moved to +8 km E where R1-B is +11 dB
+    clear and A-B, R3-B blocked; hard check: A's capture shows a
+    `path_adopted` shorter than the old path and no `path_adoption_
+    failed`; the post-move `resolved` per probe is reported). Tests:
+    `tests/test_shorter_path_adoption_0921.py`; shipped-default pin and
+    golden config re-pinned for the two keys.

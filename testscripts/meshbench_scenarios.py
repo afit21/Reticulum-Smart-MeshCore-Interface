@@ -328,6 +328,22 @@ SCENARIOS = {
               "a ridge at ~51 km east blocked R3-B): found with `topology three_hop --place ...` on 2026-09-20 -- R2-R3 +16 dB, "
               "R3-B +12 dB, R1-R3 -6.7 dB, R2-B -6.6 dB, R1-B -16 dB.",
     ),
+    "shortcut_appears": Scenario(
+        "shortcut_appears", "three_hop chain; after --fail-after probes B moves to within one clear hop of R1 while A still holds the three-hop path: shorter-path adoption from B's own floods (alpha 0.1.5 item 3).",
+        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), rep("R3", 26, 16, mast=15), comp("B", 20.3, 21.7)],
+        must_link=[("A", "R1"), ("R1", "R2"), ("R2", "R3"), ("R3", "B")],
+        must_block=[("A", "R2"), ("R1", "R3"), ("R2", "B"), ("R1", "B"), ("A", "B")],
+        expected_hops=None, min_delivered=0.0, probes=10, start_after_paths=True,
+        actions=lambda args: [After(args.fail_after, "move", "B", {"east_km": 8.0, "north_km": 0.0})],
+        notes="The 2026-09-21 field asymmetry (the desktop held a four-hop path to the laptop for 35 minutes while the "
+              "laptop's floods arrived over two hops). Probes start at three hops; after --fail-after probes B is moved to "
+              "(+8 km E, 0 N): R1-B +11.2 dB grazing, A-B -6.2 dB blocked, R2-B +0.7 dB marginal, R3-B -10.1 dB blocked "
+              "(`topology three_hop --place B=8,0` on 2026-09-21), so a one-hop route via R1 exists while A holds R1,R2,R3. "
+              "Hard check: A's capture shows a `path_adopted` record (new path shorter than the old) and no "
+              "`path_adoption_failed`; informational: how many of A's path_resolved events after the move rediscovered "
+              "three hops (a stale-path reset + rediscovery, the old way), the hop count of A's sends after adoption. "
+              "Delivery is not asserted (B's own three-hop path to A dies with the move and it must reset and rediscover).",
+    ),
     "failover": Scenario(
         "failover", "A - R1 - B with R2 a cold standby; after --fail-after probes R1's firmware dies and R2's starts. "
                     "The path must be reset and rediscovered through a repeater the interface has never seen.",
@@ -1035,6 +1051,31 @@ def run_scenario(scenario: Scenario, args) -> int:
                       f"sender bound >= {scenario.min_bound_peers} peers (max seen {bound_max})")
                 check(non_small > 0, f"sender routed with small-mesh mode OFF ({non_small} sends outside small-mesh mode)")
                 measurements.update(bound_peers_max=bound_max, sends_outside_small_mesh=non_small)
+            if scenario.name == "shortcut_appears" and capture_dir:
+                recs = read_capture(capture_dir, scenario.sender)
+                adopted = [r for r in recs if r.get("event") == "path_adopted"]
+                failed = [r for r in recs if r.get("event") == "path_adoption_failed"]
+                confirmed = [r for r in recs if r.get("event") == "path_adoption_confirmed"]
+                check(bool(adopted) and all(r["new_path_len"] < r["old_path_len"] for r in adopted),
+                      f"sender adopted a shorter path from the responder's floods: "
+                      f"{[(r['old_path_len'], r['new_path_len'], r['source']) for r in adopted]}")
+                check(not failed, f"no adopted path was dropped for missing its first sends: {len(failed)}")
+                move = next((a for a in actions if a.action == "move"), None)
+                # Each probe event carries the sender's MeshCore out_path_len per peer
+                # (`resolved`); after the move the sequence shows when, and how, the
+                # sender left the three-hop path (adoption: no gap; reset +
+                # rediscovery: probes with an empty map in between).
+                after_move = [(p.get("seq"), sorted((p.get("resolved") or {}).values())) for p in plist
+                              if move is not None and move.fired_at_probe is not None and (p.get("seq") or 0) > move.fired_at_probe]
+                after_sends = [r.get("out_path_len") for r in recs if r.get("event") == "direct_send_result"
+                               and adopted and r.get("seq", 0) > adopted[0].get("seq", 0)]
+                measurements.update(path_adopted=[(r["old_path_len"], r["new_path_len"], r["source"]) for r in adopted],
+                                    path_adoption_confirmed=len(confirmed), path_adoption_failed=len(failed),
+                                    sender_resolved_after_move=after_move,
+                                    sender_out_path_len_after_adoption=dict(collections.Counter(after_sends)))
+                log(f"info  adoption: {measurements['path_adopted']} confirmed {len(confirmed)}; sender's out_path_len per "
+                    f"probe after the move {after_move}; sends after adoption by out_path_len "
+                    f"{measurements['sender_out_path_len_after_adoption']}")
             for name in repeaters:
                 stopped_forever = any(a.action == "stop" and a.node == name and not any(
                     b.action == "start" and b.node == name for b in actions) for a in actions)

@@ -387,6 +387,10 @@ class _DirectSendMixin:
         table can cause -- see path_discovery_spec.md's persistence
         note)."""
         resolved = self._resolved_paths.get(peer_prefix)
+        # Alpha 0.1.5 (item 3): a shorter route seen on the peer's own floods
+        # replaces a longer resolved path here, inside the one place that
+        # decides resolved-versus-discover, never beside it.
+        resolved = await self._maybe_adopt_shorter_path(peer_prefix, resolved)
         if resolved is None:
             # Milestone 6: docs/reliability_engine_design.md §8's "next
             # send attempt for this peer goes through discover_path()

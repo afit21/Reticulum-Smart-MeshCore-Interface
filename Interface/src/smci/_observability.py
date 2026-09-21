@@ -865,6 +865,8 @@ class _ObservabilityMixin:
             fields["medium_busy_remaining_s"] = round(self._medium_busy_remaining_s(now), 3)
             if self._rx_log_window is not None:
                 self._classify_rx_log_for_window(fields, now)
+            # Alpha 0.1.5 (item 3): a bound peer's flood shows a route to it.
+            self._note_flood_route(payload, fields, now)
             if self._packet_capture_file is None and not self.debug_logs:
                 return
             if self._packet_capture_file is not None:

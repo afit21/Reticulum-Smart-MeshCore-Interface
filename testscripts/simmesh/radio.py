@@ -543,6 +543,12 @@ class SimRadio:
             "payload_length": packet.size, "pkt_payload": pkt_payload,
             "pkt_hash": int(packet.pkt_id[:8], 16), "recv_time": int(time.time()),
         }
+        if packet.ptype == PTYPE_ADVERT:
+            # The library's parser exposes the advert's cleartext pubkey as
+            # `adv_key` (meshcore_parser.py); the interface's shorter-path
+            # adoption (alpha 0.1.5 item 3) attributes flood adverts by it.
+            payload["adv_key"] = packet.body.get("pubkey", "")
+            payload["adv_name"] = packet.body.get("name", "")
         self._push_event("RX_LOG_DATA", payload, {
             "route_type": payload["route_type"], "payload_type": packet.ptype,
             "path_len": len(packet.path), "path": path_hex, "recv_time": payload["recv_time"],

@@ -1634,6 +1634,30 @@ class _ConfigMixin:
         self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 20.0))
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
         self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 1.8))
+        # Alpha 0.1.5 (item 3, 2026-09-21): shorter-path adoption. A bound
+        # peer's flood packets (its adverts; its path-discovery and text
+        # floods addressed to us) carry the route they took -- each relaying
+        # repeater appends its hash (`Mesh::routeRecvPacket`) -- and the
+        # reverse of that route is a route to the peer. When the peer's
+        # current out_path is at least one hop longer than the shortest
+        # route its floods showed within `path_adopt_window`, that reversed
+        # route is set on the contact (`change_contact_path`, the same
+        # library call discovery persists with) and used, instead of running
+        # discovery. The field: from 11:05 on 2026-09-21 the desktop's
+        # discovery returned a four-hop path (19 76 be d6) to the laptop
+        # while the laptop reached the desktop in two (d6 19), three stale-
+        # path resets rediscovered the same four hops, and the desktop's
+        # radio log had seen the laptop's floods arrive over the two-hop
+        # route (`path` d619) the whole time -- 35 minutes of 17 s ACK
+        # timeouts at 50 % success. An adopted path is provisional: if it
+        # misses its first PATH_ADOPT_MISS_LIMIT sends it is dropped, put on
+        # cooldown for the window, and the next send goes through discovery
+        # as before. Attribution is conservative: an advert by its full
+        # key; an addressed flood only when it is addressed to us and its
+        # 1-byte source hash matches exactly one bound peer and no other
+        # contact on the device. No wire change.
+        self.path_adopt_enabled = _cfg_bool(cfg.get("path_adopt_enabled", "yes"))
+        self.path_adopt_window_s = float(cfg.get("path_adopt_window", 600.0))
 
         # Stale cached-DIRECT-path detection (§8). Built and unit-tested in
         # Milestone 4; since Milestone 5 every live DIRECT send path feeds it
@@ -3048,6 +3072,8 @@ class _ObservabilityMixin:
             fields["medium_busy_remaining_s"] = round(self._medium_busy_remaining_s(now), 3)
             if self._rx_log_window is not None:
                 self._classify_rx_log_for_window(fields, now)
+            # Alpha 0.1.5 (item 3): a bound peer's flood shows a route to it.
+            self._note_flood_route(payload, fields, now)
             if self._packet_capture_file is None and not self.debug_logs:
                 return
             if self._packet_capture_file is not None:
@@ -4292,6 +4318,9 @@ class _PeerStateMixin:
         # Alpha 0.1.5 (2b): a held complete report for this sender.
         self._cancel_sender_report(pubkey_prefix)
         self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
+        self._flood_routes_seen.pop(pubkey_prefix, None)   # item 3
+        self._adopted_paths.pop(pubkey_prefix, None)
+        self._adoption_cooldown.pop(pubkey_prefix, None)
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 
@@ -5104,6 +5133,191 @@ class _PathDiscoveryMixin:
                 RNS.LOG_WARNING,
             )
 
+    # -- Shorter-path adoption (alpha 0.1.5, item 3) -----------------------
+    # A bound peer's floods carry the route they took; the reverse is a
+    # route to the peer. `_note_flood_route` (from the rx-log tap) records
+    # them per peer, `_maybe_adopt_shorter_path` (from `_send_direct_
+    # packet`, the one resolved-vs-discover decision) adopts a route at
+    # least one hop shorter than the resolved path, `_note_adopted_path_
+    # result` (from `record_direct_send_result`) drops a provisional path
+    # that misses its first PATH_ADOPT_MISS_LIMIT sends.
+
+    @staticmethod
+    def _reverse_flood_path(path_hex: str, hash_size: int = 1) -> str:
+        """The route back along a flood's recorded path (pure): the hashes
+        in reverse order, `hash_size` bytes each. The firmware appends each
+        relaying repeater's hash at the end (`Mesh::routeRecvPacket`), and
+        `sendDirect` consumes `path[0]` first, so the reverse is exactly the
+        out_path a DIRECT frame to the originator needs. Never reversed by
+        the firmware itself: a PATH return carries the received path
+        unreversed to its originator, for whom it is already forward."""
+        size = max(1, int(hash_size)) * 2
+        chunks = [path_hex[i:i + size] for i in range(0, len(path_hex) - len(path_hex) % size, size)]
+        return "".join(reversed(chunks))
+
+    def _attribute_flood_to_peer(self, payload: dict, fields: dict) -> "Optional[tuple]":
+        """Which bound peer originated this overheard FLOOD, and how
+        ("advert" / "addressed"), or None. Conservative on purpose (the
+        rx-log window's docstring forbids promoting the 1-byte hashes to a
+        routing decision without a stronger check): an ADVERT names its
+        full public key in the clear; a REQ / RESPONSE / TEXT_MSG / PATH
+        flood is attributed only when it is addressed to THIS node
+        (`dst_hash` is our own first byte) and its 1-byte source hash
+        matches exactly one bound peer and no other contact on the
+        device."""
+        if fields.get("route_type") not in self._RX_LOG_ROUTE_FLOOD:
+            return None
+        ptype = fields.get("payload_type")
+        if ptype == self._RX_LOG_PAYLOAD_TYPE_ADVERT:
+            key = str(payload.get("adv_key") or "").lower()
+            if len(key) >= 12 and key[:12] in self._peers:
+                return key[:12], "advert"
+            return None
+        if ptype in self._RX_LOG_ADDRESSED_PAYLOAD_TYPES:
+            own = (self._own_pubkey_hex or "")[:2].lower()
+            src, dst = fields.get("src_hash"), fields.get("dst_hash")
+            if not own or not src or dst != own:
+                return None
+            candidates = [p for p in self._peers if p[:2].lower() == src]
+            if len(candidates) != 1:
+                return None
+            contacts = self._mc.contacts if self._mc is not None and getattr(self._mc, "contacts", None) else {}
+            others = [k for k in contacts if str(k)[:2].lower() == src and not str(k).lower().startswith(candidates[0])]
+            if others:
+                return None
+            return candidates[0], "addressed"
+        return None
+
+    def _note_flood_route(self, payload: dict, fields: dict, now: float) -> None:
+        """Record the route an overheard flood from a bound peer took (cheap:
+        runs inline on the rx-log tap). Every copy of a flood is logged --
+        one per repeater that relayed it -- so the shortest within the
+        window, not the first, is what adoption reads."""
+        if not self.path_adopt_enabled:
+            return
+        try:
+            who = self._attribute_flood_to_peer(payload, fields)
+            if who is None:
+                return
+            peer_prefix, source = who
+            hops = int(fields.get("path_len") or 0)
+            hash_size = int(payload.get("path_hash_size") or 1)
+            reversed_hex = self._reverse_flood_path(str(fields.get("path") or ""), hash_size)
+            if hops > 0 and len(reversed_hex) != hops * hash_size * 2:
+                return
+            routes = self._flood_routes_seen.setdefault(peer_prefix, collections.deque(maxlen=self.FLOOD_ROUTES_KEPT))
+            routes.append((now, hops, reversed_hex, hash_size, source))
+        except Exception as exc:
+            self._debug(f"flood route observer: ignored an rx-log record: {exc}")
+
+    def _shortest_flood_route(self, peer_prefix: str, now: float) -> "Optional[tuple]":
+        """The shortest route seen on this peer's floods within
+        `path_adopt_window` (pure over the recorded routes): (hops,
+        reversed path hex, hash size, source, seen at), the most recent
+        among equals, excluding routes on adoption cooldown."""
+        window_s = max(0.0, self.path_adopt_window_s)
+        cooldown = self._adoption_cooldown.get(peer_prefix, {})
+        best = None
+        for seen_at, hops, reversed_hex, hash_size, source in self._flood_routes_seen.get(peer_prefix, ()):
+            if now - seen_at > window_s:
+                continue
+            if cooldown.get(reversed_hex, 0.0) > now:
+                continue
+            if best is None or hops < best[0] or (hops == best[0] and seen_at > best[4]):
+                best = (hops, reversed_hex, hash_size, source, seen_at)
+        return best
+
+    async def _maybe_adopt_shorter_path(self, peer_prefix: str, resolved: "Optional[_ResolvedPath]"):
+        """Adopt the shortest flood route to `peer_prefix` when it is at
+        least one hop shorter than the resolved path: set it on the device
+        contact (`change_contact_path`, as discovery persists), make it the
+        resolved path (provisional), and return it. Otherwise return
+        `resolved` unchanged. Not while a raw window to the peer is in
+        flight (its fragments are source-routed on the old path and a
+        change mid-send aborts it), and not while an earlier adoption is
+        still provisional."""
+        if not self.path_adopt_enabled or resolved is None:
+            return resolved
+        if peer_prefix in self._adopted_paths or peer_prefix in self._raw_windows:
+            return resolved
+        now = time.monotonic()
+        best = self._shortest_flood_route(peer_prefix, now)
+        if best is None:
+            return resolved
+        hops, reversed_hex, hash_size, source, seen_at = best
+        if hops > max(0, resolved.out_path_len) - 1:
+            return resolved
+        contact = self._resolve_contact(peer_prefix)
+        if contact is None:
+            return resolved
+        adopted = _ResolvedPath(out_path_hex=reversed_hex, out_path_len=hops, out_path_hash_len=hash_size, resolved_at=now)
+        previous = resolved
+        self._resolved_paths[peer_prefix] = adopted
+        self._adopted_paths[peer_prefix] = {
+            "path_hex": reversed_hex, "previous": previous, "misses": 0, "adopted_at": now, "source": source,
+        }
+        self._direct_path_failures.pop(peer_prefix, None)
+        self._invalidate_ack_rtt(peer_prefix, "shorter path adopted")
+        RNS.log(
+            f"{self}: adopted a shorter path to {peer_prefix!r} from its own {source} flood: "
+            f"{reversed_hex or '<zero-hop>'} ({hops} hop(s)) replaces {previous.out_path_hex or '<zero-hop>'} "
+            f"({previous.out_path_len} hop(s)), seen {now - seen_at:.0f}s ago; provisional until it delivers.",
+            RNS.LOG_INFO,
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", {
+                "event": "path_adopted", "peer_prefix": peer_prefix, "source": source,
+                "old_path_len": previous.out_path_len, "old_path_hex": previous.out_path_hex,
+                "new_path_len": hops, "new_path_hex": reversed_hex, "seen_age_s": round(now - seen_at, 1),
+            })
+        await self._persist_resolved_path(contact, adopted)
+        return adopted
+
+    def _note_adopted_path_result(self, pubkey_prefix: str, succeeded: bool, waited_full_timeout: bool) -> bool:
+        """Bookkeeping for a provisional adopted path, from `record_direct_
+        send_result`. Returns True when the failure was consumed here (the
+        adopted path was dropped and the ordinary detector should not count
+        it). A success confirms the adoption; PATH_ADOPT_MISS_LIMIT
+        consecutive full-timeout failures before any success drop it: the
+        route goes on cooldown for the window, the resolved path is
+        forgotten so the next send runs discovery, exactly as before the
+        adoption."""
+        entry = self._adopted_paths.get(pubkey_prefix)
+        if entry is None:
+            return False
+        resolved = self._resolved_paths.get(pubkey_prefix)
+        if resolved is None or resolved.out_path_hex != entry["path_hex"]:
+            self._adopted_paths.pop(pubkey_prefix, None)
+            return False
+        if succeeded:
+            self._adopted_paths.pop(pubkey_prefix, None)
+            if self._packet_capture_file is not None:
+                self._capture_event("out", {"event": "path_adoption_confirmed", "peer_prefix": pubkey_prefix,
+                                            "path_len": resolved.out_path_len, "path_hex": resolved.out_path_hex,
+                                            "after_s": round(time.monotonic() - entry["adopted_at"], 1)})
+            return False
+        if not waited_full_timeout:
+            return False
+        entry["misses"] += 1
+        if entry["misses"] < self.PATH_ADOPT_MISS_LIMIT:
+            return True
+        self._adopted_paths.pop(pubkey_prefix, None)
+        now = time.monotonic()
+        self._adoption_cooldown.setdefault(pubkey_prefix, {})[entry["path_hex"]] = now + max(0.0, self.path_adopt_window_s)
+        self._resolved_paths.pop(pubkey_prefix, None)
+        self._direct_path_failures.pop(pubkey_prefix, None)
+        self._invalidate_ack_rtt(pubkey_prefix, "adopted path dropped")
+        RNS.log(
+            f"{self}: adopted path {entry['path_hex'] or '<zero-hop>'} to {pubkey_prefix!r} missed its first "
+            f"{entry['misses']} send(s) -- dropped; the next send goes through path discovery.",
+            RNS.LOG_WARNING,
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", {"event": "path_adoption_failed", "peer_prefix": pubkey_prefix,
+                                        "path_hex": entry["path_hex"], "misses": entry["misses"],
+                                        "previous_path_len": entry["previous"].out_path_len})
+        return True
+
     # -- Stale cached-path detection and reset (§8) ------------------------
 
     def record_direct_send_result(
@@ -5144,6 +5358,10 @@ class _PathDiscoveryMixin:
         feed this floor honestly. Left as configured/tested-but-unreached
         rather than deleted or faked with a converted value that hasn't
         been validated against real hardware."""
+        # Alpha 0.1.5 (item 3): a provisional adopted path keeps its own
+        # two-miss rule; a failure it consumed is not the detector's.
+        if self._note_adopted_path_result(pubkey_prefix, succeeded, waited_full_timeout):
+            return
         if succeeded:
             self._direct_path_failures.pop(pubkey_prefix, None)
             # Field fix (2026-09-19): remember that this path just worked --
@@ -5637,6 +5855,10 @@ class _DirectSendMixin:
         table can cause -- see path_discovery_spec.md's persistence
         note)."""
         resolved = self._resolved_paths.get(peer_prefix)
+        # Alpha 0.1.5 (item 3): a shorter route seen on the peer's own floods
+        # replaces a longer resolved path here, inside the one place that
+        # decides resolved-versus-discover, never beside it.
+        resolved = await self._maybe_adopt_shorter_path(peer_prefix, resolved)
         if resolved is None:
             # Milestone 6: docs/reliability_engine_design.md §8's "next
             # send attempt for this peer goes through discover_path()
@@ -11777,6 +11999,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Alpha 0.1.5 (item 5): peer prefix -> recent raw part arrival times
         # (monotonic), the window collect's inter-part spacing estimate.
         self._raw_part_arrivals = {}
+        # Alpha 0.1.5 (item 3): peer prefix -> recent flood routes seen from
+        # that peer (monotonic time, hops, reversed path hex, hash size,
+        # source); peer prefix -> the provisional adopted path's bookkeeping;
+        # peer prefix -> {path hex: cooldown until} for routes that failed.
+        self._flood_routes_seen = {}
+        self._adopted_paths = {}
+        self._adoption_cooldown = {}
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 
@@ -12412,6 +12641,11 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     _TXT_MSG_FIXED_OVERHEAD_BYTES = 2 + 1 + 1 + 2
     _TXT_MSG_PLAINTEXT_OVERHEAD_BYTES = 4 + 1 + 1
 
+    # Alpha 0.1.5 (item 3): an adopted path that misses this many sends in
+    # a row before its first success is dropped for discovery.
+    PATH_ADOPT_MISS_LIMIT = 2
+    FLOOD_ROUTES_KEPT = 16
+    _RX_LOG_PAYLOAD_TYPE_ADVERT = 4
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT
     _RX_LOG_ACK_BEARING_TYPES = {0, 2}  # REQ, TEXT_MSG -- the receiver answers with an ACK (or PATH when flooded)

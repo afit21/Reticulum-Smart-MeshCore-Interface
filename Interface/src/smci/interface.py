@@ -850,6 +850,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Alpha 0.1.5 (item 5): peer prefix -> recent raw part arrival times
         # (monotonic), the window collect's inter-part spacing estimate.
         self._raw_part_arrivals = {}
+        # Alpha 0.1.5 (item 3): peer prefix -> recent flood routes seen from
+        # that peer (monotonic time, hops, reversed path hex, hash size,
+        # source); peer prefix -> the provisional adopted path's bookkeeping;
+        # peer prefix -> {path hex: cooldown until} for routes that failed.
+        self._flood_routes_seen = {}
+        self._adopted_paths = {}
+        self._adoption_cooldown = {}
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 
@@ -1485,6 +1492,11 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     _TXT_MSG_FIXED_OVERHEAD_BYTES = 2 + 1 + 1 + 2
     _TXT_MSG_PLAINTEXT_OVERHEAD_BYTES = 4 + 1 + 1
 
+    # Alpha 0.1.5 (item 3): an adopted path that misses this many sends in
+    # a row before its first success is dropped for discovery.
+    PATH_ADOPT_MISS_LIMIT = 2
+    FLOOD_ROUTES_KEPT = 16
+    _RX_LOG_PAYLOAD_TYPE_ADVERT = 4
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT
     _RX_LOG_ACK_BEARING_TYPES = {0, 2}  # REQ, TEXT_MSG -- the receiver answers with an ACK (or PATH when flooded)
