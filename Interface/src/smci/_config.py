@@ -522,6 +522,17 @@ class _ConfigMixin:
         # burst of airtime for nothing.
         self.direct_raw_reconcile_rounds = max(1, min(4, int(cfg.get("direct_raw_reconcile_rounds", 3))))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
+        # Alpha 0.1.6 (item 2, 2026-09-22): through repeaters a window's
+        # rounds are capped lower than `direct_raw_reconcile_rounds` (which
+        # zero hop keeps). Every round at two hops is a burst (three
+        # fragments at ~0.9 s plus 4.5 s gaps), a report wait and up to two
+        # QUERY exchanges of ~18 s each, and the 2026-09-21 session's
+        # two-hop windows ran all three while link proofs and answers
+        # queued behind them (23 sends waited more than 30 s for the
+        # radio). After this many rounds the window falls back to the
+        # existing text path (per-fragment ACKs) or fails, exactly as it
+        # does when the rounds are exhausted today. 0: no separate cap.
+        self.direct_raw_window_max_rounds = max(0, int(cfg.get("direct_raw_window_max_rounds", 2)))
         # Receiver-initiated completion report (2026-09-20, module docstring
         # entry of that date). After a raw burst the sender used to key its
         # reconcile QUERY the instant the last fragment's gap ended -- which

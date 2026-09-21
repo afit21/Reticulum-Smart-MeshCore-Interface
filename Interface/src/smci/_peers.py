@@ -494,6 +494,7 @@ class _PeerStateMixin:
         self._cancel_sender_report(pubkey_prefix)
         self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
         self._path_boards.pop(pubkey_prefix, None)   # alpha 0.1.6 item 1: the path scoreboard
+        self._pending_link_proofs.pop(pubkey_prefix, None)   # alpha 0.1.6 item 2
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 
@@ -720,6 +721,9 @@ class _PeerStateMixin:
             link_id = self._compute_link_id(data)
             if link_id is not None:
                 self._learn_rns_token(link_id, sender_peer_prefix)
+                # Alpha 0.1.6 (item 2): the peer asked again -- any LRPROOF
+                # still pending for its earlier link is pure airtime.
+                self._supersede_link_proofs(sender_peer_prefix, link_id)
                 self._debug(
                     f"_observe_incoming_rns_packet: LINKREQUEST from {sender_peer_prefix!r} -- "
                     f"learned link_id {link_id.hex()} -> {sender_peer_prefix!r} for the LRPROOF reply."

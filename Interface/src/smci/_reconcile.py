@@ -704,6 +704,21 @@ class _ReconcileMixin:
             if slot_held:
                 slot.release()
 
+    @staticmethod
+    def _raw_window_rounds_rule(reconcile_rounds: int, max_rounds_relayed: int, hops: int) -> int:
+        """Burst-and-reconcile rounds a window gets (pure, alpha 0.1.6 item
+        2): `reconcile_rounds` at zero hop; through repeaters the smaller
+        of that and `max_rounds_relayed` (0: no separate cap). The field's
+        two-hop windows ran three rounds of a burst, a report wait and up
+        to two ~18 s QUERY exchanges each while link proofs waited."""
+        rounds = max(1, int(reconcile_rounds))
+        if hops >= 1 and max_rounds_relayed > 0:
+            rounds = max(1, min(rounds, int(max_rounds_relayed)))
+        return rounds
+
+    def _raw_window_rounds(self, gap_hops: int) -> int:
+        return self._raw_window_rounds_rule(self.direct_raw_reconcile_rounds, self.direct_raw_window_max_rounds, gap_hops)
+
     async def _run_raw_window_rounds(self, window, parts, path: bytes, own_prefix: str, hop_count, priority: int, gap_hops: int) -> None:
         peer_prefix, target = window.peer_prefix, window.target
         self._debug(
@@ -727,7 +742,7 @@ class _ReconcileMixin:
                 if not p.future.done():
                     p.future.set_result(value)
 
-        rounds = max(1, self.direct_raw_reconcile_rounds)
+        rounds = self._raw_window_rounds(gap_hops)
         query_unanswered_rounds = 0
         empty_answered_bursts = 0
         burst_allowed = True

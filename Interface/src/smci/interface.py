@@ -290,6 +290,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # Wire shape: "Q" + Z85([ver:1][type:1][complete:1][pkt_id_hi:1]
     # [pkt_id_lo:1][frag_total:1]), 6 raw bytes -> 10 characters on the
     # wire, comfortably one DIRECT bare message under any realistic budget.
+    LRPROOF_KEY_PREFIX = b"LRP:"   # the answered-send key of an LRPROOF is this + its link_id (alpha 0.1.6 item 2)
     COMPLETION_MARKER = "Q"
     # Step 3 (2026-09-18): v2 ANSWER frames append a have-bitmap
     # (ceil(frag_total/8) bytes, bit i set = receiver holds frag_idx i)
@@ -841,6 +842,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # See _answered_send_key / _signal_send_answered.
         self._send_answered_events = {}
         self._send_answered_at = {}
+        self._send_answered_how = {}      # key -> how it was answered ("superseded" is a drop, alpha 0.1.6 item 2)
+        # Alpha 0.1.6 (item 2): peer prefix -> {link_id} of LRPROOFs queued
+        # or in flight to that peer (`_supersede_link_proofs`).
+        self._pending_link_proofs = {}
         # Phase 1 (2026-09-20): destination_hash -> (announce bytes as
         # received, time.monotonic(), source peer prefix) for every ANNOUNCE
         # a bound peer delivered to RNS through this interface (LRU,

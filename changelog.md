@@ -9,7 +9,7 @@ nodes must run alpha 0.1.6.** The dated design record is `docs/history.md` ("Alp
 MeshBench results per item are at the end of this section. New config keys, all optional (defaults
 shown): `path_selection_enabled = yes` (the old `path_adopt_enabled` is accepted as an alias),
 `path_weak_snr_db = 3.0`, `path_switch_after_misses = 2`, `path_switch_margin = 0.25`,
-`path_switch_cooldown = 120`. Removed: `path_adopt_window`. Every default is pinned by
+`path_switch_cooldown = 120`, `direct_raw_window_max_rounds = 2`. Removed: `path_adopt_window`. Every default is pinned by
 `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`; the wire golden gained the
 v5 cases (the v4 cases are byte-identical under their new names).
 
@@ -35,6 +35,16 @@ v5 cases (the v4 cases are byte-identical under their new names).
   candidate's score). Tests: `tests/test_path_selection_0922.py` (the pure rules, the field replay
   from `tests/fixtures/field_0921_desktop_22h.json`, the v5 codec, the scoreboard on the fake node).
   MeshBench: `shortcut_appears`'s hard check reads `path_selected`; new scenario `weak_direct`.
+- **Bounded multi-hop window hold** (new key `direct_raw_window_max_rounds = 2`). Through repeaters a
+  raw window runs at most two burst-and-reconcile rounds (zero hop keeps `direct_raw_reconcile_rounds`,
+  3) before falling back to the text path or failing; a newer LINKREQUEST from a peer supersedes the
+  LRPROOF still pending for its earlier link (no further attempts, an in-flight ACK wait cut, captured
+  as `superseded` / `lrproof_superseded`, not path evidence); and the QUERY's quiet hold yields to a
+  queued completion report as it already did to a handshake. Field motivation: at two hops 23 sends
+  waited more than 30 s for the radio (worst 182 s), and at 22:25-22:28 answers and reports waited
+  50-125 s behind six LRPROOFs of four 11 s attempts each for links MeshChat had already re-requested.
+  The window's between-parts yields and its release before every QUERY round were already
+  hop-independent; they are now pinned at two hops. Tests: `tests/test_multihop_window_hold_0922.py`.
 - **"Q" protocol v5.** Every QUERY, ANSWER and REPORT carries the sender's current path length to
   the receiver and its measured delivery rate on it (two header bytes, 0xFF unknown); the receiver
   adds a reported zero-hop path as a candidate and uses the reported rate as the prior for untried

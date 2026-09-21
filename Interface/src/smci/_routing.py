@@ -777,17 +777,34 @@ class _RoutingMixin:
     async def _send_delayed_link_proof(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
     ) -> None:
-        await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
-        if self.detached or not self.online:
-            return
-        inner: list = []
-        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
-        # Finish everything the dispatch spawned before this task ends, so
-        # the packet's in-flight entry (released when THIS task finishes)
-        # really covers the whole send.
-        live = [t for t in inner if t is not None]
-        if live:
-            await asyncio.gather(*live, return_exceptions=True)
+        # Alpha 0.1.6 (item 2): registered for supersession for the whole
+        # delay and send, so a newer LINKREQUEST from the peer expires it.
+        link_id = bytes(header.destination_hash) if header.destination_hash else None
+        peer = self._rns_token_peer.get(header.destination_hash) if link_id is not None else None
+        if peer is not None:
+            self._pending_link_proofs.setdefault(peer, set()).add(link_id)
+        try:
+            await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
+            if self.detached or not self.online:
+                return
+            if peer is not None and self._send_superseded(self.LRPROOF_KEY_PREFIX + link_id):
+                self._capture_outgoing(header, data, "lrproof_superseded")
+                return
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            # Finish everything the dispatch spawned before this task ends, so
+            # the packet's in-flight entry (released when THIS task finishes)
+            # really covers the whole send.
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if peer is not None:
+                pending = self._pending_link_proofs.get(peer)
+                if pending is not None:
+                    pending.discard(link_id)
+                    if not pending:
+                        self._pending_link_proofs.pop(peer, None)
 
     async def _dispatch_outgoing_packet(
         self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,

@@ -34,6 +34,7 @@ In short, this version lets you send LXMF messages and browse NomadNet sites ove
 New in alpha 0.1.6 (**wire change: both nodes must run alpha 0.1.6** -- the fragment-reconciliation frames now carry each node's view of its path to the other):
 
 - path selection by measured reliability replaces shorter-path adoption: every route a node learns to a peer (discovered, seen on the peer's own floods, direct, or reported by the peer) is scored by airtime per delivered byte from its measured delivery rate, a delivering path is kept, a path that misses twice is trialled against the best alternative, and a weak direct signal is scored below a repeater path (`path_selection_enabled`, `path_weak_snr_db`, `path_switch_after_misses`, `path_switch_margin`, `path_switch_cooldown`; `path_adopt_window` is gone, `path_adopt_enabled` still works as an alias).
+- through repeaters a fragment window runs at most two reconcile rounds before falling back (`direct_raw_window_max_rounds`), a link proof the other side has already re-requested is dropped instead of retried, and a completion report owed to the other side also goes out during a reconcile query's quiet hold -- link handshakes at two hops no longer wait a minute or more for the radio.
 
 New in alpha 0.1.5 (no wire change from 0.1.4; both nodes should still run the same build):
 

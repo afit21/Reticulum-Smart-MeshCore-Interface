@@ -1472,6 +1472,17 @@ class _ConfigMixin:
         # burst of airtime for nothing.
         self.direct_raw_reconcile_rounds = max(1, min(4, int(cfg.get("direct_raw_reconcile_rounds", 3))))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
+        # Alpha 0.1.6 (item 2, 2026-09-22): through repeaters a window's
+        # rounds are capped lower than `direct_raw_reconcile_rounds` (which
+        # zero hop keeps). Every round at two hops is a burst (three
+        # fragments at ~0.9 s plus 4.5 s gaps), a report wait and up to two
+        # QUERY exchanges of ~18 s each, and the 2026-09-21 session's
+        # two-hop windows ran all three while link proofs and answers
+        # queued behind them (23 sends waited more than 30 s for the
+        # radio). After this many rounds the window falls back to the
+        # existing text path (per-fragment ACKs) or fails, exactly as it
+        # does when the rounds are exhausted today. 0: no separate cap.
+        self.direct_raw_window_max_rounds = max(0, int(cfg.get("direct_raw_window_max_rounds", 2)))
         # Receiver-initiated completion report (2026-09-20, module docstring
         # entry of that date). After a raw burst the sender used to key its
         # reconcile QUERY the instant the last fragment's gap ended -- which
@@ -4569,6 +4580,7 @@ class _PeerStateMixin:
         self._cancel_sender_report(pubkey_prefix)
         self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
         self._path_boards.pop(pubkey_prefix, None)   # alpha 0.1.6 item 1: the path scoreboard
+        self._pending_link_proofs.pop(pubkey_prefix, None)   # alpha 0.1.6 item 2
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 
@@ -4795,6 +4807,9 @@ class _PeerStateMixin:
             link_id = self._compute_link_id(data)
             if link_id is not None:
                 self._learn_rns_token(link_id, sender_peer_prefix)
+                # Alpha 0.1.6 (item 2): the peer asked again -- any LRPROOF
+                # still pending for its earlier link is pure airtime.
+                self._supersede_link_proofs(sender_peer_prefix, link_id)
                 self._debug(
                     f"_observe_incoming_rns_packet: LINKREQUEST from {sender_peer_prefix!r} -- "
                     f"learned link_id {link_id.hex()} -> {sender_peer_prefix!r} for the LRPROOF reply."
@@ -6325,6 +6340,13 @@ class _DirectSendMixin:
             return None
         if header.packet_type == RNS.Packet.LINKREQUEST:
             return self._compute_link_id(data)
+        if header.packet_type == RNS.Packet.PROOF and header.context == RNS.Packet.LRPROOF \
+                and header.destination_hash:
+            # Alpha 0.1.6 (item 2): an LRPROOF is keyed by its link_id so a
+            # newer LINKREQUEST from the same peer can supersede it
+            # (`_supersede_link_proofs`); its retries stop like an answered
+            # send's, but as a drop, not a success.
+            return self.LRPROOF_KEY_PREFIX + bytes(header.destination_hash)
         if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
                 and header.destination_type == RNS.Destination.SINGLE):
             # Review (2026-09-20): every plain DATA to a SINGLE destination,
@@ -6346,6 +6368,7 @@ class _DirectSendMixin:
             event = asyncio.Event()
             if key in self._send_answered_at:
                 event.set()
+            event.superseded = self._send_answered_how.get(key) == "superseded"
             self._send_answered_events[key] = (event, time.monotonic())
             return event
         return entry[0]
@@ -6370,10 +6393,48 @@ class _DirectSendMixin:
         if key is None:
             return
         self._send_answered_at[key] = (time.monotonic(), sender_peer_prefix)
+        self._send_answered_how[key] = how
         entry = self._send_answered_events.get(key)
         if entry is not None and not entry[0].is_set():
+            entry[0].superseded = how == "superseded"
             entry[0].set()
             self._debug(f"send {key.hex()} answered ({how}) while its retry loop was live -- no further attempts.")
+
+    def _send_superseded(self, key: Optional[bytes]) -> bool:
+        """Whether the send with this key was superseded (alpha 0.1.6 item 2:
+        an LRPROOF whose peer has since sent a newer LINKREQUEST) rather
+        than answered."""
+        return key is not None and self._send_answered_how.get(key) == "superseded"
+
+    def _supersede_link_proofs(self, peer_prefix: str, new_link_id: Optional[bytes]) -> int:
+        """A new LINKREQUEST from `peer_prefix` supersedes every LRPROOF
+        still pending for an earlier link of that peer (alpha 0.1.6, item
+        2): RNS on the far side has abandoned that link after its client's
+        window (MeshChat gives a link 15 s), so the frame is pure airtime.
+        The 2026-09-21 session at two hops: six LINKREQUESTs in 2.5 minutes,
+        each answered by an LRPROOF of four attempts at 11 s ACK timeouts,
+        queued at the handshake tier ahead of everything -- completion
+        answers and reports waited up to 125 s behind them. Returns how
+        many were superseded."""
+        pending = self._pending_link_proofs.get(peer_prefix)
+        if not pending:
+            return 0
+        superseded = 0
+        for link_id in list(pending):
+            if new_link_id is not None and link_id == new_link_id:
+                continue
+            key = self.LRPROOF_KEY_PREFIX + link_id
+            if not self._send_superseded(key):
+                self._signal_send_answered(key, "superseded")
+                superseded += 1
+        if superseded:
+            self._outgoing_dropped_total += superseded
+            RNS.log(
+                f"{self}: {superseded} queued LRPROOF(s) for {peer_prefix!r} expired -- superseded by its newer "
+                f"LINKREQUEST (the far side abandoned that link); not (re)sent.",
+                RNS.LOG_DEBUG,
+            )
+        return superseded
 
     def _send_answered_sweep(self, now: float) -> None:
         ttl = self.proof_correlation_ttl_s
@@ -6381,6 +6442,8 @@ class _DirectSendMixin:
             del self._send_answered_at[k]
         for k in [k for k, (_ev, t) in self._send_answered_events.items() if now - t > ttl]:
             del self._send_answered_events[k]
+        for k in [k for k in self._send_answered_how if k not in self._send_answered_at]:
+            del self._send_answered_how[k]
 
     async def _send_direct_packet(
         self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str,
@@ -6957,6 +7020,17 @@ class _DirectSendMixin:
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            if cancel_event is not None and cancel_event.is_set() and self._send_superseded(cancel_key):
+                # Alpha 0.1.6 (item 2): an LRPROOF superseded by the peer's
+                # newer LINKREQUEST -- expired, like a stale plain proof.
+                self._outgoing_dropped_total += 1
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
+                    pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                    time_critical=time_critical, pass_number=pass_number,
+                    ack_timeout_source="superseded",
+                )
+                return False
             if cancel_event is not None and cancel_event.is_set():
                 self._debug(
                     f"DIRECT send to {peer_prefix!r} answered before attempt {attempt} -- "
@@ -7019,6 +7093,11 @@ class _DirectSendMixin:
                     RNS.LOG_WARNING,
                 )
                 ok, waited_full_timeout = False, False
+            if ok and self._send_superseded(cancel_key):
+                # Cut mid-wait by the supersession: the frame went out, no
+                # ACK came before the newer LINKREQUEST; not path evidence.
+                self._outgoing_dropped_total += 1
+                return False
             if ok:
                 if record_result and not (
                         cancel_event is not None and cancel_event.is_set()
@@ -7431,6 +7510,9 @@ class _DirectSendMixin:
                         preemptible=preemptible,
                     )
                     preempted = ack_timeout_source == "preempted"
+                    if ack_timeout_source == "answered" and getattr(cancel_event, "superseded", False):
+                        # Alpha 0.1.6 (item 2): cut by a supersession, not a reply.
+                        ok, ack_timeout_source = False, "superseded"
                     ack_done_at = time.monotonic()
                 except Exception as exc:
                     send_exc = exc
@@ -7544,13 +7626,16 @@ class _DirectSendMixin:
                         # the hold early; the caller keeps waiting for the
                         # answer with the radio free, as it does after the
                         # window.
-                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s)
+                        # Alpha 0.1.6 (item 2): and so does a completion
+                        # REPORT this node owes the far sender (the item-6
+                        # class), as the window's report wait already did.
+                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s, also_reports=True)
                         if answered and quiet_info is not None:
                             quiet_info["answered_at"] = time.monotonic()
                         if cut:
                             self._debug(
                                 f"quiet window for {peer_prefix!r} cut at {time.monotonic() - quiet_started:.2f}s "
-                                f"of {quiet_remaining_s:.2f}s -- a Link handshake is waiting for the radio."
+                                f"of {quiet_remaining_s:.2f}s -- a Link handshake or a completion report is waiting for the radio."
                             )
                         quiet_hold_s = time.monotonic() - quiet_started
                     if quiet_info is not None:
@@ -8474,6 +8559,21 @@ class _ReconcileMixin:
             if slot_held:
                 slot.release()
 
+    @staticmethod
+    def _raw_window_rounds_rule(reconcile_rounds: int, max_rounds_relayed: int, hops: int) -> int:
+        """Burst-and-reconcile rounds a window gets (pure, alpha 0.1.6 item
+        2): `reconcile_rounds` at zero hop; through repeaters the smaller
+        of that and `max_rounds_relayed` (0: no separate cap). The field's
+        two-hop windows ran three rounds of a burst, a report wait and up
+        to two ~18 s QUERY exchanges each while link proofs waited."""
+        rounds = max(1, int(reconcile_rounds))
+        if hops >= 1 and max_rounds_relayed > 0:
+            rounds = max(1, min(rounds, int(max_rounds_relayed)))
+        return rounds
+
+    def _raw_window_rounds(self, gap_hops: int) -> int:
+        return self._raw_window_rounds_rule(self.direct_raw_reconcile_rounds, self.direct_raw_window_max_rounds, gap_hops)
+
     async def _run_raw_window_rounds(self, window, parts, path: bytes, own_prefix: str, hop_count, priority: int, gap_hops: int) -> None:
         peer_prefix, target = window.peer_prefix, window.target
         self._debug(
@@ -8497,7 +8597,7 @@ class _ReconcileMixin:
                 if not p.future.done():
                     p.future.set_result(value)
 
-        rounds = max(1, self.direct_raw_reconcile_rounds)
+        rounds = self._raw_window_rounds(gap_hops)
         query_unanswered_rounds = 0
         empty_answered_bursts = 0
         burst_allowed = True
@@ -10787,17 +10887,34 @@ class _RoutingMixin:
     async def _send_delayed_link_proof(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
     ) -> None:
-        await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
-        if self.detached or not self.online:
-            return
-        inner: list = []
-        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
-        # Finish everything the dispatch spawned before this task ends, so
-        # the packet's in-flight entry (released when THIS task finishes)
-        # really covers the whole send.
-        live = [t for t in inner if t is not None]
-        if live:
-            await asyncio.gather(*live, return_exceptions=True)
+        # Alpha 0.1.6 (item 2): registered for supersession for the whole
+        # delay and send, so a newer LINKREQUEST from the peer expires it.
+        link_id = bytes(header.destination_hash) if header.destination_hash else None
+        peer = self._rns_token_peer.get(header.destination_hash) if link_id is not None else None
+        if peer is not None:
+            self._pending_link_proofs.setdefault(peer, set()).add(link_id)
+        try:
+            await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
+            if self.detached or not self.online:
+                return
+            if peer is not None and self._send_superseded(self.LRPROOF_KEY_PREFIX + link_id):
+                self._capture_outgoing(header, data, "lrproof_superseded")
+                return
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            # Finish everything the dispatch spawned before this task ends, so
+            # the packet's in-flight entry (released when THIS task finishes)
+            # really covers the whole send.
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if peer is not None:
+                pending = self._pending_link_proofs.get(peer)
+                if pending is not None:
+                    pending.discard(link_id)
+                    if not pending:
+                        self._pending_link_proofs.pop(peer, None)
 
     async def _dispatch_outgoing_packet(
         self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
@@ -12026,6 +12143,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # Wire shape: "Q" + Z85([ver:1][type:1][complete:1][pkt_id_hi:1]
     # [pkt_id_lo:1][frag_total:1]), 6 raw bytes -> 10 characters on the
     # wire, comfortably one DIRECT bare message under any realistic budget.
+    LRPROOF_KEY_PREFIX = b"LRP:"   # the answered-send key of an LRPROOF is this + its link_id (alpha 0.1.6 item 2)
     COMPLETION_MARKER = "Q"
     # Step 3 (2026-09-18): v2 ANSWER frames append a have-bitmap
     # (ceil(frag_total/8) bytes, bit i set = receiver holds frag_idx i)
@@ -12577,6 +12695,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # See _answered_send_key / _signal_send_answered.
         self._send_answered_events = {}
         self._send_answered_at = {}
+        self._send_answered_how = {}      # key -> how it was answered ("superseded" is a drop, alpha 0.1.6 item 2)
+        # Alpha 0.1.6 (item 2): peer prefix -> {link_id} of LRPROOFs queued
+        # or in flight to that peer (`_supersede_link_proofs`).
+        self._pending_link_proofs = {}
         # Phase 1 (2026-09-20): destination_hash -> (announce bytes as
         # received, time.monotonic(), source peer prefix) for every ANNOUNCE
         # a bound peer delivered to RNS through this interface (LRU,

@@ -322,6 +322,13 @@ class _DirectSendMixin:
             return None
         if header.packet_type == RNS.Packet.LINKREQUEST:
             return self._compute_link_id(data)
+        if header.packet_type == RNS.Packet.PROOF and header.context == RNS.Packet.LRPROOF \
+                and header.destination_hash:
+            # Alpha 0.1.6 (item 2): an LRPROOF is keyed by its link_id so a
+            # newer LINKREQUEST from the same peer can supersede it
+            # (`_supersede_link_proofs`); its retries stop like an answered
+            # send's, but as a drop, not a success.
+            return self.LRPROOF_KEY_PREFIX + bytes(header.destination_hash)
         if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
                 and header.destination_type == RNS.Destination.SINGLE):
             # Review (2026-09-20): every plain DATA to a SINGLE destination,
@@ -343,6 +350,7 @@ class _DirectSendMixin:
             event = asyncio.Event()
             if key in self._send_answered_at:
                 event.set()
+            event.superseded = self._send_answered_how.get(key) == "superseded"
             self._send_answered_events[key] = (event, time.monotonic())
             return event
         return entry[0]
@@ -367,10 +375,48 @@ class _DirectSendMixin:
         if key is None:
             return
         self._send_answered_at[key] = (time.monotonic(), sender_peer_prefix)
+        self._send_answered_how[key] = how
         entry = self._send_answered_events.get(key)
         if entry is not None and not entry[0].is_set():
+            entry[0].superseded = how == "superseded"
             entry[0].set()
             self._debug(f"send {key.hex()} answered ({how}) while its retry loop was live -- no further attempts.")
+
+    def _send_superseded(self, key: Optional[bytes]) -> bool:
+        """Whether the send with this key was superseded (alpha 0.1.6 item 2:
+        an LRPROOF whose peer has since sent a newer LINKREQUEST) rather
+        than answered."""
+        return key is not None and self._send_answered_how.get(key) == "superseded"
+
+    def _supersede_link_proofs(self, peer_prefix: str, new_link_id: Optional[bytes]) -> int:
+        """A new LINKREQUEST from `peer_prefix` supersedes every LRPROOF
+        still pending for an earlier link of that peer (alpha 0.1.6, item
+        2): RNS on the far side has abandoned that link after its client's
+        window (MeshChat gives a link 15 s), so the frame is pure airtime.
+        The 2026-09-21 session at two hops: six LINKREQUESTs in 2.5 minutes,
+        each answered by an LRPROOF of four attempts at 11 s ACK timeouts,
+        queued at the handshake tier ahead of everything -- completion
+        answers and reports waited up to 125 s behind them. Returns how
+        many were superseded."""
+        pending = self._pending_link_proofs.get(peer_prefix)
+        if not pending:
+            return 0
+        superseded = 0
+        for link_id in list(pending):
+            if new_link_id is not None and link_id == new_link_id:
+                continue
+            key = self.LRPROOF_KEY_PREFIX + link_id
+            if not self._send_superseded(key):
+                self._signal_send_answered(key, "superseded")
+                superseded += 1
+        if superseded:
+            self._outgoing_dropped_total += superseded
+            RNS.log(
+                f"{self}: {superseded} queued LRPROOF(s) for {peer_prefix!r} expired -- superseded by its newer "
+                f"LINKREQUEST (the far side abandoned that link); not (re)sent.",
+                RNS.LOG_DEBUG,
+            )
+        return superseded
 
     def _send_answered_sweep(self, now: float) -> None:
         ttl = self.proof_correlation_ttl_s
@@ -378,6 +424,8 @@ class _DirectSendMixin:
             del self._send_answered_at[k]
         for k in [k for k, (_ev, t) in self._send_answered_events.items() if now - t > ttl]:
             del self._send_answered_events[k]
+        for k in [k for k in self._send_answered_how if k not in self._send_answered_at]:
+            del self._send_answered_how[k]
 
     async def _send_direct_packet(
         self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str,
@@ -954,6 +1002,17 @@ class _DirectSendMixin:
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            if cancel_event is not None and cancel_event.is_set() and self._send_superseded(cancel_key):
+                # Alpha 0.1.6 (item 2): an LRPROOF superseded by the peer's
+                # newer LINKREQUEST -- expired, like a stale plain proof.
+                self._outgoing_dropped_total += 1
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
+                    pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                    time_critical=time_critical, pass_number=pass_number,
+                    ack_timeout_source="superseded",
+                )
+                return False
             if cancel_event is not None and cancel_event.is_set():
                 self._debug(
                     f"DIRECT send to {peer_prefix!r} answered before attempt {attempt} -- "
@@ -1016,6 +1075,11 @@ class _DirectSendMixin:
                     RNS.LOG_WARNING,
                 )
                 ok, waited_full_timeout = False, False
+            if ok and self._send_superseded(cancel_key):
+                # Cut mid-wait by the supersession: the frame went out, no
+                # ACK came before the newer LINKREQUEST; not path evidence.
+                self._outgoing_dropped_total += 1
+                return False
             if ok:
                 if record_result and not (
                         cancel_event is not None and cancel_event.is_set()
@@ -1428,6 +1492,9 @@ class _DirectSendMixin:
                         preemptible=preemptible,
                     )
                     preempted = ack_timeout_source == "preempted"
+                    if ack_timeout_source == "answered" and getattr(cancel_event, "superseded", False):
+                        # Alpha 0.1.6 (item 2): cut by a supersession, not a reply.
+                        ok, ack_timeout_source = False, "superseded"
                     ack_done_at = time.monotonic()
                 except Exception as exc:
                     send_exc = exc
@@ -1541,13 +1608,16 @@ class _DirectSendMixin:
                         # the hold early; the caller keeps waiting for the
                         # answer with the radio free, as it does after the
                         # window.
-                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s)
+                        # Alpha 0.1.6 (item 2): and so does a completion
+                        # REPORT this node owes the far sender (the item-6
+                        # class), as the window's report wait already did.
+                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s, also_reports=True)
                         if answered and quiet_info is not None:
                             quiet_info["answered_at"] = time.monotonic()
                         if cut:
                             self._debug(
                                 f"quiet window for {peer_prefix!r} cut at {time.monotonic() - quiet_started:.2f}s "
-                                f"of {quiet_remaining_s:.2f}s -- a Link handshake is waiting for the radio."
+                                f"of {quiet_remaining_s:.2f}s -- a Link handshake or a completion report is waiting for the radio."
                             )
                         quiet_hold_s = time.monotonic() - quiet_started
                     if quiet_info is not None:

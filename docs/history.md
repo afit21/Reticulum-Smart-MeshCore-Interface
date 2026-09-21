@@ -3769,3 +3769,55 @@ parity stays on.
     +7.2 dB both ways, from `topology relay --place`), hard check: the
     sender's last six DIRECT sends are at one hop and a `path_selected`
     record exists. Gate results in `changelog.md`.
+
+ 2. **Bound the multi-hop window hold** (`direct_raw_window_max_rounds`,
+    new, 2; `_raw_window_rounds_rule` pure; `_supersede_link_proofs`,
+    `_send_superseded`, `LRPROOF_KEY_PREFIX`, `_pending_link_proofs`; the
+    QUERY quiet hold's `also_reports`). The field, desktop capture at two
+    hops: 23 sends waited more than 30 s for the radio lock, the worst
+    182 s (a text fragment at 22:13:06, behind a storm of handshake- and
+    answer-tier frames each costing an 11 s ACK timeout at 50 % success),
+    and at 22:25-22:28 completion answers and reports waited 50-125 s
+    (queue depth 13). Reading the lock's holders against the source before
+    changing anything: the window already releases the lock before every
+    QUERY round (`finally: release_for_handshake()` precedes the QUERY
+    loop), its between-parts yields to a handshake and to a completion
+    report carry no hop condition (item 6 of 0.1.5 is hop-independent as
+    written), and a HANDSHAKE waiter (tier 0) is served at every release
+    ahead of the QUERY (tier 1) and the re-burst (tier 2). What held the
+    radio at 22:25 was the handshake tier itself: six LINKREQUESTs from
+    the laptop in 2.5 minutes (MeshChat re-requests every ~17 s once its
+    15 s window passes), each answered by an LRPROOF of four attempts at
+    11 s ACK timeouts, queued at tier 0 ahead of everything, while the
+    LRPROOF for the link the laptop had already abandoned was still being
+    retried. Three changes: (a) a newer LINKREQUEST from a peer supersedes
+    every LRPROOF still pending for an earlier link of that peer -- the
+    LRPROOF's answered-send key is `LRP:` + its link_id, registered for the
+    whole 1.5 s RTT-inflation delay and send in `_send_delayed_link_proof`,
+    and `_observe_incoming_rns_packet`'s LINKREQUEST branch signals it as
+    "superseded": no further attempts (captured as `direct_attempt_result`
+    `ack_timeout_source="superseded"`, or `routing_decision="lrproof_
+    superseded"` when it had not left the delay), an in-flight ACK wait is
+    cut, nothing is recorded as path evidence, counted as a drop; the
+    newest link's own LRPROOF is untouched. (b) Through repeaters a window
+    gets at most `direct_raw_window_max_rounds` burst-and-reconcile rounds
+    (zero hop keeps `direct_raw_reconcile_rounds`, 3): the field's two-hop
+    windows ran three rounds of a 3-fragment burst with 4.5 s gaps, a report
+    wait and up to two ~18 s QUERY exchanges; after the cap the window
+    falls back to the text path or fails exactly as it does when its
+    rounds are exhausted. (c) The QUERY's quiet hold (lock held, listening
+    for the ANSWER) is ended by a queued completion REPORT as it already
+    was by a handshake, and as the window's report wait already was by a
+    report (item 6's second cut): the report goes out, the ANSWER wait
+    continues radio-free. Tests: `tests/test_multihop_window_hold_0922.py`
+    (the rounds rule and its default; a two-hop window yields between its
+    parts to a queued handshake and a queued report, handshake first; a
+    handshake queued in a two-hop window's report wait gets the radio
+    before round 1's burst and the window stops after two rounds; the
+    LRPROOF key, direct supersession, the retry loop stopping after
+    attempt 0 with `superseded` captured and no path evidence, the newest
+    link untouched, a supersession inside the RTT delay dropping the proof
+    before dispatch; the quiet hold cut by a report waiter). Shipped-
+    default pin and golden config re-pinned for the new key. MeshBench:
+    `link_setup`, `page_transfer_bidir`, `two_hop`, two runs each, in
+    `changelog.md`.
