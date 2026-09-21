@@ -174,6 +174,8 @@ Enable packet captures with:
     packet_capture_enabled = yes
 ```
 
+The capture file is named after your MeshCore node (`<node name>_capture_..._<timestamp>.jsonl`); set `packet_capture_label = <name>` to use a different label.
+
 Feel free to contribute code if you'd like to by opening a pull request :)
 
 The interface file is assembled: the source lives in `Interface/src/smci/` (one module per concern) and `python3 Interface/build_interface.py` builds `Interface/SmartMeshCoreInterface.py` from it. Edit the sources, run the build, and commit both; the unit suite is `python3 -m unittest discover -s tests`.

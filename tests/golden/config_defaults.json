@@ -25,6 +25,7 @@
     "debug_logs": false,
     "packet_capture_dir": null,
     "packet_capture_enabled": false,
+    "packet_capture_label": "",
     "rx_log_observe_enabled": true,
     "stats_interval_s": 60.0
   },

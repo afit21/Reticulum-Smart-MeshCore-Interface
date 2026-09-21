@@ -36,6 +36,10 @@ record is `docs/history.md` ("Alpha 0.1.5 pass").
   behind the sender's own queue). The `completion_check_result` record gains `early_reports` and the
   report's `entries`. Tests: `tests/test_early_report_is_progress_0921.py` (the 08:38 sequence
   re-sends nothing).
+- **Capture filename carries a node label** (new key `packet_capture_label`, default the MeshCore
+  node name from SELF_INFO): `<label>_capture_<interface>_<stamp>.jsonl`. The capture readers accept
+  both forms. `fieldtests/AB_PROTOCOL.md`: laptop files need the label; MeshChat's RNS at loglevel 6.
+  Tests: `tests/test_capture_label_0921.py`.
 
 ## alpha-0.1.4 (2026-09-21)
 

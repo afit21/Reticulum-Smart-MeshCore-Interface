@@ -3370,3 +3370,20 @@ update together; parity stays on; aim for no wire change.
     2a-2c together: re-sent fragments per part at zero hop from 0.55
     towards 0.1, the page's duty-cycle share to nearly all of its
     remaining time. MeshBench gate in `changelog.md`.
+
+ 7. **Capture hygiene** (`packet_capture_label`, new, empty; `_capture_
+    filename`, pure). The capture file is `<label>_capture_<interface>_
+    <stamp>.jsonl`, the label the MeshCore node name from SELF_INFO
+    (`afipc`, `a`) unless the key sets one; empty and nameless keeps the
+    old name. The 2026-09-21 session's desktop file had to be renamed by
+    hand to be told from the laptop's. The three readers accept both
+    forms (`meshbench_report.capture_files` -- its node key stays the
+    interface name the scenario runner uses; `field_ab_compare.node_of`
+    -- the node is the label; `simmesh.harness.read_capture`).
+    `since_own_tx_s` reads the radio's busy-until since 2a. `fieldtests/
+    AB_PROTOCOL.md` now asks for the label on the laptop's files and for
+    MeshChat's RNS at loglevel 6, so link-validation lines exist next to
+    the capture (two link requests to the desktop's LXMF destination went
+    unanswered in this session with nothing to say why). Tests:
+    `tests/test_capture_label_0921.py`; shipped-default pin and golden
+    config re-pinned for the new key.

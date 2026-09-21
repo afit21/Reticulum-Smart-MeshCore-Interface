@@ -18,6 +18,17 @@ happened; this is the procedure that makes two of them comparable.
 - `packet_capture_enabled = yes` on both, capturing to a fresh directory per session. Note the
   radio settings once (`SELF_INFO`: 916.575 / 62.5 / SF7 / CR8 on 2026-09-18); the interface does
   not log them and every airtime number depends on them.
+- Since alpha 0.1.5 the capture file is named `<label>_capture_<interface>_<stamp>.jsonl`, the
+  label being the MeshCore node name (`afipc` on the desktop, `a` on the laptop) unless
+  `packet_capture_label` sets one. Check that the laptop's files carry their label before copying
+  them into `fieldtests/raw/`; `field_ab_compare.py` keys on it. Two files with the same
+  label in one set are two runs of the same machine.
+- MeshChat's RNS instance should run with logging at level 6 (`[logging]` / `loglevel = 6` in
+  `~/.reticulum/config`, restart MeshChat) on both machines, so RNS's own link-validation lines
+  exist alongside the capture: the 2026-09-21 session had two link requests to the desktop's
+  LXMF delivery destination handed to RNS and never answered, and without the RNS log there is
+  no telling whether RNS refused them or MeshChat never replied. That is RNS/MeshChat behaviour,
+  not the interface's, but the A/B verdict should be able to set it aside on evidence.
 - One route, driven the same way both times, and one page: the NomadNet page that gives 12 parts of
   483 B (the field's page-transfer class), fetched from the laptop off the desktop's node. A few LXMF
   messages per phase are fine; the page fetch is the unit of comparison.

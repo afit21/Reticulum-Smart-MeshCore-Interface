@@ -98,14 +98,21 @@ def parse_when(text: str, reference: float) -> float:
 
 
 def node_of(path: str) -> str:
-    """The interface writes capture_<iface name>_<stamp>.jsonl; the field
-    captures under fieldtests/raw/ are renamed by hand to
-    <machine>_<iface name>_<stamp>[_<tag>].jsonl. Either way the name is
-    what precedes the first timestamp-looking token."""
+    """The interface writes capture_<iface name>_<stamp>.jsonl, or since
+    alpha 0.1.5 <node label>_capture_<iface name>_<stamp>.jsonl (the label
+    is the MeshCore node name or packet_capture_label); the older field
+    captures under fieldtests/raw/ were renamed by hand to
+    <machine>_<iface name>_<stamp>[_<tag>].jsonl. Either way the node is
+    the label when there is one, else what precedes the first
+    timestamp-looking token."""
     stem = os.path.basename(path)[:-len(".jsonl")]
     parts = stem.split("_")
     if parts[0] == "capture":
         parts = parts[1:]
+    elif "capture" in parts:
+        # alpha 0.1.5 item 7: <label>_capture_<iface>_<stamp>.jsonl -- the
+        # node is the label the interface wrote (its MeshCore name).
+        parts = parts[:parts.index("capture")]
     keep = []
     for part in parts:
         if part[:8].isdigit() and len(part) >= 8:

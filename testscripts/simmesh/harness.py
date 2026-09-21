@@ -430,7 +430,8 @@ def read_capture(capture_dir: str, iface_name: str) -> list:
     if not os.path.isdir(capture_dir):
         return records
     for fn in sorted(os.listdir(capture_dir)):
-        if fn.startswith(f"capture_{safe_name}_") and fn.endswith(".jsonl"):
+        # alpha 0.1.5 item 7: a node label may precede "capture_".
+        if (fn.startswith(f"capture_{safe_name}_") or f"_capture_{safe_name}_" in fn) and fn.endswith(".jsonl"):
             with open(os.path.join(capture_dir, fn)) as f:
                 for line in f:
                     line = line.strip()

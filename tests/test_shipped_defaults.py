@@ -278,6 +278,7 @@ CONFIGURE_OBSERVABILITY = {
     'debug_logs': False,
     'packet_capture_dir': None,
     'packet_capture_enabled': False,
+    'packet_capture_label': '',
     'rx_log_observe_enabled': True,
     'stats_interval_s': 60.0,
 }

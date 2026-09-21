@@ -125,10 +125,14 @@ def _miss_cause(detail: str) -> str:
 
 def capture_files(run_dir: str) -> dict:
     """{node_name: [capture paths]} -- the interface names its file
-    capture_<iface name>_<stamp>.jsonl."""
+    capture_<iface name>_<stamp>.jsonl, or, since alpha 0.1.5 (item 7),
+    <label>_capture_<iface name>_<stamp>.jsonl with the MeshCore node name
+    (or packet_capture_label) in front. The node key here stays the
+    INTERFACE name (what the scenario runner keys on)."""
     out = collections.defaultdict(list)
-    for cap in sorted(glob.glob(os.path.join(run_dir, "capture_*.jsonl"))):
-        stem = os.path.basename(cap)[len("capture_"):-len(".jsonl")]
+    for cap in sorted(glob.glob(os.path.join(run_dir, "*capture_*.jsonl"))):
+        stem = os.path.basename(cap)[:-len(".jsonl")]
+        stem = stem[stem.index("capture_") + len("capture_"):]
         node = stem.rsplit("_", 1)[0] if "_" in stem else stem
         out[node].append(cap)
     return dict(out)

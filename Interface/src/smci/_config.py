@@ -1154,6 +1154,13 @@ class _ConfigMixin:
         # storage path is known).
         self.packet_capture_enabled = _cfg_bool(cfg.get("packet_capture_enabled", "no"))
         self.packet_capture_dir = cfg.get("packet_capture_dir", None)
+        # Alpha 0.1.5 (item 7, 2026-09-21): the capture file carries a node
+        # label so two machines' captures of one session tell apart at a
+        # glance -- the MeshCore node name from SELF_INFO by default (the
+        # field's `afipc` and `a`; the desktop's 2026-09-21 file had to be
+        # renamed by hand), or this value. Empty and no node name gives the
+        # pre-0.1.5 filename. `_capture_filename` is the pure rule.
+        self.packet_capture_label = str(cfg.get("packet_capture_label", "") or "").strip()
 
         # User-requested (2026-09-18, "lessen our reliance on arbitrary
         # wait times" -- step 1 of that plan, see module docstring): tap
