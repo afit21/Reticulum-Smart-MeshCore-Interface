@@ -2941,6 +2941,7 @@ class _ObservabilityMixin:
         self, peer_prefix: str, pkt_id: int, frag_total: int, outcome: str, complete: bool,
         stage: str = "final", timeout_s: Optional[float] = None,
         answer_version: Optional[int] = None, held: Optional[list] = None,
+        hop_count: Optional[int] = None,
     ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per
         `_check_remote_completion` call, so the next field test can
@@ -2957,6 +2958,11 @@ class _ObservabilityMixin:
             return
         self._capture_event("out", {
             "event": "completion_check_result",
+            # Alpha 0.1.8 (item 5): the hop count, so the field summary can
+            # stratify reconcile outcomes the way it stratifies everything
+            # else -- without it every window landed in an untyped bucket
+            # and "frames per completed window by hop" could not be built.
+            "hop_count": hop_count,
             "peer_prefix": peer_prefix,
             "pkt_id": pkt_id,
             "frag_total": frag_total,
@@ -8756,6 +8762,7 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result",
                 "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
+                "hop_count": hops,
                 "outcome": "reported_stale" if acted_on_early else "reported", "complete": got.complete, "stage": stage,
                 "timeout_s": round(wait_s, 3), "answer_version": got.version,
                 "held": sorted(got.held) if got.held is not None else None,
@@ -8994,6 +9001,7 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result", "peer_prefix": peer_prefix,
                 "pkt_id": part.pkt_id, "frag_total": part.frag_total,
+                "hop_count": self._receiver_hops_to(peer_prefix),
                 "outcome": "proved", "complete": True, "stage": stage,
                 "timeout_s": None, "answer_version": None, "held": None, "entries": None,
                 "report_wait_s": None, "provisional": False, "early_reports": 0,
@@ -9796,7 +9804,7 @@ class _ReconcileMixin:
             self._capture_completion_check_result(
                 peer_prefix, pkt_id, frag_total, outcome,
                 answer.complete if answer is not None else False,
-                stage=stage, timeout_s=timeout_s,
+                stage=stage, timeout_s=timeout_s, hop_count=hop_count,
                 answer_version=answer.version if answer is not None else None,
                 held=sorted(answer.held) if answer is not None and answer.held is not None else None,
             )

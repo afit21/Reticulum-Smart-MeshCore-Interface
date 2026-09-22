@@ -73,6 +73,18 @@ record is `docs/history.md` ("Alpha 0.1.8 pass"). New config keys, both optional
   the firmware attempt byte; no path evidence is recorded either way. `direct_report_ack_min_hops =
   0` disables the item. Capture: `report_acked` on `completion_report_sent`. Tests:
   `tests/test_report_ack_at_multihop_0923.py`. MeshBench: `two_hop`, `three_hop`, `relay`.
+- **Capture and field summary for the above.** New capture fields: `report_skipped_for_proof` on a
+  `completion_report_skipped` record and `outcome: "proved"` with `proved_by` on
+  `completion_check_result` (item 1), `report_acked` on `completion_report_sent` (item 2), `stale` /
+  `snr_fresh` / `peer_rate_fresh` on every candidate of `path_selected` (item 3), and `hop_count` on
+  `completion_check_result` -- without that last one every reconcile outcome landed in an untyped
+  bucket and could not be stratified by hop the way everything else is. `field_ab_compare.py` gained
+  two tables: frames per completed raw window by hop (data fragments, reports, QUERYs, ANSWERs,
+  proof/data attempts and firmware ACKs, which is this release's metric in frames) and report
+  carrier and arrival by hop (sent, acknowledged, no-ACK, skipped for a proof, against the sender's
+  own outcomes). The duplicate-delivery window is now 60 s rather than 30: the two-hop copies of one
+  211-byte message were spaced up to 50 s by the interface's own queue and ACK timeouts, so a 30 s
+  link broke exactly the chains this release is about.
 - **The path scoreboard ages its evidence.** A candidate's peer-reported delivery rate and its
   last-leg SNR now count only while those readings are inside `PATH_SAMPLE_WINDOW_S` (600 s), the
   same window the send outcomes are weighed over; older readings are kept for the capture and score

@@ -4719,3 +4719,29 @@ client-specific workaround).
     `tests/test_raw_fragments.py` widened for the new keyword.
     Shipped-default pin and golden config re-pinned (one key added).
     MeshBench: `two_hop`, `three_hop`, `relay`.
+
+ 5. **Capture and field summary.** The fields items 1-3 need, plus one the
+    summariser could not do without. `report_skipped_for_proof` on a new
+    `completion_report_skipped` record and `outcome: "proved"` with
+    `proved_by` on `completion_check_result` (item 1); `report_acked` on
+    `completion_report_sent` (item 2); `stale`, `snr_fresh` and
+    `peer_rate_fresh` on every candidate of a `path_selected` record
+    (item 3); and `hop_count` on `completion_check_result` -- that record
+    had never carried one, so every reconcile outcome in a capture landed
+    in an untyped bucket and "frames per completed window by hop" could
+    not be built at all.
+
+    `testscripts/field_ab_compare.py` gained `frames_per_proved_packet`
+    (per hop: data fragments, reports, reports skipped for a proof,
+    QUERYs, ANSWERs, proof/data attempts, firmware ACKs, windows ended
+    `proved`, and the frames-per-completed-window ratio -- this release's
+    metric expressed in frames) and `report_carrier_and_arrival` (per
+    hop: reports sent and on which carrier, reports skipped, against the
+    sender's own `completion_check_result` outcomes; the two-hop reading
+    to beat is 22 sent and 3 arrived inside the wait). `DUPLICATE_WINDOW_
+    S` is 60 s rather than 30: LXMF re-sends every 10-14 s, but the
+    2026-09-22 two-hop stop spaced the copies of one 211-byte message up
+    to 50 s apart -- the interface's own queue, lock waits and 8 s ACK
+    timeouts stretched them -- so a 30 s link broke those chains in the
+    middle and under-counted the 23-copy and 8-copy cases the release is
+    about. No interface behaviour changes here beyond the added fields.

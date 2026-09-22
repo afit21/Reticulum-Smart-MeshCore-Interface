@@ -381,11 +381,20 @@ def analyse_set(recs: list, hop_filter=None, radio=(7, 62.5, 8)) -> dict:
     # is when it left the radio. Stratified by the DATA's hop count.
     out["proof_turnaround"], out["proof_pending"] = proof_turnaround(recs, hop_filter=hop_filter)
     out["lxmf_duplicates"] = duplicate_deliveries(recs, hop_filter=hop_filter)
+    # Alpha 0.1.8 (item 5): the release's own metric, in frames.
+    out["frames_per_proved_packet"] = frames_per_proved_packet(recs, hop_filter=hop_filter)
+    out["report_carrier"] = report_carrier_and_arrival(recs, hop_filter=hop_filter)
     return out
 
 
 PROOF_JOIN_S = 2.0          # an `out PROOF` this soon after an `in DATA` answers it
-DUPLICATE_WINDOW_S = 30.0   # LXMF re-sends every 10-14 s; six copies span ~70 s, so a chain of 30 s links
+# Alpha 0.1.8 (item 5): 60 s, not 30. LXMF re-sends every 10-14 s, but the
+# 2026-09-22 two-hop stop spaced the copies of one 211-byte message up to
+# 50 s apart -- the interface's own queue, lock waits and 8 s ACK timeouts
+# stretched them -- so a 30 s link broke those chains in the middle and
+# under-counted the very case the release is about (23 copies of one
+# message and 8 of another).
+DUPLICATE_WINDOW_S = 60.0
 
 
 def proof_turnaround(recs: list, hop_filter=None) -> "tuple[dict, int]":
@@ -455,6 +464,93 @@ def duplicate_deliveries(recs: list, hop_filter=None) -> dict:
             chain[key] = 0
     return {"repeats_by_hop": dict(repeats), "messages_by_hop": {h: len(v) for h, v in messages.items()},
             "longest_chain": longest}
+
+
+def frames_per_proved_packet(recs: list, hop_filter=None) -> dict:
+    """Alpha 0.1.8 (item 5). Per hop, what a delivered RNS packet actually
+    costs in FRAMES, which is what this release is about: the data
+    fragments of its raw window, the completion report, the QUERY and
+    ANSWER of a reconcile round, the PROOF's transmit attempts, and the
+    firmware ACKs each acknowledged exchange drew. Counted per node and
+    divided by the raw windows that completed, so the number reads as
+    "frames on the air per packet the far side got".
+
+    `report_skipped` and `proved` are the two alpha 0.1.8 outcomes: a
+    window the proof completed sent no report and ran no QUERY, so the
+    ratio should fall by roughly two frames plus the QUERY round."""
+    per_hop = collections.defaultdict(lambda: collections.Counter())
+    windows = collections.Counter()
+    for r in recs:
+        ev = r.get("event")
+        hop = r.get("hop_count")
+        if hop_filter is not None and hop != hop_filter:
+            continue
+        if ev == "raw_fragment_sent" and r.get("ok"):
+            per_hop[hop]["data_fragments"] += 1
+        elif ev == "completion_report_sent":
+            per_hop[hop]["reports"] += 1
+            if r.get("report_acked"):
+                per_hop[hop]["reports_acked"] += 1
+        elif ev == "completion_report_skipped":
+            per_hop[hop]["reports_skipped_for_proof"] += 1
+        elif ev == "completion_query_received":
+            per_hop[hop]["answers"] += 1
+        elif ev == "completion_check_result":
+            outcome = r.get("outcome")
+            if outcome in ("answered", "timeout"):
+                per_hop[hop]["queries"] += 1
+            if outcome == "proved":
+                per_hop[hop]["proved"] += 1
+                windows[hop] += 1
+            elif outcome in ("reported", "reported_stale", "answered"):
+                windows[hop] += 1
+        elif ev == "direct_attempt_result":
+            kind = r.get("kind")
+            if kind is None:
+                per_hop[hop]["proof_or_data_attempts"] += 1
+            elif kind == "completion_query":
+                per_hop[hop]["query_attempts"] += 1
+            if r.get("ok"):
+                per_hop[hop]["firmware_acks"] += 1
+
+    out = {}
+    for hop, c in per_hop.items():
+        n = windows.get(hop, 0)
+        total = (c["data_fragments"] + c["reports"] + c["queries"] + c["answers"]
+                 + c["proof_or_data_attempts"] + c["firmware_acks"])
+        out[hop] = dict(c, windows=n, frames=total,
+                        frames_per_window=(total / n) if n else None)
+    return {h: out[h] for h in sorted(out, key=lambda h: (h is None, h if h is not None else -1))}
+
+
+def report_carrier_and_arrival(recs: list, hop_filter=None) -> dict:
+    """Alpha 0.1.8 (item 5). Per hop: how many completion reports this node
+    SENT and on which carrier (`report_acked`, item 2), how many it
+    skipped because the proof said the same thing (item 1), and -- from
+    the other node's side of the same capture set -- how many reports
+    arrived, as the sender's `completion_check_result` records with
+    outcome "reported" or "reported_stale". The field's two-hop reading to
+    beat is 22 sent and 3 arrived inside the wait."""
+    sent = collections.defaultdict(collections.Counter)
+    arrived = collections.defaultdict(collections.Counter)
+    for r in recs:
+        hop = r.get("hop_count")
+        if hop_filter is not None and hop != hop_filter:
+            continue
+        ev = r.get("event")
+        if ev == "completion_report_sent":
+            sent[hop]["sent"] += 1
+            sent[hop]["acked" if r.get("report_acked") else "noack"] += 1
+            if (r.get("held_s") or 0) == 0:
+                sent[hop]["immediate"] += 1
+        elif ev == "completion_report_skipped":
+            sent[hop]["skipped_for_proof"] += 1
+        elif ev == "completion_check_result":
+            outcome = r.get("outcome")
+            if outcome in ("reported", "reported_stale", "proved", "answered", "timeout"):
+                arrived[hop][outcome] += 1
+    hops = sorted(set(sent) | set(arrived), key=lambda h: (h is None, h if h is not None else -1))
+    return {h: {"sent": dict(sent.get(h, {})), "sender_outcomes": dict(arrived.get(h, {}))} for h in hops}
 
 
 def sum_calibrations(parts: list) -> dict:
@@ -571,7 +667,33 @@ def print_comparison(sets: dict, min_n: int) -> None:
     for h in sorted({h for s in sets.values() for h in s["proof_turnaround"]}, key=lambda h: (h is None, h if h is not None else -1)):
         row(f"hop {h} med/p90/max s", [d_str(s["proof_turnaround"].get(h)) for s in sets.values()])
     row("proofs with no send result", [s["proof_pending"] for s in sets.values()])
-    print("\n  -- LXMF-style duplicate deliveries: same destination and size within 30 s (field: six copies of one message) --")
+    print("\n  -- frames per completed raw window, by hop (alpha 0.1.8's metric: fewer frames per delivered packet) --")
+    fhops = sorted({h for s in sets.values() for h in s.get("frames_per_proved_packet", {})},
+                   key=lambda h: (h is None, h if h is not None else -1))
+    for h in fhops:
+        vals = [s.get("frames_per_proved_packet", {}).get(h, {}) for s in sets.values()]
+        row(f"hop {h} frames / window (windows)",
+            [(f"{fmt(v.get('frames_per_window'), 2)} ({v.get('windows', 0)})" if v else "-") for v in vals])
+        for field, label in (("data_fragments", "data fragments"), ("reports", "reports"),
+                             ("reports_skipped_for_proof", "reports skipped (proof)"),
+                             ("queries", "QUERYs"), ("answers", "ANSWERs"),
+                             ("proof_or_data_attempts", "proof/data attempts"),
+                             ("firmware_acks", "firmware ACKs"), ("proved", "windows ended `proved`")):
+            if any(v.get(field) for v in vals):
+                row(f"    {label}", [v.get(field, 0) for v in vals])
+    print("\n  -- completion report carrier and arrival, by hop (alpha 0.1.8 items 1 and 2; field two-hop: 22 sent, 3 arrived) --")
+    rhops = sorted({h for s in sets.values() for h in s.get("report_carrier", {})},
+                   key=lambda h: (h is None, h if h is not None else -1))
+    for h in rhops:
+        vals = [s.get("report_carrier", {}).get(h, {}) for s in sets.values()]
+        row(f"hop {h} sent (acked / no-ACK / skipped)",
+            [(f"{v.get('sent', {}).get('sent', 0)} "
+              f"({v.get('sent', {}).get('acked', 0)} / {v.get('sent', {}).get('noack', 0)} / "
+              f"{v.get('sent', {}).get('skipped_for_proof', 0)})" if v else "-") for v in vals])
+        row(f"hop {h} sender outcomes",
+            [(", ".join(f"{k} {n}" for k, n in sorted(v.get("sender_outcomes", {}).items())) or "-") for v in vals])
+    print(f"\n  -- LXMF-style duplicate deliveries: same destination and size within {DUPLICATE_WINDOW_S:.0f} s "
+          f"(field two-hop: 23 copies of one message, 8 of another) --")
     for h in sorted({h for s in sets.values() for h in s["lxmf_duplicates"]["repeats_by_hop"]}, key=lambda h: (h is None, h if h is not None else -1)):
         row(f"hop {h} repeat copies (messages)", [f"{s['lxmf_duplicates']['repeats_by_hop'].get(h, 0)} ({s['lxmf_duplicates']['messages_by_hop'].get(h, 0)})"
                                                  for s in sets.values()])

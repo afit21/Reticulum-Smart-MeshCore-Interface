@@ -475,6 +475,7 @@ class _ObservabilityMixin:
         self, peer_prefix: str, pkt_id: int, frag_total: int, outcome: str, complete: bool,
         stage: str = "final", timeout_s: Optional[float] = None,
         answer_version: Optional[int] = None, held: Optional[list] = None,
+        hop_count: Optional[int] = None,
     ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per
         `_check_remote_completion` call, so the next field test can
@@ -491,6 +492,11 @@ class _ObservabilityMixin:
             return
         self._capture_event("out", {
             "event": "completion_check_result",
+            # Alpha 0.1.8 (item 5): the hop count, so the field summary can
+            # stratify reconcile outcomes the way it stratifies everything
+            # else -- without it every window landed in an untyped bucket
+            # and "frames per completed window by hop" could not be built.
+            "hop_count": hop_count,
             "peer_prefix": peer_prefix,
             "pkt_id": pkt_id,
             "frag_total": frag_total,

@@ -464,6 +464,7 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result",
                 "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
+                "hop_count": hops,
                 "outcome": "reported_stale" if acted_on_early else "reported", "complete": got.complete, "stage": stage,
                 "timeout_s": round(wait_s, 3), "answer_version": got.version,
                 "held": sorted(got.held) if got.held is not None else None,
@@ -702,6 +703,7 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result", "peer_prefix": peer_prefix,
                 "pkt_id": part.pkt_id, "frag_total": part.frag_total,
+                "hop_count": self._receiver_hops_to(peer_prefix),
                 "outcome": "proved", "complete": True, "stage": stage,
                 "timeout_s": None, "answer_version": None, "held": None, "entries": None,
                 "report_wait_s": None, "provisional": False, "early_reports": 0,
@@ -1504,7 +1506,7 @@ class _ReconcileMixin:
             self._capture_completion_check_result(
                 peer_prefix, pkt_id, frag_total, outcome,
                 answer.complete if answer is not None else False,
-                stage=stage, timeout_s=timeout_s,
+                stage=stage, timeout_s=timeout_s, hop_count=hop_count,
                 answer_version=answer.version if answer is not None else None,
                 held=sorted(answer.held) if answer is not None and answer.held is not None else None,
             )
