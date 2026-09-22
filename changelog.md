@@ -33,6 +33,12 @@ key, optional: `proof_fresh_s = 8`. Every default is pinned by `tests/test_shipp
   `field_ab_compare.py` prints proof turnaround per hop and LXMF-style duplicate deliveries (the
   0.1.6 set: 13.5 s median, six proofs, one message delivered five times inside 30 s chains at one
   hop). Tests: `tests/test_capture_fields_0922.py`.
+- **The two-hop reading, attributed -- no change.** Twelve MeshBench `two_hop` runs on the shipped
+  0.1.6 build, four each with the defaults, with `path_selection_enabled = no` and with
+  `direct_raw_window_max_rounds = 3`: 81 % [62-100], 75 % [50-88] and 56 % [38-75] delivered, the
+  responder's two-hop attempt rate 65 / 68 / 61 %. Neither suspect of the 0.1.6 close-out (phantom
+  flood candidates, the round cap) moves the number: a phantom candidate appeared in one run of
+  twelve, and a third round costs airtime without deliveries. The full table is in `docs/history.md`.
 - **Procedure** (`fieldtests/AB_PROTOCOL.md`): the one-hop gap A/B written out step by step, how to
   keep MeshChat's own RNS log (its link requests are validated there, not in rnsd), and one two-hop
   stop with capture on.

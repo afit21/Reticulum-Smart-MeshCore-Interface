@@ -4236,3 +4236,40 @@ reliability over hop count; parity on).
     0.1.5: a 115 B message to the desktop's delivery destination arrived
     25 times at zero hop). No interface change beyond (a); the item 4
     fields are pinned by `tests/test_capture_fields_0922.py`.
+
+ 2. **The two-hop reading: attributed, nothing changed.** The 0.1.6
+    close-out read `two_hop` at 50 % [50-75] against 0.1.5's 75 %
+    [62-100], with the responder's two-hop attempt success 50 % against
+    85 %, and named two suspects: the scoreboard trialling phantom
+    candidates built from flood copies that crossed the marginal skip
+    links (each a failed trial window), and the two-round cap through
+    repeaters. Twelve runs on the shipped 0.1.6 build (`77c765c`, frozen
+    via `SMCI_INTERFACE_PATH`, seeds 7/11/17/11, two concurrent,
+    `/tmp/mb/017/item2/`, the table in `attribution.md` there), four per
+    configuration, read for the responder's two-hop attempt rate, the
+    `path_selected` records and the windows that reached the round cap:
+
+    | configuration | delivered, median [range] (mean) | responder h2 attempt rate | sender h2 | round-cap hits / raw windows (A, B) | trials or switches (A, B) | phantom one-hop candidates |
+    |---|---|---|---|---|---|---|
+    | shipped defaults | 81 % [62-100] (81 %) | 65 % [53-67] | 71 % [36-100] | 4/19, 3/4 | 2, 0 (one exhaustion + rediscovery on the sole candidate, seed 11) | none |
+    | `path_selection_enabled = no` | 75 % [50-88] (72 %) | 68 % [60-77] | 81 % [25-100] | 3/27, 2/6 | 0, 0 | n/a |
+    | `direct_raw_window_max_rounds = 3` | 56 % [38-75] (56 %) | 61 % [57-67] | 63 % [33-69] | 2/21, 4/9 (cap 3) | 0, 3 | one (B in run 4: the untried one-hop flood copy selected first, two misses, a trial of the two-hop path, a switch; that run delivered 5/8) |
+
+    Neither suspect moves the number. Turning selection off does not
+    raise delivery or the responder's rate (72 % and 68 % against 81 %
+    and 65 %: inside the spread, if anything lower), and a phantom
+    candidate appeared in one run of twelve, costing one window. Raising
+    the cap lowers delivery (56 %) and the responder's rate (61 %): a
+    third round through two repeaters is more airtime at the same
+    per-attempt success, not more deliveries. The shipped build's four
+    runs sit inside and above the 0.1.5 baseline range; across the 0.1.6
+    builds the two-hop scenario has now delivered 38-100 % over 22 runs,
+    and the close-out suite's 50 % on three seeds was the low end of that
+    spread. What stays lower than 0.1.5 in every configuration is the
+    responder's two-hop attempt rate (61-68 % against 85 % [60-95]),
+    which selection and the cap therefore do not explain; on MeshBench
+    the responder's attempts are its proofs and answers into R2 while the
+    sender's fragments arrive, with no listen-before-talk, so the field's
+    two-hop stop (item 5) is where that number is read next. No code
+    change; `two_hop` and `shortcut_appears` run again in the close-out
+    suite on the kept build.
