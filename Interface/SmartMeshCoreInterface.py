@@ -5518,7 +5518,9 @@ class _PathDiscoveryMixin:
                         self._capture_path_selected(
                             pubkey_prefix, "discovered", cand, previous if previous is not cand else None,
                             self._rank_paths([self._path_view(c) for c in board.candidates.values()],
-                                             resolved.resolved_at, **self._path_rank_kwargs()))
+                                             resolved.resolved_at,
+                                             **self._path_rank_kwargs(pubkey_prefix, now=resolved.resolved_at)),
+                            now=resolved.resolved_at)
                     RNS.log(
                         f"{self}: path discovered to {pubkey_prefix!r} in "
                         f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
@@ -5731,17 +5733,84 @@ class _PathDiscoveryMixin:
         return (num / den) if den > 0 else None
 
     @staticmethod
+    def _path_evidence(view, now: float, window_s: float) -> "tuple[Optional[float], Optional[float], bool]":
+        """What a candidate's record still says (pure): `(peer_rate, snr,
+        stale)`, the peer-reported rate and the last-leg signal only while
+        those readings are inside `window_s`, and whether the candidate is
+        STALE -- evidence it once had, every piece of it now aged out.
+
+        Alpha 0.1.8 (item 3), from the 2026-09-22 field session: the
+        desktop's 22:49:42 record trialled the zero-hop path while the
+        laptop was two hops away, scored `rate 1.0, measured False, misses
+        3, snr 11.75`. Its own send outcomes HAD aged out of the window
+        (hence `measured False`), but the peer-reported rate of 22:07 and
+        the SNR reading of the zero-hop period never aged, so the dead path
+        still scored 1.0 and outranked a one-hop candidate heard at
+        12.25 dB. A reading only counts while it is inside the same window
+        the samples are weighed over.
+
+        A reading with no timestamp is NOT aged: the pure-rule replays in
+        `tests/` and every candidate built before this release carry the
+        value alone, and ageing those would silently turn a known-good
+        candidate into a weak one. A candidate that never had any evidence
+        is UNTRIED, not stale, and keeps the optimistic prior -- staleness
+        is evidence that expired, not evidence that never existed."""
+        expired = False
+        fresh_any = False
+
+        def keep(value, at):
+            nonlocal expired, fresh_any
+            if value is None:
+                return None
+            if at is not None:
+                age = now - float(at)
+                if age < 0 or age > window_s:
+                    expired = True
+                    return None
+            fresh_any = True
+            return value
+
+        peer_rate = keep(view.get("peer_rate"), view.get("peer_rate_at"))
+        snr = keep(view.get("snr"), view.get("signal_at"))
+        for t, _ok in (view.get("samples") or ()):
+            age = now - t
+            if 0 <= age <= window_s:
+                fresh_any = True
+            else:
+                expired = True
+        return peer_rate, snr, (expired and not fresh_any)
+
+    @staticmethod
     def _path_prior(hops: int, snr: Optional[float], weak_snr_db: float, peer_rate: Optional[float] = None,
-                    optimistic: float = 0.8, weak: float = 0.25) -> float:
+                    optimistic: float = 0.8, weak: float = 0.25, stale: bool = False,
+                    peer_path_len: Optional[int] = None) -> float:
         """The delivery rate an UNTRIED candidate is scored with (pure): the
+        weak prior for a candidate whose evidence has all aged out, else the
         peer's own reported rate on a path of this length when it sent one,
-        else the weak prior for a zero-hop candidate whose last direct frame
-        was below `weak_snr_db` (the owner's repeater assumption), else the
-        optimistic prior -- so the shortest untried path scores best and is
-        tried first."""
+        else the weak prior for a candidate whose last direct frame was
+        below `weak_snr_db`, else the weak prior for a candidate claiming
+        FEWER hops than the peer says it needs to reach us, else the
+        optimistic prior -- so the shortest untried path with honest
+        evidence behind it scores best and is tried first.
+
+        Alpha 0.1.8 (item 3): the weak-signal rule applies at ANY hop count.
+        It was written for `hops == 0` alone, and the laptop's 22:30:26
+        field record is what that cost: a three-hop candidate `4fbe02`
+        heard once at -9 dB was scored with the optimistic prior (0.8,
+        score 5.0) and trialled ahead of the current two-hop path, for two
+        misses and 26 s before the board gave up and rediscovered. A weak
+        last leg is weak evidence whatever precedes it; the zero-hop rule
+        is a special case of this, not an exception to it. The peer's own
+        reported rate still comes FIRST: the same session's 22:51:37 trial
+        of `d619` read -9.5 dB and a fresh peer rate of 0.668, was
+        trialled on that rate, delivered, and became the current path."""
+        if stale:
+            return weak
         if peer_rate is not None:
             return max(0.0, min(1.0, float(peer_rate)))
-        if hops == 0 and snr is not None and float(snr) < weak_snr_db:
+        if snr is not None and float(snr) < weak_snr_db:
+            return weak
+        if peer_path_len is not None and int(hops) < int(peer_path_len):
             return weak
         return optimistic
 
@@ -5754,22 +5823,34 @@ class _PathDiscoveryMixin:
 
     @classmethod
     def _rank_paths(cls, views, now: float, weak_snr_db: float, window_s: float, half_life_s: float,
-                    optimistic: float = 0.8, weak: float = 0.25, rate_floor: float = 0.05) -> list:
+                    optimistic: float = 0.8, weak: float = 0.25, rate_floor: float = 0.05,
+                    peer_path_len: Optional[int] = None) -> list:
         """Every candidate scored (pure): [(score, view, rate, measured)]
         sorted best first -- a candidate on switch-back cooldown ranks
-        behind every other, then by score, then fewer hops (the tiebreak),
-        then most recently seen."""
+        behind every other, then a STALE candidate behind every one with
+        evidence inside `window_s` (alpha 0.1.8, item 3), then by score,
+        then fewer hops (the tiebreak), then most recently seen.
+
+        The peer-reported rate and the signal reading are aged the same way
+        the samples are (`_path_evidence`); `peer_path_len` is the peer's
+        own reported path length to us while that report is itself inside
+        the window, which makes an untried candidate claiming fewer hops
+        than that score weak rather than optimistic."""
         ranked = []
+        stale_by_id = {}
         for v in views:
             rate = cls._path_delivery_rate(v.get("samples") or (), now, window_s, half_life_s)
             measured = rate is not None
+            peer_rate, snr, stale = cls._path_evidence(v, now, window_s)
+            stale_by_id[id(v)] = stale
             if not measured:
-                rate = cls._path_prior(int(v.get("hops") or 0), v.get("snr"), weak_snr_db, v.get("peer_rate"),
-                                       optimistic=optimistic, weak=weak)
+                rate = cls._path_prior(int(v.get("hops") or 0), snr, weak_snr_db, peer_rate,
+                                       optimistic=optimistic, weak=weak, stale=stale,
+                                       peer_path_len=peer_path_len)
             score = cls._path_score(int(v.get("hops") or 0), rate, rate_floor=rate_floor)
             ranked.append((score, v, rate, measured))
-        ranked.sort(key=lambda r: ((r[1].get("cooldown_until") or 0.0) > now, r[0], int(r[1].get("hops") or 0),
-                                   -float(r[1].get("last_seen") or 0.0)))
+        ranked.sort(key=lambda r: ((r[1].get("cooldown_until") or 0.0) > now, stale_by_id[id(r[1])], r[0],
+                                   int(r[1].get("hops") or 0), -float(r[1].get("last_seen") or 0.0)))
         return ranked
 
     @classmethod
@@ -5850,14 +5931,29 @@ class _PathDiscoveryMixin:
             "peer_rate": cand.peer_rate, "cooldown_until": cand.cooldown_until,
             "consecutive_misses": cand.consecutive_misses, "last_failure_at": cand.last_failure_at,
             "last_seen": cand.last_seen, "source": cand.source,
+            # Alpha 0.1.8 (item 3): when each reading was taken, so the
+            # pure rules can age it. The values stay on the view whatever
+            # their age -- the capture prints them either way.
+            "peer_rate_at": cand.peer_rate_at, "signal_at": cand.signal_at,
         }
 
-    def _path_rank_kwargs(self) -> dict:
-        return {
+    def _path_rank_kwargs(self, peer_prefix: Optional[str] = None, now: Optional[float] = None) -> dict:
+        """The tuning the pure rules read. With a peer, also that peer's own
+        reported path length to us while the report is inside the sample
+        window (alpha 0.1.8, item 3) -- an untried candidate shorter than
+        the peer says it needs scores weak, not optimistic."""
+        kwargs = {
             "weak_snr_db": self.path_weak_snr_db, "window_s": self.PATH_SAMPLE_WINDOW_S,
             "half_life_s": self.PATH_SAMPLE_HALF_LIFE_S, "optimistic": self.PATH_PRIOR_OPTIMISTIC,
             "weak": self.PATH_PRIOR_WEAK, "rate_floor": self.PATH_RATE_FLOOR,
         }
+        if peer_prefix is not None:
+            board = self._path_boards.get(peer_prefix)
+            if board is not None and board.peer_path_len is not None and board.peer_report_at is not None:
+                age = (time.monotonic() if now is None else now) - float(board.peer_report_at)
+                if 0 <= age <= self.PATH_SAMPLE_WINDOW_S:
+                    kwargs["peer_path_len"] = int(board.peer_path_len)
+        return kwargs
 
     def _add_path_candidate(self, peer_prefix: str, path_hex: str, hops: int, hash_size: int, source: str,
                             now: Optional[float] = None, snr: Optional[float] = None,
@@ -5873,7 +5969,7 @@ class _PathDiscoveryMixin:
         if cand is None:
             if len(board.candidates) >= self.PATH_CANDIDATES_KEPT:
                 ranked = self._rank_paths([self._path_view(c) for c in board.candidates.values()], now,
-                                          **self._path_rank_kwargs())
+                                          **self._path_rank_kwargs(peer_prefix, now=now))
                 for _score, v, _rate, _m in reversed(ranked):
                     if v["path_hex"] != board.current:
                         board.candidates.pop(v["path_hex"], None)
@@ -5965,7 +6061,7 @@ class _PathDiscoveryMixin:
             return
         if ok and path_hex != board.current:
             ranked = self._rank_paths([self._path_view(c) for c in board.candidates.values()], now,
-                                      **self._path_rank_kwargs())
+                                      **self._path_rank_kwargs(peer_prefix, now=now))
             scores = {v["path_hex"]: s for s, v, _r, _m in ranked}
             if board.current in scores and self._switch_for_good(
                     scores[board.current], scores[path_hex], self.path_switch_margin, cand.cooldown_until, now):
@@ -5973,7 +6069,7 @@ class _PathDiscoveryMixin:
                 if previous is not None:
                     previous.cooldown_until = now + self.path_switch_cooldown_s
                 board.current = path_hex
-                self._capture_path_selected(peer_prefix, "switch", cand, previous, ranked)
+                self._capture_path_selected(peer_prefix, "switch", cand, previous, ranked, now=now)
                 RNS.log(
                     f"{self}: path to {peer_prefix!r} switched to {path_hex or '<zero-hop>'} ({cand.hops} hop(s), "
                     f"score {scores[path_hex]:.2f}) from {previous.path_hex or '<zero-hop>' if previous else '?'} "
@@ -5982,9 +6078,12 @@ class _PathDiscoveryMixin:
                 )
 
     def _capture_path_selected(self, peer_prefix: str, reason: str, cand: "Optional[_PathCandidate]",
-                               previous: "Optional[_PathCandidate]", ranked) -> None:
+                               previous: "Optional[_PathCandidate]", ranked, now: Optional[float] = None) -> None:
         if self._packet_capture_file is None:
             return
+        # `now` is the instant `ranked` was scored at, so the freshness
+        # flags below read the same ages the decision did (alpha 0.1.8).
+        now = time.monotonic() if now is None else now
         board = self._path_boards.get(peer_prefix)
         peer_reported = any(v.get("source") == "peer_report" for _s, v, _r, _m in ranked)
         self._capture_event("out", {
@@ -5997,10 +6096,19 @@ class _PathDiscoveryMixin:
             # candidates came from its report (the v5 header).
             "peer_path_len": board.peer_path_len if peer_reported and board is not None else None,
             "peer_rate": (round(board.peer_rate, 3) if peer_reported and board is not None and board.peer_rate is not None else None),
-            "scores": [{
+            # Alpha 0.1.8 (item 3): `stale` (every piece of this candidate's
+            # evidence aged out of PATH_SAMPLE_WINDOW_S) and `snr_fresh` /
+            # `peer_rate_fresh` (whether each reading still counted), so a
+            # field capture shows WHY a candidate scored as it did. The
+            # readings themselves are printed whatever their age.
+            "scores": [dict({
                 "path_hex": v["path_hex"], "hops": v["hops"], "score": round(score, 3), "rate": round(rate, 3),
                 "measured": measured, "misses": v["consecutive_misses"], "snr": v.get("snr"), "source": v.get("source"),
-            } for score, v, rate, measured in ranked],
+            }, **(lambda pr, sn, st: {
+                "stale": st, "snr_fresh": sn is not None, "peer_rate_fresh": pr is not None,
+                "peer_rate": round(v["peer_rate"], 3) if v.get("peer_rate") is not None else None,
+            })(*self._path_evidence(v, now, self.PATH_SAMPLE_WINDOW_S)))
+                for score, v, rate, measured in ranked],
         })
 
     async def _select_path(self, peer_prefix: str) -> "Optional[_ResolvedPath]":
@@ -6035,12 +6143,12 @@ class _PathDiscoveryMixin:
         views = [self._path_view(c) for c in board.candidates.values()]
         chosen_hex, reason, ranked = self._choose_path(
             views, board.current, now, self.path_switch_after_misses, self.path_switch_cooldown_s,
-            **self._path_rank_kwargs(),
+            **self._path_rank_kwargs(peer_prefix, now=now),
         )
         previous = board.candidates.get((resolved.out_path_hex or "").lower()) if resolved is not None else None
         if chosen_hex is None:
             if reason != board.last_reason:
-                self._capture_path_selected(peer_prefix, reason, None, previous, ranked)
+                self._capture_path_selected(peer_prefix, reason, None, previous, ranked, now=now)
                 if reason == "exhausted":
                     RNS.log(
                         f"{self}: every candidate path to {peer_prefix!r} has missed its last "
@@ -6059,7 +6167,7 @@ class _PathDiscoveryMixin:
             cand.trials += 1
         changed = resolved is None or (resolved.out_path_hex or "").lower() != chosen_hex
         if changed or reason != board.last_reason and reason in ("selected", "trial", "switch"):
-            self._capture_path_selected(peer_prefix, reason, cand, previous, ranked)
+            self._capture_path_selected(peer_prefix, reason, cand, previous, ranked, now=now)
             RNS.log(
                 f"{self}: path to {peer_prefix!r}: {reason} {chosen_hex or '<zero-hop>'} ({cand.hops} hop(s), "
                 f"{cand.source}" + (f", {cand.consecutive_misses} miss(es)" if cand.consecutive_misses else "") + ")"

@@ -4355,3 +4355,92 @@ reliability over hop count; parity on).
     hard check should read both boards (a shorter path selected on
     either node and confirmed), and the field's two-hop stop (item 5)
     is where a trial is read next.
+
+**Alpha 0.1.8 pass (2026-09-23, from the alpha 0.1.7 field session's
+captures in `fieldtests/raw/Alpha0.1.7/`, desktop `afipc_` + laptop `a_`:
+zero hop at home 22:05-22:20, a two-hop stop 22:29-22:45, a transition,
+a one-hop stop 22:53-23:07).** The release is about frames per exchange.
+What the session established: alpha 0.1.7's item 1 worked where it could
+(one-hop proof turnaround 5.3 s median against 0.1.6's 13.5 s), the
+one-hop stop matched 0.1.6 (attempt success 75-80 %, 15 s per page part)
+and zero hop was 100 %, but the two-hop stop was unusable for pages and
+barely usable for messages. Owner decisions in force as for 0.1.7
+(airtime 85 % zero hop / 30 % relayed, never loosened; measured
+reliability over hop count; parity on; interface efficiency before any
+client-specific workaround).
+
+ 3. **The scoreboard ages its evidence** (`_path_evidence` in `_paths.py`,
+    new and pure; `_path_prior` gains `stale` and `peer_path_len` and
+    drops its `hops == 0` condition; `_rank_paths` ranks stale last and
+    takes `peer_path_len`; `_path_view` carries `peer_rate_at` and
+    `signal_at`; `_path_rank_kwargs(peer_prefix, now)` supplies the
+    peer's reported path length while that report is itself inside the
+    window; `stale` / `snr_fresh` / `peer_rate_fresh` on every candidate
+    of a `path_selected` capture record). No config key, no wire change.
+
+    Two field records are the motivation, and both are replayed in the
+    test. The desktop at 22:49:42 trialled the ZERO-HOP path while the
+    laptop was two hops away, scored `rate 1.0, measured False, misses 3,
+    snr 11.75`: its own send outcomes HAD aged out of
+    `PATH_SAMPLE_WINDOW_S` -- that is what `measured False` means -- but
+    `_path_prior` read the peer-reported rate of 22:07 and the SNR
+    reading of the zero-hop period with no reference to when either was
+    taken, so a path that had missed its last three sends scored 1.0 and
+    outranked a one-hop candidate heard 60 s earlier at 12.25 dB. Six
+    more misses and 70 s, while the laptop's own reports in the same
+    capture said `peer_path_len 2, peer_rate 1.0`. The laptop at
+    22:30:26 trialled a THREE-hop candidate `4fbe02` heard once at -9 dB
+    (scored 0.8, score 5.0) ahead of its current two-hop path at 10.143,
+    because the weak-signal prior was written for `hops == 0` alone: two
+    misses, "exhausted", rediscovery, 26 s. A weak last leg is weak
+    evidence whatever precedes it, so the zero-hop rule is now a special
+    case of the general one rather than an exception to it.
+
+    Three boundaries drawn deliberately, each pinned by a test. (a) A
+    reading with NO timestamp is not aged: the pure-rule replays in
+    `tests/` and every candidate built before this release carry the
+    value alone, and ageing those would silently turn a known-good
+    candidate weak. (b) Evidence that never existed is not staleness --
+    an untried candidate with no sample, no signal and no peer report and
+    no expired reading either keeps the optimistic prior, which is what
+    bring-up depends on; staleness is evidence that EXPIRED. (c) The
+    peer's own reported rate still comes before the weak-signal rule:
+    the same session's later trial of `d619` read -9.5 dB but carried a
+    fresh peer rate of 0.668, was trialled on it, delivered, and became
+    the current path two records later. Putting the SNR test first would
+    have cost that switch.
+
+    What this does NOT change, and why. The laptop's 22:30:26 candidate
+    now scores 16.0 instead of 5.0 and ranks last, but `_choose_path`
+    picks the best ELIGIBLE candidate, and that evening the current path
+    was ineligible (two misses, rate 0.296) while the -9 dB candidate had
+    none -- so it is still the one trialled. Making a weak candidate
+    ineligible would fix that record and would also break the MeshBench
+    scenarios by construction: MeshBench's firmware reports every frame
+    at SNR 0.0, which is below `path_weak_snr_db` (3.0), so EVERY untried
+    candidate there is weak, and `shortcut_appears` and `weak_direct`
+    both gate on a trial happening. Scoring is therefore made honest here
+    and the eligibility gate is left alone; the field's two-hop stop is
+    where a `path_selected` trial with a stale or weak candidate is read
+    next. Related, and also left alone: the desktop's 14 misses on the
+    dead zero-hop path between 22:28:01 and 22:30:38 were NOT an
+    "exhausted" branch that failed to run. At 22:30:55 that candidate
+    showed `misses 3` -- the scoreboard records one sample per SEND and
+    per QUERY ROUND (deliberately, 2026-09-19: "a single lost ACK still
+    is not a path failure"), so 14 attempts produced 3 samples and the
+    exhaust rule (which needs 2-4) was never reached before the laptop's
+    post-restart announce supplied an alternative. The branch is as
+    designed; the gap is evidence granularity against attempt cost, and
+    changing it would declare paths dead roughly four times faster
+    everywhere. Noted here, not changed, with no isolation run to support
+    it.
+
+    Tests: `tests/test_path_evidence_ageing_0923.py` (the three field
+    records replayed through the pure rules; the readings ageing; a
+    timestamp-less reading not aged; never-evidenced is not stale; a
+    stale candidate ranking behind a candidate it out-SCORES; the peer's
+    reported path length). One assertion of
+    `tests/test_path_selection_0922.py` ("a weak last leg does not make a
+    relayed path weak") re-pinned to its reversal, with the field record
+    cited at the line. MeshBench: `shortcut_appears`, `failover`,
+    `repeater_returns`, `weak_direct`, `two_hop`.

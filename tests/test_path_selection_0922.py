@@ -107,7 +107,11 @@ class PureScore(_Pure):
         self.assertEqual(prior(0, 2.0, WEAK_SNR), 0.25, "zero hop heard below 3 dB: weak")
         self.assertEqual(prior(0, 11.75, WEAK_SNR), 0.8, "zero hop heard well: optimistic")
         self.assertEqual(prior(0, 3.0, WEAK_SNR), 0.8, "the threshold itself is not weak")
-        self.assertEqual(prior(2, 1.0, WEAK_SNR), 0.8, "a weak last leg does not make a relayed path weak")
+        # Reversed deliberately by alpha 0.1.8 (item 3): a weak last leg IS
+        # weak evidence at any hop count. The laptop's 2026-09-22 22:30:26
+        # record trialled a three-hop candidate heard once at -9 dB ahead of
+        # its current path because this rule read `hops == 0` only.
+        self.assertEqual(prior(2, 1.0, WEAK_SNR), 0.25, "a weak last leg is weak at any hop count (0.1.8 item 3)")
         self.assertEqual(prior(0, 2.0, WEAK_SNR, peer_rate=0.6), 0.6, "the peer's reported rate overrides the priors")
         self.assertEqual(prior(1, None, WEAK_SNR, peer_rate=0.6), 0.6)
         self.assertEqual(self.Iface.PATH_PRIOR_OPTIMISTIC, 0.8)

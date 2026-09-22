@@ -1,5 +1,33 @@
 # Changelog
 
+## alpha-0.1.8 (unreleased, 2026-09-23)
+
+From the alpha 0.1.7 field session (`fieldtests/raw/Alpha0.1.7/`, 2026-09-22 evening: zero hop at
+home, a two-hop stop, a one-hop stop). The release is about frames per exchange. The dated design
+record is `docs/history.md` ("Alpha 0.1.8 pass"). Every default is pinned by
+`tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
+
+- **The path scoreboard ages its evidence.** A candidate's peer-reported delivery rate and its
+  last-leg SNR now count only while those readings are inside `PATH_SAMPLE_WINDOW_S` (600 s), the
+  same window the send outcomes are weighed over; older readings are kept for the capture and score
+  as unknown. A candidate whose evidence has *all* aged out is STALE: it scores with
+  `PATH_PRIOR_WEAK` rather than the optimistic prior and ranks behind every candidate with evidence
+  inside the window. A candidate that never had evidence is untried, not stale, and keeps the
+  optimistic prior, so bring-up is unchanged. The weak-signal prior now applies at **any** hop
+  count, not only at zero hops; the peer's own reported rate still comes first. And while the peer's
+  reported path length is itself inside the window, an untried candidate claiming fewer hops than
+  that scores weak. Field motivation (desktop, 22:49:42): a `path_selected` trial of the dead
+  zero-hop path while the laptop was two hops away, scored `rate 1.0, measured False, misses 3, snr
+  11.75` -- its own send outcomes had aged out, but a peer-reported rate from 22:07 and an SNR
+  reading from the zero-hop period never aged, so a dead path outranked a one-hop candidate heard at
+  12.25 dB; six more misses and 70 s. And (laptop, 22:30:26) a trial of a three-hop candidate heard
+  once at -9 dB, because the weak prior read `hops == 0` only; two misses, "exhausted", rediscovery,
+  26 s. No config key and no wire change. Capture: `stale`, `snr_fresh` and `peer_rate_fresh` on
+  every candidate of a `path_selected` record. Tests: `tests/test_path_evidence_ageing_0923.py`
+  (each of the three field records replayed through the pure rules); one assertion of
+  `tests/test_path_selection_0922.py` re-pinned, since the weak-last-leg rule is reversed on
+  purpose. MeshBench: `shortcut_appears`, `failover`, `repeater_returns`, `weak_direct`, `two_hop`.
+
 ## alpha-0.1.7 (unreleased, 2026-09-22)
 
 A small release from the alpha 0.1.6 field session (`fieldtests/raw/Alpha0.1.6/`, 2026-09-22, one
