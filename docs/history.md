@@ -4070,3 +4070,169 @@ parity stays on.
     recovered in 7.7 s) and a 12-packet zero-hop transfer (12/12 in round
     0, 1.00 reports per reported packet, calibration corrected 1.00 /
     1.01), `fieldtests/raw/Alpha0.1.6-bench/`.
+
+**Alpha 0.1.7 pass (2026-09-22 afternoon, from the alpha 0.1.6 field
+session's captures in `fieldtests/raw/Alpha0.1.6/`, desktop `afipc_` +
+laptop `a_`, one hop then zero hop, no two-hop stop).** A small release:
+no wire change (alpha 0.1.6 and 0.1.7 interoperate; the golden wire
+snapshot is untouched), four code items and two procedure items. The
+metric is unchanged. What the 0.1.6 session established: the multi-hop
+regression is fixed (one-hop attempt success 80 % against 66 %, on-air
+bytes per delivered byte 1.92 against 2.89, control frames per raw send
+1.15 against 5.1, QUERY attempts per raw send 0.22 against 1.27,
+completion timeouts 4 of 48 against 55 of 120, lock wait p90 7 s and max
+54 s against 11.9 s and 143 s), path selection made seven decisions and
+all were right, the supervisor came up within a second on all three
+starts, zero hop held its 0.1.5 numbers. Owner decisions in force as for
+0.1.6 (airtime 85 % zero hop / 30 % relayed, never loosened; measured
+reliability over hop count; parity on).
+
+ 1. **Young plain proofs go ahead of bulk** (`proof_fresh_s`, new, 8 s, in
+    `_configure_retry`; `_note_proof_enqueued` / `_proof_enqueued_at_for`
+    / `_proof_is_fresh` in `_wire.py`; `_proof_enqueued_at` with
+    PROOF_ENQUEUED_MAX_KEYS 64, swept with the proof correlations;
+    `_PriorityAsyncLock.preempt_resume_priority`; `proof_age_s` and
+    `proof_fresh` on `direct_attempt_result`). The field, desktop capture
+    11:49:34-11:50:44 at one hop: the laptop sent one 211 B LXMF message
+    six times (opportunistic, two raw fragments each). The desktop's RNS
+    proved every copy at once (`out PROOF NONE 83 B` on the same second as
+    each `in DATA`) but each proof left the radio 5-20 s later
+    (`direct_send_result` at +15, +11, +9, +20, +17, +5 s) -- lock waits
+    of 3-7 s behind the page windows the desktop was serving, the
+    incoming-quiet courtesy wait of up to 2.8 s, a 2 s ACK, and one miss
+    at the 8 s one-hop timeout with its retry. LXMF re-sends an unproved
+    opportunistic message after DELIVERY_RETRY_WAIT 10 s, checked every
+    PROCESSING_INTERVAL 4 s, up to MAX_DELIVERY_ATTEMPTS 5 (`LXMRouter.py`
+    30-32, 2757, 2817), so a plain PROOF answering fresh DATA is
+    time-critical the way a handshake is, and it was bulk-tier (the
+    ANSWER tier since 2026-09-19, queued like everything else at that
+    tier). Read against the source before changing anything: a plain
+    proof is dispatched on exactly one DIRECT path, `_send_direct_payload`
+    (the primary route via `_proof_correlation`, the small-mesh
+    DIRECT-to-all copies and the bootstrap supplement all end there),
+    which is where `_is_link_handshake` sets the lock's `preempt` flag;
+    that flag is what every idle hold consults -- the between-fragments
+    yield of the raw window (`_run_window`, `lock.preempt_requested()`),
+    the report wait and the QUERY quiet hold (`_wait_future_or_preempt`),
+    the post-send listen and the no-ACK report hold (`_idle_hold`), the
+    pre-emptible ACK wait, and the duty-cycle throttle interrupt in
+    `_send_raw_fragment`. Now `process_outgoing` records when each plain
+    PROOF was queued, keyed by its destination field (the proved packet's
+    truncated hash -- `ProofDestination.hash`, `RNS/Packet.py` -- or the
+    link_id for a Link's proof, `Link.prove_packet`), and
+    `_send_direct_with_attempts` re-reads the age at EVERY attempt: under
+    `proof_fresh_s` the attempt acquires the lock with `preempt=True`,
+    exactly as an LRPROOF does; past it (a retry after a miss at the hop
+    cap usually is) the proof queues as bulk again and still expires at
+    `proof_max_age`. The tier stays ANSWER: the handshake attempt budget
+    and the duty-cycle exemption are keyed on PRIORITY_HANDSHAKE and must
+    not apply (the 2026-09-19 finding: 188 proofs at that tier cost
+    1716 s of lock). The queue time, not the DATA's receipt, is the
+    anchor because it is already stamped for `proof_max_age` and is
+    within milliseconds of the receipt: on the installed RNS 1.4.2 (and
+    the 1.3.7 inside the MeshChat AppImage) `Transport.inbound` is
+    synchronous and LXMF's `delivery_packet` calls `packet.prove()` as its
+    first line; on RNS 1.5 (`USE_INBOUND_QUEUE`) it is one thread hop
+    later. One lock change: a holder yielding to a pre-empting waiter
+    resumes half a step BEHIND the pre-empting tier (`preempt_resume_
+    priority`: 0.5 behind a handshake as before, 1.5 behind a fresh proof
+    at the ANSWER tier, the tier a report yield already resumes at) --
+    the grant itself is immediate on `release()`, but with two fresh
+    proofs queued a resume at 0.5 would splice the window between them.
+    What this costs, accepted because it is what a handshake already
+    does: a fresh proof splits a part's burst at a fragment gap (the
+    handshake yield fires between fragments, the report yield only
+    between parts), a cut report wait releases the lock for the rest of
+    the round, and a cut QUERY quiet hold lets the proof transmit into
+    the ANSWER's relay. `proof_fresh_s` 8 s: the far side's retry is due
+    10-14 s after its send, minus ~2 s of transit at one hop. Tests:
+    `tests/test_fresh_proof_0922.py` (the rule and default; the queue
+    time recorded for plain proofs only, bounded, swept; the lock's
+    resume tier and two fresh proofs both out before the holder resumes;
+    on a three-part one-hop window with the real
+    `_send_direct_payload` -> attempts loop -> lock and only the radio
+    keying stubbed: a 0.5 s old proof goes out before the next part with
+    `proof_fresh` true on its attempt record, a 30 s old one waits for the
+    window). Shipped-default pin and golden config re-pinned (one key
+    added). MeshBench: `large_payload` and `relay` twice each,
+    `page_transfer_bidir` once, in `changelog.md`.
+
+ 3. **Token learning never maps a local destination, and learns only
+    from packets that name a source** (`_token_learnable_from`,
+    `_is_local_destination`, the guard in `_learn_rns_token`; a
+    `path_response_announce` kind in the simmesh harness). The desktop's
+    rnsd log: "learned token d4c70c4b... -> '343377c464a7'" seven times,
+    once per inbound LXMF DATA addressed to the desktop's own LXMF
+    delivery destination. Read against the source: the generic branch of
+    `_observe_incoming_rns_packet` learned `destination_hash -> sender`
+    for every non-PROOF packet a bound peer delivered DIRECT. Per class:
+    an ANNOUNCE (context NONE or PATH_RESPONSE -- a real path response IS
+    an ANNOUNCE, `Destination.announce(path_response=True)`) names a
+    destination that lives in the sender's direction, the inference RNS's
+    own path table makes; a packet carried on a Link puts the link_id
+    there, and a Link is one bidirectional session, so the peer that
+    delivered it is the peer this node's own Link packets go to; but a
+    DATA to a SINGLE destination, a LINKREQUEST (whose link_id is learned
+    separately via `_compute_link_id`) and a PLAIN path request are
+    addressed TO a destination that is this node's own or lies beyond
+    some other interface -- "outgoing to this hash -> this peer" is wrong
+    either way, and on a transport node it OVERWROTE the announce-learned
+    token for a destination beyond another peer (`_learn_rns_token` pops
+    and re-inserts). No dated entry ever justified learning from DATA:
+    the M6 bootstrap note's "one successful delivery teaches the
+    recipient a token" was the recipient's own hash, which routes
+    nothing; the 2026-09-19 raw widening was about path-response
+    ANNOUNCEs. Now the generic branch learns only from announce-class and
+    Link-carried packets; the LINKREQUEST link_id learn and its
+    supersession, the PROOF / LRPROOF branches and the unconditional
+    `_proof_correlation` write (it routes this node's outgoing PROOF for
+    the DATA -- the field case exactly) are unchanged. And
+    `_learn_rns_token`, the single entry point, refuses a token that is
+    one of this node's own destinations: registered in this process
+    (`RNS.Transport.destinations_map`, IN destinations only) or -- the
+    field's case, since MeshChat runs as a shared-instance client and
+    `d4c70c4b` is registered in ITS process -- a `path_table` entry at
+    zero hops (RNS's own `for_local_client` test) or received on a local
+    client interface (`Transport.is_local_client_interface`). Tests:
+    `tests/test_token_learning_0922.py` (the learnable shapes; inbound
+    DATA to a local destination learns nothing while its PROOF still
+    routes; DATA for a destination beyond another peer does not
+    overwrite that peer's announce-learned token; a LINKREQUEST learns
+    the link_id and not the requested destination; a Link packet learns
+    the link_id; ANNOUNCE and both path-response shapes still learn and
+    clear the backoff; the guard at the entry point for a registered
+    destination, a zero-hop path entry and a local-client entry, a
+    reflected own announce). Four tests and `_support._prime` had taught
+    the token with a DATA packet addressed to the receiver's own
+    destination (an RNS-impossible packet used as a shortcut); they now
+    send an announce, as RNS does. No MeshBench.
+
+ 4. **Capture and summary hygiene.** (a) `peer_path_len` and `peer_rate`
+    (the peer's "Q" v5 header, `_note_peer_reported_path`) and this
+    node's own `hop_count` are now on `completion_report_sent` and
+    `completion_query_received` (`_peer_view_fields`), and on
+    `path_selected` when a candidate came from the peer's report -- the
+    numbers the receiver's holds scale by (`_receiver_hops_to`), which
+    the 0.1.6 captures did not carry. (b) The desktop's "1.33 reports
+    per window" was the summariser, not a rule: the laptop's interface
+    restarted at 12:35 (its second capture file), its pkt_id counter
+    restarted at 0, and `meshbench_report.py` keyed reports on `(sender,
+    pkt_id, round)`, so pkt 0, 1 and 4 of 11:45-11:49 collided with the
+    same ids 50 minutes later -- 12 reports over 9 keys. Every desktop
+    report was one per window, every one immediate (`held_s` 0.0), pkt 2
+    at 12:38:07 folded into pkt 3's report two seconds later. The key now
+    counts a repeat only within REPORT_REPEAT_WINDOW_S (120 s) of the
+    previous report for the same key (`reports_per_packet`); the desktop
+    reads 1.0. (c) `field_ab_compare.py` gained proof turnaround per hop
+    (`proof_turnaround`: an inbound DATA to the `direct_send_result` of
+    the plain PROOF answering it, joined by order since the capture holds
+    no packet bytes -- the `out PROOF` follows its `in DATA` on the same
+    second -- and by the proof's destination hash; the 0.1.6 one-hop row
+    reads 13.5 / 17.7 / 20.5 s over six proofs, the 0.1.5 set 5.7 s
+    median at one hop and 15.5 s at two) and LXMF-style duplicate
+    deliveries (`duplicate_deliveries`: an inbound context-NONE DATA to
+    the same SINGLE destination with the same size within 30 s of the
+    previous copy; 0.1.6: one message, four repeat copies at one hop;
+    0.1.5: a 115 B message to the desktop's delivery destination arrived
+    25 times at zero hop). No interface change beyond (a); the item 4
+    fields are pinned by `tests/test_capture_fields_0922.py`.

@@ -1,5 +1,42 @@
 # Changelog
 
+## alpha-0.1.7 (unreleased, 2026-09-22)
+
+A small release from the alpha 0.1.6 field session (`fieldtests/raw/Alpha0.1.6/`, 2026-09-22, one
+hop then zero hop): no wire change -- alpha 0.1.6 and 0.1.7 nodes interoperate and the golden wire
+snapshot is untouched. The dated design record is `docs/history.md` ("Alpha 0.1.7 pass"). New config
+key, optional: `proof_fresh_s = 8`. Every default is pinned by `tests/test_shipped_defaults.py` and
+`tests/golden/config_defaults.json`.
+
+- **Young plain proofs go ahead of bulk** (`proof_fresh_s = 8`). A plain delivery PROOF younger than
+  eight seconds (from the moment RNS queued it, within milliseconds of the DATA it answers) pre-empts
+  idle holds of the radio and is taken at the raw window's existing yield points, exactly as a Link
+  proof and the receiver's own completion report already are; its tier, attempt budget and airtime
+  accounting are unchanged, older proofs stay bulk-tier and still expire at `proof_max_age`. Field
+  motivation: at one hop the desktop proved each of six copies of one LXMF message the second it
+  arrived, but each proof left the radio 5-20 s later behind the page windows it was serving, past
+  LXMF's 10 s re-send. Capture: `proof_age_s` and `proof_fresh` on `direct_attempt_result`. Tests:
+  `tests/test_fresh_proof_0922.py`. MeshBench: `large_payload`, `relay`, `page_transfer_bidir`, below.
+- **Token learning never maps a local destination.** The desktop's rnsd learned a route to its own
+  LXMF delivery destination seven times, from the inbound LXMF packets addressed to it. Inbound DATA
+  and LINKREQUESTs name their recipient, not a source, so they no longer teach a `destination -> peer`
+  token (announces, path responses and packets carried on a Link still do; a LINKREQUEST's link_id
+  is still learned; the proof for an inbound DATA still routes); and the single learning entry point
+  refuses a token for one of this node's own destinations, including those a shared-instance client
+  such as MeshChat registered (RNS's own local-client test). On a transport node the old learn had
+  overwritten the announce-learned token for a destination beyond another peer. Tests:
+  `tests/test_token_learning_0922.py`.
+- **Capture and summary hygiene.** `completion_report_sent`, `completion_query_received` and
+  `path_selected` (for a peer-reported candidate) carry `peer_path_len`, `peer_rate` and the node's
+  own `hop_count`; `meshbench_report.py`'s reports-per-window key no longer double-counts a peer
+  whose pkt_id counter restarted (the desktop's "1.33" was that, every report was one per window);
+  `field_ab_compare.py` prints proof turnaround per hop and LXMF-style duplicate deliveries (the
+  0.1.6 set: 13.5 s median, six proofs, one message delivered five times inside 30 s chains at one
+  hop). Tests: `tests/test_capture_fields_0922.py`.
+- **Procedure** (`fieldtests/AB_PROTOCOL.md`): the one-hop gap A/B written out step by step, how to
+  keep MeshChat's own RNS log (its link requests are validated there, not in rnsd), and one two-hop
+  stop with capture on.
+
 ## alpha-0.1.6 (2026-09-22)
 
 The items of the alpha 0.1.6 pass, each from the alpha 0.1.5 field session's captures

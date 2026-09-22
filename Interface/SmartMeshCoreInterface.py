@@ -5960,12 +5960,18 @@ class _PathDiscoveryMixin:
                                previous: "Optional[_PathCandidate]", ranked) -> None:
         if self._packet_capture_file is None:
             return
+        board = self._path_boards.get(peer_prefix)
+        peer_reported = any(v.get("source") == "peer_report" for _s, v, _r, _m in ranked)
         self._capture_event("out", {
             "event": "path_selected", "peer_prefix": peer_prefix, "reason": reason,
             "path_hex": cand.path_hex if cand is not None else None,
             "path_len": cand.hops if cand is not None else None,
             "previous_path_hex": previous.path_hex if previous is not None else None,
             "previous_path_len": previous.hops if previous is not None else None,
+            # Alpha 0.1.7 (item 4): the peer's reported view when one of the
+            # candidates came from its report (the v5 header).
+            "peer_path_len": board.peer_path_len if peer_reported and board is not None else None,
+            "peer_rate": (round(board.peer_rate, 3) if peer_reported and board is not None and board.peer_rate is not None else None),
             "scores": [{
                 "path_hex": v["path_hex"], "hops": v["hops"], "score": round(score, 3), "rate": round(rate, 3),
                 "measured": measured, "misses": v["consecutive_misses"], "snr": v.get("snr"), "source": v.get("source"),
@@ -9477,6 +9483,10 @@ class _ReconcileMixin:
                         "pkt_id": frame.pkt_id, "frag_total": frame.frag_total, "query_version": frame.version,
                         "answering_complete": entries[0][2], "answering_held": sorted(entries[0][3]),
                         "entries": [(p, t, c, sorted(h)) for p, t, c, h in entries],
+                        # alpha 0.1.7 (item 4): the v5 header as received
+                        "peer_path_len": frame.peer_path_len,
+                        "peer_rate": round(frame.peer_rate, 3) if frame.peer_rate is not None else None,
+                        "hop_count": self._peer_view_fields(sender_token)["hop_count"],
                     })
                 self._spawn_background_task(
                     self._send_completion_answer(
@@ -9499,6 +9509,9 @@ class _ReconcileMixin:
                     "query_version": frame.version,
                     "answering_complete": complete,
                     "answering_held": sorted(held),
+                    "peer_path_len": frame.peer_path_len,
+                    "peer_rate": round(frame.peer_rate, 3) if frame.peer_rate is not None else None,
+                    "hop_count": self._peer_view_fields(sender_token)["hop_count"],
                 })
             self._spawn_background_task(
                 self._send_completion_answer(
@@ -9737,6 +9750,22 @@ class _ReconcileMixin:
         reported = board.peer_path_len if board is not None and board.peer_path_len is not None else 0
         return max(own, reported)
 
+    def _peer_view_fields(self, sender_token: str) -> dict:
+        """Capture fields for the peer's reported view of the path between
+        us (alpha 0.1.7, item 4): this node's own resolved hop count to the
+        sender, and the path length and delivery rate the peer last put in
+        a "Q" v5 header (`_note_peer_reported_path`) -- the numbers the
+        receiver's holds scale by (`_receiver_hops_to`), which the field
+        could not read from the 0.1.6 captures."""
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        board = self._path_boards.get(peer_prefix) if peer_prefix else None
+        return {
+            "hop_count": resolved.out_path_len if resolved is not None else None,
+            "peer_path_len": board.peer_path_len if board is not None else None,
+            "peer_rate": round(board.peer_rate, 3) if board is not None and board.peer_rate is not None else None,
+        }
+
     def _schedule_sender_report(self, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
         """Alpha 0.1.5 (2b): a part completed on an unflagged fragment --
         the sender's window is still in the air. Hold ONE complete report
@@ -9848,6 +9877,7 @@ class _ReconcileMixin:
                 "round": (header.attempt or 0) & 0x03,
                 "held_s": round(held_s, 3) if held_s is not None else None,   # the hold this report waited (0.0: at once; item 3)
                 "noack": self.direct_report_noack,
+                **self._peer_view_fields(sender_token),   # alpha 0.1.7 (item 4): what the hold scaled by
             })
         # M2 (2026-09-20): the report lists this sender's recent raw packets
         # (newest first, the triggering one guaranteed), so one report

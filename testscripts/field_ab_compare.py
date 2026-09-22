@@ -368,7 +368,93 @@ def analyse_set(recs: list, hop_filter=None, radio=(7, 62.5, 8)) -> dict:
         if parts:
             calib[node] = sum_calibrations(parts)
     out["estimator_calibration"] = calib
+    # Alpha 0.1.7 (item 4): proof turnaround per hop -- an inbound DATA to
+    # the proof RNS answers it with leaving the radio -- and LXMF-style
+    # duplicate deliveries. The 2026-09-22 one-hop session: one 211 B LXMF
+    # message arrived six times in 70 s because each proof left 5-20 s
+    # after its DATA (LXMF re-sends after DELIVERY_RETRY_WAIT 10 s), so
+    # these two numbers read together say whether the proof is fast
+    # enough. The capture holds no packet bytes, so the join is by order:
+    # RNS proves synchronously inside `owner.inbound`, and the `out PROOF`
+    # (context NONE) packet record follows its `in DATA` on the same
+    # second; that proof's `direct_send_result` (same destination_hash)
+    # is when it left the radio. Stratified by the DATA's hop count.
+    out["proof_turnaround"], out["proof_pending"] = proof_turnaround(recs, hop_filter=hop_filter)
+    out["lxmf_duplicates"] = duplicate_deliveries(recs, hop_filter=hop_filter)
     return out
+
+
+PROOF_JOIN_S = 2.0          # an `out PROOF` this soon after an `in DATA` answers it
+DUPLICATE_WINDOW_S = 30.0   # LXMF re-sends every 10-14 s; six copies span ~70 s, so a chain of 30 s links
+
+
+def proof_turnaround(recs: list, hop_filter=None) -> "tuple[dict, int]":
+    """Per hop: the seconds from an inbound DATA packet to the
+    `direct_send_result` of the plain PROOF answering it (see
+    `analyse_set`); also how many such proofs never got a send result in
+    the capture (dropped, expired, or still queued at the end)."""
+    pk = [r for r in recs if "event" not in r]
+    dsr_by_dest = collections.defaultdict(list)
+    for r in recs:
+        if r.get("event") == "direct_send_result" and r.get("destination_hash"):
+            dsr_by_dest[(r["_node"], r["destination_hash"])].append(r["ts"])
+    last_data = {}   # node -> (ts, hop_count) of the latest inbound DATA
+    by_hop = collections.defaultdict(list)
+    pending = 0
+    for r in sorted(pk, key=lambda x: x["ts"]):
+        node = r["_node"]
+        if r.get("direction") == "in" and r.get("packet_type_name") == "DATA":
+            last_data[node] = (r["ts"], r.get("hop_count"))
+            continue
+        if not (r.get("direction") == "out" and r.get("packet_type_name") == "PROOF"
+                and (r.get("context_name") or "NONE") == "NONE"):
+            continue
+        data = last_data.get(node)
+        if data is None or r["ts"] - data[0] > PROOF_JOIN_S:
+            continue
+        hop = data[1]
+        if hop_filter is not None and hop != hop_filter:
+            continue
+        sent = [t for t in dsr_by_dest.get((node, r.get("destination_hash")), []) if t >= r["ts"]]
+        if not sent:
+            pending += 1
+            continue
+        by_hop[hop].append(sent[0] - data[0])
+    return ({h: dist(v) for h, v in sorted(by_hop.items(), key=lambda kv: (kv[0] is None, kv[0] if kv[0] is not None else -1))},
+            pending)
+
+
+def duplicate_deliveries(recs: list, hop_filter=None) -> dict:
+    """LXMF-style duplicate deliveries: an inbound DATA (context NONE, a
+    SINGLE destination) to the same destination with the same size within
+    DUPLICATE_WINDOW_S of the previous copy. Returns per hop the number of
+    copies beyond the first (`repeats`) and the messages they belong to
+    (`messages`), plus the worst chain length."""
+    last = {}   # (node, dest, size) -> ts of the previous copy
+    chain = collections.Counter()
+    repeats = collections.defaultdict(int)
+    messages = collections.defaultdict(set)
+    longest = 0
+    for r in sorted((r for r in recs if "event" not in r), key=lambda x: x["ts"]):
+        if not (r.get("direction") == "in" and r.get("packet_type_name") == "DATA"
+                and (r.get("context_name") or "NONE") == "NONE"
+                and (r.get("destination_type_name") or "SINGLE") == "SINGLE"):
+            continue
+        hop = r.get("hop_count")
+        if hop_filter is not None and hop != hop_filter:
+            continue
+        key = (r["_node"], r.get("destination_hash"), r.get("size_bytes"))
+        prev = last.get(key)
+        last[key] = r["ts"]
+        if prev is not None and r["ts"] - prev <= DUPLICATE_WINDOW_S:
+            chain[key] += 1
+            repeats[hop] += 1
+            messages[hop].add(key)
+            longest = max(longest, chain[key] + 1)
+        else:
+            chain[key] = 0
+    return {"repeats_by_hop": dict(repeats), "messages_by_hop": {h: len(v) for h, v in messages.items()},
+            "longest_chain": longest}
 
 
 def sum_calibrations(parts: list) -> dict:
@@ -481,6 +567,15 @@ def print_comparison(sets: dict, min_n: int) -> None:
     row("parts started / completed", [f"{s['parts_started']} / {s['parts_completed']}" for s in sets.values()])
     for h in sorted({h for s in sets.values() for h in s["part_time"]}, key=lambda h: (h is None, h if h is not None else -1)):
         row(f"hop {h} med/p90/max s", [d_str(s["part_time"].get(h)) for s in sets.values()])
+    print("\n  -- proof turnaround: inbound DATA -> its plain PROOF's direct_send_result (item 1 of 0.1.7; field 5-20 s at one hop) --")
+    for h in sorted({h for s in sets.values() for h in s["proof_turnaround"]}, key=lambda h: (h is None, h if h is not None else -1)):
+        row(f"hop {h} med/p90/max s", [d_str(s["proof_turnaround"].get(h)) for s in sets.values()])
+    row("proofs with no send result", [s["proof_pending"] for s in sets.values()])
+    print("\n  -- LXMF-style duplicate deliveries: same destination and size within 30 s (field: six copies of one message) --")
+    for h in sorted({h for s in sets.values() for h in s["lxmf_duplicates"]["repeats_by_hop"]}, key=lambda h: (h is None, h if h is not None else -1)):
+        row(f"hop {h} repeat copies (messages)", [f"{s['lxmf_duplicates']['repeats_by_hop'].get(h, 0)} ({s['lxmf_duplicates']['messages_by_hop'].get(h, 0)})"
+                                                 for s in sets.values()])
+    row("longest chain of copies", [s["lxmf_duplicates"]["longest_chain"] for s in sets.values()])
     print("\n  -- link handshakes (LINKREQUEST out -> LRPROOF in) --")
     row("LINKREQUESTs / matched", [f"{s['linkrequests']} / {s['handshakes']['n']}" for s in sets.values()])
     row("med/p90/max s", [d_str(s["handshakes"]) for s in sets.values()])

@@ -988,12 +988,18 @@ class _PathDiscoveryMixin:
                                previous: "Optional[_PathCandidate]", ranked) -> None:
         if self._packet_capture_file is None:
             return
+        board = self._path_boards.get(peer_prefix)
+        peer_reported = any(v.get("source") == "peer_report" for _s, v, _r, _m in ranked)
         self._capture_event("out", {
             "event": "path_selected", "peer_prefix": peer_prefix, "reason": reason,
             "path_hex": cand.path_hex if cand is not None else None,
             "path_len": cand.hops if cand is not None else None,
             "previous_path_hex": previous.path_hex if previous is not None else None,
             "previous_path_len": previous.hops if previous is not None else None,
+            # Alpha 0.1.7 (item 4): the peer's reported view when one of the
+            # candidates came from its report (the v5 header).
+            "peer_path_len": board.peer_path_len if peer_reported and board is not None else None,
+            "peer_rate": (round(board.peer_rate, 3) if peer_reported and board is not None and board.peer_rate is not None else None),
             "scores": [{
                 "path_hex": v["path_hex"], "hops": v["hops"], "score": round(score, 3), "rate": round(rate, 3),
                 "measured": measured, "misses": v["consecutive_misses"], "snr": v.get("snr"), "source": v.get("source"),

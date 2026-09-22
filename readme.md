@@ -27,9 +27,15 @@ As this project is under a GPL license, there is nothing stopping you from lifti
 
 In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
 
-## Features (Version alpha0.1.6)
+## Features (Version alpha0.1.7)
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
+
+New in alpha 0.1.7 (no wire change; alpha 0.1.6 and 0.1.7 nodes work together):
+
+- a delivery proof answering a message that just arrived goes ahead of bulk traffic on the radio, the way a link handshake does, so LXMF stops re-sending messages that were already delivered (`proof_fresh_s`, default 8 s; 0 turns it off).
+- the interface no longer learns a route to its own destinations from the messages addressed to them.
+- capture records carry the other node's reported path length and delivery rate, and the field comparison script reports proof turnaround and duplicate deliveries.
 
 New in alpha 0.1.6 (**wire change: both nodes must run alpha 0.1.6** -- the fragment-reconciliation frames now carry each node's view of its path to the other):
 

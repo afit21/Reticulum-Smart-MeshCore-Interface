@@ -138,6 +138,28 @@ def capture_files(run_dir: str) -> dict:
     return dict(out)
 
 
+
+REPORT_REPEAT_WINDOW_S = 120.0   # longer than any receiver hold or sender report wait
+
+
+def reports_per_packet(recs: list):
+    """Reports sent per (sender, pkt_id, round) key, counting a later
+    report for the same key as a repeat only within REPORT_REPEAT_WINDOW_S
+    of the previous one (see the alpha 0.1.7 note where this is used).
+    None when no report was sent."""
+    last = {}
+    reports = 0
+    firsts = 0
+    for r in sorted((r for r in recs if r.get("event") == "completion_report_sent"), key=lambda r: r.get("ts") or 0):
+        key = (r.get("sender_token"), r.get("pkt_id"), r.get("round"))
+        ts = r.get("ts") or 0
+        reports += 1
+        prev = last.get(key)
+        if prev is None or ts - prev > REPORT_REPEAT_WINDOW_S:
+            firsts += 1
+        last[key] = ts
+    return round(reports / firsts, 2) if firsts else None
+
 def analyse_capture(recs: list) -> dict:
     n = {"records": len(recs)}
     att_all = [r for r in recs if r.get("event") == "direct_attempt_result"]
@@ -226,10 +248,13 @@ def analyse_capture(recs: list) -> dict:
     n["reports_sent_complete"] = sum(1 for r in recs if r.get("event") == "completion_report_sent" and r.get("complete"))
     # Alpha 0.1.6 (item 3): reports per reported packet -- the field's
     # doubled reports were two records for one (sender, pkt_id, round);
-    # 1.0 is one report per window.
-    _rep_keys = {(r.get("sender_token"), r.get("pkt_id"), r.get("round"))
-                 for r in recs if r.get("event") == "completion_report_sent"}
-    n["reports_per_packet"] = round(n["reports_sent"] / len(_rep_keys), 2) if _rep_keys else None
+    # 1.0 is one report per window. Alpha 0.1.7 (item 4): a repeat only
+    # counts within REPORT_REPEAT_WINDOW_S of the previous report for the
+    # same key -- the sender's pkt_id counter restarts with its process
+    # (the laptop's did at 12:35 on 2026-09-22, and its ids 0, 1 and 4 were
+    # reported again 50 minutes after the first time, reading as 1.33
+    # reports per window on a receiver that sent exactly one per window).
+    n["reports_per_packet"] = reports_per_packet(recs)
     n["reports_held"] = sum(1 for r in recs if r.get("event") == "completion_report_sent" and (r.get("held_s") or 0) > 0)
     n["queries_received"] = sum(1 for r in recs if r.get("event") == "completion_query_received")
     n["small_mesh_mode"] = dict(collections.Counter(r.get("small_mesh_mode") for r in pk_out))
