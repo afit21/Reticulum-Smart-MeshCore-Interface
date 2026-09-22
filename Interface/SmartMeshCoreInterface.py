@@ -13,7 +13,18 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.7 (alpha 0.1.6 plus the 2026-09-22 afternoon pass
+STATUS -- alpha 0.1.8 (alpha 0.1.7 plus the 2026-09-23 pass from that
+build's 2026-09-22 evening field session, which had a two-hop stop: for a
+raw window whose packets RNS proves, the PROOF is the completion and the
+report is not sent; at two hops and beyond a report that IS sent goes on
+the acknowledged carrier with one retry; the path scoreboard ages its
+peer-reported rate and signal readings and scores a candidate whose
+evidence has all expired as weak; the announce cache is persisted across a
+restart and one path-request verification per interval goes on the air
+instead of most of them. No wire change -- the golden wire snapshot is
+untouched and alpha 0.1.7 and 0.1.8 nodes interoperate, although the two
+sides get the benefit only when both run 0.1.8); alpha 0.1.7 was alpha
+0.1.6 plus the 2026-09-22 afternoon pass
 from that build's field session: young plain proofs pre-empt bulk like a
 handshake, token learning never maps a local destination, the peer's
 reported path view on the capture records; no wire change, alpha 0.1.6
