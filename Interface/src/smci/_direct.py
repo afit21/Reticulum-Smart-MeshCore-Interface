@@ -1181,6 +1181,7 @@ class _DirectSendMixin:
     async def _await_direct_ack(
         self, sent, peer_prefix: Optional[str], hop_count: Optional[int], rx_window: dict, ack_wait_start: float,
         cancel_event: "Optional[asyncio.Event]" = None, preemptible: bool = False,
+        ack_timeout_max_s: Optional[float] = None,
     ) -> "tuple[bool, bool, Optional[float], str, Optional[float], Optional[float]]":
         """The ACK wait for one transmitted DIRECT frame (refactor,
         2026-09-19: lifted verbatim out of `_send_direct_frame_and_wait_
@@ -1219,6 +1220,16 @@ class _DirectSendMixin:
             if peer_prefix is not None:
                 self._last_firmware_ack_timeout_s[peer_prefix] = timeout_s
             timeout_s, ack_timeout_source = self._adaptive_ack_timeout(peer_prefix, timeout_s)
+            if ack_timeout_max_s is not None and ack_timeout_max_s > 0 and ack_timeout_max_s < timeout_s:
+                # Alpha 0.1.8 (item 2): a completion REPORT's ACK wait is
+                # bounded by how long its answer is still USEFUL to the
+                # sender, not by the miss ceiling. At two hops the cap is
+                # 11 s (adaptively ~9.4 s) while the sender's whole report
+                # wait is 9 s, so an unbounded first attempt would hold
+                # this radio past the moment the sender gave up and would
+                # put the retry on the air after the QUERY round had
+                # already started.
+                timeout_s, ack_timeout_source = ack_timeout_max_s, "report_window"
 
             # Field fix (2026-09-18 evening): early abort on a
             # dead first hop -- see _hop1_abort_deadline_s. Wait
@@ -1370,6 +1381,8 @@ class _DirectSendMixin:
         preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
         proof_age_s: Optional[float] = None,  # capture-only (alpha 0.1.7, item 1): a plain PROOF's age at this attempt
         proof_fresh: Optional[bool] = None,  # capture-only: whether that age made it pre-empt (proof_fresh_s)
+        report: bool = False,  # alpha 0.1.8 item 2: take the lock in the REPORT class, as the no-ACK carrier does
+        ack_timeout_max_s: Optional[float] = None,  # alpha 0.1.8 item 2: ceiling on this frame's ACK wait
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -1447,7 +1460,13 @@ class _DirectSendMixin:
         wait_start = time.monotonic()
         preempted = False
         try:
-            async with self._direct_exchange_lock(priority, preempt=preempt):
+            # Alpha 0.1.8 (item 2): `report=True` takes the lock in the
+            # REPORT class, exactly as `_send_direct_noack_frame` does for
+            # the same frame -- without it, moving a report onto this
+            # carrier would silently lose alpha 0.1.5 item 6 (a raw window
+            # yields the radio between its parts to a report this node
+            # owes) and alpha 0.1.7 item 3c.
+            async with self._direct_exchange_lock(priority, preempt=preempt, report=report):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 if quiet_wait is not None and quiet_wait.done():
@@ -1519,7 +1538,7 @@ class _DirectSendMixin:
                     (ok, waited_full_timeout, ack_timeout_s, ack_timeout_source,
                      ack_latency_s, hop1_abort_deadline_s) = await self._await_direct_ack(
                         sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=cancel_event,
-                        preemptible=preemptible,
+                        preemptible=preemptible, ack_timeout_max_s=ack_timeout_max_s,
                     )
                     preempted = ack_timeout_source == "preempted"
                     if ack_timeout_source == "answered" and getattr(cancel_event, "superseded", False):

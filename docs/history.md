@@ -4608,3 +4608,114 @@ client-specific workaround).
     report; a report going out for another reason cancelling the grace).
     Shipped-default pin and golden config re-pinned (one key added).
     MeshBench: `relay`, `two_hop`, `large_payload`, `page_transfer`.
+
+ 2. **Acknowledge the report where the no-ACK frame does not arrive**
+    (`direct_report_ack_min_hops`, new, 2, in `_configure_retry`;
+    `_report_should_ack`; `report` and `ack_timeout_max_s` on
+    `_send_direct_frame_and_wait_for_ack` / `_await_direct_ack`; the
+    two-attempt loop in `_send_completion_answer`; `report_acked` on
+    `completion_report_sent`). No wire change: the frame's content is
+    identical on either carrier and the golden snapshot is untouched.
+
+    The completion REPORT has gone out since 2026-09-20 as a no-ACK frame
+    (TXT_TYPE_CLI_DATA, which the firmware never acknowledges): one
+    transmission, never retried, followed by a hold of the radio for the
+    report's relay window. At one hop that is adequate -- 33 of 48
+    arrived in the alpha 0.1.6 session -- but at two hops the 2026-09-22
+    session had 3 of 22 arrive, and each miss cost the sender its whole
+    10-18 s report wait and then a QUERY round to learn exactly what the
+    report had said. Airtime at the field radios' settings (SF7, BW
+    62.5 kHz, CR 4/8, every frame keyed three times at two hops): the
+    report 0.86 s, its ACK 0.42 s, the QUERY round it avoids 2.1-2.4 s
+    plus up to an 18 s answer budget of dead lock time. Break-even is
+    about one QUERY round in five, and the field baseline is 19 of 22
+    windows going to a QUERY round. The ACK itself is transmitted by the
+    far node's firmware, so it adds nothing to THIS node's duty-cycle
+    ledger, and avoiding a QUERY round removes about 1.3 s from it; the
+    30 % relayed cap is untouched and not approached.
+
+    The carrier already existed -- `direct_report_noack = no` has been
+    the alternative branch of `_send_completion_answer` since 2026-09-20
+    -- so this item is that boolean made hop-conditional, plus three
+    corrections found by reading the two paths against each other:
+
+    (a) The acknowledged path did NOT take the lock in the report class.
+    `_send_direct_noack_frame` acquires `_direct_exchange_lock(priority,
+    report=(kind == "completion_report"))`; the acknowledged path took it
+    with `preempt=` only. Moving a report onto that carrier without
+    `report=True` would silently lose two shipped behaviours that nothing
+    in the wire tests would catch: alpha 0.1.5 item 6 (a raw window this
+    node is sending yields the radio between its parts to a report it
+    owes -- 12-15 s otherwise) and alpha 0.1.7 item 3c
+    (`_wait_future_or_preempt(also_reports=True)`). The parameter is
+    added and forwarded.
+
+    (b) The retry as first specified could never land. The sender's
+    report wait is `4.0 + 2.5 x hops`, i.e. 9 s at two hops, while the
+    ACK timeout cap there is 11 s (adaptively ~9.4 s) plus a 0-5 s
+    post-miss listen -- so a second transmission would go out 10-16 s
+    after the first, after the sender had already given up and started a
+    QUERY round, and the first attempt would meanwhile hold this radio
+    through all of it. The report's ACK wait is therefore bounded by
+    `_ack_preempt_floor_s` (the peer's own expected ACK time: srtt +
+    rttvar when measured, else 2 s + 1 s per hop, ~3.2 s at two hops
+    against a measured hop-2 ACK median of 2.7 s), recorded as
+    `ack_timeout_source = "report_window"`. Two attempts then fit inside
+    the sender's window with room.
+
+    (c) The retry re-encodes rather than resending the bytes. The report
+    body is an absolute snapshot built from `_recent_raw_entries`, which
+    re-reads the buckets live; held sets only ever grow, and re-driving
+    fragments the receiver has since reconstructed from parity (which
+    fired 10 times in the 0.1.7 field session) would be worse than
+    saying nothing. The round NONCE is kept -- the sender registered its
+    waiter under that exact value -- while the firmware `attempt` byte
+    varies, so neither a repeater nor the destination dedups the retry
+    against the first transmission (`composeMsgPacket` puts `attempt & 3`
+    in the hashed prefix). No path evidence is recorded either way:
+    `record_direct_send_result` lives in `_send_direct_with_attempts`,
+    not in the frame-level send, so a missed report ACK cannot become a
+    stale-path reset -- which at two hops, where reports miss most, it
+    otherwise would.
+
+    Pre-emption is unchanged and deliberately so: `preemptible=True` is
+    kept, which under the 0.1.7 second cut means the ACK wait consults
+    `preempt_event(handshake_only=True)` -- a Link handshake may cut it,
+    a fresh plain PROOF may not. `preempt` stays False: a report is not
+    tier 0 and must not cut anyone else's hold.
+
+    Only a REPORT changes carrier. A QUERY's ANSWER keeps the no-ACK
+    frame and its `_completion_answer_hold_s`: it already has the
+    querier's own timeout as its recovery path and is not what the field
+    evidence is about.
+
+    Read alongside item 1: that item removes the report entirely for
+    packets RNS proves per packet, so what item 2 serves at two hops is
+    the traffic RNS does not prove that way -- Resource parts inside a
+    Link (context RESOURCE; a Resource is proved once, whole, as
+    RESOURCE_PRF) and announces. In the 0.1.7 session's two-hop inbound
+    raw windows that was about a third (ANNOUNCE 7 of 21), and it grows
+    to most of them the moment a page fetch happens while the laptop is
+    away, which is the owner's actual workload.
+
+    One risk carried into the field test rather than pre-empted here: an
+    acknowledged report makes the SENDER's firmware transmit an ACK
+    autonomously 200 ms after the report decodes, which is near the
+    moment its report wait resolves. When the report is COMPLETE the
+    window then ends and the sender transmits nothing, so the common case
+    is safe; a gaps report leading to a re-burst is the exposure, and
+    `two_hop` / `three_hop` plus the field's two-hop stop are where it is
+    read. It was not mitigated speculatively because doing so needs the
+    inbound `txt_type` plumbed through and could not be verified here.
+
+    Tests: `tests/test_report_ack_at_multihop_0923.py` (the default and
+    the hop count the threshold reads, including the peer-reported path
+    length and the unknown case; one hop keeps the no-ACK frame; two hops
+    go acknowledged, in the report lock class, pre-emptible, with the
+    bounded ACK wait; a lost first transmission retried exactly once with
+    a different firmware attempt byte; two failures then stop; a QUERY's
+    ANSWER unaffected; the same bytes on either carrier at the same hop
+    count; `report_acked` on the capture record). One stub in
+    `tests/test_raw_fragments.py` widened for the new keyword.
+    Shipped-default pin and golden config re-pinned (one key added).
+    MeshBench: `two_hop`, `three_hop`, `relay`.

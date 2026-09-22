@@ -2034,6 +2034,29 @@ class _ReconcileMixin:
         if task is not None and not task.done():
             task.cancel()
 
+    def _report_should_ack(self, sender_token: str) -> bool:
+        """Whether this node's completion REPORT to `sender_token` goes
+        through the ACKNOWLEDGED send path instead of the no-ACK frame
+        (alpha 0.1.8, item 2).
+
+        The threshold reads `_receiver_hops_to`, which is the larger of
+        this node's own resolved path length to the sender and the path
+        length the SENDER reported in its last "Q" v5 header -- the
+        question is how lossy the link is, and the `max()` errs toward
+        acknowledging, which is the safe direction here. It returns 0 when
+        neither is known, so an unknown hop count keeps today's behaviour.
+
+        Why the threshold and not always: at two hops the 2026-09-22 field
+        session had the no-ACK report reach the sender 3 times out of 22,
+        and each miss cost the sender its whole report wait and then a
+        QUERY round (2.1-2.4 s of channel time at two hops) to learn what
+        the report already said; the ACK is about 0.42 s there. At ONE hop
+        reports arrived 33 times of 48 in alpha 0.1.6 and the ACK would
+        cost more than it saves."""
+        if self.direct_report_ack_min_hops <= 0:
+            return False
+        return self._receiver_hops_to(sender_token) >= self.direct_report_ack_min_hops
+
     def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set,
                                 held_s: Optional[float] = None) -> None:
         """Receiver-initiated completion report (2026-09-20): one unsolicited
@@ -2070,6 +2093,11 @@ class _ReconcileMixin:
                 "round": (header.attempt or 0) & 0x03,
                 "held_s": round(held_s, 3) if held_s is not None else None,   # the hold this report waited (0.0: at once; item 3)
                 "noack": self.direct_report_noack,
+                # Alpha 0.1.8 (item 2): which carrier this report took.
+                # `report_acked` true means the acknowledged path with one
+                # retry, because this node is at least
+                # `direct_report_ack_min_hops` from the sender.
+                "report_acked": self._report_should_ack(sender_token),
                 **self._peer_view_fields(sender_token),   # alpha 0.1.7 (item 4): what the hold scaled by
             })
         # M2 (2026-09-20): the report lists this sender's recent raw packets
@@ -2153,7 +2181,13 @@ class _ReconcileMixin:
         gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
         if gap_s > 0:
             await asyncio.sleep(gap_s)
-        if self.direct_report_noack:
+        # Alpha 0.1.8 (item 2): a REPORT at or above `direct_report_ack_
+        # min_hops` takes the acknowledged carrier instead, with one retry.
+        # Only a report -- a QUERY's ANSWER already has the querier's own
+        # timeout as its recovery path and is not what the field evidence
+        # is about.
+        acked_report = report and self._report_should_ack(sender_token)
+        if self.direct_report_noack and not acked_report:
             # Phase 3 M1 (2026-09-20): TXT_TYPE_CLI_DATA -- delivered, never
             # ACKed; the querier's / sender's next action confirms it.
             try:
@@ -2165,24 +2199,56 @@ class _ReconcileMixin:
             except Exception as exc:
                 self._debug(f"no-ACK completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) failed locally: {exc}.")
             return
+        # Alpha 0.1.8 (item 2): an acknowledged REPORT gets one retry, and
+        # its ACK wait is bounded by how long its answer is still useful to
+        # the sender rather than by the miss ceiling -- at two hops that
+        # ceiling is ~9.4-11 s while the sender's whole report wait is 9 s,
+        # so an unbounded first attempt would put the retry on the air only
+        # after the sender had already given up and started a QUERY round.
+        attempts = 2 if acked_report else 1
+        ack_max_s = self._ack_preempt_floor_s(peer_prefix, hops) if acked_report else None
         try:
-            ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
-                target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
-                priority=self.PRIORITY_ANSWER, time_critical=True,
-                kind="completion_report" if report else "completion_answer",
-                # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
-                # used to run with hop_count=None, i.e. the flat firmware
-                # suggestion, so neither the hop cap nor the abort applied).
-                hop_count=hops,
-                # Phase 1 (2026-09-20): best effort, never retried -- a
-                # queued Link handshake may cut this ACK wait once the
-                # peer's expected ACK time has passed.
-                preemptible=True,
-            )
+            ok = False
+            for attempt in range(attempts):
+                if attempt:
+                    # Re-encode rather than resend the bytes: the report
+                    # body is an absolute snapshot of what this node holds
+                    # (`_recent_raw_entries` reads the buckets live), held
+                    # sets only ever grow, and re-driving fragments the
+                    # receiver has since reconstructed from parity would be
+                    # worse than saying nothing. The round NONCE is kept --
+                    # the sender registered its waiter under that exact
+                    # value -- while the firmware `attempt` byte varies, so
+                    # neither a repeater nor the destination dedups the
+                    # retry against the first transmission.
+                    fresh = self._recent_raw_entries(sender_token)
+                    if not fresh or not any(e[2] for e in fresh):
+                        break      # nothing complete left to tell it about
+                    frame = self._encode_completion_frame_v5(
+                        self.COMPLETION_TYPE_ANSWER, [(p, t, c, h) for p, t, c, h in fresh], nonce=nonce,
+                        path_len=wire_path_len, rate=wire_rate,
+                    )
+                ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
+                    target, frame, ((nonce or 0) + attempt) & 0x03, peer_prefix=peer_prefix,
+                    priority=self.PRIORITY_ANSWER, time_critical=True,
+                    kind="completion_report" if report else "completion_answer",
+                    # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
+                    # used to run with hop_count=None, i.e. the flat firmware
+                    # suggestion, so neither the hop cap nor the abort applied).
+                    hop_count=hops,
+                    # Phase 1 (2026-09-20): best effort, never retried -- a
+                    # queued Link handshake may cut this ACK wait once the
+                    # peer's expected ACK time has passed.
+                    preemptible=True,
+                    report=report,
+                    ack_timeout_max_s=ack_max_s,
+                )
+                if ok:
+                    break
             if not ok:
                 self._debug(
-                    f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) got no ACK -- "
-                    f"not retried; the querier's own timeout is the recovery path."
+                    f"completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) got no ACK "
+                    f"in {attempts} attempt(s) -- the sender's own timeout is the recovery path."
                 )
         except Exception as exc:
             self._debug(

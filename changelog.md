@@ -5,7 +5,7 @@
 From the alpha 0.1.7 field session (`fieldtests/raw/Alpha0.1.7/`, 2026-09-22 evening: zero hop at
 home, a two-hop stop, a one-hop stop). The release is about frames per exchange. The dated design
 record is `docs/history.md` ("Alpha 0.1.8 pass"). New config keys, both optional:
-`proof_report_grace = 0.25`, `announce_cache_path` (empty). Every default is pinned by
+`proof_report_grace = 0.25`, `direct_report_ack_min_hops = 2`, `announce_cache_path` (empty). Every default is pinned by
 `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
 
 - **The proof is the completion** (`proof_report_grace = 0.25`). RNS proves every
@@ -54,6 +54,25 @@ record is `docs/history.md` ("Alpha 0.1.8 pass"). New config keys, both optional
   No wire change. Tests: `tests/test_announce_cache_restart_0923.py`; two assertions of
   `tests/test_local_announce_cache_0920.py` re-pinned, since the rule is reversed on purpose.
   MeshBench: `companion_restart`, `bring_up`.
+- **The completion report is acknowledged where the no-ACK frame does not arrive**
+  (`direct_report_ack_min_hops = 2`). From that hop count up, a completion REPORT goes through the
+  acknowledged send path with one retry instead of the no-ACK frame; a firmware ACK counts as
+  delivered. Below the threshold the no-ACK frame and its relay hold are untouched. The frame's
+  CONTENT does not change -- only its MeshCore carrier -- so the golden wire snapshot is unaffected.
+  Field motivation: at two hops the receiver's report reached the sender 3 times out of 22 (it is
+  one transmission, never retried), and each miss cost the sender its whole 10-18 s report wait and
+  then a QUERY round -- about 2.1-2.4 s of channel time at two hops -- to learn what the report had
+  already said. The ACK costs about 0.42 s there, so it pays for itself if it saves roughly one
+  QUERY round in five. At one hop reports arrived 33 times of 48 in alpha 0.1.6 and the ACK would
+  cost more than it saves. Two details that matter: the acknowledged carrier now takes the radio
+  lock in the REPORT class, as the no-ACK carrier always has (without it, alpha 0.1.5 item 6 and
+  alpha 0.1.7 item 3c would be silently lost), and the report's ACK wait is bounded by the sender's
+  own report window rather than the miss ceiling (~9.4-11 s at two hops against a 9 s report wait,
+  which would have put the retry on the air only after the sender had already started a QUERY
+  round). The retry re-encodes the bitmap from the live buckets, keeps the round nonce and varies
+  the firmware attempt byte; no path evidence is recorded either way. `direct_report_ack_min_hops =
+  0` disables the item. Capture: `report_acked` on `completion_report_sent`. Tests:
+  `tests/test_report_ack_at_multihop_0923.py`. MeshBench: `two_hop`, `three_hop`, `relay`.
 - **The path scoreboard ages its evidence.** A candidate's peer-reported delivery rate and its
   last-leg SNR now count only while those readings are inside `PATH_SAMPLE_WINDOW_S` (600 s), the
   same window the send outcomes are weighed over; older readings are kept for the capture and score

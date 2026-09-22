@@ -225,6 +225,7 @@ CONFIGURE_RETRY = {
     'direct_raw_zero_hop_gap_s': 0.15,
     'direct_report_debounce': True,
     'direct_report_hold_during_burst': True,
+    'direct_report_ack_min_hops': 2,
     'direct_report_noack': True,
     'ordinary_data_bare_retransmit_extra': 1,
     'ordinary_data_link_retransmit_extra': 0,

@@ -589,6 +589,22 @@ class _ConfigMixin:
         # zero-hop session were the previous report's ACK wait). `no`
         # restores ACKed reports and answers.
         self.direct_report_noack = _cfg_bool(cfg.get("direct_report_noack", "yes"))
+        # Alpha 0.1.8 (item 2): from this hop count up, a completion REPORT
+        # goes through the ACKNOWLEDGED send path instead, with one retry.
+        # The no-ACK frame is one transmission and is never retried, and at
+        # two hops the 2026-09-22 field session had it reach the sender 3
+        # times out of 22 -- the sender then waited out its 10-18 s report
+        # wait and spent a whole QUERY round (a QUERY, its ACK and an
+        # ANSWER, 2.1-2.4 s of channel time at two hops) to learn what the
+        # report already said. The ACK costs about 0.42 s of channel time
+        # at two hops, so it pays for itself if it saves roughly one QUERY
+        # round in five. At ONE hop it does not: reports arrived 33 times
+        # of 48 there in alpha 0.1.6 and the ACK would cost more than it
+        # saves, so below the threshold the no-ACK frame and its hold are
+        # untouched. The frame's CONTENT is identical either way -- only
+        # its carrier changes -- so the golden wire snapshot is unaffected.
+        # 0 disables the item entirely.
+        self.direct_report_ack_min_hops = max(0, int(cfg.get("direct_report_ack_min_hops", 2)))
         # Phase 3 M1: a flagged fragment that leaves gaps no longer reports
         # at once -- the second-last fragment is flagged too, so at zero hop
         # the receiver sent a gaps report and, 0.2-0.4 s later, the complete
