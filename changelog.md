@@ -43,6 +43,23 @@ key, optional: `proof_fresh_s = 8`. Every default is pinned by `tests/test_shipp
   keep MeshChat's own RNS log (its link requests are validated there, not in rnsd), and one two-hop
   stop with capture on.
 
+**MeshBench gates per item (against `tests/baselines/2026-09-22-meshbench-09105ae.md`):**
+
+- Item 1, first cut (`/tmp/mb/017/item1/`): `large_payload` x3 delivered 17 % [17-33] (baseline 33 %
+  [17-50]) but probe RTT 44.9 s [43.3-46.5] against 22.3 [20.6-31.9] on every run -- the fresh
+  proof cut the receiver's no-ACK report hold and keyed into the repeater's relay of the report,
+  was missed there, and its 8 s timeout delayed the next report (`reported` windows 3/13 against
+  9/13). `relay` x2 held (69 % [62-75], RTT 13.7 [12.8-14.6]). Revised: the two relay-window holds
+  are cut by a handshake only. Second cut (`/tmp/mb/017/item1-cut2/`): `large_payload` 5/6 and 3/6
+  (67 % [50-83]), RTT 28.7 s [27.0-30.3], reports per window 1.0, `reported` 6/15 and 9/12;
+  `relay` 6/8 and 6/8 (75 %), RTT 11.0 s [9.2-12.9], responder one-hop attempt rate 65 % (63 %),
+  proof turnaround 10.7 / 4.2 s median (baseline 10.0-15.6); `page_transfer_bidir` 0/3 (baseline
+  0 %), 22.5 B/B (12.1 [9.7-32.5]), informational. MeshBench's responder never queues its proofs
+  behind its own windows (lock waits under a second in the baseline too), so the field's 5-20 s
+  is not reproduced there; the gates read as no regression.
+- Item 2: the twelve `two_hop` attribution runs above, no change.
+- Items 3, 4, 5: no MeshBench (unit tests only, as specified).
+
 ## alpha-0.1.6 (2026-09-22)
 
 The items of the alpha 0.1.6 pass, each from the alpha 0.1.5 field session's captures
