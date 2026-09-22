@@ -208,7 +208,7 @@ class ZeroHopRawTransferIsReportedNotQueried(unittest.TestCase):
         self.assertTrue(mesh.wait_bound(40.0))
         self.assertTrue(mesh.wait_resolved(60.0))
         a, b = mesh.nodes["A"], mesh.nodes["B"]
-        b.send(build_rns_packet("data", dest_hash=b.dest_hash, payload=b"prime"))
+        b.send(build_rns_packet("announce", dest_hash=b.dest_hash, payload=b"prime"))   # item 3 of 0.1.7: an announce teaches the token
         self.assertTrue(wait_until(lambda: b.dest_hash in a.iface._rns_token_peer, 30.0))
         big = build_rns_packet("data", dest_hash=b.dest_hash, payload=b"report-" + os.urandom(440))
         a.send(big)

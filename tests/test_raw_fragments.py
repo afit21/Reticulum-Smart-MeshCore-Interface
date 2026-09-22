@@ -617,7 +617,7 @@ def _raw_mesh(test, links, repeaters=(), seed=1, config=None):
     assert mesh.wait_bound(40.0), "bind-frame discovery never completed"
     assert mesh.wait_resolved(60.0), "DIRECT paths never resolved"
     a, b = mesh.nodes["A"], mesh.nodes["B"]
-    b.send(build_rns_packet("data", dest_hash=b.dest_hash, payload=b"prime"))
+    b.send(build_rns_packet("announce", dest_hash=b.dest_hash, payload=b"prime"))   # item 3 of 0.1.7: an announce teaches the token
     assert wait_until(lambda: b.dest_hash in a.iface._rns_token_peer, 30.0), "token never learned"
     assert a.iface._peers[b.prefix].raw_fragments is True, "bind frame did not carry the raw capability"
     return mesh, a, b
@@ -814,7 +814,7 @@ class ZeroHopBidirectionalPageTransfer(unittest.TestCase):
         self.assertTrue(mesh.wait_resolved(60.0))
         a, b = mesh.nodes["A"], mesh.nodes["B"]
         for x, y in ((a, b), (b, a)):
-            y.send(build_rns_packet("data", dest_hash=y.dest_hash, payload=b"prime"))
+            y.send(build_rns_packet("announce", dest_hash=y.dest_hash, payload=b"prime"))
             self.assertTrue(wait_until(lambda: y.dest_hash in x.iface._rns_token_peer, 30.0), "token never learned")
             self.assertTrue(x.iface._peers[y.prefix].raw_fragments)
         wait_until(lambda: not a.iface._direct_exchange_lock_impl.locked() and not b.iface._direct_exchange_lock_impl.locked(), 30.0)

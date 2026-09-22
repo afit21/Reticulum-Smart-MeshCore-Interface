@@ -4674,12 +4674,51 @@ class _PeerStateMixin:
             return None
         return full_key[: self.BIND_PUBKEY_PREFIX_BYTES * 2]
 
+    def _is_local_destination(self, destination_hash: bytes) -> bool:
+        """Whether `destination_hash` is served by this node's own RNS
+        (alpha 0.1.7, item 3): a destination registered in this process
+        (`RNS.Transport.destinations_map`, IN destinations only --
+        `Transport.register_destination`), or one a shared-instance client
+        of this rnsd registered -- RNS's own test for that is a path_table
+        entry at zero hops (`Transport.inbound`'s `for_local_client`) or
+        received on a local client interface (`is_local_client_interface`;
+        the entry indices IDX_PT_HOPS 2 / IDX_PT_RVCD_IF 5 are module
+        constants in RNS/Transport.py). The field's `d4c70c4b` was the
+        second kind: MeshChat's LXMF delivery destination, registered in
+        MeshChat's process, not in rnsd's."""
+        transport = getattr(RNS, "Transport", None)
+        if transport is None or not destination_hash:
+            return False
+        try:
+            if destination_hash in (getattr(transport, "destinations_map", None) or {}):
+                return True
+            entry = (getattr(transport, "path_table", None) or {}).get(destination_hash)
+            if entry is None:
+                return False
+            if entry[2] == 0:
+                return True
+            is_local_if = getattr(transport, "is_local_client_interface", None)
+            return bool(is_local_if(entry[5])) if callable(is_local_if) else False
+        except Exception:
+            return False
+
     def _learn_rns_token(self, token: bytes, sender_peer_prefix: str) -> None:
         """The one place `_rns_token_peer` grows (audit fix, 2026-09-19 --
         added so the capacity bound cannot be bypassed by a future call
         site, in the spirit of `_register_peer` being the single entry point
         for peer state). Re-learning an existing token also refreshes its
-        position, so the eviction below targets genuinely idle tokens."""
+        position, so the eviction below targets genuinely idle tokens.
+
+        Alpha 0.1.7 (item 3): a token for one of this node's own
+        destinations is never learned -- this node never routes to itself,
+        and the 2026-09-22 desktop learned `d4c70c4b -> laptop` seven times
+        from inbound LXMF DATA to its own delivery destination."""
+        if self._is_local_destination(token):
+            self._debug(
+                f"_learn_rns_token: {token.hex()} is one of this node's own destinations -- "
+                f"not mapped to {sender_peer_prefix!r}."
+            )
+            return
         self._rns_token_peer.pop(token, None)
         self._rns_token_peer[token] = sender_peer_prefix
         while len(self._rns_token_peer) > self.RNS_TOKEN_PEER_MAX_KEYS:
@@ -4734,6 +4773,26 @@ class _PeerStateMixin:
             )
             return
         self._observe_incoming_rns_packet(data, claimed_peer_prefix)
+
+    def _token_learnable_from(self, header: _RnsHeader) -> bool:
+        """Which inbound packets teach `destination_hash -> sender` (alpha
+        0.1.7, item 3). An ANNOUNCE (any context; a path response is an
+        ANNOUNCE with context PATH_RESPONSE, `RNS.Destination.announce`)
+        names a destination that lives in the sender's direction -- the
+        same inference RNS's own path table makes from it. A packet carried
+        on a Link puts the link_id in that field, and a Link is one
+        bidirectional session between two nodes, so the peer that delivered
+        it is the peer this node's own packets on that Link go to. Every
+        other packet -- DATA to a SINGLE destination, a LINKREQUEST (its
+        link_id is learned separately below), a PLAIN path request -- is
+        addressed TO a destination that is either this node's own or lies
+        beyond some other interface; "outgoing to this hash -> this peer"
+        is wrong either way, and on a transport node it overwrote the
+        announce-learned token. The 2026-09-22 desktop learned its own LXMF
+        delivery destination from every inbound LXMF packet this way."""
+        if header.packet_type == RNS.Packet.ANNOUNCE or header.context == RNS.Packet.PATH_RESPONSE:
+            return True
+        return header.destination_type == RNS.Destination.LINK
 
     def _observe_incoming_rns_packet(self, data: bytes, sender_peer_prefix: Optional[str]) -> None:
         """§7: populated only from the DIRECT receive path -- a CHANNEL
@@ -4815,16 +4874,23 @@ class _PeerStateMixin:
             )
             return
 
-        self._learn_rns_token(header.destination_hash, sender_peer_prefix)
-        self._debug(
-            f"_observe_incoming_rns_packet: learned token "
-            f"{header.destination_hash.hex()} -> {sender_peer_prefix!r} "
-            f"(rns_tokens_learned now {len(self._rns_token_peer)})."
-        )
-        # A real token learned for this exact destination proves it IS
-        # reachable through this peer after all -- clear any backoff
-        # immediately rather than waiting for it to expire on its own.
-        self._clear_unknown_dest_backoff(header.destination_hash)
+        if self._token_learnable_from(header):
+            self._learn_rns_token(header.destination_hash, sender_peer_prefix)
+            self._debug(
+                f"_observe_incoming_rns_packet: learned token "
+                f"{header.destination_hash.hex()} -> {sender_peer_prefix!r} "
+                f"(rns_tokens_learned now {len(self._rns_token_peer)})."
+            )
+            # A real token learned for this exact destination proves it IS
+            # reachable through this peer after all -- clear any backoff
+            # immediately rather than waiting for it to expire on its own.
+            self._clear_unknown_dest_backoff(header.destination_hash)
+        else:
+            self._debug(
+                f"_observe_incoming_rns_packet: {sender_peer_prefix!r}'s packet (type {header.packet_type}) "
+                f"is addressed TO {header.destination_hash.hex()}, which is this node's or beyond another "
+                f"interface -- nothing learned from its destination field (item 3, alpha 0.1.7)."
+            )
 
         if header.packet_type == RNS.Packet.LINKREQUEST:
             # Code review (2026-09-18): this node's own LRPROOF answering

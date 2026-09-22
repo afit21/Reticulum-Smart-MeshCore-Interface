@@ -164,6 +164,10 @@ def build_rns_packet(kind: str, dest_hash: bytes = TEST_DEST_HASH, payload: byte
         "proof": (RNS.Packet.PROOF, RNS.Destination.SINGLE, RNS.Packet.NONE),
         "lrproof": (RNS.Packet.PROOF, RNS.Destination.LINK, RNS.Packet.LRPROOF),
         "path_response": (RNS.Packet.DATA, RNS.Destination.SINGLE, RNS.Packet.PATH_RESPONSE),
+        # The shape RNS actually sends for a path response (`Destination.
+        # announce(path_response=True)`: an ANNOUNCE with that context);
+        # "path_response" above is the older DATA-typed stand-in (alpha 0.1.7).
+        "path_response_announce": (RNS.Packet.ANNOUNCE, RNS.Destination.SINGLE, RNS.Packet.PATH_RESPONSE),
         "link_data": (RNS.Packet.DATA, RNS.Destination.LINK, RNS.Packet.NONE),
         # A Resource data part on a Link (2026-09-20): context RESOURCE, which
         # the interface exempts from outgoing_max_age (RNS's Resource layer

@@ -168,7 +168,12 @@ class RawProofCorrelationTests(SingleNodeCase):
         self.assertEqual(iface._resolve_routing_peer(proof_hdr), PEER)
         # Widened 2026-09-19 afternoon: a bound, path-resolved peer's raw
         # receive teaches the token too, exactly as its text frames do.
-        self.assertEqual(iface._rns_token_peer.get(iface._parse_rns_header(data).destination_hash), PEER)
+        # Alpha 0.1.7 (item 3): a DATA packet names its recipient and
+        # teaches nothing; an ANNOUNCE received raw still does.
+        self.assertNotIn(iface._parse_rns_header(data).destination_hash, iface._rns_token_peer)
+        announced = os.urandom(16)
+        iface._observe_raw_received_packet(build_rns_packet("announce", dest_hash=announced, payload=os.urandom(120)), PEER)
+        self.assertEqual(iface._rns_token_peer.get(announced), PEER)
 
     def test_raw_received_announce_teaches_route(self):
         # The field case: the desktop's path-response ANNOUNCE for d4c70c4b
