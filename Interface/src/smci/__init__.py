@@ -13,11 +13,15 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.6 (alpha 0.1.5 plus the 2026-09-22 pass from that
-build's field session: path selection by measured reliability, the
-bounded multi-hop window hold, the connection supervisor, one report per
-window, the corrected calibration line -- the "Q" wire format changed
-(v5 carries the sender's path view), so BOTH NODES MUST RUN ALPHA 0.1.6);
+STATUS -- alpha 0.1.7 (alpha 0.1.6 plus the 2026-09-22 afternoon pass
+from that build's field session: young plain proofs pre-empt bulk like a
+handshake, token learning never maps a local destination, the peer's
+reported path view on the capture records; no wire change, alpha 0.1.6
+and 0.1.7 nodes interoperate); alpha 0.1.6 was alpha 0.1.5 plus the
+2026-09-22 pass (path selection by measured reliability, the bounded
+multi-hop window hold, the connection supervisor, one report per window,
+the corrected calibration line -- the "Q" wire format changed to v5, the
+sender's path view, so both nodes must run alpha 0.1.6 or later);
 alpha 0.1.5 was alpha 0.1.4 plus the 2026-09-21 pass (the hop-aware
 airtime cap, the burst / report collision fixes, shorter-path adoption,
 the adaptive window collect, the report yield); the
