@@ -859,6 +859,12 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # _answer_path_request_locally.
         self._announce_cache = collections.OrderedDict()
         self._path_request_local_answer_at = {}
+        # Alpha 0.1.8 (item 4): the cache is persisted under
+        # RNS.Reticulum.storagepath and restored at start, so a restart
+        # does not re-request destinations this node already holds an
+        # announce for. Set whenever an entry is added.
+        self._announce_cache_dirty = False
+        self._announce_cache_loaded = False
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
@@ -1525,6 +1531,12 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         if self.peer_discovery_enabled and not self._peer_cache_loaded:
             self._peer_cache_loaded = True
             self._load_peer_cache()
+        # Alpha 0.1.8 (item 4): once per process, like the peer cache, and
+        # after it -- a restored entry's source peer must already be bound
+        # for `_answer_path_request_locally` to use it.
+        if not self._announce_cache_loaded:
+            self._announce_cache_loaded = True
+            self._load_announce_cache()
         try:
             await self._refresh_contacts_and_grant_telemetry()
         except Exception as exc:

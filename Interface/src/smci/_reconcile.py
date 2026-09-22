@@ -2274,6 +2274,10 @@ class _ReconcileMixin:
                 self._pending_link_request_sweep(now)
                 self._send_answered_sweep(now)
                 self._announce_cache_sweep(now)
+                # Alpha 0.1.8 (item 4): persist it here rather than at
+                # detach, so an unclean exit (the field's restarts) still
+                # leaves a usable file. A no-op unless something changed.
+                self._save_announce_cache()
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
                 self._closed_links_sweep(now)

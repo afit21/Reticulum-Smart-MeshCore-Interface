@@ -238,6 +238,7 @@ CONFIGURE_RETRY = {
 }
 
 CONFIGURE_PATH_DISCOVERY = {
+    'announce_cache_path': '',
     'announce_cache_ttl_s': 3600.0,
     'contact_refresh_interval_s': 30.0,
     'direct_path_reset_min_age_s': 60.0,

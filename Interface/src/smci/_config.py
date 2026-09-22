@@ -948,6 +948,11 @@ class _ConfigMixin:
         # interval goes over the air, which is how a genuinely dead
         # destination is re-verified. 0 disables either.
         self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 3600.0))
+        # Alpha 0.1.8 (item 4): where the cache is persisted. Empty means
+        # `smci_announces.json` beside the peer cache under
+        # RNS.Reticulum.storagepath; `announce_cache_ttl = 0` disables
+        # both the cache and its file.
+        self.announce_cache_path = str(cfg.get("announce_cache_path", "") or "")
         self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 120.0))
 
     def _configure_peer_discovery(self, cfg):

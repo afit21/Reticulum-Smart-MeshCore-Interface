@@ -103,7 +103,7 @@ class LocalAnnounceCache(SingleNodeCase):
             self.assertNotIn(DEST, iface._announce_cache, "unbound sender: not cached")
             self.on_loop(lambda: iface.process_incoming(announce, transport="direct_raw_multifragment", sender_peer_prefix=PEER))
             self.assertIn(DEST, iface._announce_cache)
-            raw, _t, src = iface._announce_cache[DEST]
+            raw, _t, src, _verified_at = iface._announce_cache[DEST]
             self.assertEqual(raw, announce)
             self.assertEqual(src, PEER)
         finally:
@@ -133,21 +133,34 @@ class LocalAnnounceCache(SingleNodeCase):
             ctx = (2 + 2 * 16) if header.header_type == 1 else (2 + 16)
             self.assertEqual(got[:ctx] + got[ctx + 1:], announce[:ctx] + announce[ctx + 1:], "every other byte as received")
 
-            # The second request inside the interval goes over the air: it
-            # is the one that verifies the destination.
+            # Reversed by alpha 0.1.8 (item 4): a re-request INSIDE the
+            # interval is answered from the cache too. The old rule capped
+            # the local answers at one per interval and let every other
+            # request transmit; with RNS re-requesting every 30-70 s the
+            # laptop's 2026-09-22 capture put 20 requests on the air for
+            # this one destination against 12 answered locally.
             iface._path_request_last_sent_at.clear()
             request2 = self._request(DEST)
             self.node.run_on_loop(iface._send_outgoing_packet(request2, iface._parse_rns_header(request2)), timeout=10.0)
-            self.assertEqual(len(dispatched), 1)
-            self.assertEqual(len(owner.received), 1)
+            self.assertEqual(dispatched, [], "still answered locally inside the interval")
+            self.assertEqual(len(owner.received), 2)
 
-            # Past the interval it is answered locally again.
-            iface._path_request_local_answer_at[DEST] -= 121.0
+            # Past the interval ONE request goes over the air: the
+            # verification is kept, it is only rate-limited now.
+            raw, cached_at, src, verified_at = iface._announce_cache[DEST]
+            iface._announce_cache[DEST] = (raw, cached_at, src, verified_at - 121.0)
             iface._path_request_last_sent_at.clear()
             request3 = self._request(DEST)
             self.node.run_on_loop(iface._send_outgoing_packet(request3, iface._parse_rns_header(request3)), timeout=10.0)
-            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(len(dispatched), 1, "the periodic verification")
             self.assertEqual(len(owner.received), 2)
+
+            # ... and that verification re-arms the cache for the next one.
+            iface._path_request_last_sent_at.clear()
+            request4 = self._request(DEST)
+            self.node.run_on_loop(iface._send_outgoing_packet(request4, iface._parse_rns_header(request4)), timeout=10.0)
+            self.assertEqual(len(dispatched), 1, "answered locally again")
+            self.assertEqual(len(owner.received), 3)
         finally:
             iface.path_request_local_answer_min_interval_s = saved_interval
             restore()
@@ -178,8 +191,8 @@ class LocalAnnounceCache(SingleNodeCase):
             self.assertEqual(len(dispatched), 3, "source peer no longer bound: on air")
             iface._peers[PEER] = self.module._PeerRecord(pubkey_prefix=PEER, has_upstream_rns=False, last_seen=time.time())
 
-            raw, t, src = iface._announce_cache[DEST]
-            iface._announce_cache[DEST] = (raw, t - iface.announce_cache_ttl_s - 1.0, src)
+            raw, t, src, _verified_at = iface._announce_cache[DEST]
+            iface._announce_cache[DEST] = (raw, t - iface.announce_cache_ttl_s - 1.0, src, t)
             send(DEST)
             self.assertEqual(len(dispatched), 4, "expired entry: on air")
             self.assertNotIn(DEST, iface._announce_cache, "and evicted")

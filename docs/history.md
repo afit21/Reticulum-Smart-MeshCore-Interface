@@ -4444,3 +4444,65 @@ client-specific workaround).
     relayed path weak") re-pinned to its reversal, with the field record
     cited at the line. MeshBench: `shortcut_appears`, `failover`,
     `repeater_returns`, `weak_direct`, `two_hop`.
+
+ 4. **The announce cache survives a restart, and the verification is
+    rate-limited instead of inverted** (`_announce_cache_file_path` /
+    `_load_announce_cache` / `_save_announce_cache` in `_routing.py`, the
+    peer cache's shape; `announce_cache_path`, new, empty by default;
+    the `_announce_cache` value gains a fourth field, `verified_at`;
+    `_note_path_request_on_air`; `_announce_cache_dirty` and
+    `_announce_cache_loaded`). No wire change.
+
+    (a) The cache was per-process. The laptop restarted at 22:28, 22:45
+    and 22:53, and each restart at two hops cost about three minutes of
+    path requests: 8 transmitted and 9 rate-limited between 22:29:07 and
+    22:32:33, answered by the desktop with three-fragment announce
+    windows through two repeaters (`small_mesh_direct_all_announce` 6,
+    `duplicate_in_flight` 4 in that span). Every one was for the single
+    destination `6b9f66014d98`, which the desktop had announced before
+    22:20 and the laptop had held in its previous process's cache. It is
+    now written beside the peer cache under `RNS.Reticulum.storagepath`,
+    by the same tmp-file-and-`os.replace` rule, from the reassembly
+    cleanup loop rather than at detach so an unclean exit (the field's
+    restarts were exactly that) still leaves a usable file, and only when
+    something changed. Ages are persisted as wall clock, since
+    `time.monotonic()` means nothing across a restart, and converted back
+    on load. The age cap on load is the existing `announce_cache_ttl`
+    (3600 s): an entry older than that is dropped exactly as
+    `_announce_cache_sweep` would drop it, and it is far inside RNS's
+    own, which keeps a restored path `PATHFINDER_E` (a week),
+    `AP_PATH_TIME` (a day) or `ROAMING_PATH_TIME` (six hours) and
+    restores each entry with its original timestamp rather than
+    refreshing it (`RNS/Transport.py`). A restored entry is stamped
+    verified at the RESTORE instant while its cache time stays truthful:
+    coming up is not evidence that a destination died, so the first
+    request after a restart is answered locally and the next
+    over-the-air verification falls due one interval later.
+
+    (b) The rule that decides when a request goes on the air was the
+    wrong way round. It read "answer locally unless we answered locally
+    within `path_request_local_answer_min_interval`", whose stated
+    purpose (`announce_cache_ttl`'s config comment) is that "the next
+    request for the same destination inside the interval goes over the
+    air, which is how a genuinely dead destination is re-verified". With
+    RNS re-requesting every 30-70 s that made the verification the COMMON
+    case: for `6b9f66014d98` over the hour the laptop transmitted about
+    20 requests and answered 12 locally, and the pair at 22:37:02 and
+    22:37:38 went out 70 s and 106 s after the local answer of 22:35:52
+    for precisely this reason. The verification is kept and is now
+    rate-limited instead: one on-air request per interval per
+    destination (`_note_path_request_on_air` re-stamps `verified_at` at
+    the point the request is dispatched), everything in between answered
+    from the cache. The separate 20 s `PATH_REQUEST_RATE_LIMIT_WINDOW_S`
+    coalescer is unchanged and still runs first.
+
+    Tests: `tests/test_announce_cache_restart_0923.py` (a restart with the
+    file present answers the first request locally; a stale entry dropped
+    on load; a future-dated, unreadable or corrupt file is not fatal; no
+    write when nothing changed; one verification per interval and its
+    re-arming; a restored entry verified from the restore instant while
+    its TTL stays truthful). Two assertions of
+    `tests/test_local_announce_cache_0920.py` re-pinned to the reversal,
+    plus the cache tuple's new arity. Shipped-default pin and golden
+    config re-pinned (one key added, no default changed). MeshBench:
+    `companion_restart`, `bring_up`.

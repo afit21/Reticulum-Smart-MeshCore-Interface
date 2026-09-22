@@ -7,6 +7,28 @@ home, a two-hop stop, a one-hop stop). The release is about frames per exchange.
 record is `docs/history.md` ("Alpha 0.1.8 pass"). Every default is pinned by
 `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
 
+- **The announce cache survives a restart, and one path-request verification per interval goes on
+  the air instead of most of them.** The cache of announces that answers RNS path requests locally
+  (`path_request_answered_locally`) is now persisted to `smci_announces.json` under
+  `RNS.Reticulum.storagepath` -- beside the peer cache, written by the same atomic tmp-file rule,
+  aged in wall-clock so a restart can read it, capped on load at the existing `announce_cache_ttl`
+  (an hour; RNS's own restored paths live 6 hours to a week, so this is far inside it). A restored
+  entry counts as verified at the restore instant, so the first path request after a restart is
+  answered from the cache. New optional key: `announce_cache_path` (empty = the default location;
+  `announce_cache_ttl = 0` still disables the cache and its file).
+  And the local-answer rule is inverted. It capped the LOCAL answers at one per
+  `path_request_local_answer_min_interval` and let every other request transmit; with RNS
+  re-requesting every 30-70 s the periodic verification had become the common case. It now caps the
+  ON-AIR verification at one per interval and answers everything in between from the cache, which
+  is what the rule was meant to do. Field motivation: the laptop restarted three times that
+  evening, and each restart at two hops cost about three minutes of path requests -- 8 transmitted
+  and 9 rate-limited between 22:29:07 and 22:32:33, answered by the desktop with three-fragment
+  announce windows through two repeaters -- all for one destination the desktop had announced
+  before 22:20. Over the hour that one destination took about 20 transmitted requests against 12
+  answered locally; the pair at 22:37:02 and 22:37:38 went out 70 s and 106 s after a local answer.
+  No wire change. Tests: `tests/test_announce_cache_restart_0923.py`; two assertions of
+  `tests/test_local_announce_cache_0920.py` re-pinned, since the rule is reversed on purpose.
+  MeshBench: `companion_restart`, `bring_up`.
 - **The path scoreboard ages its evidence.** A candidate's peer-reported delivery rate and its
   last-leg SNR now count only while those readings are inside `PATH_SAMPLE_WINDOW_S` (600 s), the
   same window the send outcomes are weighed over; older readings are kept for the capture and score

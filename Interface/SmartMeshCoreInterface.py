@@ -1940,6 +1940,11 @@ class _ConfigMixin:
         # interval goes over the air, which is how a genuinely dead
         # destination is re-verified. 0 disables either.
         self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 3600.0))
+        # Alpha 0.1.8 (item 4): where the cache is persisted. Empty means
+        # `smci_announces.json` beside the peer cache under
+        # RNS.Reticulum.storagepath; `announce_cache_ttl = 0` disables
+        # both the cache and its file.
+        self.announce_cache_path = str(cfg.get("announce_cache_path", "") or "")
         self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 120.0))
 
     def _configure_peer_discovery(self, cfg):
@@ -10491,6 +10496,10 @@ class _ReconcileMixin:
                 self._pending_link_request_sweep(now)
                 self._send_answered_sweep(now)
                 self._announce_cache_sweep(now)
+                # Alpha 0.1.8 (item 4): persist it here rather than at
+                # detach, so an unclean exit (the field's restarts) still
+                # leaves a usable file. A no-op unless something changed.
+                self._save_announce_cache()
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
                 self._closed_links_sweep(now)
@@ -10991,6 +11000,109 @@ class _RoutingMixin:
             self._unknown_dest_backoff_until.pop(h, None)
             self._unknown_dest_last_attempt.pop(h, None)
 
+    # -- The announce cache across restarts (alpha 0.1.8, item 4) --------
+
+    def _announce_cache_file_path(self) -> Optional[str]:
+        """Beside the peer cache, under `RNS.Reticulum.storagepath` and by
+        the same rules (`_peer_cache_file_path`)."""
+        if self.announce_cache_path:
+            return self.announce_cache_path
+        base = getattr(RNS, "Reticulum", None)
+        base = getattr(base, "storagepath", None) if base is not None else None
+        if not base:
+            return None
+        return os.path.join(base, "smci_announces.json")
+
+    def _load_announce_cache(self) -> None:
+        """Restore the announce cache at start, so a restart does not put
+        a path request on the air for every destination this node already
+        holds an announce for. The laptop restarted three times in the
+        2026-09-22 evening session and each restart at two hops cost about
+        three minutes of path requests (8 transmitted and 9 rate-limited
+        between 22:29:07 and 22:32:33), answered by the desktop with
+        three-fragment announce windows through two repeaters -- for
+        destinations the desktop had announced before 22:20 and the laptop
+        had already cached in its previous process.
+
+        Ages are persisted as wall-clock (`time.time()`), since
+        `time.monotonic()` has no meaning across a restart, and converted
+        back on load. An entry older than `announce_cache_ttl` is dropped
+        here exactly as `_announce_cache_sweep` would drop it -- that TTL
+        (an hour by default) is the age cap, and it is far inside RNS's
+        own: `Transport.PATHFINDER_E` keeps a restored path a week,
+        `AP_PATH_TIME` a day and `ROAMING_PATH_TIME` six hours
+        (`RNS/Transport.py`), and RNS restores each entry with its own
+        original timestamp and expiry rather than refreshing it.
+
+        Each restored entry is stamped as verified AT THE RESTORE INSTANT
+        rather than at its original cache time: coming up is not evidence
+        that the destination died, so the first request after a restart is
+        answered from the cache and the next over-the-air verification
+        falls due one interval later."""
+        if self.announce_cache_ttl_s <= 0:
+            return
+        path = self._announce_cache_file_path()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            now_wall, now_mono = time.time(), time.monotonic()
+            restored = dropped = 0
+            for entry in data.get("announces", [])[-self.ANNOUNCE_CACHE_MAX_KEYS:]:
+                try:
+                    dst = bytes.fromhex(str(entry["destination_hash"]))
+                    raw = bytes.fromhex(str(entry["raw"]))
+                    source_peer = str(entry["source_peer"])
+                    age_s = now_wall - float(entry["cached_at_wall"])
+                except (KeyError, ValueError, TypeError):
+                    dropped += 1
+                    continue
+                if not dst or not raw or age_s < 0 or age_s > self.announce_cache_ttl_s:
+                    dropped += 1
+                    continue
+                self._announce_cache[dst] = (raw, now_mono - age_s, source_peer, now_mono)
+                restored += 1
+            RNS.log(
+                f"{self}: restored {restored} cached announce(s) from {path}"
+                + (f" ({dropped} dropped as stale or unreadable)." if dropped else "."),
+                RNS.LOG_INFO,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to load the announce cache ({path}): {exc} -- "
+                f"starting with an empty one.",
+                RNS.LOG_WARNING,
+            )
+
+    def _save_announce_cache(self) -> None:
+        """Written the way the peer cache is (tmp file + os.replace), and
+        only when something changed since the last write."""
+        if self.announce_cache_ttl_s <= 0 or not self._announce_cache_dirty:
+            return
+        path = self._announce_cache_file_path()
+        if not path:
+            return
+        try:
+            now_wall, now_mono = time.time(), time.monotonic()
+            data = {"announces": [
+                {
+                    "destination_hash": dst.hex(),
+                    "raw": raw.hex(),
+                    "source_peer": source_peer,
+                    "cached_at_wall": now_wall - (now_mono - cached_at),
+                }
+                for dst, (raw, cached_at, source_peer, _verified_at) in self._announce_cache.items()
+                if now_mono - cached_at <= self.announce_cache_ttl_s
+            ]}
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+            self._announce_cache_dirty = False
+        except Exception as exc:
+            RNS.log(f"{self}: failed to save the announce cache ({path}): {exc}", RNS.LOG_WARNING)
+
     def _cache_announce(self, data: bytes, header: Optional[_RnsHeader], sender_peer_prefix: Optional[str]) -> None:
         """Remember an ANNOUNCE a bound peer delivered DIRECT (phase 1,
         2026-09-20), bytes exactly as received. CHANNEL announces are never
@@ -11000,13 +11112,21 @@ class _RoutingMixin:
                 or sender_peer_prefix is None or sender_peer_prefix not in self._peers
                 or self.announce_cache_ttl_s <= 0):
             return
+        now = time.monotonic()
         self._announce_cache.pop(header.destination_hash, None)
-        self._announce_cache[header.destination_hash] = (bytes(data), time.monotonic(), sender_peer_prefix)
+        # Alpha 0.1.8 (item 4): the fourth field is when this destination
+        # was last VERIFIED -- a live announce is itself a verification, so
+        # it starts equal to the cache time; a restored entry is stamped
+        # with the restore instant (`_load_announce_cache`) and a path
+        # request that goes on the air re-stamps it. It is deliberately
+        # separate from the cache time, which stays truthful for the TTL.
+        self._announce_cache[header.destination_hash] = (bytes(data), now, sender_peer_prefix, now)
         while len(self._announce_cache) > self.ANNOUNCE_CACHE_MAX_KEYS:
             self._announce_cache.popitem(last=False)
+        self._announce_cache_dirty = True
 
     def _announce_cache_sweep(self, now: float) -> None:
-        stale = [k for k, (_raw, t, _src) in self._announce_cache.items() if now - t > self.announce_cache_ttl_s]
+        stale = [k for k, entry in self._announce_cache.items() if now - entry[1] > self.announce_cache_ttl_s]
         for k in stale:
             del self._announce_cache[k]
         stale = [k for k, t in self._path_request_local_answer_at.items() if now - t > self.path_request_local_answer_min_interval_s]
@@ -11026,17 +11146,27 @@ class _RoutingMixin:
         entry = self._announce_cache.get(requested_hash)
         if entry is None:
             return None
-        raw, cached_at, source_peer = entry
+        raw, cached_at, source_peer, verified_at = entry
         now = time.monotonic()
         if now - cached_at > self.announce_cache_ttl_s:
             self._announce_cache.pop(requested_hash, None)
             return None
         if source_peer not in self._peers or self._path_discovery_in_backoff(source_peer):
             return None
-        last = self._path_request_local_answer_at.get(requested_hash)
-        if last is not None and now - last < self.path_request_local_answer_min_interval_s:
-            # The second re-request inside the interval is the one that
-            # verifies the destination over the air.
+        if now - verified_at >= self.path_request_local_answer_min_interval_s:
+            # Alpha 0.1.8 (item 4): ONE verification per interval goes over
+            # the air; every other request in between is answered from the
+            # cache. This is the inverse of the 0.1.6 rule, which capped the
+            # LOCAL answers at one per interval and let everything else
+            # transmit -- with RNS re-requesting every 30-70 s, that put the
+            # majority on the air. The laptop's 2026-09-22 capture, for the
+            # one destination `6b9f66014d98` over an hour: 20 requests
+            # transmitted against 12 answered locally, and the pair at
+            # 22:37:02 / 22:37:38 went out 70 s and 106 s after a local
+            # answer for exactly that reason. The verification itself is
+            # kept -- a genuinely dead destination must still be re-checked
+            # (the 0.1.6 rule's purpose) -- it is now rate-limited instead
+            # of inverted. `_note_path_request_on_air` re-stamps it.
             return None
         header = self._parse_rns_header(raw)
         if header is None:
@@ -11056,6 +11186,17 @@ class _RoutingMixin:
         self._path_request_local_answer_at[requested_hash] = now
         self.process_incoming(bytes(answer), transport="local_announce_cache", sender_peer_prefix=source_peer)
         return source_peer
+
+    def _note_path_request_on_air(self, requested_hash: Optional[bytes]) -> None:
+        """A path request for `requested_hash` is being transmitted: that
+        IS the periodic verification, so the cached announce may answer
+        every request for the next `path_request_local_answer_min_interval`
+        (alpha 0.1.8, item 4)."""
+        if requested_hash is None:
+            return
+        entry = self._announce_cache.get(requested_hash)
+        if entry is not None:
+            self._announce_cache[requested_hash] = entry[:3] + (time.monotonic(),)
 
     def _path_request_rate_limited(self, requested_hash: Optional[bytes]) -> bool:
         """PATH_REQUEST_RATE_LIMIT_WINDOW_S -- same shape and fail-open
@@ -11295,6 +11436,8 @@ class _RoutingMixin:
                 )
                 return
             answered_from = self._answer_path_request_locally(requested)
+            if answered_from is None:
+                self._note_path_request_on_air(requested)
             if answered_from is not None:
                 # Phase 1 (2026-09-20): answered from the cached announce,
                 # nothing transmitted -- see announce_cache_ttl.
@@ -13149,6 +13292,12 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # _answer_path_request_locally.
         self._announce_cache = collections.OrderedDict()
         self._path_request_local_answer_at = {}
+        # Alpha 0.1.8 (item 4): the cache is persisted under
+        # RNS.Reticulum.storagepath and restored at start, so a restart
+        # does not re-request destinations this node already holds an
+        # announce for. Set whenever an entry is added.
+        self._announce_cache_dirty = False
+        self._announce_cache_loaded = False
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
@@ -13815,6 +13964,12 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         if self.peer_discovery_enabled and not self._peer_cache_loaded:
             self._peer_cache_loaded = True
             self._load_peer_cache()
+        # Alpha 0.1.8 (item 4): once per process, like the peer cache, and
+        # after it -- a restored entry's source peer must already be bound
+        # for `_answer_path_request_locally` to use it.
+        if not self._announce_cache_loaded:
+            self._announce_cache_loaded = True
+            self._load_announce_cache()
         try:
             await self._refresh_contacts_and_grant_telemetry()
         except Exception as exc:
