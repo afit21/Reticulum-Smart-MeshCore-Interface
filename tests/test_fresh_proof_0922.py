@@ -18,6 +18,9 @@ every attempt. Its tier (ANSWER), attempt budget and duty accounting are
 unchanged; an older proof stays bulk-tier and still expires at
 proof_max_age. The lock's yielding holder resumes half a step behind the
 tier that pre-empted it (1.5 behind a fresh proof, 0.5 behind a handshake).
+Second cut: the two holds that are a repeater's relay window for this
+node's own frame (the no-ACK report hold, the QUERY quiet hold) are cut by
+a handshake only, not by a fresh proof.
 """
 import asyncio
 import os
@@ -133,6 +136,73 @@ class LockResumeTier(SingleNodeCase):
             return order
 
         self.assertEqual(self.node.run_on_loop(run(), timeout=10.0), ["proofA", "proofB", "window-resumed", "normal"])
+
+
+class RelayWindowHoldsAreHandshakeOnly(SingleNodeCase):
+    """Second cut (from MeshBench `large_payload` on the first cut): a
+    fresh proof that cut the receiver's no-ACK report hold at its
+    own-airtime floor keyed while the repeater relayed the report, was
+    missed there, and held the radio for the 8 s timeout that the next
+    report then waited behind (`reported` windows 9/13 -> 3/13). The holds
+    that are a repeater's relay window for this node's own frame -- the
+    no-ACK hold and the QUERY quiet hold -- are cut by a Link handshake
+    only; the window's fragment gaps, its report wait and the throttle are
+    still pre-empted by a fresh proof."""
+
+    def test_handshake_only_event_ignores_answer_tier_preemptors(self):
+        iface = self.iface
+        Lock = self.module._PriorityAsyncLock
+
+        async def run():
+            lock = Lock()
+            await lock.acquire(iface.PRIORITY_NORMAL)
+            any_ev, hs_ev = lock.preempt_event(), lock.preempt_event(handshake_only=True)
+            proof = asyncio.ensure_future(lock.acquire(iface.PRIORITY_ANSWER, preempt=True))
+            await asyncio.sleep(0.01)
+            self.assertTrue(any_ev.is_set())
+            self.assertFalse(hs_ev.is_set(), "a fresh proof is not a handshake")
+            handshake = asyncio.ensure_future(lock.acquire(iface.PRIORITY_HANDSHAKE, preempt=True))
+            await asyncio.sleep(0.01)
+            self.assertTrue(hs_ev.is_set())
+            lock.release(); await handshake          # the handshake is served first
+            await asyncio.sleep(0.01)
+            self.assertFalse(hs_ev.is_set(), "cleared once the handshake was granted")
+            self.assertTrue(any_ev.is_set(), "the proof is still queued")
+            lock.release(); await proof; lock.release()
+
+        self.node.run_on_loop(run(), timeout=10.0)
+
+    def test_idle_hold_and_quiet_wait_are_not_cut_by_a_fresh_proof(self):
+        iface = self.iface
+        lock = iface._direct_exchange_lock
+
+        async def run():
+            await lock.acquire(iface.PRIORITY_NORMAL)
+            proof = asyncio.ensure_future(lock.acquire(iface.PRIORITY_ANSWER, preempt=True))
+            await asyncio.sleep(0.01)
+            t = time.monotonic()
+            cut = await iface._idle_hold(0.3, floor_s=0.05, handshake_only=True)
+            held = time.monotonic() - t
+            self.assertFalse(cut, "a fresh proof must not cut the no-ACK hold")
+            self.assertGreaterEqual(held, 0.28)
+            fut = asyncio.get_running_loop().create_future()
+            t = time.monotonic()
+            done, cut = await iface._wait_future_or_preempt(fut, 0.3, also_reports=True, handshake_only=True)
+            self.assertEqual((done, cut), (False, False), "nor the QUERY quiet hold")
+            self.assertGreaterEqual(time.monotonic() - t, 0.28)
+            # while the report wait (any pre-emptor) is cut at once
+            fut2 = asyncio.get_running_loop().create_future()
+            done, cut = await iface._wait_future_or_preempt(fut2, 0.3, also_reports=True)
+            self.assertEqual((done, cut), (False, True))
+            # and a handshake still cuts the hold
+            handshake = asyncio.ensure_future(lock.acquire(iface.PRIORITY_HANDSHAKE, preempt=True))
+            await asyncio.sleep(0.01)
+            t = time.monotonic()
+            self.assertTrue(await iface._idle_hold(1.0, floor_s=0.05, handshake_only=True))
+            self.assertLess(time.monotonic() - t, 0.5)
+            lock.release(); await handshake; lock.release(); await proof; lock.release()
+
+        self.node.run_on_loop(run(), timeout=10.0)
 
 
 class FreshProofAndTheWindow(_WindowSend):

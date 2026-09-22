@@ -241,18 +241,21 @@ class _DirectSendMixin:
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
     async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float,
-                                      also_reports: bool = False) -> "tuple[bool, bool]":
+                                      also_reports: bool = False, handshake_only: bool = False) -> "tuple[bool, bool]":
         """Await `fut` (shielded: it outlives this wait) for up to
         `timeout_s`, ending early when a Link handshake queues for the
         radio lock (phase 1, 2026-09-20) -- or, with `also_reports` (item
         6, alpha 0.1.5), when a completion REPORT this node owes the far
         sender does: the report wait is radio-free, so the holder loses
         nothing by letting the report out. Returns `(future_done, cut)`;
-        the future's own exception is the caller's."""
+        the future's own exception is the caller's. `handshake_only`
+        (alpha 0.1.7, item 1): only a Link handshake cuts this wait, not a
+        fresh plain PROOF -- for the QUERY quiet hold, which keeps this
+        node silent while the ANSWER transits the repeater."""
         if fut.done():
             return True, False
         lock = self._direct_exchange_lock
-        events = [lock.preempt_event()] + ([lock.report_event()] if also_reports else [])
+        events = [lock.preempt_event(handshake_only=handshake_only)] + ([lock.report_event()] if also_reports else [])
         if any(e.is_set() for e in events):
             return False, True
         if timeout_s <= 0:
@@ -277,14 +280,19 @@ class _DirectSendMixin:
             return True, False
         return False, any(w in done for w in waits[1:])
 
-    async def _idle_hold(self, seconds: float, floor_s: float = 0.0) -> bool:
+    async def _idle_hold(self, seconds: float, floor_s: float = 0.0, handshake_only: bool = False) -> bool:
         """Sleep `seconds` with the radio lock held, but return early
         (True) once a link handshake is queued for the lock and at least
         `floor_s` has passed (phase 1, 2026-09-20). The lock's pre-empt
-        event is the signal; False when the whole time elapsed."""
+        event is the signal; False when the whole time elapsed. With
+        `handshake_only` (alpha 0.1.7, item 1) a fresh plain PROOF does not
+        cut the hold -- the no-ACK report hold is the repeater's relay
+        window for this node's own frame, and a proof keyed into it was
+        missed at the repeater in MeshBench `large_payload` (proof success
+        4/23 against 9/24, every report behind an 8 s timeout)."""
         if seconds <= 0:
             return False
-        event = self._direct_exchange_lock.preempt_event()
+        event = self._direct_exchange_lock.preempt_event(handshake_only=handshake_only)
         started = time.monotonic()
         if floor_s > 0:
             await asyncio.sleep(min(seconds, floor_s))
@@ -1224,7 +1232,7 @@ class _DirectSendMixin:
                 floor_s = min(timeout_s, self._ack_preempt_floor_s(peer_prefix, hop_count))
                 ack_event, answered = await self._wait_for_ack_event(ack_filters, floor_s, cancel_event)
                 if ack_event is None and not answered and timeout_s > floor_s:
-                    preempt_event = self._direct_exchange_lock.preempt_event()
+                    preempt_event = self._direct_exchange_lock.preempt_event(handshake_only=True)
                     if preempt_event.is_set():
                         return False, False, timeout_s, "preempted", None, None
                     ack_event, answered = await self._wait_for_ack_event(
@@ -1626,7 +1634,8 @@ class _DirectSendMixin:
                         # Alpha 0.1.6 (item 2): and so does a completion
                         # REPORT this node owes the far sender (the item-6
                         # class), as the window's report wait already did.
-                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s, also_reports=True)
+                        answered, cut = await self._wait_future_or_preempt(
+                            quiet_wait, quiet_remaining_s, also_reports=True, handshake_only=True)
                         if answered and quiet_info is not None:
                             quiet_info["answered_at"] = time.monotonic()
                         if cut:
@@ -1753,9 +1762,10 @@ class _DirectSendMixin:
                     hold_s = self._noack_frame_hold_s(on_air_bytes, hop_count)
                     # The frame is on air / in the chain: keep the radio
                     # quiet for its hold, yielding to a Link handshake only
-                    # once the frame itself is off the air.
+                    # once the frame itself is off the air (and to nothing
+                    # else: alpha 0.1.7, item 1, second cut).
                     airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-                    await self._idle_hold(hold_s, floor_s=airtime_s)
+                    await self._idle_hold(hold_s, floor_s=airtime_s, handshake_only=True)
                 except Exception as exc:
                     send_exc = exc
                 self._debug(

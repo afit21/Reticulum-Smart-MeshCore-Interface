@@ -4273,3 +4273,35 @@ reliability over hop count; parity on).
     two-hop stop (item 5) is where that number is read next. No code
     change; `two_hop` and `shortcut_appears` run again in the close-out
     suite on the kept build.
+
+    Item 1, second cut (from MeshBench `large_payload` on the first cut,
+    three runs, `/tmp/mb/017/item1/`): delivered 2/6, 1/6, 1/6 (17 %
+    [17-33] against the baseline's 33 % [17-50], inside) but the probe
+    RTT 44.9 s [43.3-46.5] against 22.3 [20.6-31.9] on every run, and the
+    sender's windows ended `reported` 3/13, 4/14, 5/18 against 9/13, 8/14,
+    3/9 -- the reports were reaching the sender late, not lost (B's frames
+    reached R at 68-72 % against 60-66 %; the miss profile at R was the
+    same half-duplex-while-relaying in both sets). The mechanism is the
+    reviewer's risk 4 of the design: the fresh proof cut the receiver's
+    no-ACK report hold at its own-airtime floor and keyed exactly while R
+    relayed the report -- a certain half-duplex miss at R (`hop1_loss`,
+    B's proof success 4/23 against 9/24) -- and the missed proof then held
+    B's radio for the 8 s timeout that the next report waited behind, so
+    the sender's report wait expired into a QUERY round. That hold, and
+    the QUERY's quiet hold, are the repeater's relay window for this
+    node's own frame (M1 of the reconcile redesign; the quiet hold's night
+    session: answer delivery 85 % -> 48 % without it); cutting them buys a
+    proof at most ~2.5 s at one hop, and the field's 5-20 s came from the
+    window bursts and report waits, which the proof still pre-empts. Now
+    `preempt_event(handshake_only=True)` is set only while a TIER-0
+    pre-emptor is queued, and the no-ACK hold (`_idle_hold(handshake_
+    only=True)`), the QUERY quiet hold (`_wait_future_or_preempt(handshake_
+    only=True)`) and the pre-emptible ACK wait consult that one; the
+    fragment-gap yields, the report wait and the throttle interrupt keep
+    the any-pre-emptor event. Pinned in `tests/test_fresh_proof_0922.py`
+    (the handshake-only event; the two holds not cut by a fresh proof, the
+    report wait cut, a handshake still cutting). On the second cut
+    (`/tmp/mb/017/item1-cut2/`): `large_payload` 5/6 and 3/6 (67 %
+    [50-83]), RTT 28.7 s [27.0-30.3], `reported` 6/15 and 9/12, parts
+    17-24 s, B's proof success 22 / 50 %, lock waits 0.4-0.9 s as in the
+    baseline; `relay` and `page_transfer_bidir` in `changelog.md`.
