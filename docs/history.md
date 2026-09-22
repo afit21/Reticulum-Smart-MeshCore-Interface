@@ -4305,3 +4305,53 @@ reliability over hop count; parity on).
     [50-83]), RTT 28.7 s [27.0-30.3], `reported` 6/15 and 9/12, parts
     17-24 s, B's proof success 22 / 50 %, lock waits 0.4-0.9 s as in the
     baseline; `relay` and `page_transfer_bidir` in `changelog.md`.
+
+ Close-out (2026-09-22 evening). Full suite 438 tests OK (`SMCI_SKIP_SLOW`
+    off). Version alpha 0.1.7 (no wire change; alpha 0.1.6 and 0.1.7
+    interoperate). Baseline `tests/baselines/2026-09-22-meshbench-84097b1.md`
+    -- the ten scenarios x seeds 7/11/17 on the final interface (the
+    deliverable of `b106d63`, unchanged by `84097b1`), run through the
+    afternoon and evening while commit hooks and the item-2 / item-1 gate
+    runs shared the machine; the comparison against alpha 0.1.6 is in
+    `changelog.md`. Two readings from it were chased before closing:
+
+    `large_payload` RTT 47.9 s [45.4-50.4] against 22.3 [20.6-31.9]: not
+    the first cut's failure (`reported` windows 6/13 and 4/13, proof lock
+    waits under a second) but slower parts (24-45 s) than the baseline
+    suite's (17-29 s) while the isolated second-cut pair read 27-30 s. A
+    same-conditions pair against the alpha 0.1.6 deliverable, run side by
+    side (`/tmp/mb/017/lp-ab/`): this build 58 % [50-67] at 36.4 s
+    [33.4-39.5], sender h1 75 %, responder h1 66 %; alpha 0.1.6 42 %
+    [33-50] at 42.5 s [38.4-46.6], 68 % / 62 %. The 0.1.6 build itself
+    reads 42.5 s tonight against its own 22.3 s of this morning: the
+    evening's machine, not the change. Read this baseline file against
+    the next one with that in mind.
+
+    `shortcut_appears` hard check (a trialled shorter path delivers its
+    next send) 1 of 3 against 2 of 3, then 0/10 and 1/10 on two more runs,
+    then three same-conditions pairs (`/tmp/mb/017/sc-ab/`): this build
+    FAIL / FAIL (no trial, RNS path 177 s) / FAIL, alpha 0.1.6 PASS / PASS
+    / PASS -- 1 of 9 against 5 of 6. Item 1 was reverted in the working
+    tree and the scenario run twice on that build (`/tmp/mb/017/
+    sc-revert/`): FAIL / FAIL, 0 of 2 trials confirmed in each, so the
+    pre-emption is not the cause and the revert was not kept. Reading the
+    captures of the passing and failing runs side by side: the check is a
+    race between the two scoreboards. A's trial window on the one-hop
+    route reaches B (MeshBench logs B's radio receiving the fragment;
+    B's capture shows the fragment, its report and its proof), but B's
+    report, answer and proof go back over B's OWN path to A, which is
+    still three hops until B's board trials a shorter candidate -- and B
+    trials only after two consecutive misses on its current path. In the
+    0.1.6 runs B's three-hop sends happened to miss twice around A's
+    trial (s7: B trialled `8b6a` at 1027 s and `6a` at 1066 s, switched at
+    1077 s; s17: `4c` at 479 s); in the new builds B held the same `6a` /
+    `8b6a` flood candidates but its sends at 655-740 s had all succeeded
+    and it missed once at 1164 s, so it never trialled, and A's windows
+    waited on three-hop replies. Whether B misses twice depends on which
+    of A's probes reach it; no code path of items 1, 3 or 4 touches it,
+    and the bring-up (A's RNS path from the CHANNEL copy of B's path
+    response at ~35 s, one path request) was the same in the passing
+    0.1.6 runs. Left open, not attributed to the change: the scenario's
+    hard check should read both boards (a shorter path selected on
+    either node and confirmed), and the field's two-hop stop (item 5)
+    is where a trial is read next.

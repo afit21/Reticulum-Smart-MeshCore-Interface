@@ -43,6 +43,31 @@ key, optional: `proof_fresh_s = 8`. Every default is pinned by `tests/test_shipp
   keep MeshChat's own RNS log (its link requests are validated there, not in rnsd), and one two-hop
   stop with capture on.
 
+**MeshBench, alpha 0.1.7 (`tests/baselines/2026-09-22-meshbench-84097b1.md`, ten scenarios x seeds
+7/11/17 on the final build, run with commit hooks and gate runs sharing the machine) against alpha
+0.1.6 (`tests/baselines/2026-09-22-meshbench-09105ae.md`), medians [ranges]:**
+
+- `zero_hop`: 100 % [100-100] at 2.90 B/B, RTT 2.8 s (was 100 % [88-100] at 2.85, 2.8).
+  `relay`: 75 % [62-88] at 7.98 [5.58-9.24], RTT 12.7 [12.4-15.4] (was 88 % [62-88] at 5.79, 15.0
+  [12.7-15.3]); seed 17's sender never resolved a MeshCore path in the run (bring-up; 5/8 through
+  the bootstrap). `two_hop`: 75 % [75-88] at 11.59, RTT 29.9 [17.6-31.3], responder two-hop attempt
+  rate 68 % [63-77] (was 50 % [50-75] at 11.37, 16.8 [12.3-19.3], 50 % [37-53]) -- in line with the
+  twelve attribution runs. `duty_cycle_pages`: 75 % [75-100] at 2.18, resources 100 % complete
+  (was 75 % [50-75] at 1.76). `weak_direct`: 81 % [81-81], 3 of 3 on the `path_selected` check
+  (was 88 % [81-88]). `link_setup`: 88 % [75-100] delivered, handshakes inside 15 s 38 % [25-62],
+  links median 22.9 s (was 100 %, 62 % [50-62], 11.6 s) -- the 38 % <-> 62 % swing the 0.1.6
+  close-out saw between two suites on the same build; RNS path times were 70-195 s this suite
+  against 22-97. `page_transfer` 0 % [0-33] and `page_transfer_bidir` 0 % [0-33] (were 0 %).
+- `large_payload`: 50 % [0-50] at 7.03, RTT 47.9 s [45.4-50.4] (was 33 % [17-50] at 6.36, 22.3
+  [20.6-31.9]); seed 17 a bring-up failure. A same-conditions pair against the 0.1.6 deliverable
+  read this build at 58 % / 36.4 s and 0.1.6 at 42 % / 42.5 s -- the evening's machine, not the
+  change (`docs/history.md`, close-out).
+- `shortcut_appears`: 40 % [30-50] delivered (was 30 %); the hard check 1 of 3 (was 2 of 3), and 1
+  of 9 across the evening against 5 of 6 for the 0.1.6 build in same-conditions pairs. Reverting
+  item 1 did not change it (0 of 2). Read as a race between the two nodes' scoreboards -- B's
+  replies stay on its own three-hop path until B's path has missed twice -- not attributed to any
+  item; open, with the reading in `docs/history.md`.
+
 **MeshBench gates per item (against `tests/baselines/2026-09-22-meshbench-09105ae.md`):**
 
 - Item 1, first cut (`/tmp/mb/017/item1/`): `large_payload` x3 delivered 17 % [17-33] (baseline 33 %
