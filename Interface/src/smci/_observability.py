@@ -258,6 +258,7 @@ class _ObservabilityMixin:
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
         duty_cycle_ledger: Optional[str] = None,
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
+        proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -341,6 +342,10 @@ class _ObservabilityMixin:
             # governed the wait. The `rx_*` fields are the correlation
             # window -- offsets in seconds after MSG_SENT.
             "ack_timeout_source": ack_timeout_source,
+            # Alpha 0.1.7 (item 1): a plain PROOF's age since RNS queued it
+            # (None for any other frame) and whether it pre-empted as fresh.
+            "proof_age_s": round(proof_age_s, 3) if proof_age_s is not None else None,
+            "proof_fresh": proof_fresh,
             "ack_latency_s": round(ack_latency_s, 3) if ack_latency_s is not None else None,
             "send_cmd_latency_s": round(send_cmd_latency_s, 3) if send_cmd_latency_s is not None else None,
             **self._rtt_capture_fields(peer_prefix),

@@ -428,6 +428,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # tens of destinations per hour, so this only ever trims pathological
     # growth over days of uptime, never a working set.
     RNS_TOKEN_PEER_MAX_KEYS = 4096
+    # Alpha 0.1.7 (item 1): queue times of recent plain PROOFs
+    # (`_proof_enqueued_at`); the field's worst backlog was 13 proofs.
+    PROOF_ENQUEUED_MAX_KEYS = 64
 
     # Audit fix (2026-09-19): how many post-bind path-discovery rounds
     # `_discover_path_after_bind` runs before leaving it to real traffic.
@@ -961,6 +964,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # it did before the token was ever learned.
         self._rns_token_peer = collections.OrderedDict()
         self._proof_correlation = {}
+        # Alpha 0.1.7 (item 1): when each queued plain PROOF was handed to
+        # this interface, keyed by its destination field (the proved
+        # packet's truncated hash, or the link_id), so its age is known at
+        # every attempt (`_send_direct_with_attempts`, proof_fresh_s).
+        # Bounded; entries older than proof_max_age are swept with the
+        # proof correlations.
+        self._proof_enqueued_at = collections.OrderedDict()
 
         # Alpha 0.1.6 (item 4): the connection supervisor's state.
         self._supervisor_task = None

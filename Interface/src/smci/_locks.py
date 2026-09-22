@@ -63,7 +63,10 @@ class _PriorityAsyncLock:
         self._waiters: "dict[int, collections.deque]" = {}
         # Pre-emption (phase 1, 2026-09-20): futures of waiters that asked
         # to pre-empt an idle holder, and the event an idle holder watches.
-        self._preempt_waiters: set = set()
+        # Alpha 0.1.7 (item 1): waiter -> its tier, so a yielding holder
+        # can resume BEHIND the tier that pre-empted it (a fresh plain PROOF
+        # pre-empts from the ANSWER tier, a handshake from tier 0).
+        self._preempt_waiters: dict = {}
         self._preempt_event: "Optional[asyncio.Event]" = None
         # Alpha 0.1.5 (item 6): a second class -- completion REPORTs this
         # node owes the far sender -- that a raw window yields to between
@@ -88,15 +91,27 @@ class _PriorityAsyncLock:
                 self._preempt_event.set()
         return self._preempt_event
 
-    def _preempt_add(self, fut) -> None:
-        self._preempt_waiters.add(fut)
+    def _preempt_add(self, fut, priority) -> None:
+        self._preempt_waiters[fut] = priority
         if self._preempt_event is not None:
             self._preempt_event.set()
 
     def _preempt_remove(self, fut) -> None:
-        self._preempt_waiters.discard(fut)
+        self._preempt_waiters.pop(fut, None)
         if not self._preempt_waiters and self._preempt_event is not None:
             self._preempt_event.clear()
+
+    def preempt_resume_priority(self) -> float:
+        """The tier a holder resumes at after yielding to whatever is
+        pre-empting it (alpha 0.1.7, item 1): half a step behind the
+        highest-priority pre-empting waiter -- YIELDED_PRIORITY 0.5 behind a
+        handshake (tier 0), REPORT_YIELDED_PRIORITY 1.5 behind a fresh plain
+        PROOF (the ANSWER tier, 1). A resume at 0.5 would put the holder
+        back ahead of a tier-1 pre-emptor still queued behind another
+        waiter, so the yield would buy that proof nothing."""
+        if not self._preempt_waiters:
+            return self.YIELDED_PRIORITY
+        return min(self._preempt_waiters.values()) + 0.5
 
     def report_requested(self) -> bool:
         """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
@@ -131,8 +146,10 @@ class _PriorityAsyncLock:
         whole other exchange into a raw burst). `resume_priority` lets a
         holder yielding to a REPORT (item 6) resume behind the report's
         tier instead."""
+        if resume_priority is None:
+            resume_priority = self.preempt_resume_priority()
         self.release()
-        await self.acquire(self.YIELDED_PRIORITY if resume_priority is None else resume_priority)
+        await self.acquire(resume_priority)
 
     async def acquire(self, priority: int, preempt: bool = False, report: bool = False) -> None:
         if not self._locked:
@@ -141,7 +158,7 @@ class _PriorityAsyncLock:
         fut = asyncio.get_running_loop().create_future()
         self._waiters.setdefault(priority, collections.deque()).append(fut)
         if preempt:
-            self._preempt_add(fut)
+            self._preempt_add(fut, priority)
         if report:
             self._report_add(fut)
         try:

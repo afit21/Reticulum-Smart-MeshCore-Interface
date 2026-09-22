@@ -552,6 +552,9 @@ class _DirectSendMixin:
                 expire_retries=self._plain_proof(header) and self.proof_max_age_s > 0,
                 # A Link handshake pre-empts idle holds of the radio lock.
                 preempt=self._is_link_handshake(header),
+                # Alpha 0.1.7 (item 1): so does a plain PROOF while it is
+                # younger than proof_fresh_s (re-read at every attempt).
+                proof_enqueued_at=self._proof_enqueued_at_for(header),
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -932,6 +935,7 @@ class _DirectSendMixin:
         attempts_override: Optional[int] = None, record_result: bool = True,
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
         expire_retries: bool = False, preempt: bool = False,
+        proof_enqueued_at: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -1002,6 +1006,13 @@ class _DirectSendMixin:
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            # Alpha 0.1.7 (item 1): a plain PROOF's age at THIS attempt --
+            # fresh, it pre-empts idle holds like a handshake; a retry after
+            # a miss at the hop cap has usually aged past proof_fresh_s and
+            # queues as bulk again. Capture-only otherwise.
+            proof_age_s = (time.monotonic() - proof_enqueued_at) if proof_enqueued_at is not None else None
+            proof_fresh = self._proof_is_fresh(proof_age_s) if proof_age_s is not None else None
+            attempt_preempt = preempt or bool(proof_fresh)
             if cancel_event is not None and cancel_event.is_set() and self._send_superseded(cancel_key):
                 # Alpha 0.1.6 (item 2): an LRPROOF superseded by the peer's
                 # newer LINKREQUEST -- expired, like a stale plain proof.
@@ -1010,7 +1021,7 @@ class _DirectSendMixin:
                     peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                     time_critical=time_critical, pass_number=pass_number,
-                    ack_timeout_source="superseded",
+                    ack_timeout_source="superseded", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
                 return False
             if cancel_event is not None and cancel_event.is_set():
@@ -1024,7 +1035,7 @@ class _DirectSendMixin:
                     peer_prefix, attempt, True, self._direct_exchange_queue_depth, 0.0, None,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                     time_critical=time_critical, pass_number=pass_number,
-                    ack_timeout_source="answered",
+                    ack_timeout_source="answered", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
                 # Path evidence only when THIS peer delivered the reply
                 # (review, 2026-09-20): a DIRECT-to-all copy cancelled by a
@@ -1056,6 +1067,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number, ack_timeout_source="expired",
+                        proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                 return False
             frame = frame_builder(attempt)
@@ -1066,7 +1078,8 @@ class _DirectSendMixin:
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
-                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=preempt,
+                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=attempt_preempt,
+                    proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
             except Exception as exc:
                 RNS.log(
@@ -1340,6 +1353,8 @@ class _DirectSendMixin:
         attempt_info: Optional[dict] = None,  # out-param: "expired" True when the attempt aged out in the lock wait and never transmitted
         preempt: bool = False,  # a Link handshake: may pre-empt an idle hold of the lock (phase 1, 2026-09-20)
         preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
+        proof_age_s: Optional[float] = None,  # capture-only (alpha 0.1.7, item 1): a plain PROOF's age at this attempt
+        proof_fresh: Optional[bool] = None,  # capture-only: whether that age made it pre-empt (proof_fresh_s)
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -1429,7 +1444,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, True, self._direct_exchange_queue_depth, time.monotonic() - wait_start, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="answered_before_send", kind=kind,
+                        ack_timeout_source="answered_before_send", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     if quiet_info is not None:
                         quiet_info["answered_at"] = time.monotonic()
@@ -1446,7 +1461,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, queue_depth_at_acquire, lock_wait_s, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="expired", kind=kind,
+                        ack_timeout_source="expired", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     return False, False
                 # Code-review fix: a local exception raised anywhere in this
@@ -1648,7 +1663,7 @@ class _DirectSendMixin:
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
-                    kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
+                    kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
                     on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)

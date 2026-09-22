@@ -546,7 +546,10 @@ class _PriorityAsyncLock:
         self._waiters: "dict[int, collections.deque]" = {}
         # Pre-emption (phase 1, 2026-09-20): futures of waiters that asked
         # to pre-empt an idle holder, and the event an idle holder watches.
-        self._preempt_waiters: set = set()
+        # Alpha 0.1.7 (item 1): waiter -> its tier, so a yielding holder
+        # can resume BEHIND the tier that pre-empted it (a fresh plain PROOF
+        # pre-empts from the ANSWER tier, a handshake from tier 0).
+        self._preempt_waiters: dict = {}
         self._preempt_event: "Optional[asyncio.Event]" = None
         # Alpha 0.1.5 (item 6): a second class -- completion REPORTs this
         # node owes the far sender -- that a raw window yields to between
@@ -571,15 +574,27 @@ class _PriorityAsyncLock:
                 self._preempt_event.set()
         return self._preempt_event
 
-    def _preempt_add(self, fut) -> None:
-        self._preempt_waiters.add(fut)
+    def _preempt_add(self, fut, priority) -> None:
+        self._preempt_waiters[fut] = priority
         if self._preempt_event is not None:
             self._preempt_event.set()
 
     def _preempt_remove(self, fut) -> None:
-        self._preempt_waiters.discard(fut)
+        self._preempt_waiters.pop(fut, None)
         if not self._preempt_waiters and self._preempt_event is not None:
             self._preempt_event.clear()
+
+    def preempt_resume_priority(self) -> float:
+        """The tier a holder resumes at after yielding to whatever is
+        pre-empting it (alpha 0.1.7, item 1): half a step behind the
+        highest-priority pre-empting waiter -- YIELDED_PRIORITY 0.5 behind a
+        handshake (tier 0), REPORT_YIELDED_PRIORITY 1.5 behind a fresh plain
+        PROOF (the ANSWER tier, 1). A resume at 0.5 would put the holder
+        back ahead of a tier-1 pre-emptor still queued behind another
+        waiter, so the yield would buy that proof nothing."""
+        if not self._preempt_waiters:
+            return self.YIELDED_PRIORITY
+        return min(self._preempt_waiters.values()) + 0.5
 
     def report_requested(self) -> bool:
         """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
@@ -614,8 +629,10 @@ class _PriorityAsyncLock:
         whole other exchange into a raw burst). `resume_priority` lets a
         holder yielding to a REPORT (item 6) resume behind the report's
         tier instead."""
+        if resume_priority is None:
+            resume_priority = self.preempt_resume_priority()
         self.release()
-        await self.acquire(self.YIELDED_PRIORITY if resume_priority is None else resume_priority)
+        await self.acquire(resume_priority)
 
     async def acquire(self, priority: int, preempt: bool = False, report: bool = False) -> None:
         if not self._locked:
@@ -624,7 +641,7 @@ class _PriorityAsyncLock:
         fut = asyncio.get_running_loop().create_future()
         self._waiters.setdefault(priority, collections.deque()).append(fut)
         if preempt:
-            self._preempt_add(fut)
+            self._preempt_add(fut, priority)
         if report:
             self._report_add(fut)
         try:
@@ -1740,6 +1757,22 @@ class _ConfigMixin:
         # the first: a proof is one bare frame, so a stale retry wastes
         # nothing already spent. 0 disables.
         self.proof_max_age_s = float(cfg.get("proof_max_age", 45.0))
+        # Alpha 0.1.7 (item 1): a plain PROOF younger than this (measured
+        # from the moment RNS handed it to this interface, which is within
+        # milliseconds of the DATA it answers arriving) is treated like a
+        # Link handshake for the RADIO LOCK only: it pre-empts idle holds
+        # and is taken at the raw window's existing yield points, exactly
+        # as an LRPROOF and the receiver's own completion report are. Its
+        # tier (ANSWER), attempt budget and duty-cycle accounting do not
+        # change, and it still expires at proof_max_age. The 2026-09-22
+        # one-hop session: one 211 B LXMF message arrived six times in 70 s
+        # because each proof left the radio 5-20 s after its DATA, queued
+        # behind the page windows this node was serving, and LXMF re-sends
+        # an unproved opportunistic message after DELIVERY_RETRY_WAIT 10 s
+        # (checked every 4 s, up to 5 attempts). 8 s: the far side's retry
+        # is due at 10-14 s after its send, minus ~2 s of transit at one
+        # hop. Past it the proof is bulk-tier as before. 0 disables.
+        self.proof_fresh_s = float(cfg.get("proof_fresh_s", 8.0))
         # How many times the same bytes may be suppressed as "already in
         # flight" before the packet is forced through with a fresh in-flight
         # entry (field fix 2026-09-19: a stuck entry deadlocked a transfer for
@@ -2627,6 +2660,7 @@ class _ObservabilityMixin:
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
         duty_cycle_ledger: Optional[str] = None,
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
+        proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -2710,6 +2744,10 @@ class _ObservabilityMixin:
             # governed the wait. The `rx_*` fields are the correlation
             # window -- offsets in seconds after MSG_SENT.
             "ack_timeout_source": ack_timeout_source,
+            # Alpha 0.1.7 (item 1): a plain PROOF's age since RNS queued it
+            # (None for any other frame) and whether it pre-empted as fresh.
+            "proof_age_s": round(proof_age_s, 3) if proof_age_s is not None else None,
+            "proof_fresh": proof_fresh,
             "ack_latency_s": round(ack_latency_s, 3) if ack_latency_s is not None else None,
             "send_cmd_latency_s": round(send_cmd_latency_s, 3) if send_cmd_latency_s is not None else None,
             **self._rtt_capture_fields(peer_prefix),
@@ -4068,6 +4106,27 @@ class _WireFormatMixin:
         """A plain delivery PROOF: packet type PROOF and not link class
         (`proof_max_age` applies; phase 1, 2026-09-20)."""
         return header is not None and header.packet_type == RNS.Packet.PROOF and not self._proof_is_link_class(header)
+
+    def _note_proof_enqueued(self, destination_hash: bytes, now: float) -> None:
+        """Remember when a plain PROOF was queued (alpha 0.1.7, item 1), so
+        `_send_direct_with_attempts` can tell a young proof from an old one
+        at every attempt. Not popped on dispatch: a small-mesh DIRECT-to-all
+        proof is sent to several peers."""
+        self._proof_enqueued_at.pop(destination_hash, None)
+        self._proof_enqueued_at[destination_hash] = now
+        while len(self._proof_enqueued_at) > self.PROOF_ENQUEUED_MAX_KEYS:
+            self._proof_enqueued_at.popitem(last=False)
+
+    def _proof_enqueued_at_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
+        """The queue time of this plain PROOF, or None for anything else."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return None
+        return self._proof_enqueued_at.get(header.destination_hash)
+
+    def _proof_is_fresh(self, proof_age_s: Optional[float]) -> bool:
+        """Whether a plain PROOF of this age still pre-empts like a handshake
+        (item 1 of alpha 0.1.7): younger than `proof_fresh_s`; 0 disables."""
+        return proof_age_s is not None and self.proof_fresh_s > 0 and proof_age_s < self.proof_fresh_s
 
     def _proof_is_link_class(self, header: _RnsHeader) -> bool:
         """Whether a PROOF packet is one a Link (or a Resource transfer)
@@ -6709,6 +6768,9 @@ class _DirectSendMixin:
                 expire_retries=self._plain_proof(header) and self.proof_max_age_s > 0,
                 # A Link handshake pre-empts idle holds of the radio lock.
                 preempt=self._is_link_handshake(header),
+                # Alpha 0.1.7 (item 1): so does a plain PROOF while it is
+                # younger than proof_fresh_s (re-read at every attempt).
+                proof_enqueued_at=self._proof_enqueued_at_for(header),
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -7089,6 +7151,7 @@ class _DirectSendMixin:
         attempts_override: Optional[int] = None, record_result: bool = True,
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
         expire_retries: bool = False, preempt: bool = False,
+        proof_enqueued_at: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -7159,6 +7222,13 @@ class _DirectSendMixin:
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            # Alpha 0.1.7 (item 1): a plain PROOF's age at THIS attempt --
+            # fresh, it pre-empts idle holds like a handshake; a retry after
+            # a miss at the hop cap has usually aged past proof_fresh_s and
+            # queues as bulk again. Capture-only otherwise.
+            proof_age_s = (time.monotonic() - proof_enqueued_at) if proof_enqueued_at is not None else None
+            proof_fresh = self._proof_is_fresh(proof_age_s) if proof_age_s is not None else None
+            attempt_preempt = preempt or bool(proof_fresh)
             if cancel_event is not None and cancel_event.is_set() and self._send_superseded(cancel_key):
                 # Alpha 0.1.6 (item 2): an LRPROOF superseded by the peer's
                 # newer LINKREQUEST -- expired, like a stale plain proof.
@@ -7167,7 +7237,7 @@ class _DirectSendMixin:
                     peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                     time_critical=time_critical, pass_number=pass_number,
-                    ack_timeout_source="superseded",
+                    ack_timeout_source="superseded", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
                 return False
             if cancel_event is not None and cancel_event.is_set():
@@ -7181,7 +7251,7 @@ class _DirectSendMixin:
                     peer_prefix, attempt, True, self._direct_exchange_queue_depth, 0.0, None,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                     time_critical=time_critical, pass_number=pass_number,
-                    ack_timeout_source="answered",
+                    ack_timeout_source="answered", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
                 # Path evidence only when THIS peer delivered the reply
                 # (review, 2026-09-20): a DIRECT-to-all copy cancelled by a
@@ -7213,6 +7283,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number, ack_timeout_source="expired",
+                        proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                 return False
             frame = frame_builder(attempt)
@@ -7223,7 +7294,8 @@ class _DirectSendMixin:
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
-                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=preempt,
+                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=attempt_preempt,
+                    proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
             except Exception as exc:
                 RNS.log(
@@ -7497,6 +7569,8 @@ class _DirectSendMixin:
         attempt_info: Optional[dict] = None,  # out-param: "expired" True when the attempt aged out in the lock wait and never transmitted
         preempt: bool = False,  # a Link handshake: may pre-empt an idle hold of the lock (phase 1, 2026-09-20)
         preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
+        proof_age_s: Optional[float] = None,  # capture-only (alpha 0.1.7, item 1): a plain PROOF's age at this attempt
+        proof_fresh: Optional[bool] = None,  # capture-only: whether that age made it pre-empt (proof_fresh_s)
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -7586,7 +7660,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, True, self._direct_exchange_queue_depth, time.monotonic() - wait_start, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="answered_before_send", kind=kind,
+                        ack_timeout_source="answered_before_send", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     if quiet_info is not None:
                         quiet_info["answered_at"] = time.monotonic()
@@ -7603,7 +7677,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, queue_depth_at_acquire, lock_wait_s, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="expired", kind=kind,
+                        ack_timeout_source="expired", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     return False, False
                 # Code-review fix: a local exception raised anywhere in this
@@ -7805,7 +7879,7 @@ class _DirectSendMixin:
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
-                    kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
+                    kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
                     on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)
@@ -10270,6 +10344,11 @@ class _ReconcileMixin:
         expired = [h for h, (_peer, expiry) in self._proof_correlation.items() if now >= expiry]
         for h in expired:
             del self._proof_correlation[h]
+        # Alpha 0.1.7 (item 1): a proof older than proof_max_age (or 120 s
+        # with that disabled) is no longer in the queue either way.
+        max_age = self.proof_max_age_s if self.proof_max_age_s > 0 else 120.0
+        for h in [h for h, t in self._proof_enqueued_at.items() if now - t > max_age]:
+            del self._proof_enqueued_at[h]
 
     # -- Whole-packet dedup (docs/reliability_engine_design.md §7) --------
 
@@ -10415,8 +10494,11 @@ class _RoutingMixin:
                 RNS.LOG_WARNING,
             )
         seq = next(self._outqueue_seq)
+        enqueued_at = time.monotonic()
         try:
-            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic(), inflight_key))
+            self._outqueue.put_nowait((priority, seq, raw, header, enqueued_at, inflight_key))
+            if header is not None and header.destination_hash and self._plain_proof(header):
+                self._note_proof_enqueued(header.destination_hash, enqueued_at)
         except queue.Full:
             self._release_inflight(inflight_key)
             self._outgoing_dropped_total += 1
@@ -12463,6 +12545,9 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # tens of destinations per hour, so this only ever trims pathological
     # growth over days of uptime, never a working set.
     RNS_TOKEN_PEER_MAX_KEYS = 4096
+    # Alpha 0.1.7 (item 1): queue times of recent plain PROOFs
+    # (`_proof_enqueued_at`); the field's worst backlog was 13 proofs.
+    PROOF_ENQUEUED_MAX_KEYS = 64
 
     # Audit fix (2026-09-19): how many post-bind path-discovery rounds
     # `_discover_path_after_bind` runs before leaving it to real traffic.
@@ -12996,6 +13081,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # it did before the token was ever learned.
         self._rns_token_peer = collections.OrderedDict()
         self._proof_correlation = {}
+        # Alpha 0.1.7 (item 1): when each queued plain PROOF was handed to
+        # this interface, keyed by its destination field (the proved
+        # packet's truncated hash, or the link_id), so its age is known at
+        # every attempt (`_send_direct_with_attempts`, proof_fresh_s).
+        # Bounded; entries older than proof_max_age are swept with the
+        # proof correlations.
+        self._proof_enqueued_at = collections.OrderedDict()
 
         # Alpha 0.1.6 (item 4): the connection supervisor's state.
         self._supervisor_task = None

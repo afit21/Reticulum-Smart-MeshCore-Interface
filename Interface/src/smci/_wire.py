@@ -674,6 +674,27 @@ class _WireFormatMixin:
         (`proof_max_age` applies; phase 1, 2026-09-20)."""
         return header is not None and header.packet_type == RNS.Packet.PROOF and not self._proof_is_link_class(header)
 
+    def _note_proof_enqueued(self, destination_hash: bytes, now: float) -> None:
+        """Remember when a plain PROOF was queued (alpha 0.1.7, item 1), so
+        `_send_direct_with_attempts` can tell a young proof from an old one
+        at every attempt. Not popped on dispatch: a small-mesh DIRECT-to-all
+        proof is sent to several peers."""
+        self._proof_enqueued_at.pop(destination_hash, None)
+        self._proof_enqueued_at[destination_hash] = now
+        while len(self._proof_enqueued_at) > self.PROOF_ENQUEUED_MAX_KEYS:
+            self._proof_enqueued_at.popitem(last=False)
+
+    def _proof_enqueued_at_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
+        """The queue time of this plain PROOF, or None for anything else."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return None
+        return self._proof_enqueued_at.get(header.destination_hash)
+
+    def _proof_is_fresh(self, proof_age_s: Optional[float]) -> bool:
+        """Whether a plain PROOF of this age still pre-empts like a handshake
+        (item 1 of alpha 0.1.7): younger than `proof_fresh_s`; 0 disables."""
+        return proof_age_s is not None and self.proof_fresh_s > 0 and proof_age_s < self.proof_fresh_s
+
     def _proof_is_link_class(self, header: _RnsHeader) -> bool:
         """Whether a PROOF packet is one a Link (or a Resource transfer)
         hangs on -- LRPROOF, RESOURCE_PRF, or any context in RNS core's own

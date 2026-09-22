@@ -121,8 +121,11 @@ class _RoutingMixin:
                 RNS.LOG_WARNING,
             )
         seq = next(self._outqueue_seq)
+        enqueued_at = time.monotonic()
         try:
-            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic(), inflight_key))
+            self._outqueue.put_nowait((priority, seq, raw, header, enqueued_at, inflight_key))
+            if header is not None and header.destination_hash and self._plain_proof(header):
+                self._note_proof_enqueued(header.destination_hash, enqueued_at)
         except queue.Full:
             self._release_inflight(inflight_key)
             self._outgoing_dropped_total += 1

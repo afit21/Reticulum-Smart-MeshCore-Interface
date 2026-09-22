@@ -790,6 +790,22 @@ class _ConfigMixin:
         # the first: a proof is one bare frame, so a stale retry wastes
         # nothing already spent. 0 disables.
         self.proof_max_age_s = float(cfg.get("proof_max_age", 45.0))
+        # Alpha 0.1.7 (item 1): a plain PROOF younger than this (measured
+        # from the moment RNS handed it to this interface, which is within
+        # milliseconds of the DATA it answers arriving) is treated like a
+        # Link handshake for the RADIO LOCK only: it pre-empts idle holds
+        # and is taken at the raw window's existing yield points, exactly
+        # as an LRPROOF and the receiver's own completion report are. Its
+        # tier (ANSWER), attempt budget and duty-cycle accounting do not
+        # change, and it still expires at proof_max_age. The 2026-09-22
+        # one-hop session: one 211 B LXMF message arrived six times in 70 s
+        # because each proof left the radio 5-20 s after its DATA, queued
+        # behind the page windows this node was serving, and LXMF re-sends
+        # an unproved opportunistic message after DELIVERY_RETRY_WAIT 10 s
+        # (checked every 4 s, up to 5 attempts). 8 s: the far side's retry
+        # is due at 10-14 s after its send, minus ~2 s of transit at one
+        # hop. Past it the proof is bulk-tier as before. 0 disables.
+        self.proof_fresh_s = float(cfg.get("proof_fresh_s", 8.0))
         # How many times the same bytes may be suppressed as "already in
         # flight" before the packet is forced through with a fresh in-flight
         # entry (field fix 2026-09-19: a stuck entry deadlocked a transfer for

@@ -2276,6 +2276,11 @@ class _ReconcileMixin:
         expired = [h for h, (_peer, expiry) in self._proof_correlation.items() if now >= expiry]
         for h in expired:
             del self._proof_correlation[h]
+        # Alpha 0.1.7 (item 1): a proof older than proof_max_age (or 120 s
+        # with that disabled) is no longer in the queue either way.
+        max_age = self.proof_max_age_s if self.proof_max_age_s > 0 else 120.0
+        for h in [h for h, t in self._proof_enqueued_at.items() if now - t > max_age]:
+            del self._proof_enqueued_at[h]
 
     # -- Whole-packet dedup (docs/reliability_engine_design.md §7) --------
 
