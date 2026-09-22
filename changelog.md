@@ -4,9 +4,34 @@
 
 From the alpha 0.1.7 field session (`fieldtests/raw/Alpha0.1.7/`, 2026-09-22 evening: zero hop at
 home, a two-hop stop, a one-hop stop). The release is about frames per exchange. The dated design
-record is `docs/history.md` ("Alpha 0.1.8 pass"). Every default is pinned by
+record is `docs/history.md` ("Alpha 0.1.8 pass"). New config keys, both optional:
+`proof_report_grace = 0.25`, `announce_cache_path` (empty). Every default is pinned by
 `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
 
+- **The proof is the completion** (`proof_report_grace = 0.25`). RNS proves every
+  single-destination DATA packet, so for a raw window whose packets it will prove, the PROOF already
+  tells the sender what the completion report would -- "I have it" -- and it has to be sent anyway.
+  The receiver now holds that window's complete report for `proof_report_grace` and drops it if RNS
+  proves the packet inside it (the packet is handed to RNS first, so there is a proof to wait for);
+  the sender treats an inbound PROOF for a packet in an open window as that packet's completion, and
+  a window whose packets are all proved ends with the new outcome `proved` -- no report wait past
+  the proof, no QUERY. Four gates keep it to the case the evidence is about: RNS must prove the
+  packet per packet (a Resource part, anything inside a Link and every announce are excluded), the
+  destination must be served by this node's own RNS, nothing else of that sender's recent raw
+  packets may be incomplete (the report's per-fragment bitmaps for the other parts are worth more
+  than the proof's latency), and the sender must be a bound peer with a resolved path so the proof
+  routes back DIRECT. Field motivation at two hops: the receiver sent 22 complete reports and the
+  sender got 3 inside its report wait plus 2 stale -- the report is a no-ACK frame, one
+  transmission, never retried -- so the sender waited out its 10-18 s report wait and ran a QUERY
+  (23 in 17 minutes, 0.93 QUERY attempts per raw send against 0.22 at one hop in 0.1.6), and every
+  answered one said the data had already arrived; and because the report went first and the radio
+  was then held for its relay window, the proof keyed about 8 s after the packet landed, first
+  attempt succeeding 3 times of 14, proof turnaround 17.9 s median / 30.6 s p90 / 45 s max.
+  Nothing here cuts a hold: alpha 0.1.7's second cut stands untouched and this works by not sending
+  a frame. `proof_report_grace = 0` disables the item. Capture: a `completion_report_skipped` record
+  with `report_skipped_for_proof`, and `outcome: "proved"` with `proved_by` on
+  `completion_check_result`. Tests: `tests/test_proof_is_the_completion_0923.py`. MeshBench:
+  `relay`, `two_hop`, `large_payload`, `page_transfer`.
 - **The announce cache survives a restart, and one path-request verification per interval goes on
   the air instead of most of them.** The cache of announces that answers RNS path requests locally
   (`path_request_answered_locally`) is now persisted to `smci_announces.json` under

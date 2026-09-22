@@ -4506,3 +4506,105 @@ client-specific workaround).
     plus the cache tuple's new arity. Shipped-default pin and golden
     config re-pinned (one key added, no default changed). MeshBench:
     `companion_restart`, `bring_up`.
+
+ 1. **The proof is the completion** (`proof_report_grace_s`, new, 0.25 s,
+    in `_configure_retry`; receiver: `_proof_expected_key`,
+    `_proof_may_replace_report`, `_hold_report_for_proof`,
+    `_cancel_proof_grace`, `_capture_report_skipped_for_proof`,
+    `_proof_enqueued_at_for_key` in `_wire.py`, `_pending_proof_graces`,
+    `PROOF_GRACE_POLL_S`; sender: `_RawPart.proof_key` from
+    `_answered_send_key`, `_window_proved_parts`, `_window_all_proved`,
+    `_mark_part_proved`, `_capture_window_proved`, the `_WINDOW_PROVED`
+    sentinel, `_wait_future_or_proof`, `extra_events` on
+    `_wait_future_or_preempt`).
+
+    The field's two-hop stop is the whole of the motivation. The receiver
+    sent 22 complete reports (`completion_report_sent`, `held_s` 0 on 17
+    of them). The sender received 3 inside its report wait and 2 more
+    stale: the report is a no-ACK frame, one transmission, never retried,
+    and through two repeaters it mostly does not arrive. The sender then
+    waited out its 10-18 s report wait and ran a QUERY -- 23 QUERYs in 17
+    minutes, 0.93 QUERY attempts per raw send against 0.22 at one hop in
+    alpha 0.1.6 -- and every one that was answered said the data had
+    already arrived. Meanwhile RNS proves every single-destination DATA
+    packet, and the desktop's capture shows the PROOF handed to
+    `process_outgoing` in the same second the packet completed; but the
+    receiver's design sends the report FIRST ("Report BEFORE RNS sees the
+    packet") and then holds the radio for the report's relay window, so
+    at two hops the proof keyed about 8 s after the packet arrived and
+    its first attempt succeeded 3 times of 14. Proof turnaround at two
+    hops: 17.9 s median, 30.6 s p90, 45 s max. LXMF's 10 s retry then
+    produced 23 copies of one 211-byte message and 8 of another.
+
+    So for a packet RNS will prove, the report is the redundant frame,
+    not the proof. Receiver: the complete report is held for
+    `proof_report_grace_s` and dropped if the proof appears inside it,
+    which means the packet must go to RNS FIRST -- the ordering the
+    "report before RNS" comment established is given up deliberately, and
+    only in this one case. Sender: `_signal_send_answered` already fires
+    for every inbound DIRECT PROOF (`_peers.py`) and the bare send path
+    already stops retrying on it; nothing was listening on the raw path.
+    A part now carries the same `_answered_send_key` the bare path uses,
+    the report wait takes the proof events as extra wakeups, and a window
+    whose outstanding parts are all proved ends with outcome `proved` --
+    the report wait cut short, no QUERY sent, the parts marked exactly as
+    `_apply_window_entries` marks them, and path evidence recorded only
+    when the proof came from the peer the window was addressed to (the
+    rule the bare path's `answered` outcome already applies).
+
+    Four gates, each from a way this could lose the sender its only
+    signal, and each pinned by a test. (a) RNS must prove the packet per
+    packet: a plain DATA to a SINGLE destination. A Resource part is
+    context RESOURCE and is proved once, whole, as RESOURCE_PRF; a
+    Link-carried packet's proof carries the link_id, which is the same
+    for every packet on that link and so names none of them; an announce
+    is never proved. All three leave `proof_key` None and report as
+    before. (b) The destination must be served by this node's own RNS
+    (`_is_local_destination`): on a transport node relaying the packet
+    onward nothing proves it, so no proof is ever coming. (c) Nothing
+    else of that sender's recent raw packets may be incomplete. The
+    complete report is NOT about one packet -- it carries a per-fragment
+    bitmap for every recent pkt_id of the sender (`_recent_raw_entries`),
+    and those bitmaps are how the sender re-drives exactly the missing
+    fragments of its OTHER parts without a QUERY first. A proof says only
+    "this one packet arrived", so while anything else is incomplete the
+    report is worth far more than the proof's latency. Without this gate
+    the optimisation would fire on almost every multi-part window and
+    cost the sender the gap information. (d) The sender must be a bound
+    peer with a resolved path, so the proof routes back DIRECT via
+    `_proof_correlation` rather than over CHANNEL or to every peer.
+
+    The default was measured, not guessed: against a real
+    `RNS.Reticulum` with a PROVE_ALL destination on the installed RNS
+    1.4.2, the PROOF reaches an interface's `process_outgoing` a median
+    0.082 ms and at worst 0.194 ms after `Transport.inbound` is handed
+    the packet (inbound is synchronous there, and LXMF's
+    `delivery_packet` calls `prove()` on its first line). The receiver
+    therefore checks synchronously the moment `process_incoming` returns
+    and normally never arms the timer at all; 0.25 s is about 1300x the
+    measured worst case, to cover RNS 1.5's `USE_INBOUND_QUEUE` thread
+    hop and a loaded host, and it is only ever spent where the four gates
+    say a proof is genuinely plausible.
+
+    What this does NOT do, deliberately: it cuts no hold. The alpha 0.1.7
+    second cut -- a fresh proof must not cut the no-ACK report hold or
+    the QUERY quiet hold, because a proof keyed into the repeater's relay
+    window for this node's own frame is a certain miss at the repeater
+    (MeshBench `large_payload`, probe RTT 22 s -> 45 s, B's proof success
+    4/23 against 9/24) -- is untouched. This item works by not sending a
+    frame, so there is no relay window to respect; no `skip_quiet_defer`
+    or `handshake_only=False` is introduced anywhere, and the proof still
+    pays the ordinary 3 s incoming-quiet defer before it keys.
+
+    Capture: `completion_report_skipped` with `report_skipped_for_proof`
+    and the proof key on the receiver, `outcome: "proved"` with
+    `proved_by` on the sender's `completion_check_result`. Tests:
+    `tests/test_proof_is_the_completion_0923.py` (the default and 0
+    disabling it; what expects a proof and what does not; each of the
+    four gates; a single-packet window completed by the proof with no
+    QUERY and inside the report wait; a proof that arrived during the
+    burst; a Resource-part window still reporting and querying; a mixed
+    window not ended by one part's proof; the grace expiring into the
+    report; a report going out for another reason cancelling the grace).
+    Shipped-default pin and golden config re-pinned (one key added).
+    MeshBench: `relay`, `two_hop`, `large_payload`, `page_transfer`.

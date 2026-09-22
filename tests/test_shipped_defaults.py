@@ -233,6 +233,7 @@ CONFIGURE_RETRY = {
     'path_req_retransmit_extra': 1,
     'proof_max_age_s': 45.0,
     'proof_fresh_s': 8.0,
+    'proof_report_grace_s': 0.25,
     'retransmit_jitter_max_s': 20.0,
     'retransmit_jitter_min_s': 8.0,
 }

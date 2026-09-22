@@ -241,7 +241,8 @@ class _DirectSendMixin:
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
     async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float,
-                                      also_reports: bool = False, handshake_only: bool = False) -> "tuple[bool, bool]":
+                                      also_reports: bool = False, handshake_only: bool = False,
+                                      extra_events=None) -> "tuple[bool, bool]":
         """Await `fut` (shielded: it outlives this wait) for up to
         `timeout_s`, ending early when a Link handshake queues for the
         radio lock (phase 1, 2026-09-20) -- or, with `also_reports` (item
@@ -251,11 +252,17 @@ class _DirectSendMixin:
         the future's own exception is the caller's. `handshake_only`
         (alpha 0.1.7, item 1): only a Link handshake cuts this wait, not a
         fresh plain PROOF -- for the QUERY quiet hold, which keeps this
-        node silent while the ANSWER transits the repeater."""
+        node silent while the ANSWER transits the repeater.
+        `extra_events` (alpha 0.1.8, item 1): further events that end
+        the wait, reported as `cut`; the caller checks its own
+        condition first to tell them apart from a pre-emptor. The raw
+        window passes the event its packets' PROOFs set."""
         if fut.done():
             return True, False
         lock = self._direct_exchange_lock
-        events = [lock.preempt_event(handshake_only=handshake_only)] + ([lock.report_event()] if also_reports else [])
+        events = ([lock.preempt_event(handshake_only=handshake_only)]
+                  + ([lock.report_event()] if also_reports else [])
+                  + list(extra_events or ()))
         if any(e.is_set() for e in events):
             return False, True
         if timeout_s <= 0:

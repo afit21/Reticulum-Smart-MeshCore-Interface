@@ -492,6 +492,7 @@ class _PeerStateMixin:
         self._pending_path_discoveries.pop(pubkey_prefix, None)
         # Alpha 0.1.5 (2b): a held complete report for this sender.
         self._cancel_sender_report(pubkey_prefix)
+        self._cancel_proof_grace(pubkey_prefix)
         self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
         self._path_boards.pop(pubkey_prefix, None)   # alpha 0.1.6 item 1: the path scoreboard
         self._pending_link_proofs.pop(pubkey_prefix, None)   # alpha 0.1.6 item 2

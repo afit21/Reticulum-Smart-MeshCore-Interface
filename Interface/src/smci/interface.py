@@ -868,6 +868,11 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
+        # Alpha 0.1.8 (item 1): sender token -> the task holding a complete
+        # report for `proof_report_grace_s` while RNS decides whether to
+        # prove the packet. Cancelled whenever a report for that sender
+        # goes out for any other reason.
+        self._pending_proof_graces = {}
         # Alpha 0.1.5 (2b): sender token -> {"task", "header", "frag_bytes"}
         # for a complete report held while that sender's fragments are still
         # arriving; re-armed by every fragment, superseded by any report.
@@ -1764,6 +1769,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # Alpha 0.1.6 (item 1): the per-peer path scoreboard (`_paths.py`).
     PATH_CANDIDATES_KEPT = 4        # candidate paths kept per peer
     PATH_SAMPLES_KEPT = 8           # send outcomes a candidate's delivery rate is over
+    # Alpha 0.1.8 (item 1): how often the proof grace looks for the proof.
+    # Short against the grace itself, so a proof that arrives early is not
+    # made to wait out the whole of it.
+    PROOF_GRACE_POLL_S = 0.02
     PATH_SAMPLE_WINDOW_S = 600.0    # outcomes older than this count for nothing
     PATH_SAMPLE_HALF_LIFE_S = 180.0 # an outcome's weight halves every this many seconds
     PATH_PRIOR_OPTIMISTIC = 0.8     # an untried path's assumed delivery rate

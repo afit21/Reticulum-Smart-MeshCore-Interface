@@ -10,6 +10,12 @@ from ._common import _FrameHeader, _ReassemblyBucket, _CompletionFrame, PRIORITY
 from ._locks import _PreemptedForHandshake
 
 
+# Alpha 0.1.8 (item 1): what `_await_completion_report` returns when the
+# far side's RNS proved every packet of the window -- the proof is the
+# completion, so there is no report to wait for and nothing to QUERY.
+_WINDOW_PROVED = object()
+
+
 class _ReconcileMixin:
     def _raw_fragments_eligible(self, peer_prefix: str, priority: int) -> bool:
         """Whether a too-big-for-one-text-frame packet to `peer_prefix` may
@@ -254,6 +260,33 @@ class _ReconcileMixin:
         self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
         return latency_s
 
+    async def _wait_future_or_proof(self, fut: "asyncio.Future", timeout_s: float, events):
+        """The report future against the events this window's PROOFs set,
+        with the radio already released (alpha 0.1.8, item 1). Returns the
+        report if it arrived, else None -- the caller re-checks whether a
+        proof completed the window and, if not, keeps waiting."""
+        if fut.done():
+            return fut.result()
+        if timeout_s <= 0:
+            return None
+        if any(e.is_set() for e in events):
+            return None
+        loop = asyncio.get_running_loop()
+        fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
+        try:
+            await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in waits:
+                if not t.done():
+                    t.cancel()
+            for t in waits:
+                try:
+                    await t
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+        return fut.result() if fut.done() else None
+
     def _expect_report(self, peer_prefix: str, pkt_id: int, burst_end: Optional[float]) -> None:
         """Register (or, with None, withdraw) the burst end time a report
         for (peer, pkt_id) is measured against."""
@@ -266,8 +299,8 @@ class _ReconcileMixin:
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
         last_sent_idx: Optional[int] = None, rearm=None, release_lock=None, window_pkts=None,
-        burst_end: Optional[float] = None, on_early=None,
-    ) -> Optional[_CompletionFrame]:
+        burst_end: Optional[float] = None, on_early=None, proved_check=None, proved_events=None,
+    ):
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
         `_completion_report_wait_s`, in which case the caller falls back to
@@ -316,6 +349,17 @@ class _ReconcileMixin:
         done_at_entry = fut.done()
         released = release_lock is None
         while True:
+            # Alpha 0.1.8 (item 1): RNS proves every single-destination DATA
+            # packet, and the proof says the same thing the report would --
+            # "I have it" -- with none of the report's own frame, hold or
+            # QUERY behind it. Checked before the wait and again after every
+            # wakeup, since a proof may have landed during the burst.
+            if proved_check is not None and proved_check():
+                self._debug(
+                    f"RAW window to {peer_prefix!r} ({stage}): every packet proved by the far side's RNS "
+                    f"{max(0.0, time.monotonic() - started):.1f}s after the burst -- no report wait, no QUERY."
+                )
+                return _WINDOW_PROVED
             remaining = deadline_s - (time.monotonic() - started)
             if remaining <= 0:
                 got = None
@@ -328,7 +372,10 @@ class _ReconcileMixin:
                         # (alpha 0.1.5): so does a completion REPORT this
                         # node owes the far sender -- under both-ways load
                         # it waited 11-13 s behind this very wait.
-                        done, cut = await self._wait_future_or_preempt(fut, remaining, also_reports=True)
+                        done, cut = await self._wait_future_or_preempt(
+                            fut, remaining, also_reports=True, extra_events=proved_events)
+                        if cut and proved_check is not None and proved_check():
+                            continue
                         if cut:
                             release_lock()
                             released = True
@@ -339,6 +386,15 @@ class _ReconcileMixin:
                             )
                             continue
                         got = fut.result() if done else None
+                    elif proved_events:
+                        # Radio-free, so no lock event is consulted here
+                        # (one that stayed set would spin): the report
+                        # future against the proof events, whichever first.
+                        got = await self._wait_future_or_proof(fut, remaining, proved_events)
+                        if got is None and (time.monotonic() - started) < deadline_s - 0.001:
+                            # A proof woke this, not the deadline: re-check
+                            # at the top of the loop.
+                            continue
                     else:
                         got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
                 except (asyncio.TimeoutError, Exception):
@@ -477,7 +533,7 @@ class _ReconcileMixin:
 
     class _RawPart:
         __slots__ = ("data", "pkt_id", "chunks", "frag_total", "acked", "resume_key", "expires_at",
-                     "future", "last_progress_at", "resumed", "hop_count", "priority")
+                     "future", "last_progress_at", "resumed", "hop_count", "priority", "proof_key")
 
         def __init__(self, data, pkt_id, expires_at, resume_key, hop_count, priority):
             self.data = data
@@ -492,6 +548,10 @@ class _ReconcileMixin:
             self.resumed = False
             self.hop_count = hop_count
             self.priority = priority
+            # Alpha 0.1.8 (item 1): the truncated hash the PROOF for this
+            # packet will carry in its destination field, or None when RNS
+            # does not prove this packet per packet (`_answered_send_key`).
+            self.proof_key = None
 
     class _RawWindow:
         __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed", "last_join_at")
@@ -589,6 +649,13 @@ class _ReconcileMixin:
             RNS.log(f"{self}: dropping raw DIRECT send to {peer_prefix!r} -- packet expired before its first transmission.", RNS.LOG_WARNING)
             return False
         part = self._RawPart(payload, pkt_id, expires_at, resume_key, hop_count, priority)
+        # Alpha 0.1.8 (item 1): the same key the bare DIRECT path already
+        # uses to stop retrying once the proof lands (`_answered_send_key`,
+        # `_direct.py`) -- a plain DATA to a SINGLE destination only, so a
+        # Link packet's proof (which carries the link_id and so names no
+        # particular packet), a Resource part and an announce all leave it
+        # None and those windows keep reporting as they do today.
+        part.proof_key = self._answered_send_key(payload, self._parse_rns_header(payload))
         part.chunks = chunks
         part.frag_total = len(chunks)
         part.acked, part.resumed = self._resume_state(resume, part.frag_total, pkt_id, peer_prefix, raw=True)
@@ -624,6 +691,61 @@ class _ReconcileMixin:
         if frame.entries:
             return tuple(frame.entries)
         return ((frame.pkt_id, frame.frag_total, frame.complete, self._held_from_answer(frame, frame.frag_total)),)
+
+    def _capture_window_proved(self, peer_prefix: str, parts, stage: str) -> None:
+        """The `proved` outcome, recorded in the same record type the
+        report and the QUERY answer use, so the reconcile accounting stays
+        in one place (alpha 0.1.8, item 1)."""
+        if self._packet_capture_file is None:
+            return
+        for part in parts:
+            self._capture_event("out", {
+                "event": "completion_check_result", "peer_prefix": peer_prefix,
+                "pkt_id": part.pkt_id, "frag_total": part.frag_total,
+                "outcome": "proved", "complete": True, "stage": stage,
+                "timeout_s": None, "answer_version": None, "held": None, "entries": None,
+                "report_wait_s": None, "provisional": False, "early_reports": 0,
+                "proved_by": self._send_answered_by(part.proof_key) if part.proof_key is not None else None,
+            })
+
+    def _mark_part_proved(self, window, part, peer_prefix: str) -> None:
+        """One part of a window completed by the PROOF its packet drew from
+        the far side's RNS, rather than by a completion report (alpha
+        0.1.8, item 1). The same three steps `_apply_window_entries` takes
+        for a part a report completed."""
+        part.acked = [True] * part.frag_total
+        part.last_progress_at = time.monotonic()
+        self._resumable_sends.pop(part.resume_key, None)
+        if not part.future.done():
+            part.future.set_result(True)
+        self._debug(f"RAW part pkt_id={part.pkt_id} to {peer_prefix!r} complete (proof).")
+
+    def _window_proved_parts(self, parts, peer_prefix: str) -> list:
+        """The parts of this window whose packet the far side's RNS has
+        proved, from the signal `_signal_send_answered` already raises for
+        every inbound DIRECT PROOF (`_peers.py`). `proof_key` is None for
+        anything RNS does not prove per packet -- a Resource part, anything
+        inside a Link, an announce -- so those parts never appear here and
+        the window keeps waiting for its report."""
+        proved = []
+        for part in parts:
+            key = getattr(part, "proof_key", None)
+            if key is None or part.future.done():
+                continue
+            if self._answered_send_event(key).is_set():
+                proved.append(part)
+        return proved
+
+    def _window_all_proved(self, parts, peer_prefix: str) -> bool:
+        """True when every part still outstanding has been proved -- the
+        window is complete and neither the report wait nor a QUERY has
+        anything left to ask about."""
+        outstanding = [p for p in parts if not p.future.done()]
+        if not outstanding:
+            return False
+        if any(getattr(p, "proof_key", None) is None for p in outstanding):
+            return False
+        return all(self._answered_send_event(p.proof_key).is_set() for p in outstanding)
 
     def _window_missing(self, parts) -> list:
         """[(part, frag_idx)] still to send, in part order."""
@@ -906,15 +1028,43 @@ class _ReconcileMixin:
                             self._apply_window_entries(window, self._frame_entries(frame), "early report")
                             return bool(self._window_missing(parts))
 
+                        # Alpha 0.1.8 (item 1): the PROOFs this window's own
+                        # packets will draw. `_signal_send_answered` already
+                        # sets these for every inbound DIRECT PROOF; nothing
+                        # was listening on the raw path until now.
+                        proof_keys = [p.proof_key for p, _ in missing if p.proof_key is not None]
+                        proved_events = [self._answered_send_event(k) for k in dict.fromkeys(proof_keys)]
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, last_part.pkt_id, last_part.frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=last_idx, rearm=rearm, release_lock=release_for_handshake,
                             window_pkts=live_pkts, burst_end=burst_end, on_early=apply_early,
+                            proved_check=(lambda: self._window_all_proved(parts, peer_prefix)) if proved_events else None,
+                            proved_events=proved_events or None,
                         )
                 finally:
                     release_for_handshake()
                 for p, _ in missing:
                     self._completion_query_waiters.pop((peer_prefix, p.pkt_id), None)
+                if report is _WINDOW_PROVED:
+                    # Alpha 0.1.8 (item 1): the window ends here. No report
+                    # wait was spent past the proof, no QUERY is sent, and
+                    # the parts are marked exactly as a report would mark
+                    # them. Path evidence only from a proof the PEER this
+                    # window was addressed to delivered -- the same rule the
+                    # bare path's `answered` outcome applies, since a proof
+                    # relayed by another peer or over CHANNEL says nothing
+                    # about this peer's path.
+                    proved_parts = list(dict.fromkeys(p for p, _ in missing))
+                    for part in proved_parts:
+                        self._mark_part_proved(window, part, peer_prefix)
+                    for p, _ in missing:
+                        self._expect_report(peer_prefix, p.pkt_id, None)
+                    if any(self._send_answered_by(p.proof_key) == peer_prefix
+                           for p in proved_parts if p.proof_key is not None):
+                        self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                    self._raw_incomplete_strikes.pop(peer_prefix, None)
+                    self._capture_window_proved(peer_prefix, proved_parts, stage=f"raw{rnd}")
+                    return
             held_before = sum(sum(p.acked) for p in parts)
             answer = report
             query_infos: list = []
@@ -1576,6 +1726,120 @@ class _ReconcileMixin:
             for k in sorted(table, key=table.get)[: len(table) - 2 * self.COMPLETION_V4_MAX_ENTRIES]:
                 table.pop(k, None)
 
+    # -- Item 1 (alpha 0.1.8): the proof is the completion ---------------
+
+    def _proof_expected_key(self, data: bytes, header) -> Optional[bytes]:
+        """The value the PROOF for this just-delivered packet will carry in
+        its destination field, when RNS proves it per packet at all: a
+        plain DATA to a SINGLE destination, which is what `_answered_send_
+        key` keys the sender's side on. None for everything RNS does not
+        prove one packet at a time -- a Resource part (context RESOURCE;
+        a Resource is proved once, whole, as RESOURCE_PRF), anything else
+        carried inside a Link, and every announce."""
+        if header is None or not data:
+            return None
+        if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
+                and header.destination_type == RNS.Destination.SINGLE):
+            return self._compute_truncated_hash(data, header.header_type)
+        return None
+
+    def _proof_may_replace_report(self, complete_data: bytes, header, sender_token: str,
+                                  peer_prefix: Optional[str]) -> Optional[bytes]:
+        """The proof key to wait for before sending this window's complete
+        report, or None to report exactly as before (alpha 0.1.8, item 1).
+
+        Four gates, each of which would otherwise cost the sender its only
+        signal:
+
+        1. RNS proves this packet per packet (`_proof_expected_key`).
+        2. Its destination is served by this node's own RNS
+           (`_is_local_destination`). On a transport node relaying the
+           packet onward nothing proves it, so no proof is ever coming.
+        3. Nothing else of this sender's recent raw packets is incomplete.
+           The complete report is NOT about one packet: it carries a
+           per-fragment bitmap for every recent pkt_id of this sender
+           (`_recent_raw_entries`), and those bitmaps are how the sender
+           re-drives exactly the missing fragments of its OTHER parts
+           without a QUERY first. A proof says only "this one packet
+           arrived", so while anything else is incomplete the report is
+           worth far more than the proof's latency.
+        4. The sender is a bound peer with a resolved path, so the proof
+           routes back to it DIRECT (`_proof_correlation`'s own gate in
+           `_observe_raw_received_packet`). Without that the proof may go
+           out over CHANNEL, to every peer, or not at all."""
+        if self.proof_report_grace_s <= 0:
+            return None
+        key = self._proof_expected_key(complete_data, header)
+        if key is None:
+            return None
+        if header.destination_hash is None or not self._is_local_destination(header.destination_hash):
+            return None
+        if any(not complete for _pkt, _total, complete, _held in self._recent_raw_entries(sender_token)):
+            return None
+        if peer_prefix is None or peer_prefix not in self._peers or peer_prefix not in self._resolved_paths:
+            return None
+        return key
+
+    def _cancel_proof_grace(self, sender_token: str) -> None:
+        task = self._pending_proof_graces.pop(sender_token, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _hold_report_for_proof(self, sender_token: str, header: "_FrameHeader", proof_key: bytes) -> None:
+        """Hold this window's complete report for `proof_report_grace_s`.
+        If RNS hands the proof over inside it, the proof IS the completion
+        and the report is dropped -- one frame instead of two, and the
+        proof no longer queues behind the report's own relay hold, which at
+        two hops in the 2026-09-22 field session put it on the air about
+        8 s after the packet landed (proof turnaround 17.9 s median, 30.6 s
+        p90). If the grace expires, the report goes exactly as before.
+
+        Nothing here bypasses a hold or shortens one. The 0.1.7 second cut
+        stands untouched: this works by not sending a frame, never by
+        cutting the relay window of one already sent."""
+        self._cancel_proof_grace(sender_token)
+
+        async def grace():
+            try:
+                deadline = time.monotonic() + self.proof_report_grace_s
+                while True:
+                    if self._proof_enqueued_at_for_key(proof_key) is not None:
+                        self._capture_report_skipped_for_proof(sender_token, header, proof_key)
+                        self._debug(
+                            f"completion REPORT to {sender_token!r} (pkt_id={header.pkt_id}) skipped: RNS proved the "
+                            f"packet inside the {self.proof_report_grace_s:.2f}s grace, and the proof says the same "
+                            f"thing with one frame instead of two."
+                        )
+                        return
+                    if time.monotonic() >= deadline or self.detached or not self.online:
+                        break
+                    await asyncio.sleep(min(self.PROOF_GRACE_POLL_S, max(0.0, deadline - time.monotonic())))
+                self._send_completion_report(
+                    sender_token, header, complete=True, held=set(range(header.frag_total)),
+                    held_s=round(self.proof_report_grace_s, 3),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                RNS.log(f"{self}: proof grace for {sender_token!r} failed: {exc}", RNS.LOG_WARNING)
+            finally:
+                if self._pending_proof_graces.get(sender_token) is task_holder.get("task"):
+                    self._pending_proof_graces.pop(sender_token, None)
+
+        task_holder = {}
+        task_holder["task"] = asyncio.get_running_loop().create_task(grace())
+        self._pending_proof_graces[sender_token] = task_holder["task"]
+
+    def _capture_report_skipped_for_proof(self, sender_token: str, header: "_FrameHeader", proof_key: bytes) -> None:
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", dict({
+            "event": "completion_report_skipped", "peer_prefix": self._canonical_peer_prefix(sender_token),
+            "pkt_id": header.pkt_id, "frag_total": header.frag_total,
+            "report_skipped_for_proof": True, "proof_key": proof_key.hex(),
+            "grace_s": round(self.proof_report_grace_s, 3),
+        }, **self._peer_view_fields(self._canonical_peer_prefix(sender_token))))
+
     def _recent_raw_entries(self, sender_token: str) -> list:
         """The v4 report entries for this sender: (pkt_id, frag_total,
         complete, held) for its recent raw packets, newest first."""
@@ -1784,6 +2048,9 @@ class _ReconcileMixin:
         # 2b: every report lists the sender's recent packets, so a report
         # held for "still arriving" is covered by whichever goes out now.
         self._cancel_sender_report(sender_token)
+        # Alpha 0.1.8 (item 1): and so is a report held for a proof -- one
+        # report per window, whichever trigger wins (the 0.1.6 item 3 rule).
+        self._cancel_proof_grace(sender_token)
         if complete:
             # Item 3 (alpha 0.1.6): a flagged frame of this packet within the
             # burst tail of this report is not reported again.
@@ -2083,14 +2350,26 @@ class _ReconcileMixin:
                 self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
         else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
+            proof_key = None
             if raw:
                 # Report BEFORE RNS sees the packet, so the report enters the
                 # radio lock ahead of whatever RNS sends back (a PROOF, the
                 # next Resource request) and the sender learns first. A gaps
                 # report still held for this bucket is dropped: complete
                 # supersedes it (M1 debounce).
+                #
+                # Alpha 0.1.8 (item 1): with one exception. When RNS is
+                # about to prove this very packet, its PROOF tells the
+                # sender everything the report would, so the report is held
+                # a moment and dropped if the proof appears -- and then RNS
+                # must see the packet FIRST, or there is no proof to wait
+                # for. `_proof_may_replace_report` states the four gates.
                 self._cancel_gaps_report(key)
-                if tail_seen or not self.direct_report_hold_during_burst:
+                rns_header = self._parse_rns_header(complete_data)
+                proof_key = self._proof_may_replace_report(complete_data, rns_header, sender_token, peer_prefix)
+                if proof_key is not None:
+                    pass          # decided below, after process_incoming
+                elif tail_seen or not self.direct_report_hold_during_burst:
                     self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
                 else:
                     # 2b: an unflagged fragment completed this part, so the
@@ -2112,6 +2391,16 @@ class _ReconcileMixin:
                 complete_data, transport="direct_raw_multifragment" if raw else "direct_multifragment",
                 sender_peer_prefix=peer_prefix, frag_total=header.frag_total, pkt_id=header.pkt_id,
             )
+            if proof_key is not None:
+                # RNS has the packet now. On the installed RNS the proof is
+                # queued within milliseconds (`Transport.inbound` is
+                # synchronous and LXMF's `delivery_packet` proves on its
+                # first line); the grace covers RNS 1.5's inbound queue and
+                # a loaded host, and expires into the report as before.
+                if self._proof_enqueued_at_for_key(proof_key) is not None:
+                    self._capture_report_skipped_for_proof(sender_token, header, proof_key)
+                else:
+                    self._hold_report_for_proof(sender_token, header, proof_key)
 
     # -- Reassembly (docs/reliability_engine_design.md §5) ----------------
 

@@ -806,6 +806,24 @@ class _ConfigMixin:
         # is due at 10-14 s after its send, minus ~2 s of transit at one
         # hop. Past it the proof is bulk-tier as before. 0 disables.
         self.proof_fresh_s = float(cfg.get("proof_fresh_s", 8.0))
+        # Alpha 0.1.8 (item 1): how long a raw window's COMPLETE report is
+        # held while RNS decides whether to prove the packet that window
+        # delivered. RNS proves every single-destination DATA packet, and
+        # its PROOF tells the sender exactly what the report would --
+        # "I have it" -- so when the proof appears inside the grace the
+        # report is dropped and the sender's window ends on the proof
+        # instead. Measured on the installed RNS 1.4.2 the proof reaches
+        # `process_outgoing` within a millisecond of the packet being
+        # handed over (`Transport.inbound` is synchronous and LXMF's
+        # `delivery_packet` calls `prove()` on its first line); the grace
+        # is set two orders of magnitude above that to cover RNS 1.5's
+        # inbound queue (`USE_INBOUND_QUEUE`, one thread hop) and a loaded
+        # host. It is only ever spent when a proof is genuinely plausible
+        # -- see `_proof_may_replace_report`'s four gates -- so it costs
+        # nothing on Resource parts, Link traffic, announces or a transport
+        # node's relayed packets. 0 disables the whole item and every such
+        # window reports as it did in alpha 0.1.7.
+        self.proof_report_grace_s = max(0.0, float(cfg.get("proof_report_grace", 0.25)))
         # How many times the same bytes may be suppressed as "already in
         # flight" before the packet is forced through with a fresh in-flight
         # entry (field fix 2026-09-19: a stuck entry deadlocked a transfer for

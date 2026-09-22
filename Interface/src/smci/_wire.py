@@ -684,6 +684,15 @@ class _WireFormatMixin:
         while len(self._proof_enqueued_at) > self.PROOF_ENQUEUED_MAX_KEYS:
             self._proof_enqueued_at.popitem(last=False)
 
+    def _proof_enqueued_at_for_key(self, key: Optional[bytes]) -> Optional[float]:
+        """When RNS queued a plain PROOF whose destination field is `key`
+        -- i.e. the proof for one particular packet this node received
+        (alpha 0.1.8, item 1). The table is the one alpha 0.1.7 item 1
+        already fills from `process_outgoing`."""
+        if key is None:
+            return None
+        return self._proof_enqueued_at.get(bytes(key))
+
     def _proof_enqueued_at_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
         """The queue time of this plain PROOF, or None for anything else."""
         if not self._plain_proof(header) or not header.destination_hash:
