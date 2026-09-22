@@ -85,6 +85,18 @@ record is `docs/history.md` ("Alpha 0.1.8 pass"). New config keys, both optional
   own outcomes). The duplicate-delivery window is now 60 s rather than 30: the two-hop copies of one
   211-byte message were spaced up to 50 s by the interface's own queue and ACK timeouts, so a 30 s
   link broke exactly the chains this release is about.
+- **`shortcut_appears`'s hard check reads both scoreboards** (`testscripts/meshbench_scenarios.py`;
+  no interface change). The alpha 0.1.7 close-out left this check open after it passed 1 of 9 on that
+  build against 5 of 6 on 0.1.6. The 2026-09-23 isolation settled it: alpha 0.1.7 with item 3 (token
+  learning) reverted passed **1 of 3**, against the shipped build's **2 of 3** on the same seeds --
+  reverting made it worse, so no 0.1.7 code change was responsible. The mechanism the close-out
+  described is a property of the scenario: A's trial window on the one-hop route does reach B, but
+  B's report, answer and proof travel back over B's OWN path, which stays three hops until B's board
+  also trials, and B trials only after two consecutive misses of its own -- so reading only A's
+  `direct_send_result` made the check a coin flip on B's unrelated luck. The check now accepts a
+  shorter path adopted and confirmed on **either** node, which is the adoption being tested. Replayed
+  over the eight runs available, this converts one false negative (a run where B confirmed 3 of 3 and
+  A none) and leaves the two runs where neither node adopted-and-delivered failing, as they should.
 - **The path scoreboard ages its evidence.** A candidate's peer-reported delivery rate and its
   last-leg SNR now count only while those readings are inside `PATH_SAMPLE_WINDOW_S` (600 s), the
   same window the send outcomes are weighed over; older readings are kept for the capture and score

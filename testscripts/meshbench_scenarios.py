@@ -1079,26 +1079,54 @@ def run_scenario(scenario: Scenario, args) -> int:
                 # switch); the hard check is that the sender left the
                 # three-hop path for a shorter one on its scoreboard and the
                 # next delivery on that path confirmed it.
-                recs = read_capture(capture_dir, scenario.sender)
-                selected = [r for r in recs if r.get("event") == "path_selected"
-                            and r.get("reason") in ("selected", "trial", "switch")]
-                shorter = [r for r in selected if r.get("previous_path_len") is None
-                           or (r.get("path_len") is not None and r["path_len"] < r["previous_path_len"])]
+                # Alpha 0.1.8 (item 0): read BOTH boards, not just the
+                # sender's. The alpha 0.1.7 close-out left this check open
+                # after it passed 1 of 9 on that build against 5 of 6 on
+                # 0.1.6, and the 2026-09-23 isolation settled it: reverting
+                # 0.1.7's item 3 (token learning) made the check FAIL MORE
+                # (1 of 3 against the shipped build's 2 of 3), so no code
+                # change of 0.1.7 was ever responsible. The mechanism the
+                # 0.1.7 close-out described is real and is a property of the
+                # SCENARIO: A's trial window on the one-hop route does reach
+                # B -- MeshBench logs B's radio receiving the fragment and
+                # B's capture shows the fragment, its report and its proof --
+                # but B's report, answer and proof travel back over B's OWN
+                # path, which stays three hops until B's board also trials,
+                # and B trials only after two consecutive misses of its own.
+                # Whether B misses twice depends on which of A's probes
+                # reach it, so reading only A's `direct_send_result` made
+                # the check a coin flip on B's unrelated luck. The adoption
+                # being tested is "a node left the three-hop path for a
+                # shorter one and that path then delivered", which either
+                # node demonstrates.
+                per_node = {}
+                for node in (scenario.sender, scenario.responder):
+                    recs = read_capture(capture_dir, node)
+                    selected = [r for r in recs if r.get("event") == "path_selected"
+                                and r.get("reason") in ("selected", "trial", "switch")]
+                    shorter = [r for r in selected if r.get("previous_path_len") is None
+                               or (r.get("path_len") is not None and r["path_len"] < r["previous_path_len"])]
+                    node_shorter = [r for r in shorter if r.get("path_len") is not None and r["path_len"] < 3]
+                    node_confirmed = []
+                    for r in node_shorter:
+                        nxt = next((d for d in recs if d.get("event") == "direct_send_result"
+                                    and d.get("seq", 0) > r.get("seq", 0) and d.get("out_path_hex") == r.get("path_hex")), None)
+                        if nxt is not None and nxt.get("ok"):
+                            node_confirmed.append(r)
+                    per_node[node] = (node_shorter, node_confirmed)
+                after_move_shorter = [r for n in per_node for r in per_node[n][0]]
+                confirmed = [r for n in per_node for r in per_node[n][1]]
                 move = next((a for a in actions if a.action == "move"), None)
                 move_seq = None
                 if move is not None and move.fired_at_probe is not None:
                     move_seq = min((p.get("seq") or 0 for p in plist if (p.get("seq") or 0) > move.fired_at_probe), default=None)
-                after_move_shorter = [r for r in shorter if r.get("path_len") is not None and r["path_len"] < 3]
-                confirmed = []
-                for r in after_move_shorter:
-                    nxt = next((d for d in recs if d.get("event") == "direct_send_result"
-                                and d.get("seq", 0) > r.get("seq", 0) and d.get("out_path_hex") == r.get("path_hex")), None)
-                    if nxt is not None and nxt.get("ok"):
-                        confirmed.append(r)
                 check(bool(after_move_shorter),
-                      f"sender selected a shorter path than three hops from its scoreboard: "
-                      f"{[(r.get('previous_path_len'), r.get('path_len'), r.get('reason')) for r in after_move_shorter]}")
-                check(bool(confirmed), f"a shorter selected path delivered its next send: {len(confirmed)} of {len(after_move_shorter)}")
+                      "a node selected a shorter path than three hops from its scoreboard: "
+                      + "; ".join(f"{n} {[(r.get('previous_path_len'), r.get('path_len'), r.get('reason')) for r in per_node[n][0]]}"
+                                  for n in per_node))
+                check(bool(confirmed),
+                      "a shorter selected path delivered its next send (either node): "
+                      + "; ".join(f"{n} {len(per_node[n][1])} of {len(per_node[n][0])}" for n in per_node))
                 after_move = [(p.get("seq"), sorted((p.get("resolved") or {}).values())) for p in plist
                               if move is not None and move.fired_at_probe is not None and (p.get("seq") or 0) > move.fired_at_probe]
                 first = after_move_shorter[0] if after_move_shorter else None

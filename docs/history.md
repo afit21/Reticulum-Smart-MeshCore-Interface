@@ -4745,3 +4745,39 @@ client-specific workaround).
     timeouts stretched them -- so a 30 s link broke those chains in the
     middle and under-counted the 23-copy and 8-copy cases the release is
     about. No interface behaviour changes here beyond the added fields.
+
+ 0. **The alpha 0.1.7 `shortcut_appears` question, settled; the check
+    fixed** (`testscripts/meshbench_scenarios.py`, no interface change).
+    The 0.1.7 close-out left open why that scenario's hard check ("a
+    shorter selected path delivered its next send") passed 1 of 9 on the
+    shipped 0.1.7 build against 5 of 6 on 0.1.6, having isolated only
+    item 1. The remaining suspect was item 3 (token learning). It is
+    exonerated: the 0.1.7 deliverable with `7db9f81` reverted -- built in
+    the scratchpad by applying the reverse diff to the frozen deliverable,
+    so the working tree was never touched -- passed **1 of 3** on seeds
+    7/11/17 against the shipped build's **2 of 3** on the same seeds in
+    the same reference suite. Reverting made it worse, so no code change
+    of 0.1.7 was responsible.
+
+    What is responsible is the check, exactly as the 0.1.7 close-out
+    suspected. It read only the SENDER's capture. A's trial window on the
+    one-hop route does reach B -- MeshBench logs B's radio receiving the
+    fragment, and B's capture shows the fragment, its report and its
+    proof -- but B's report, answer and proof travel back over B's OWN
+    path, which stays three hops until B's board also trials, and B
+    trials only after two consecutive misses of its own. Whether B misses
+    twice depends on which of A's probes reach it, so A's
+    `direct_send_result` on the shorter path was gated on B's unrelated
+    luck. The adoption being tested -- a node left the three-hop path for
+    a shorter one and that path then delivered -- is demonstrated by
+    either node, so the check now reads both boards and reports per node.
+
+    Replayed over the eight `shortcut_appears` runs available on
+    2026-09-23 (three on 0.1.7 shipped, three on 0.1.7 minus item 3, two
+    on the 0.1.8 kept build), the two-board rule takes the pass count
+    from 5 of 8 to 6 of 8: it converts one false negative (0.1.7 minus
+    item 3, seed 17, where B adopted and confirmed 3 of 3 while A
+    confirmed none) and leaves failing the two runs in which NEITHER node
+    adopted-and-delivered, which are real negatives rather than check
+    artefacts. The check is therefore better but still not deterministic,
+    and the scenario's delivery remains un-asserted by design.
