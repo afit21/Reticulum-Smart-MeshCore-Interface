@@ -4051,3 +4051,22 @@ parity stays on.
     after two, but alone it stays in use and no discovery runs; a path
     with no successes behind its misses is exhausted on two as before.
     Pinned in `tests/test_path_selection_0922.py`.
+
+ Close-out (2026-09-22 morning). Full suite 418 tests OK (`SMCI_SKIP_SLOW`
+    off). Version alpha 0.1.6 ("Q" v5: both nodes must run it). Baseline
+    `tests/baselines/2026-09-22-meshbench-09105ae.md` -- ten scenarios
+    (the nine of alpha 0.1.5 plus `weak_direct`) x seeds 7/11/17 on the
+    final build; the comparison against alpha 0.1.5 is in `changelog.md`.
+    A first suite on 9aa4b7d (before the fourth cut) is what forced that
+    cut: `link_setup` handshakes inside 15 s 38 % on every seed, 62 %
+    [50-62] after it. The reading that remains open: `two_hop` 50 %
+    [50-75] delivered against 75 % [62-100], with the responder's two-hop
+    attempt success 50 % against 85 % -- ten two-hop runs across the
+    night's builds delivered 38-100 % (mean 67 %), every one mechanics
+    PASS, and the field test proposed in the session report reads it
+    first. `page_transfer` 0 % on this suite against 33 % [0-33]; the
+    same coin flip as in 0.1.4 / 0.1.5. On the bench: item 4's supervisor
+    on the real port (online 2.5 s after the port opened, a forced drop
+    recovered in 7.7 s) and a 12-packet zero-hop transfer (12/12 in round
+    0, 1.00 reports per reported packet, calibration corrected 1.00 /
+    1.01), `fieldtests/raw/Alpha0.1.6-bench/`.

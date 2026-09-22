@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased -- alpha-0.1.6 (2026-09-22)
+## alpha-0.1.6 (2026-09-22)
 
 The items of the alpha 0.1.6 pass, each from the alpha 0.1.5 field session's captures
 (`fieldtests/raw/Alpha0.1.5/`, desktop `afipc_` + laptop `a_`, the 2026-09-21 evening drive).
@@ -78,6 +78,36 @@ v5 cases (the v4 cases are byte-identical under their new names).
   the receiver and its measured delivery rate on it (two header bytes, 0xFF unknown); the receiver
   adds a reported zero-hop path as a candidate and uses the reported rate as the prior for untried
   candidates of that hop count. v1-v4 frames still decode; a v4 QUERY is answered in v4.
+
+**MeshBench, alpha 0.1.6 (`tests/baselines/2026-09-22-meshbench-09105ae.md`, ten scenarios x seeds
+7/11/17 on the final build, run with the desktop otherwise idle) against alpha 0.1.5
+(`tests/baselines/2026-09-21-meshbench-7dcc232.md`), medians [ranges]:**
+
+- `zero_hop`: 100 % [88-100] at 2.85 B/B (was 100 % at 2.72), RTT 2.8 s (same); `relay`: 88 %
+  [62-88] at 5.79 (was 88 % [75-100] at 5.96); `duty_cycle_pages`: 75 % [50-75] at 1.76 (was 75 %
+  at 1.84); `link_setup`: 100 % delivered, handshakes inside 15 s 62 % [50-62], links median
+  11.6 s (was 88 %, 62 % [25-75], 8.8 s) -- the fourth cut restored this from 38 % on every seed
+  before it.
+- `two_hop`: 50 % [50-75] at 11.37 B/B [8.62-12.43], RTT 16.8 s (was 75 % [62-100] at 9.75
+  [7.24-12.62], RTT 10.9 [10.9-29.1]); the responder's two-hop attempt success 50 % [37-53]
+  against 85 % [60-95]. Ten two-hop runs on the 0.1.6 builds tonight delivered 38-100 %, mean
+  67 %; mechanics PASS on every one. Below the 0.1.5 range on two seeds -- the number to read
+  first in the field, where the 2026-09-21 session's two-hop path was the problem this pass
+  set out to fix.
+- `large_payload`: 33 % [17-50] at 6.36 [6.22-7.11] (was 50 % [33-67] at 5.61); the item-3 gate's
+  two runs on 18059a2 delivered 6/6 and 6/6 at 4.7. `page_transfer`: 0 % [0-0] (was 33 %
+  [0-33]; the 9aa4b7d suite an hour earlier 0 % [0-67]); `page_transfer_bidir`: 0 % (was 0 %
+  [0-33]) at 12.1 B/B (was 29.5).
+- `shortcut_appears`: 2 of 3 seeds passed the hard check (the sender selected a shorter path from
+  its scoreboard after the move and its next send on it delivered), as in 0.1.5; seed 11's sender
+  never left three hops in the run (no flood copy of B's reached it over the one-hop route).
+- `weak_direct` (new): 3 of 3 PASS on the `path_selected` check; the +3 dB direct link delivered
+  88 % [81-88] -- MeshBench does not make it weak, and the one-hop expectation is informational.
+
+Mechanics FAILs in the suite: none other than the delivery floors above and one `link_setup`
+run whose sender never resolved a MeshCore path in the run (bring-up; it delivered 8/8 links
+through the bootstrap). Per-item gates, the cuts they forced (item 1 four times) and the bench
+results are in `docs/history.md`'s "Alpha 0.1.6 pass" entry.
 
 ## alpha-0.1.5 (2026-09-21)
 
