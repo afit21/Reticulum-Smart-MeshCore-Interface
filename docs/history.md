@@ -4867,3 +4867,56 @@ written to do -- reports arrive, and no stale candidate was trialled.
     `tests/test_local_announce_cache_0920.py` re-pinned. Shipped-default
     pin re-dumped (two defaults changed, no key added). MeshBench:
     `companion_restart`, `bring_up`.
+
+ 5. **The comparison script's part-time pairing, and two proof readings it
+    was missing** (`testscripts/field_ab_compare.py`; no interface change,
+    no wire change, no config key).
+
+    (a) `pkt_id` is per-process and restarts from 0. The part-time table
+    keyed on `(node, pkt_id)` alone, so when a node restarted mid-session
+    -- the laptop did, and `fieldtests/raw/Alpha0.1.8/` holds three of its
+    capture files -- a `raw_fragment_sent` of one process paired with a
+    `completion_check_result` of the next and the 017-vs-018 hop-3 row
+    read a median of 7434 s, two hours reported as a part time. The key is
+    now `(node, capture file, pkt_id)`: one capture file is one interface
+    start, which is the same restart-safe key the report summariser was
+    given in alpha 0.1.7. The round-0 / round-1 fragment-position table
+    and the parity-reconstruction lookup had the same key and are fixed
+    with it. After the change that row reads 110.6 s median (n=5).
+
+    (b) Proof turnaround was printed as one number per hop, but the two
+    populations differ by about a factor of two -- at the 2026-09-23
+    two-hop stop a proof answering a raw multi-fragment window turned
+    round in 10.0 s median against 3.8 s for one answering a bare
+    single-fragment packet -- so a combined median hides what alpha
+    0.1.9's item 2 sets out to move. The rows are now split into raw
+    window, bare packet, and the subset of raw windows whose completion
+    report was SKIPPED because the proof replaced it (alpha 0.1.8's item
+    1). That last one is matched exactly rather than joined on pkt_id:
+    `completion_report_skipped` records the `proof_key`, which is the
+    value the outgoing proof carries as its destination hash.
+
+    (c) The proof's FIRST-ATTEMPT success per hop and population, which
+    is the reading item 2 is about and which nothing printed before. A
+    proof is a bare DIRECT send, so its attempt records carry `pkt_id:
+    null`, and since `_direct_exchange_lock` holds one exchange at a
+    time, the last `attempt == 0` between the proof being queued and its
+    `direct_send_result` is that send's first attempt.
+
+    What the new rows say about alpha 0.1.8, read over the whole session
+    at two hops: bare-packet proofs' first attempts succeeded 6 of 7
+    (86 %), raw-window proofs' 11 of 19 (58 %), and the report-skipped
+    subset -- the proofs item 1 put in the report's place -- 9 of 17
+    (53 %), against the path's own 67-69 % attempt success. NOTE that
+    this last figure is 9 of 17, not the 6 of 17 the alpha 0.1.9 brief
+    quotes; the population size matches exactly, so the difference is in
+    how the first attempt was identified, and the rule used here is
+    written down above so the next reading is comparable. The
+    conclusion is unchanged either way: a proof that replaces a report
+    does measurably worse on its first attempt than a bare packet's
+    proof on the same path, which is what item 2 addresses.
+
+    Tests: `tests/test_field_ab_compare_restart_0923.py` (a pkt_id reused
+    after a restart not pairing, while the two processes stay one node;
+    the raw-window / bare-packet split; the report-skipped subset matched
+    on `proof_key`).

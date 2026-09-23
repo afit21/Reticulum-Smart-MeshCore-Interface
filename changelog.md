@@ -23,6 +23,16 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   six requests on the air for three destinations in the three and a half minutes from 11:40:51 to
   11:44:16, each a relayed DIRECT request answered with a multi-fragment announce window. Tests:
   `tests/test_field_day_cache_defaults_0923.py`. MeshBench: `companion_restart`, `bring_up`.
+- **The field comparison script's part-time pairing, and two proof readings it was missing**
+  (`testscripts/field_ab_compare.py`; no interface change). `pkt_id` is per-process, so a node that
+  restarted mid-session paired a fragment of one process with a completion of the next and the
+  017-vs-018 hop-3 part time read 7434 s; part timing (and the round-0/round-1 position table and
+  the parity-reconstruction lookup, which shared the key) is now keyed per capture file, one file
+  being one interface start. That row now reads 110.6 s. Proof turnaround is split into raw-window,
+  bare-packet and report-skipped rows, because the first two differ by about a factor of two at two
+  hops (10.0 s against 3.8 s) and a combined median hides it, and the proof's first-attempt success
+  is printed per hop and population for the first time. Tests:
+  `tests/test_field_ab_compare_restart_0923.py`.
 
 ## alpha-0.1.8 (unreleased, 2026-09-23)
 
