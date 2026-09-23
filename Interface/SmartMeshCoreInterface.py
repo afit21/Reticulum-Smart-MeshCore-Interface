@@ -29,7 +29,16 @@ wire change -- the golden wire snapshot is untouched and alpha 0.1.8 and
 RECEIVER runs 0.1.9. The interface also defines `ifac_size`, which RNS 1.5 reads on every
 inbound frame and which only `RNS.Reticulum` used to set -- so building
 this interface without Reticulum, as the white-box hardware scripts do,
-works again on RNS 1.5.4); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
+works again on RNS 1.5.4. A second pass on 2026-09-24, from the release's
+own two field sessions of 2026-09-23 evening, corrected it: a zero-hop
+attempt counts toward the path's miss count (the empty hex is the
+zero-hop path, not the absence of one); a candidate dead over
+PATH_EXHAUST_MISSES attempts stays out until something is heard over it
+again, a candidate re-admitted after its cooldown must measure no worse
+than the current path, and the current path is kept while its measured
+rate beats every eligible alternative; the proof waits for no burst tail
+at zero hop; and `direct_raw_gap_own_airtime` defaults to `yes` again
+until the field A/B has run); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
 build's 2026-09-22 evening field session, which had a two-hop stop: for a
 raw window whose packets RNS proves, the PROOF is the completion and the
 report is not sent; at two hops and beyond a report that IS sent goes on
