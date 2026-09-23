@@ -87,6 +87,10 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   are unchanged. Cost, from the same replays: twice the new rule keeps a 0.36-0.40 path where the
   field's trial of a weak-prior candidate delivered. Tests:
   `tests/test_rate_aware_eligibility_0924.py` (fixture `field_0923_path_decisions.json`).
+- **Second pass (2026-09-24), close-out.** MeshBench on the final build: 16 of 16 PASS over the eight
+  reference scenarios (alpha 0.1.8 on the same RNS 1.5.4: 14 of 16), recorded in
+  `tests/baselines/2026-09-24-meshbench-ac637dd.md`; the alpha 0.1.8 reference on RNS 1.5.4 is
+  `tests/baselines/2026-09-24-meshbench-2b968d0-rns154.md`. No wire change; the version stays alpha 0.1.9.
 - **Second pass (2026-09-24), item 2, second cut: an untried candidate always gets its trial.** Item 2's
   first cut failed its own MeshBench gate: in `shortcut_appears` every flood candidate reads 0 dB and
   carries the weak prior, the current three-hop path's 0.27-0.33 beat it, and the one-hop shortcut was

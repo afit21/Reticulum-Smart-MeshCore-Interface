@@ -5612,3 +5612,18 @@ added, no wire change, the version stays alpha 0.1.9.
     tried: trial; the same candidate stale or tried: kept). MeshBench:
     `shortcut_appears` x3 on this build, and the close-out set.
 
+    **Close-out of the second pass** (`tests/baselines/2026-09-24-meshbench-ac637dd.md`). The final
+    build (`ac637dd`) ran the reference's eight scenarios at seeds 7 and 11: 16 of 16 PASS, against
+    14 of 16 for alpha 0.1.8 on the same RNS 1.5.4 (`2026-09-24-meshbench-2b968d0-rns154.md`, item
+    0). `shortcut_appears` passed at both seeds here and at 7, 11 and 17 in item 2's own runs on
+    the second cut. Delivery and RTT medians are inside the reference's spread. The time to an RNS
+    path at the sender is bimodal on 1.5.4 and landed high more often (`repeater_returns` 93/101 s
+    against 24/40 s). In the run read, the scoreboard had made no decision before the path formed
+    (a direct announce lost at the relay; path requests answered at 92.6 s), so it is recorded to
+    watch, not attributed. Full unit suite 553 green (one run-to-run flake of
+    `test_local_announce_cache_0920`'s real-Transport wait on the first full run, green on its
+    re-run and alone). readme may need updating: the version heading; "Path Selection" (dead
+    candidates, rate-aware re-admission, the current path kept while it beats the alternatives,
+    untried candidates always trialled, zero-hop attempts counted); the inter-fragment gap
+    default is `yes` again; "Fragment Reconciliation" (no proof tail hold at zero hop).
+
