@@ -132,5 +132,61 @@ class ProofRowsSeparateThePopulations(unittest.TestCase):
         self.assertEqual((first["ok"], first["n"]), (0, 1))
 
 
+class MeshbenchReportAgreesWithTheFieldComparison(unittest.TestCase):
+    """The same proof reading is printed by two scripts -- the field
+    comparison and the MeshBench run analysis -- so a bench run and a field
+    session can be read against each other. They must not drift apart.
+    """
+
+    def _records(self):
+        return (ProofRowsSeparateThePopulations._proved(
+                    1000.0, "aa01", "direct_raw_multifragment", first_ok=False,
+                    turnaround=15.0, skipped_key="aa01")
+                + ProofRowsSeparateThePopulations._proved(
+                    1100.0, "aa02", "direct_bare", first_ok=True, turnaround=4.0))
+
+    def test_the_two_scripts_report_the_same_proof_numbers(self):
+        import meshbench_report as mbr
+
+        recs = self._records()
+        pk_in = [r for r in recs if r.get("direction") == "in" and "event" not in r]
+        pk_out = [r for r in recs if r.get("direction") == "out" and "event" not in r]
+        att = [r for r in recs if r.get("event") == "direct_attempt_result"]
+        got = mbr.proof_attempts(recs, pk_in, pk_out, att)
+
+        self.assertEqual(got["turnaround_s"]["raw window"]["2"]["med"], 15.0)
+        self.assertEqual(got["turnaround_s"]["bare packet"]["2"]["med"], 4.0)
+        self.assertEqual(got["turnaround_s"]["raw win, report skipped"]["2"]["n"], 1)
+        self.assertEqual(got["first_attempt"]["raw window"]["2"], {"ok": 0, "n": 1})
+        self.assertEqual(got["first_attempt"]["bare packet"]["2"], {"ok": 1, "n": 1})
+        self.assertEqual(got["first_attempt"]["all"]["2"], {"ok": 1, "n": 2})
+
+        # And the field comparison, over the same records, agrees.
+        import tempfile as _tf
+        d = _tf.mkdtemp(prefix="smci-abcmp-")
+        _write(os.path.join(d, "a_capture_Smart_MeshCore_Interface_20260923T112824.jsonl"), recs)
+        out = fac.analyse_set(fac.collect([d]))
+        for kind in ("raw window", "bare packet", "raw win, report skipped"):
+            self.assertEqual(out["proof_turnaround_by_kind"][kind][2]["med"],
+                             got["turnaround_s"][kind]["2"]["med"], kind)
+            self.assertEqual(out["proof_first_attempt"][kind][2],
+                             got["first_attempt"][kind]["2"], kind)
+
+    def test_the_tail_hold_is_reported_when_the_attempt_carries_it(self):
+        import meshbench_report as mbr
+
+        recs = self._records()
+        for r in recs:
+            if r.get("event") == "direct_attempt_result" and r["ts"] < 1100.0:
+                r["proof_tail_hold_s"] = 5.0
+        got = mbr.proof_attempts(
+            recs,
+            [r for r in recs if r.get("direction") == "in" and "event" not in r],
+            [r for r in recs if r.get("direction") == "out" and "event" not in r],
+            [r for r in recs if r.get("event") == "direct_attempt_result"])
+        self.assertEqual(got["tail_hold_s"]["n"], 1)
+        self.assertEqual(got["tail_hold_s"]["med"], 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

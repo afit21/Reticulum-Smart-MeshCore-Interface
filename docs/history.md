@@ -5074,8 +5074,22 @@ written to do -- reports arrive, and no stale candidate was trialled.
 
     MeshBench: `two_hop`, `three_hop`, `large_payload`, `relay` -- probe
     RTT must not rise at one hop, and the proof's first-attempt success
-    per hop is now printed by `field_ab_compare.py` (item 5) for the field
-    reading.
+    per hop is now printed by `field_ab_compare.py` (item 5) and, in the
+    same shape, by `testscripts/meshbench_report.py` (`proof_attempts`,
+    added here), so a bench run and a field session can be read against
+    each other; `tests/test_field_ab_compare_restart_0923.py` pins the two
+    to the same numbers so they cannot drift apart.
+
+    **A caveat on what MeshBench can show for this item.** Read against
+    the item 0 reference, the unchanged 0.1.8 build already wins 7 of 7
+    first attempts on `two_hop-s7` with a 4.74 s median turnaround. The
+    collision this item removes is a half-duplex one, and MeshBench's
+    virtual radio has no listen-before-talk (its own analysis counts the
+    LBT-preventable share precisely because of this), so the burst tail
+    that costs the field its proofs does not cost them there. MeshBench is
+    therefore a NO-REGRESSION gate for item 2 -- probe RTT must not rise
+    at one hop, and turnaround should rise by about the hold and no more
+    -- and the field is where the benefit is read.
 
  4. **Path misses count per attempt** (`_note_path_attempt_result` in
     `_paths.py`, new, called from `_send_direct_frame_and_wait_for_ack`;
