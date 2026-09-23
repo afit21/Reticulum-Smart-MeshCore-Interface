@@ -1,6 +1,6 @@
 # Changelog
 
-## alpha-0.1.9 (unreleased, 2026-09-23)
+## alpha-0.1.9 (2026-09-23)
 
 From the alpha 0.1.8 field session (`fieldtests/raw/Alpha0.1.8/`, 2026-09-23: a three-hop stop and a
 two-hop stop). Every item corrects something alpha 0.1.8 shipped; nothing new is added. The dated

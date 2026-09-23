@@ -13,7 +13,20 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.8 (alpha 0.1.7 plus the 2026-09-23 pass from that
+STATUS -- alpha 0.1.9 (alpha 0.1.8 plus the corrections its own first
+field session, 2026-09-23, asked for: a completion report that was skipped
+because RNS's PROOF replaces it now counts as reported, so the parity
+fragment in the sender's burst tail no longer sends it after all; that
+proof waits one fragment spacing for the tail before it is dispatched,
+instead of being keyed into it; the announce cache's TTL and the
+path-request verification interval are sized for a field day rather than
+an hour; and a path's miss count is kept per ATTEMPT rather than per send,
+so the raw-fragment and QUERY attempts that dominate the airtime finally
+reach the death clock -- `path_switch_after_misses` 2 -> 4 and
+`PATH_EXHAUST_MISSES` 4 -> 8 are the same thresholds in the new unit. No
+wire change -- the golden wire snapshot is untouched and alpha 0.1.8 and
+0.1.9 nodes interoperate, although items 1 and 2 pay off only when the
+RECEIVER runs 0.1.9); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
 build's 2026-09-22 evening field session, which had a two-hop stop: for a
 raw window whose packets RNS proves, the PROOF is the completion and the
 report is not sent; at two hops and beyond a report that IS sent goes on
