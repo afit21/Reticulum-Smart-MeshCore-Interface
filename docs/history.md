@@ -5542,3 +5542,38 @@ added, no wire change, the version stays alpha 0.1.9.
     `shortcut_appears` x3, `failover`, `repeater_returns`, `weak_direct`,
     `two_hop` x2.
 
+ 3. **No proof tail hold at zero hop** (`_proof_tail_hold_s` in
+    `_reconcile.py`). No wire change, no config key, no default changed.
+
+    The first pass's item 2 holds the proof that replaces a raw window's
+    complete report for one of the sender's fragment spacings, because
+    through repeaters the parity trails the data by a relay-scaled
+    spacing and the proof would be in the relay chain as it is sent. At
+    zero hop the parity follows within `direct_raw_zero_hop_gap` (0.15 s)
+    and there is no chain, so the hold buys nothing and costs latency;
+    the first-pass brief asked for zero there, and its test asserted only
+    one of the two branches (the flagged last frame completing the part).
+    Session 2's desktop, at home on the first-pass build, shows
+    `proof_tail_hold_s` of 0.96 to 2.27 s on zero-hop proofs (six
+    records): the unflagged-completion branch held one zero-hop spacing
+    (0.96 s), and 2.27 s is exactly one ONE-hop spacing on that build's
+    `no` gap arm (2 x 0.91 s + 0.45 s margin) -- consistent with a stale
+    one-hop peer report, since `_receiver_hops_to` takes the larger of
+    this node's own hop count and the peer's last reported path length
+    and does not age the report.
+
+    So the hold is now zero whenever this node's OWN resolved path to the
+    sender is zero hop -- the path the proof goes over -- whatever the
+    peer last reported, and whenever no hop count is known at all.
+    Through repeaters nothing changes. `_receiver_hops_to` itself is left
+    as it is (its report holds are a separate rule, and ageing that
+    report is not in this pass).
+
+    Tests: `tests/test_no_proof_tail_hold_at_zero_hop_0924.py` (an
+    unflagged completion at zero hop does not wait; the own zero-hop path
+    wins over a one-hop peer report; the one-hop hold is unchanged), and
+    `tests/test_proof_tail_and_skip_stamp_0923.py`'s zero-hop test
+    re-pinned to assert zero in both branches. Against the item 2 build
+    (`c5ce761`) the new tests and the re-pinned one fail. MeshBench:
+    `zero_hop` (probe RTT must not rise).
+

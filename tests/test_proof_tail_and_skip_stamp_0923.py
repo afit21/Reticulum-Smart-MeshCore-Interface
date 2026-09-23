@@ -209,8 +209,16 @@ class TheProofWaitsForTheBurstTail(SingleNodeCase):
     def test_zero_hop_waits_nothing(self):
         # No parity below direct_raw_parity_min_hops, and a zero-hop burst
         # has no relay chain to collide with.
+        # Re-pinned by the alpha 0.1.9 second pass (item 3): this used to
+        # assert only the flagged-last-frame case, and the unflagged
+        # completion still held one zero-hop spacing -- session 2 of
+        # 2026-09-23 held zero-hop proofs 1.0 to 2.3 s. Both are zero now,
+        # and tests/test_no_proof_tail_hold_at_zero_hop_0924.py pins the
+        # rest.
         self.assertEqual(self.iface.direct_raw_parity_min_hops, 1)
         self.assertEqual(self._hold(0, report_requested=True), 0.0)
+        self.assertEqual(self._hold(0, report_requested=False), 0.0)
+        self.assertEqual(self._hold(0, frag_total=4, report_requested=False), 0.0)
 
     def test_a_window_completed_by_the_flagged_last_frame_with_parity_in_does_not_wait(self):
         # The parity already landed (it is in the bucket) and the flagged

@@ -87,6 +87,13 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   are unchanged. Cost, from the same replays: twice the new rule keeps a 0.36-0.40 path where the
   field's trial of a weak-prior candidate delivered. Tests:
   `tests/test_rate_aware_eligibility_0924.py` (fixture `field_0923_path_decisions.json`).
+- **Second pass (2026-09-24), item 3: no proof tail hold at zero hop.** The first pass's burst-tail
+  hold still fired at zero hop -- session 2's desktop held zero-hop proofs 0.96 to 2.27 s -- through
+  the unflagged-completion branch and a stale one-hop peer report. At zero hop the parity follows
+  within 0.15 s and there is no relay chain, so the hold is now zero whenever this node's own path to
+  the sender is zero hop, whatever the peer last reported. Through repeaters nothing changes. Tests:
+  `tests/test_no_proof_tail_hold_at_zero_hop_0924.py`; the first pass's zero-hop test re-pinned to
+  assert zero in both branches.
 - **Second pass (2026-09-24), item 5: `field_ab_compare.py` prints the path scoreboard's cost.**
   Per node: `path_selected` decisions, the longest run of consecutive counted misses on one path per
   hop count and what ended it, and the decisions that chose a path and got zero successes (count,

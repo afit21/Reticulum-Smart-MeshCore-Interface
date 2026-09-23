@@ -1968,6 +1968,20 @@ class _ReconcileMixin:
         if self.proof_report_grace_s <= 0:
             return 0.0
         hops = self._receiver_hops_to(sender_token)
+        # Alpha 0.1.9 second pass (item 3): no hold at zero hop. The hold
+        # exists because through repeaters the parity trails the data by a
+        # relay-scaled spacing and the proof is in the relay chain when it
+        # is keyed; at zero hop the parity follows within
+        # `direct_raw_zero_hop_gap` (0.15 s) and there is no chain, so the
+        # hold buys nothing and costs the proof's latency. Zero hop is this
+        # node's OWN path to the sender -- the proof goes over it -- whatever
+        # the peer last reported: session 2 of 2026-09-23 held zero-hop
+        # proofs 1.0 to 2.3 s, the unflagged-completion branch below plus a
+        # stale one-hop peer report in `_receiver_hops_to`.
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        own = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        if hops == 0 or (own is not None and own.out_path_len == 0):
+            return 0.0
         # Did the sender put a parity fragment behind this part, and has it
         # arrived? The raw header declares no parity count -- `frag_total`
         # counts data fragments only -- so this reads the sender's own pure
