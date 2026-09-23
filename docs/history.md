@@ -4781,3 +4781,89 @@ client-specific workaround).
     adopted-and-delivered, which are real negatives rather than check
     artefacts. The check is therefore better but still not deterministic,
     and the scenario's delivery remains un-asserted by design.
+
+**Alpha 0.1.9 pass (2026-09-23, from the alpha 0.1.8 field session's
+captures in `fieldtests/raw/Alpha0.1.8/`, desktop `afipc_` + laptop `a_`:
+a three-hop stop 09:25-09:48 and a two-hop stop 11:40-12:07).** The
+release adds nothing; every item corrects something alpha 0.1.8 shipped.
+The metric is unchanged -- on-air bytes per delivered RNS byte, stratified
+by hop count -- and so are the owner's standing constraints (airtime 85 %
+zero hop / 30 % anything relayed, never loosened; path choice weighs
+measured reliability over hop count; parity on; interface efficiency
+before any change that special-cases LXMF or MeshChat behaviour).
+
+What the session established. The first stop is not a release problem:
+the laptop sat on a three-hop path whose last leg read -3 dB while the
+desktop reached it on two, and it was unusable (49 % of attempts, lock
+waits to 178 s, one report sent in 17 minutes) -- a weak-link location.
+The second stop was two hops both ways and is the comparison to alpha
+0.1.7's two-hop stop: attempt success 67-69 % against 63-68 %; QUERY
+attempts per raw send 0.27 (desktop) and 0.38 (laptop) against 0.93;
+2 of 42 sender windows timing out against 9 of 29; 23 of 24 reports
+arriving and acknowledged against 3 of 22; maximum lock wait 44 s
+against 105 s; page part time 20 s median with two Resources completed
+against 80 s and none; proof turnaround 10.0 s median for raw windows
+and 3.9 s for bare packets against 17.9 s combined; 21 of 22 proofs back
+per LXMF send against 10 of 62. Two hops became usable, and alpha 0.1.8's
+items 2 (acknowledged reports) and 3 (evidence ageing) did what they were
+written to do -- reports arrive, and no stale candidate was trialled.
+
+ 3. **Cache defaults that survive a field day** (`announce_cache_ttl`
+    3600 -> 604800 s, `path_request_local_answer_min_interval` 120 ->
+    600 s, both in `_configure_transport`). No code change, no wire
+    change; the two literals and their justification only.
+
+    Alpha 0.1.8 made the announce cache survive a restart and inverted
+    the local-answer rule, and both worked. What it did not survive is a
+    gap between stops. The 2026-09-23 session's two stops are two hours
+    apart and the TTL was one hour, so every entry cached in the morning
+    had expired before the afternoon and eight announces went over the
+    air again at two hops -- the laptop's 11:28 capture shows them as
+    `direct_raw_multifragment` announces in, the desktop's as `announces
+    out` between 11:41 and 12:04 -- for destinations it had already held
+    that morning. The load-time age cap in `_load_announce_cache` is the
+    same TTL, so persistence bought nothing across that gap either.
+
+    A week is not a round number picked for being large: it is what RNS
+    itself keeps. This interface declares no `mode`, so it is MODE_FULL,
+    and in `RNS/Transport.py` (read 2026-09-23) a path learned over such
+    an interface is stamped `now + Transport.PATHFINDER_E` (60*60*24*7)
+    and the path table is culled at `Transport.DESTINATION_TIMEOUT`
+    (also 60*60*24*7); the shorter `AP_PATH_TIME` (a day) and
+    `ROAMING_PATH_TIME` (six hours) apply to MODE_ACCESS_POINT and
+    MODE_ROAMING interfaces and not to this one. The cache therefore now
+    expires exactly when the answering node's own record of the same
+    announce would, and never later -- which is the property that makes
+    it safe, because answering locally from a week-old entry is
+    indistinguishable from RNS answering a path request out of its own
+    week-old path table (`Transport.path_request`).
+
+    What actually bounds a long TTL is liveness, not age, and that gate
+    already existed: `_answer_path_request_locally` answers only while
+    the peer that delivered the announce is still in `self._peers` and
+    out of path-discovery backoff, so a route that has gone away stops
+    being answered from cache regardless of the entry's age. On top of
+    that the periodic on-air verification still runs. The cache stays
+    LRU-bounded at `ANNOUNCE_CACHE_MAX_KEYS` (256), so a week costs
+    bounded memory and a bounded file rather than unbounded growth.
+
+    The verification interval moves for its own evidence. At 120 s the
+    rule put six requests on the air for three destinations in the three
+    and a half minutes between 11:40:51 and 11:44:16 of the second stop,
+    each a relayed DIRECT request answered with a multi-fragment announce
+    window -- five times the cost of re-checking a destination that had
+    just been heard from. Ten minutes keeps the re-verification that is
+    the rule's purpose (0.1.6's reason for having it at all: a genuinely
+    dead destination must still be re-checked) at one request per
+    destination per interval.
+
+    Tests: `tests/test_field_day_cache_defaults_0923.py` (the shipped TTL
+    pinned against `Transport.PATHFINDER_E` and
+    `Transport.DESTINATION_TIMEOUT` in the vendored RNS; an entry cached
+    two hours ago answered locally, in memory and after a restart; an
+    entry older than a week still dropped on load; the 11:40-11:44 span
+    replayed, putting nothing on the air, and the verification still
+    falling due one interval later and re-arming). One assertion of
+    `tests/test_local_announce_cache_0920.py` re-pinned. Shipped-default
+    pin re-dumped (two defaults changed, no key added). MeshBench:
+    `companion_restart`, `bring_up`.

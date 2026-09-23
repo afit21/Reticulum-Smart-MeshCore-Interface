@@ -981,13 +981,40 @@ class _ConfigMixin:
         # nothing: the next request for the same destination inside the
         # interval goes over the air, which is how a genuinely dead
         # destination is re-verified. 0 disables either.
-        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 3600.0))
+        #
+        # Alpha 0.1.9 (item 3): the TTL was 3600 s, which is shorter than
+        # a field day. The 2026-09-23 session had two stops two hours
+        # apart; every entry cached at the first stop had expired by the
+        # second, so eight announces went over the air again at two hops
+        # (the laptop's 11:28 capture, `direct_raw_multifragment`) for
+        # destinations it had already held. A week matches what RNS
+        # itself keeps: a path learned over a MODE_FULL interface expires
+        # at `Transport.PATHFINDER_E` (60*60*24*7) and the path table is
+        # culled at `Transport.DESTINATION_TIMEOUT` (also a week) --
+        # `RNS/Transport.py`, verified 2026-09-23 -- so the cache now
+        # expires exactly when the answering node's OWN record of the
+        # same announce would, and never later. Serving a week-old entry
+        # is bounded by liveness rather than by age: the entry answers
+        # only while the peer that delivered it is still bound and out of
+        # path-discovery backoff (`_answer_path_request_locally`), and
+        # one on-air verification per destination per
+        # `path_request_local_answer_min_interval` still runs. The cache
+        # is LRU-bounded at ANNOUNCE_CACHE_MAX_KEYS (256), so the longer
+        # TTL costs bounded memory and a bounded file.
+        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 604800.0))
         # Alpha 0.1.8 (item 4): where the cache is persisted. Empty means
         # `smci_announces.json` beside the peer cache under
         # RNS.Reticulum.storagepath; `announce_cache_ttl = 0` disables
         # both the cache and its file.
         self.announce_cache_path = str(cfg.get("announce_cache_path", "") or "")
-        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 120.0))
+        # Alpha 0.1.9 (item 3): 120 s put six verification requests on the
+        # air for three destinations in the 3 1/2 minutes between
+        # 11:40:51 and 11:44:16 of the 2026-09-23 two-hop stop, each one a
+        # relayed DIRECT request answered with a multi-fragment announce
+        # window. Ten minutes keeps the re-verification of a genuinely
+        # dead destination (0.1.6's purpose for the rule) while costing
+        # one request per destination per interval instead of five.
+        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 600.0))
 
     def _configure_peer_discovery(self, cfg):
         # Master on/off switch for the entire bind-frame subsystem (both

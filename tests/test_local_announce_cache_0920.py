@@ -270,8 +270,13 @@ class LocalAnnounceCache(SingleNodeCase):
     def test_shipped_defaults(self):
         bare = self.module.SmartMeshCoreInterface.__new__(self.module.SmartMeshCoreInterface)
         bare._configure_path_discovery({})
-        self.assertEqual(bare.announce_cache_ttl_s, 3600.0)
-        self.assertEqual(bare.path_request_local_answer_min_interval_s, 120.0)
+        # Both re-pinned by alpha 0.1.9 (item 3): 3600 s was shorter than a
+        # field day, so every entry cached at the 2026-09-23 session's first
+        # stop had expired before the second two hours later, and 120 s made
+        # the on-air verification cost six requests for three destinations in
+        # three and a half minutes. See tests/test_field_day_cache_defaults_0923.py.
+        self.assertEqual(bare.announce_cache_ttl_s, 604800.0)
+        self.assertEqual(bare.path_request_local_answer_min_interval_s, 600.0)
         self.assertEqual(self.module.SmartMeshCoreInterface.ANNOUNCE_CACHE_MAX_KEYS, 256)
 
 

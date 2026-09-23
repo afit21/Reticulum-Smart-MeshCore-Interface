@@ -1,5 +1,29 @@
 # Changelog
 
+## alpha-0.1.9 (unreleased, 2026-09-23)
+
+From the alpha 0.1.8 field session (`fieldtests/raw/Alpha0.1.8/`, 2026-09-23: a three-hop stop and a
+two-hop stop). Every item corrects something alpha 0.1.8 shipped; nothing new is added. The dated
+design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned by
+`tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
+
+- **Cache defaults that survive a field day** (`announce_cache_ttl` 3600 -> 604800,
+  `path_request_local_answer_min_interval` 120 -> 600). The session's two stops were two hours
+  apart and the announce cache's TTL was one hour, so every entry cached at the first stop had
+  expired before the second and eight announces went over the air again at two hops for
+  destinations already held that morning; persistence across a restart, added in 0.1.8, bought
+  nothing across that gap because the load-time age cap is the same TTL. A week is what RNS itself
+  keeps: this interface is MODE_FULL, so a path learned over it is stamped
+  `Transport.PATHFINDER_E` and the path table culled at `Transport.DESTINATION_TIMEOUT`, both
+  60*60*24*7 (`RNS/Transport.py`) -- the cache now expires exactly when the answering node's own
+  record of the same announce would, and never later. A long TTL is bounded by liveness rather than
+  age: an entry answers only while the peer that delivered it is still bound and out of
+  path-discovery backoff, the periodic on-air verification still runs, and the cache stays
+  LRU-capped at 256 keys. The verification interval moves for its own evidence -- at 120 s it put
+  six requests on the air for three destinations in the three and a half minutes from 11:40:51 to
+  11:44:16, each a relayed DIRECT request answered with a multi-fragment announce window. Tests:
+  `tests/test_field_day_cache_defaults_0923.py`. MeshBench: `companion_restart`, `bring_up`.
+
 ## alpha-0.1.8 (unreleased, 2026-09-23)
 
 From the alpha 0.1.7 field session (`fieldtests/raw/Alpha0.1.7/`, 2026-09-22 evening: zero hop at
