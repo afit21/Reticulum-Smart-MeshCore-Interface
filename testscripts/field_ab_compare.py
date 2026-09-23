@@ -67,6 +67,11 @@ WHAT IS COMPARED (per set, per hop, with n)
                  pass, lower is better; the MeshBench ledger (`meshbench_report.py`) is the
                  all-nodes equivalent. Captures without `on_air_bytes` print the ratio with a '~'.
   stale paths    `direct_send_result` failures and consecutive-failure triples (the stale-path reset trigger)
+  path decisions `path_selected` records per node; the longest run of consecutive counted misses
+                 (`firmware` / `hop1_abort`) on one path per hop count and what ended it; and the
+                 decisions that chose a path and got zero successes before the next one (count,
+                 attempts, ACK-wait seconds) -- alpha 0.1.9 second pass, item 5, for the two 2026-09-23
+                 evening defects (a zero-hop miss run no decision ended; trials of dead paths)
 
 Nothing here decides; it puts the two columns next to each other with their
 sample sizes so the decision is made on numbers, and prints a one-line
@@ -407,7 +412,114 @@ def analyse_set(recs: list, hop_filter=None, radio=(7, 62.5, 8)) -> dict:
     # Alpha 0.1.8 (item 5): the release's own metric, in frames.
     out["frames_per_proved_packet"] = frames_per_proved_packet(recs, hop_filter=hop_filter)
     out["report_carrier"] = report_carrier_and_arrival(recs, hop_filter=hop_filter)
+    # Alpha 0.1.9, second pass (item 5): the path scoreboard's two field
+    # defects of 2026-09-23 evening, as rows.
+    out["path_decisions"] = path_decisions(recs, hop_filter=hop_filter)
     return out
+
+
+# The attempt outcomes the path scoreboard counts (`PATH_ATTEMPT_MISS_SOURCES`
+# in `_paths.py`, alpha 0.1.9 item 4): a success is an attempt with a real ACK
+# latency, a miss one that waited the full ceiling for the path's silence.
+PATH_MISS_SOURCES = ("firmware", "hop1_abort")
+
+
+def path_decisions(recs: list, hop_filter=None) -> dict:
+    """Alpha 0.1.9, second pass (item 5). Per node: the `path_selected`
+    decisions; the LONGEST RUN of consecutive counted misses on one path,
+    per hop count, and what ended it (a decision, a success, the hop count
+    changing under it, or the capture ending); and the decisions that
+    chose a path and then got ZERO successes before the next decision --
+    how many, their counted attempts and the seconds those attempts spent
+    waiting for ACKs.
+
+    The two 2026-09-23 evening defects, which these rows exist to show
+    without a script. Session 2: the laptop missed 144 attempts in a row
+    on the zero-hop path with no decision at all, because the zero-hop
+    path's hex is "" and the per-attempt counter dropped it as "no path"
+    (item 1). Session 1: the desktop's 22 decisions that chose a path
+    during the drive include 16 that never delivered, 84 attempts and
+    626 s of ACK waits, three of them on a zero-hop path measured dead
+    (item 2).
+
+    Attempt records carry the hop count and not the path, so a run is kept
+    per (node, capture file, peer) and closed by that peer's next
+    `path_selected` or by the hop count changing; an attempt that is
+    neither a counted miss nor an ACKed success (expired, pre-empted,
+    no-ACK, a locally shortened ceiling) neither extends nor ends a run.
+    Only attempts inside `hop_filter` are counted when one is given."""
+    decisions = collections.Counter()
+    runs = {}
+    longest = collections.defaultdict(dict)       # node -> hop -> (n, ended_by, started_ts)
+    segments = {}
+    zero = collections.defaultdict(lambda: {"count": 0, "attempts": 0, "timeout_s": 0.0})
+    chose = collections.Counter()
+
+    def close_run(key, why):
+        run = runs.pop(key, None)
+        if run is None:
+            return
+        best = longest[key[0]].get(run["hop"])
+        if best is None or run["n"] > best[0]:
+            longest[key[0]][run["hop"]] = (run["n"], why, run["t0"])
+
+    def close_segment(key):
+        seg = segments.pop(key, None)
+        if seg is not None and seg["attempts"] and not seg["ok"]:
+            z = zero[key[0]]
+            z["count"] += 1
+            z["attempts"] += seg["attempts"]
+            z["timeout_s"] += seg["timeout_s"]
+
+    for r in recs:
+        ev = r.get("event")
+        if ev not in ("path_selected", "direct_attempt_result"):
+            continue
+        key = (r["_node"], r["_file"], r.get("peer_prefix"))
+        if ev == "path_selected":
+            decisions[r["_node"]] += 1
+            close_run(key, "decision")
+            close_segment(key)
+            if r.get("path_hex") is not None:
+                chose[r["_node"]] += 1
+                segments[key] = {"ok": 0, "attempts": 0, "timeout_s": 0.0}
+            continue
+        if hop_filter is not None and r.get("hop_count") != hop_filter:
+            continue
+        ok = bool(r.get("ok")) and r.get("ack_latency_s") is not None
+        miss = not r.get("ok") and r.get("ack_timeout_source") in PATH_MISS_SOURCES
+        if not (ok or miss):
+            continue
+        seg = segments.get(key)
+        if seg is not None:
+            seg["attempts"] += 1
+            if ok:
+                seg["ok"] += 1
+            else:
+                seg["timeout_s"] += r.get("ack_timeout_s") or 0.0
+        if ok:
+            close_run(key, "success")
+            continue
+        run = runs.get(key)
+        if run is not None and run["hop"] != r.get("hop_count"):
+            close_run(key, "hop change")
+            run = None
+        if run is None:
+            run = runs[key] = {"n": 0, "hop": r.get("hop_count"), "t0": r.get("ts")}
+        run["n"] += 1
+    for key in list(runs):
+        close_run(key, "capture end")
+    for key in list(segments):
+        close_segment(key)
+    nodes = sorted(set(decisions) | set(longest))
+    return {node: {
+        "decisions": decisions.get(node, 0),
+        "decisions_choosing_a_path": chose.get(node, 0),
+        "longest_miss_run_by_hop": {h: {"misses": v[0], "ended_by": v[1], "started_ts": v[2]}
+                                    for h, v in sorted(longest.get(node, {}).items(),
+                                                       key=lambda kv: (kv[0] is None, kv[0] if kv[0] is not None else -1))},
+        "zero_success_decisions": dict(zero[node]) if node in zero else {"count": 0, "attempts": 0, "timeout_s": 0.0},
+    } for node in nodes}
 
 
 PROOF_JOIN_S = 2.0          # an `out PROOF` this soon after an `in DATA` answers it
@@ -809,6 +921,24 @@ def print_comparison(sets: dict, min_n: int) -> None:
     row("unknown_dest_backoff_drop (near PROOFs)", [f"{s['backoff_drops']} ({s['backoff_drops_near_proofs']})" for s in sets.values()])
     row("direct sends ok / failed", [f"{s['send_ok']} / {s['send_fail']}" for s in sets.values()])
     row("failure triples (stale-path reset trigger)", [s["fail_triples"] for s in sets.values()])
+    # Alpha 0.1.9, second pass (item 5): 2026-09-23 evening, session 2's
+    # laptop ran 144 zero-hop misses with no decision; session 1's desktop
+    # had 16 decisions that never delivered (84 attempts, 626 s).
+    print("\n  -- path decisions (path_selected) and what they cost --")
+    pnodes = sorted({n for s in sets.values() for n in s.get("path_decisions", {})})
+    for node in pnodes:
+        vals = [s.get("path_decisions", {}).get(node) for s in sets.values()]
+        row(f"{node}: decisions (choosing a path)",
+            [(f"{v['decisions']} ({v['decisions_choosing_a_path']})" if v else "-") for v in vals])
+        row(f"{node}: zero-success decisions (att, ACK s)",
+            [(f"{v['zero_success_decisions']['count']} ({v['zero_success_decisions']['attempts']}, "
+              f"{v['zero_success_decisions']['timeout_s']:.0f})" if v else "-") for v in vals])
+        rhops = sorted({h for v in vals if v for h in v["longest_miss_run_by_hop"]},
+                       key=lambda h: (h is None, h if h is not None else -1))
+        for h in rhops:
+            row(f"{node}: h{h} longest miss run (ended by)",
+                [(f"{v['longest_miss_run_by_hop'][h]['misses']} ({v['longest_miss_run_by_hop'][h]['ended_by']})"
+                  if v and h in v["longest_miss_run_by_hop"] else "-") for v in vals])
     print("\n  -- one-hop gap A/B safety signals (direct_raw_gap_own_airtime) --")
     hops_seen = sorted({h for a in sets.values() for k in ("gap_s_by_hop", "round1_fragments_per_part") for h in a.get(k, {})},
                        key=lambda h: (h is None, h if h is not None else -1))

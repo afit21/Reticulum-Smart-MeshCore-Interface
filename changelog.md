@@ -65,6 +65,12 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   `testscripts/` and the hermetic unit tests, raised AttributeError on its first inbound packet on
   RNS 1.5.4. An instance value set by Reticulum still shadows the default, so a configured IFAC size
   is untouched. Tests: `tests/test_rns15_interface_contract_0923.py`.
+- **Second pass (2026-09-24), item 5: `field_ab_compare.py` prints the path scoreboard's cost.**
+  Per node: `path_selected` decisions, the longest run of consecutive counted misses on one path per
+  hop count and what ended it, and the decisions that chose a path and got zero successes (count,
+  attempts, ACK-wait seconds). The 2026-09-23 evening sessions read: session 1, 45 decisions and 16
+  zero-success decisions on the desktop (84 attempts, 626 s); session 2, a 144-attempt zero-hop miss
+  run on the laptop that no decision ended. Tests: `tests/test_field_ab_compare_path_rows_0924.py`.
 - **Path misses count per attempt** (`path_switch_after_misses` 2 -> 4, `PATH_EXHAUST_MISSES` 4 -> 8;
   both are the old thresholds expressed in the new unit, since a missed send is exactly
   `direct_send_attempts` = 2 consecutive missed attempts). Airtime is spent per attempt but the

@@ -5341,3 +5341,46 @@ added, no wire change, the version stays alpha 0.1.9.
     reports_0920.py` reversed; `tests/test_shipped_defaults.py` and
     `tests/golden/config_defaults.json` re-pinned (one default). No
     MeshBench run: the suite cannot judge this knob.
+
+ 5. **The comparison script shows what the path scoreboard cost**
+    (`path_decisions` in `testscripts/field_ab_compare.py`; no interface
+    change). Both defects of the evening were found with a throwaway
+    script, so the next session gets them as rows: per node, the
+    `path_selected` decisions (and how many chose a path); the LONGEST
+    RUN of consecutive counted misses on one path, per hop count, and
+    what ended it -- a decision, a success, the hop count changing under
+    it, or the capture ending; and the decisions that chose a path and
+    got ZERO successes before the next decision, with their counted
+    attempts and ACK-wait seconds.
+
+    Counted means what the scoreboard counts: a miss is a
+    `direct_attempt_result` that waited the full ceiling with source
+    `firmware` or `hop1_abort` (alpha 0.1.9 item 4's allow-list), a
+    success one with a real ACK latency; anything else (expired,
+    pre-empted, `report_window`, a no-ACK frame) neither extends nor ends
+    a run. Attempt records carry the hop count and not the path, so a run
+    is kept per node, capture file and peer and closed by that peer's
+    next decision or by a hop-count change.
+
+    What the rows read on the evening's captures (`--set 019-s1=
+    fieldtests/raw/Alpha0.1.9-drive --set 019-s2=fieldtests/raw/
+    Alpha0.1.9`): session 1, 23 decisions on the desktop and 22 on the
+    laptop (45); the desktop's 22 path-choosing decisions include 16
+    with zero successes, 84 attempts, 626 s of ACK waits (the brief
+    quotes 15 / 83 / about ten minutes; the difference is where a
+    decision's span is cut, and the definition used is written above);
+    the laptop's 12, 35 and 284 s. Session 2: the laptop's longest
+    zero-hop run is 144 counted misses, ended by the capture (the
+    restart), with one decision in the whole file -- the brief's 132 is
+    the same run counted from a later start -- and the desktop's 27,
+    also ended by its capture. The alpha 0.1.8 session reads 5 and 3
+    decisions, one zero-success decision.
+
+    Tests: `tests/test_field_ab_compare_path_rows_0924.py` (a run no
+    decision ends counted to the capture end; only counted misses extend
+    a run and only an ACKed success ends it; a decision and a hop change
+    close it; zero-success decisions with their attempts and seconds,
+    and an "exhausted" record opening no segment; runs per capture file;
+    the rows print; and, when the captures are present locally, the two
+    sessions reading as above).
+
