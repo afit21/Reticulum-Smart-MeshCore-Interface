@@ -26,7 +26,14 @@ reach the death clock -- `path_switch_after_misses` 2 -> 4 and
 `PATH_EXHAUST_MISSES` 4 -> 8 are the same thresholds in the new unit. No
 wire change -- the golden wire snapshot is untouched and alpha 0.1.8 and
 0.1.9 nodes interoperate, although items 1 and 2 pay off only when the
-RECEIVER runs 0.1.9); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
+RECEIVER runs 0.1.9. Two further changes landed with the release: the
+inter-fragment gap through repeaters loses the frame's own airtime
+(`direct_raw_gap_own_airtime` defaults to `no`, the owner's decision --
+one hop 2.73 -> 1.82 s, two hops 4.55 -> 3.64 s, zero hop untouched), and
+the interface now defines `ifac_size`, which RNS 1.5 reads on every
+inbound frame and which only `RNS.Reticulum` used to set -- so building
+this interface without Reticulum, as the white-box hardware scripts do,
+works again on RNS 1.5.4); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
 build's 2026-09-22 evening field session, which had a two-hop stop: for a
 raw window whose packets RNS proves, the PROOF is the completion and the
 report is not sent; at two hops and beyond a report that IS sent goes on

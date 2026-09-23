@@ -5201,3 +5201,95 @@ written to do -- reports arrive, and no stale candidate was trialled.
     Shipped-default pin and golden config re-pinned (one default changed).
     MeshBench: `failover`, `repeater_returns`, `shortcut_appears`,
     `two_hop`, `weak_direct`.
+
+ 6. **`direct_raw_gap_own_airtime` defaults to `no`** (`_configure_retry`;
+    no code change beyond the literal, no wire change), **and the burst
+    loop always yields** (`_run_raw_window_rounds`).
+
+    The owner's decision, 2026-09-23, and it is the A/B's `no` arm adopted
+    WITHOUT the A/B: `fieldtests/AB_PROTOCOL.md` has still never been run,
+    so this is a judgement that the burst should spend less airtime, not a
+    measured result. Recorded plainly because the config comment used to
+    say the A/B decides.
+
+    What changes, at SF7 / BW 62.5 kHz / CR 4/8 (the field radios, 0.91 s
+    airtime for a full 170-byte fragment): the gap through repeaters goes
+    from `(1 + 2 x hops)` to `(2 x hops)` airtimes -- one hop 2.73 ->
+    1.82 s (-33 %), two hops 4.55 -> 3.64 s (-20 %), three hops 6.37 ->
+    5.46 s (-14 %). Zero hop is untouched. The risk the `+1` covered is
+    real (MeshBench finding 2, 2026-09-20: `send_raw_data` returns when
+    the frame is QUEUED, so without the term the next fragment can key
+    inside the repeater's relay of the previous one -- 7/7 second
+    fragments lost at R in `large_payload`, 7/9 QUERYs in `relay`), but a
+    real SX1262 has listen-before-talk and defers on hearing that relay,
+    which MeshBench's virtual radio cannot do. MeshBench therefore
+    overstates this particular risk, which is exactly why the knob exists.
+
+    Two derived values shrink with the gap, both in this release's
+    favour. `_report_hold_s` shrinks, so item 2's proof burst-tail hold
+    becomes 2.28 s at one hop and 4.09 s at two (more margin inside the
+    sender's report wait). And the burst-tail suppression window in
+    `_report_recently_sent` becomes 7.74 s at two hops, which now sits
+    INSIDE the sender's 9.0 s report wait rather than just outside it --
+    the one cost item 1 documented is reduced by this change.
+
+    **The burst loop now always awaits between fragments**, even for a
+    zero wait. Skipping the `await` on a zero gap meant the loop ran a
+    whole burst without giving the event loop a turn, so a completion
+    report or Link handshake queued while a fragment was in flight never
+    registered as a lock waiter and `report_requested()` was False at
+    every part boundary -- the report then waited out the entire window,
+    exactly what alpha 0.1.5's item 6 exists to prevent. No shipped
+    configuration reaches a zero gap (the factor is 2.0 and the zero-hop
+    gap 0.15), and it was surfaced only because the unit scaffold sets
+    `direct_raw_hop_gap_factor = 0` for speed and the `+1 x airtime` term
+    had been the only thing keeping its gap nonzero. Nothing should
+    depend on the gap being nonzero, so the await is unconditional.
+
+    Tests: `tests/test_raw_gap_own_airtime_0921.py` re-pinned (both arms
+    still pinned explicitly; the shipped default now asserts the `no`
+    arithmetic). Three assertions re-pinned in
+    `tests/test_reconcile_m1_noack_reports_0920.py` and
+    `tests/test_raw_fragments.py`. Five behaviour tests across
+    `test_report_yield_between_parts_0921`, `test_fresh_proof_0922`,
+    `test_multihop_window_hold_0922` and `test_handshake_preemption_0920`
+    pass unchanged once the loop always yields -- they are the regression
+    gate for it. Shipped-default pin and golden config re-pinned.
+    MeshBench: every scenario is affected; the alpha 0.1.9 gate set must
+    be re-run against this build, and the results recorded before were
+    taken with the `yes` arm.
+
+ 7. **RNS 1.5 reads `ifac_size` on every inbound frame** (`interface.py`;
+    no wire change, no config key).
+
+    `Transport.preprocess_inbound` on RNS 1.5 sizes every frame against
+    `interface.HW_MTU + (interface.ifac_size or 0)`. That attribute is
+    set by `RNS.Reticulum` when IT configures an interface from the config
+    file -- None when no IFAC is configured (`RNS/Reticulum.py`, read
+    2026-09-23) -- and the RNS base `Interface` class does not define it,
+    on either the installed 1.5.4 or the 1.5.2 copy under
+    `referenceprojects/`. Under `rnsd` nothing was ever wrong: Reticulum
+    sets the instance attribute before any traffic flows, and the
+    deliverable still loads through 1.5.4's loader.
+
+    Every path that constructs this interface WITHOUT Reticulum raised
+    AttributeError on its first inbound packet: the white-box hardware
+    scripts in `testscripts/` that build a `SmartMeshCoreInterface`
+    directly (`zero_hop_peer_discovery_test.py` and the other
+    single-radio tools) and the hermetic unit tests. The interface now
+    defines it itself, next to `HW_MTU` and for the same reason; an
+    instance value set by Reticulum still shadows it, so a configured
+    IFAC size is untouched.
+
+    Found independently from two directions on 2026-09-23: while
+    diagnosing a unit failure here, and by the owner's RNS 1.5.4 upgrade
+    review, which is where the one-line shape of the fix came from.
+
+    Tests: `tests/test_rns15_interface_contract_0923.py`. Separately,
+    `tests/test_local_announce_cache_0920.py`'s real-Transport test now
+    WAITS for the path instead of asserting synchronously: RNS 1.5 hands
+    an inbound packet to a worker rather than processing it on the
+    caller's thread, so a path appears about 50 ms after
+    `Transport.inbound` returns. That test had always failed when run on
+    its own, on every build, and passed in a full suite only by incidental
+    timing.

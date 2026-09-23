@@ -191,7 +191,8 @@ class _ReconcileMixin:
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
         # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
-        # airtime from the gap through repeaters; the default keeps it.
+        # airtime from the gap through repeaters. Since alpha 0.1.9 that arm
+        # is the DEFAULT (the owner's decision, `direct_raw_gap_own_airtime`).
         own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
         return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
 
@@ -986,8 +987,24 @@ class _ReconcileMixin:
                             gap_hops, gap_s, self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes),
                             time.monotonic(), self._radio_busy_until,
                         )
-                        if wait_s > 0:
-                            await asyncio.sleep(wait_s)
+                        # Always await, even for a zero wait (alpha 0.1.9,
+                        # 2026-09-23). `asyncio.sleep(0)` yields to the loop
+                        # once, which is what lets a report or handshake that
+                        # was queued while this fragment was in flight
+                        # actually register as a waiter before the two checks
+                        # below ask whether one is queued. Skipping the await
+                        # on a zero gap starved them: the loop ran the whole
+                        # burst without ever giving the event loop a turn, so
+                        # `report_requested()` was False at every part
+                        # boundary and the report waited out the entire
+                        # window -- exactly what alpha 0.1.5's item 6 exists
+                        # to prevent. Surfaced by defaulting
+                        # `direct_raw_gap_own_airtime` to `no`, which leaves a
+                        # gap of zero wherever `direct_raw_hop_gap_factor` is
+                        # also 0; the shipped factor is 2.0 and the zero-hop
+                        # gap is 0.15, so no shipped configuration hits it,
+                        # but nothing should depend on the gap being nonzero.
+                        await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()

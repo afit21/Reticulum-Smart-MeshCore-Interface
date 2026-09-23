@@ -218,6 +218,22 @@ class LocalAnnounceCache(SingleNodeCase):
             iface._capture_event = original
             iface._packet_capture_file = original_file
 
+    @staticmethod
+    def _wait_for_path(dest_hash, want=True, timeout=3.0):
+        """`RNS.Transport.inbound` hands the packet to a worker rather than
+        processing it on the caller's thread (`preprocess_inbound` on the
+        installed RNS), so a path appears a few tens of milliseconds after
+        the call returns -- measured at ~50 ms here. Asserting synchronously
+        made this test depend on whatever else had run first; it passed in a
+        full suite and failed on its own, on every build, until 2026-09-23.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if RNS.Transport.has_path(dest_hash) == want:
+                return True
+            time.sleep(0.02)
+        return RNS.Transport.has_path(dest_hash) == want
+
     def test_real_rns_transport_accepts_the_re_injected_announce(self):
         """Against the real `RNS.Transport` of the test process (a hermetic
         `RNS.Reticulum`, non-transport): a signed announce re-injected with
@@ -231,6 +247,31 @@ class LocalAnnounceCache(SingleNodeCase):
         packet.pack()
         raw = bytes(packet.raw)
         iface = self.iface
+        # Two things this test needs from RNS that the unit harness does not
+        # provide, both found on 2026-09-23 when the test began failing in
+        # the full suite (it had always failed on its own, on every build --
+        # it was relying on state left by whichever tests ran before it).
+        #
+        # `Transport.preprocess_inbound` reads `interface.ifac_size`, which
+        # `RNS.Reticulum` sets when IT configures an interface; None is what
+        # it sets for an interface with no IFAC, which is this one
+        # (`RNS/Reticulum.py`) -- the interface now sets that itself, so
+        # this test exercises the shipped default rather than patching it.
+        #
+        # And a PATH_RESPONSE is only accepted on a NON-TRANSPORT node for a
+        # destination RNS actually has an outstanding request for -- which is
+        # also what exempts it from the interface's announce ingress limiter
+        # ("Skipping ingress limit check ... due to waiting path requests").
+        # That is exactly the production situation: this cache answers a path
+        # request RNS itself just made, so `Transport.path_requests` holds the
+        # hash. The second half of this test already sets it up that way and
+        # says so; the first injection was relying on state left by whichever
+        # tests happened to run before it, which is why it failed on its own
+        # on every build.
+        self.assertTrue(hasattr(iface, "ifac_size"),
+                        "RNS 1.5 reads ifac_size on every inbound frame; the interface must define it")
+        with RNS.Transport.path_requests_lock:
+            RNS.Transport.path_requests[dest.hash] = time.time()
         # Not a local destination as far as Transport is concerned, or it
         # would answer from the destinations map instead of the path table.
         RNS.Transport.deregister_destination(dest)
@@ -241,9 +282,10 @@ class LocalAnnounceCache(SingleNodeCase):
             answer = bytearray(raw)
             answer[ctx] = RNS.Packet.PATH_RESPONSE
             RNS.Transport.inbound(bytes(answer), iface)
-            self.assertTrue(RNS.Transport.has_path(dest.hash), "an unknown destination's announce is added")
+            self.assertTrue(self._wait_for_path(dest.hash), "an unknown destination's announce is added")
             entry_before = list(RNS.Transport.path_table[dest.hash])
             RNS.Transport.inbound(bytes(answer), iface)
+            time.sleep(0.2)
             self.assertEqual(RNS.Transport.path_table[dest.hash][0], entry_before[0], "a duplicate while the path exists is ignored")
             RNS.Transport.expire_path(dest.hash)
             # Cull what expire_path marked (Transport.jobs does this on its
@@ -260,7 +302,7 @@ class LocalAnnounceCache(SingleNodeCase):
             with RNS.Transport.path_requests_lock:
                 RNS.Transport.path_requests[dest.hash] = time.time()
             RNS.Transport.inbound(bytes(answer), iface)
-            self.assertTrue(RNS.Transport.has_path(dest.hash), "accepted again once the path was expired and culled")
+            self.assertTrue(self._wait_for_path(dest.hash), "accepted again once the path was expired and culled")
         finally:
             with RNS.Transport.path_table_lock:
                 RNS.Transport.path_table.pop(dest.hash, None)

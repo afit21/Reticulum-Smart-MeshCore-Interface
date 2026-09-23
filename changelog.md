@@ -32,6 +32,27 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   Capture: `proof_tail_hold_s` on the proof's attempt record and a `proof_tail_hold` decision
   record. Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`. MeshBench: `two_hop`, `three_hop`,
   `large_payload`, `relay`.
+- **`direct_raw_gap_own_airtime` now defaults to `no`** (the owner's decision). The gap between raw
+  fragments through repeaters drops from `(1 + 2 x hops)` to `(2 x hops)` airtimes -- at the field
+  radios' SF7/62.5/4:8, one hop 2.73 -> 1.82 s, two hops 4.55 -> 3.64 s, three hops 6.37 -> 5.46 s;
+  zero hop is untouched. This is the field A/B's `no` arm adopted without the A/B
+  (`fieldtests/AB_PROTOCOL.md` has still never been run), so it is a judgement about spending less
+  airtime per burst rather than a measured result. It also shrinks two derived values in this
+  release's favour: the proof burst-tail hold becomes 2.28 s at one hop and 4.09 s at two, and the
+  burst-tail report suppression window becomes 7.74 s at two hops, now inside the sender's 9.0 s
+  report wait rather than just outside it. **The burst loop now always awaits between fragments**,
+  even for a zero gap -- skipping the await starved the event loop, so a completion report or Link
+  handshake queued mid-burst never registered as a lock waiter and waited out the whole window. No
+  shipped configuration reaches a zero gap; nothing should depend on it being nonzero. Tests:
+  `tests/test_raw_gap_own_airtime_0921.py` plus re-pins. Every MeshBench scenario is affected.
+- **RNS 1.5 compatibility: the interface defines `ifac_size`.** `Transport.preprocess_inbound` on
+  RNS 1.5 sizes every inbound frame against `interface.HW_MTU + (interface.ifac_size or 0)`, and the
+  base `Interface` class does not define that attribute -- `RNS.Reticulum` sets it when it
+  configures an interface (None with no IFAC). Under `rnsd` nothing was wrong, but every path that
+  builds a `SmartMeshCoreInterface` directly, including the white-box hardware scripts in
+  `testscripts/` and the hermetic unit tests, raised AttributeError on its first inbound packet on
+  RNS 1.5.4. An instance value set by Reticulum still shadows the default, so a configured IFAC size
+  is untouched. Tests: `tests/test_rns15_interface_contract_0923.py`.
 - **Path misses count per attempt** (`path_switch_after_misses` 2 -> 4, `PATH_EXHAUST_MISSES` 4 -> 8;
   both are the old thresholds expressed in the new unit, since a missed send is exactly
   `direct_send_attempts` = 2 consecutive missed attempts). Airtime is spent per attempt but the

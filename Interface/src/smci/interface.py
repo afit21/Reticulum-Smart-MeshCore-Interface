@@ -560,6 +560,23 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # base class's None default, even if this constructor's connection
         # attempt below fails and the interface stays offline.
         self.HW_MTU = RNS.Reticulum.MTU
+        # RNS 1.5 reads `ifac_size` on EVERY inbound frame
+        # (`Transport.preprocess_inbound`: `len(raw) > interface.HW_MTU +
+        # (interface.ifac_size or 0)`), and it is set by `RNS.Reticulum`
+        # when IT configures an interface from the config file -- None when
+        # no IFAC is configured (`RNS/Reticulum.py`). So under `rnsd` this
+        # attribute already exists and the assignment below is shadowed by
+        # the instance value Reticulum sets. It matters for every path that
+        # constructs this interface WITHOUT Reticulum: the hardware scripts
+        # in `testscripts/` that build a SmartMeshCoreInterface directly
+        # (`zero_hop_peer_discovery_test.py` and friends) and the hermetic
+        # unit tests, which on RNS 1.5.4 raised AttributeError on the first
+        # inbound packet. Set here rather than left to the base class
+        # because the base class does not define it (verified against both
+        # the installed 1.5.4 and the 1.5.2 copy in `referenceprojects/`).
+        # Added 2026-09-23 with alpha 0.1.9.
+        if not hasattr(self, "ifac_size"):
+            self.ifac_size = None
 
         # --- Internal async/threading state -----------------------------
         # `self._mc` itself stays a plain, genuinely-Optional attribute --
