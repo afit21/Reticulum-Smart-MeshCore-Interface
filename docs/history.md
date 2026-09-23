@@ -5076,3 +5076,114 @@ written to do -- reports arrive, and no stale candidate was trialled.
     RTT must not rise at one hop, and the proof's first-attempt success
     per hop is now printed by `field_ab_compare.py` (item 5) for the field
     reading.
+
+ 4. **Path misses count per attempt** (`_note_path_attempt_result` in
+    `_paths.py`, new, called from `_send_direct_frame_and_wait_for_ack`;
+    `_note_path_result`'s failure branch stops incrementing the counter;
+    `PATH_ATTEMPT_MISS_SOURCES`, new; `PATH_EXHAUST_MISSES` 4 -> 8,
+    `path_switch_after_misses` 2 -> 4). No wire change, no new config key.
+
+    The defect, which the 0.1.8 handover raised as its gap (d) and the
+    2026-09-23 capture then showed a second time. Airtime is spent per
+    attempt and the scoreboard learned per send -- and the two paths that
+    spend the most airtime recorded nothing at all: a fragmented send's
+    per-fragment attempts pass `record_result=False`, and a QUERY round's
+    evidence passes `path_sample=False` (alpha 0.1.6's second cut, for the
+    good reason that one failing window must not count four or five
+    samples of its own). The desktop between 11:29:35 and 11:31:26, on a
+    two-hop path that was dead: nine raw-fragment attempts (`pkt_id` 8) and
+    two QUERY attempts, every one a `firmware` miss at two hops, and not
+    one `direct_send_result` in the whole span. The board did not reach its
+    trial threshold until 11:41:22, ten minutes and a stop later, and never
+    reached "exhausted". The 2026-09-22 shape was the same: 14 failed
+    attempts over 2.5 minutes recorded as 3 misses.
+
+    **The design choice, written down as the release asked: (B), count the
+    attempts into `consecutive_misses` and keep one delivery-rate sample
+    per send.** The rate is not a local number. It is computed from
+    `samples`, put on the wire in the "Q" v5 rate byte by
+    `_path_rate_for_wire`, and read by the peer as the FIRST rule of
+    `_path_prior`; `PATH_PRIOR_OPTIMISTIC` (0.8), `PATH_PRIOR_WEAK` (0.25),
+    `PATH_HEALTHY_RATE` (0.5) and `PATH_RATE_FLOOR` are all calibrated
+    against per-send rates, and so is the replay fixture
+    `tests/fixtures/field_0921_desktop_22h.json`. A per-attempt rate would
+    settle near the measured field figures (0.65 at one hop, 0.51 at two),
+    i.e. below the 0.8 optimistic prior, so every untried candidate would
+    outscore every measured one -- the churn alpha 0.1.8's item 3 exists to
+    stop -- and all four constants would have to be re-derived from field
+    data first, with no baseline to do it against. `consecutive_misses` is
+    purely local and is the quantity the death clock actually reads, so it
+    is the one whose unit changes. Design (A), per-attempt samples as well,
+    is therefore not taken; if the latent unit error in `_path_score`
+    (`1/rate` is expected SENDS, while the score's docstring says expected
+    transmissions) is worth fixing, it is a separate change that keeps the
+    rate per send.
+
+    **The rescale is exact, not a guess.** A missed send IS
+    `direct_send_attempts` (2) consecutive missed attempts, because any
+    successful attempt both ends the send and resets the counter. So 2 -> 4
+    and 4 -> 8 reproduce today's patience on a healthy path at 50 % attempt
+    success exactly -- about 20 sends to a trial and about 340 to
+    exhaustion -- and the "fourth cut" in `_choose_path` is untouched. What
+    changes is that a send with a larger budget now costs what it spends: a
+    four-attempt handshake or a pass-1 finish counts four, not one, and the
+    raw-window and QUERY attempts that counted nothing now count one each.
+    Replayed against the field burst, the path stops being current 29 s in
+    and the board exhausts 85 s in (the eleven attempts are spread over
+    111 s by the sender's own spacing), against ten minutes and never.
+
+    **Which attempts count is an allow-list, deliberately**
+    (`PATH_ATTEMPT_MISS_SOURCES` = `firmware`, `hop1_abort`). A miss is
+    evidence about the path only when this node transmitted and waited the
+    full miss ceiling and the silence is the path's. Excluded, each for its
+    own reason: `measured` (this engine's own tightened ceiling, already
+    excluded by `waited_full_timeout`), `report_window` (alpha 0.1.8 item
+    2's deliberately short local ceiling on a report or answer -- 6 of the
+    21 failed attempts in the desktop's 11:20-11:45 window were these, and
+    counting them would have killed a live path on this node's own
+    decision), `preempted`, `superseded`, `answered`,
+    `answered_before_send`, `expired` (including the lock-wait expiry that
+    never transmitted) and `noack` (a no-ACK frame has no outcome). A
+    duty-cycle or medium-busy throttle needs no exclusion: those are pure
+    waits with no failure outcome, and if one pushes a packet past its
+    deadline the result is `expired`, which is excluded. `hop1_abort` is
+    included on purpose -- its premise is silence where a forward was due.
+    On the success side an `ok` with no measured ACK latency does not
+    reset the count, so a no-ACK frame cannot clear a dying path's record.
+
+    **Why `_note_path_result` no longer increments, and why that is safe.**
+    Counting the send as well would bill the same transmissions twice.
+    Every send that reaches `record_direct_send_result` with
+    `succeeded=False` has at least one counted attempt behind it: that call
+    is only reached on a failure with `waited_full_timeout` True, and an
+    attempt that waited the full miss ceiling carries `firmware` or
+    `hop1_abort`; every other source either returns before recording or
+    sets `waited_full_timeout` False, and `report_window` belongs to the
+    report/answer sends, which never record a send result at all. The
+    failure branch still stamps `last_failure_at`, which is what the
+    cooldown re-try in `_choose_path` reads.
+
+    Placement: the call sits in `_send_direct_frame_and_wait_for_ack`
+    beside `_capture_direct_attempt_result`, because that is the single
+    place that knows both an attempt's outcome and WHY -- and because
+    every caller reaches it, including the raw fragments and the
+    QUERY/ANSWER sends that bypass `_send_direct_with_attempts` and were
+    the whole of the field bill.
+
+    Not changed: `_record_query_path_evidence` still passes
+    `path_sample=False`. A QUERY round is still not a rate sample of its
+    own -- alpha 0.1.6's second cut stands -- what changed is that the
+    round's individual attempts are now counted, which is the airtime it
+    actually spent. The re-pinned assertion in
+    `tests/test_path_selection_0922.py` states both halves at the line.
+
+    Tests: `tests/test_path_misses_per_attempt_0923.py` (both field
+    sequences replayed at their real inter-attempt times; a healthy path at
+    50 % attempt success not abandoned on a missed send; every excluded
+    source; the no-ACK success; the thresholds as the old ones times
+    `direct_send_attempts`). Four assertions of
+    `tests/test_path_selection_0922.py` re-pinned in the new unit, with a
+    `_missed_send` helper that drives a send the way production does.
+    Shipped-default pin and golden config re-pinned (one default changed).
+    MeshBench: `failover`, `repeater_returns`, `shortcut_appears`,
+    `two_hop`, `weak_direct`.

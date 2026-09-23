@@ -901,7 +901,15 @@ class _ConfigMixin:
         legacy = cfg.get("path_adopt_enabled")
         self.path_selection_enabled = _cfg_bool(cfg.get("path_selection_enabled", "yes" if legacy is None else legacy))
         self.path_weak_snr_db = float(cfg.get("path_weak_snr_db", 3.0))
-        self.path_switch_after_misses = max(1, int(cfg.get("path_switch_after_misses", 2)))
+        # Alpha 0.1.9 (item 4): 2 -> 4 because the unit changed. This
+        # counts consecutive missed ATTEMPTS now, not missed sends, and a
+        # missed send is exactly `direct_send_attempts` (2) consecutive
+        # missed attempts -- so 4 is the same patience 2 used to buy, while
+        # a send with a larger budget (a four-attempt handshake, a pass-1
+        # finish) finally costs what it spends. See
+        # `_note_path_attempt_result` for the field evidence and for why
+        # the delivery-rate samples stay per send.
+        self.path_switch_after_misses = max(1, int(cfg.get("path_switch_after_misses", 4)))
         self.path_switch_margin = max(0.0, float(cfg.get("path_switch_margin", 0.25)))
         self.path_switch_cooldown_s = max(0.0, float(cfg.get("path_switch_cooldown", 120.0)))
 

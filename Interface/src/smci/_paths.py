@@ -14,7 +14,23 @@ from ._common import _PathBoard, _PathCandidate, _ResolvedPath
 # the path still used) until PATH_EXHAUST_MISSES consecutive missed sends;
 # below the rate, `path_switch_after_misses` misses exhaust it as before.
 PATH_HEALTHY_RATE = 0.5
-PATH_EXHAUST_MISSES = 4
+# Alpha 0.1.9 (item 4): `consecutive_misses` counts ATTEMPTS, not sends, so
+# both thresholds are doubled -- a missed send is exactly
+# `direct_send_attempts` (2) consecutive missed attempts, so 8 attempts is
+# the 4 missed sends this was before, and `path_switch_after_misses` 4 is
+# the 2 it was. See `_note_path_attempt_result` for why the unit changed.
+PATH_EXHAUST_MISSES = 8
+# The only two missed-attempt reasons that are evidence about the PATH.
+# Everything else in `ack_timeout_source` is this node's own decision or a
+# reply that arrived another way, and must not kill a path: "measured" (the
+# engine's own tightened ceiling, which already sets waited_full_timeout
+# False), "report_window" (alpha 0.1.8 item 2's deliberately short local
+# ceiling on a report/answer -- 6 of the 21 failed attempts in the desktop's
+# 2026-09-23 11:20-11:45 window were these), "preempted", "superseded",
+# "answered", "answered_before_send", "expired" and "noack" (a no-ACK frame
+# has no outcome at all). "hop1_abort" IS included deliberately: its premise
+# is silence where a forward was due, which is exactly a path failure.
+PATH_ATTEMPT_MISS_SOURCES = ("firmware", "hop1_abort")
 
 
 class _PathDiscoveryMixin:
@@ -1034,6 +1050,85 @@ class _PathDiscoveryMixin:
                                             self.PATH_SAMPLE_HALF_LIFE_S)
         return int(resolved.out_path_len), rate
 
+    def _note_path_attempt_result(self, peer_prefix: Optional[str], ok: bool, waited_full_timeout: bool,
+                                  ack_timeout_source: str, ack_latency_s: Optional[float] = None) -> None:
+        """One ATTEMPT's outcome on the path it went over (alpha 0.1.9,
+        item 4). Moves `consecutive_misses` only: the delivery-rate samples
+        stay one per send.
+
+        The defect this fixes. Airtime is spent per attempt, but the
+        scoreboard learned per send -- and a fragmented send's per-fragment
+        attempts were not recorded at all (`record_result=False` on the
+        fragment passes), while a QUERY round's were deliberately not a
+        sample (`path_sample=False`, alpha 0.1.6's second cut). The
+        desktop's 2026-09-23 capture shows what that costs: between
+        11:29:35 and 11:31:26 it spent nine raw-fragment attempts and two
+        QUERY attempts on a two-hop path that was dead, every one a
+        `firmware` miss, and no `direct_send_result` at all in that span --
+        so almost nothing reached the scoreboard, the board did not reach
+        its trial threshold until 11:41:22 and never reached "exhausted".
+        The same shape cost 14 attempts and 2.5 minutes on 2026-09-22
+        between 22:28 and 22:31, where 14 attempts registered as 3 misses.
+        Counting attempts, the 11:29 burst passes `path_switch_after_misses`
+        at its fourth attempt and `PATH_EXHAUST_MISSES` at its eighth, so
+        discovery runs about a minute in rather than ten.
+
+        Why the count and not the rate (design (B), written down as the
+        release asked). The delivery rate is not a local number: it is
+        computed from `samples`, put on the wire in the "Q" v5 rate byte by
+        `_path_rate_for_wire`, and read by the peer as the FIRST rule of
+        `_path_prior`. `PATH_PRIOR_OPTIMISTIC` (0.8), `PATH_PRIOR_WEAK`
+        (0.25), `PATH_HEALTHY_RATE` (0.5) and `PATH_RATE_FLOOR` are all
+        calibrated against per-send rates, and so is the replay fixture
+        `tests/fixtures/field_0921_desktop_22h.json`. A per-attempt rate
+        would settle near 0.65 at one hop and 0.51 at two (the measured
+        field figures), below the 0.8 optimistic prior, so every untried
+        candidate would outscore every measured one -- the churn alpha
+        0.1.8's item 3 was written to stop -- and all four constants would
+        have to be re-derived first. `consecutive_misses` is purely local
+        and is the quantity the death clock actually reads, so it is the
+        one that changes unit.
+
+        The thresholds are rescaled by `direct_send_attempts` so today's
+        patience is preserved exactly: a missed send IS two consecutive
+        missed attempts (any successful attempt both ends the send and
+        resets the counter), so 2 -> 4 and 4 -> 8. On a healthy path at
+        50 % attempt success that still means about 20 sends to a trial and
+        about 340 to exhaustion, as before -- the "fourth cut" patience in
+        `_choose_path` is untouched. What changes is that a send with a
+        LARGER budget now costs what it spends: a four-attempt handshake or
+        pass-1 finish counts four, not one.
+
+        Which attempts count is deliberately an allow-list, not a
+        deny-list (`PATH_ATTEMPT_MISS_SOURCES`): a miss is evidence about
+        the path only when this node transmitted and waited the full miss
+        ceiling and the silence is the path's. A locally shortened ceiling,
+        a pre-empted wait, a supersession, an expiry in the lock queue, a
+        reply that arrived another way and a no-ACK frame are all excluded,
+        and so, as before, is anything with `waited_full_timeout` False."""
+        if not self.path_selection_enabled or not peer_prefix:
+            return
+        if ok:
+            if ack_timeout_source == "noack" or ack_latency_s is None:
+                return          # no real ACK came back: not evidence either way
+        elif not (waited_full_timeout and ack_timeout_source in PATH_ATTEMPT_MISS_SOURCES):
+            return
+        resolved = self._resolved_paths.get(peer_prefix)
+        path_hex = (resolved.out_path_hex or "").lower() if resolved is not None else None
+        if not path_hex:
+            return
+        board = self._path_board(peer_prefix)
+        cand = board.candidates.get(path_hex)
+        if cand is None:
+            return              # nothing known about this path yet; the send outcome adds it
+        now = time.monotonic()
+        if ok:
+            cand.consecutive_misses = 0
+            cand.last_success_at = now
+        else:
+            cand.consecutive_misses += 1
+            cand.last_failure_at = now
+
     def _note_path_result(self, peer_prefix: str, path_hex: Optional[str], ok: bool,
                           ack_latency_s: Optional[float] = None, now: Optional[float] = None) -> None:
         """One send's outcome on a candidate path (a send = its whole
@@ -1057,7 +1152,25 @@ class _PathDiscoveryMixin:
             if ack_latency_s is not None and ack_latency_s > 0:
                 cand.ack_latencies.append(float(ack_latency_s))
         else:
-            cand.consecutive_misses += 1
+            # Alpha 0.1.9 (item 4): the miss COUNT is kept per attempt by
+            # `_note_path_attempt_result`, which has already counted every
+            # attempt behind this send; incrementing again here would
+            # double-count it. The delivery-rate SAMPLE stays per send --
+            # that number is published on the wire and read by the peer as
+            # a prior, so its unit must not change.
+            #
+            # The invariant that makes this safe: every send that reaches
+            # here with `succeeded=False` has at least one counted attempt
+            # behind it. `record_direct_send_result` is only reached on a
+            # failure with `waited_full_timeout` True, and an attempt that
+            # waited the full miss ceiling has `ack_timeout_source`
+            # "firmware" or "hop1_abort" -- the two in
+            # PATH_ATTEMPT_MISS_SOURCES. Every other source either returns
+            # before recording (expired, superseded, answered) or sets
+            # `waited_full_timeout` False (measured), and "report_window"
+            # belongs to the report/answer sends, which never record a send
+            # result at all. A miss counted here as well would be the same
+            # airtime counted twice.
             cand.last_failure_at = now
         if board.current is None:
             board.current = path_hex
@@ -1155,7 +1268,7 @@ class _PathDiscoveryMixin:
                 if reason == "exhausted":
                     RNS.log(
                         f"{self}: every candidate path to {peer_prefix!r} has missed its last "
-                        f"{self.path_switch_after_misses} send(s) -- running path discovery.",
+                        f"{self.path_switch_after_misses} attempt(s) -- running path discovery.",
                         RNS.LOG_WARNING,
                     )
             board.last_reason = reason

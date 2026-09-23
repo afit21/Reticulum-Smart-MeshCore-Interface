@@ -1693,6 +1693,14 @@ class _DirectSendMixin:
                     f"quiet_hold={quiet_hold_s if quiet_hold_s is None else round(quiet_hold_s, 2)}"
                     + (f" (local send exception: {send_exc})" if send_exc is not None else "") + "."
                 )
+                # Alpha 0.1.9 (item 4): one attempt's evidence about the
+                # path, recorded here because this is the single place that
+                # knows both the outcome and WHY -- every caller of this
+                # method reaches it, including the raw fragments and the
+                # QUERY/ANSWER sends that bypass `_send_direct_with_attempts`
+                # and were therefore never counted at all.
+                self._note_path_attempt_result(peer_prefix, ok, waited_full_timeout,
+                                               ack_timeout_source, ack_latency_s=ack_latency_s)
                 self._capture_direct_attempt_result(
                     peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,

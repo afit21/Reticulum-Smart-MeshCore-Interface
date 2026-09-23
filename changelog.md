@@ -32,6 +32,22 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   Capture: `proof_tail_hold_s` on the proof's attempt record and a `proof_tail_hold` decision
   record. Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`. MeshBench: `two_hop`, `three_hop`,
   `large_payload`, `relay`.
+- **Path misses count per attempt** (`path_switch_after_misses` 2 -> 4, `PATH_EXHAUST_MISSES` 4 -> 8;
+  both are the old thresholds expressed in the new unit, since a missed send is exactly
+  `direct_send_attempts` = 2 consecutive missed attempts). Airtime is spent per attempt but the
+  scoreboard learned per send, and the two paths that spend the most recorded nothing: a fragmented
+  send's per-fragment attempts pass `record_result=False` and a QUERY round's evidence passes
+  `path_sample=False`. On 2026-09-23 the desktop spent nine raw-fragment attempts and two QUERY
+  attempts on a dead two-hop path between 11:29:35 and 11:31:26 with no `direct_send_result` at all,
+  did not reach its trial threshold until 11:41:22 and never exhausted; replayed per attempt it
+  stops being current 29 s in and exhausts 85 s in. The delivery-rate samples stay one per send --
+  that number goes on the wire and is read by the peer as a prior, and four constants are calibrated
+  against it -- so only the miss count changes unit. Which attempts count is an allow-list
+  (`firmware`, `hop1_abort`): a locally shortened ceiling, a pre-empted or superseded wait, an
+  expiry in the lock queue, a reply that arrived another way and a no-ACK frame are all excluded,
+  and 6 of the 21 failed attempts in that field window were the excluded `report_window` class.
+  Tests: `tests/test_path_misses_per_attempt_0923.py`. MeshBench: `failover`, `repeater_returns`,
+  `shortcut_appears`, `two_hop`, `weak_direct`.
 - **Cache defaults that survive a field day** (`announce_cache_ttl` 3600 -> 604800,
   `path_request_local_answer_min_interval` 120 -> 600). The session's two stops were two hours
   apart and the announce cache's TTL was one hour, so every entry cached at the first stop had

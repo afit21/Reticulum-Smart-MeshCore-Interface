@@ -186,23 +186,32 @@ class PureChoose(_Pure):
         """Fourth cut (the 2026-09-22 baseline suite): at one hop's ~50 %
         attempt success two consecutive missed sends are common; a path
         with a measured rate of at least PATH_HEALTHY_RATE stays in use
-        (no discovery flood) until PATH_EXHAUST_MISSES misses."""
+        (no discovery flood) until PATH_EXHAUST_MISSES misses.
+
+        Re-pinned by alpha 0.1.9 (item 4) in ATTEMPTS: the counter now
+        moves per attempt, so both thresholds doubled (a missed send is
+        exactly `direct_send_attempts` = 2 consecutive missed attempts) and
+        the scenario below is the same one expressed in the new unit. The
+        patience the fourth cut bought is unchanged -- about 20 sends to a
+        trial and about 340 to exhaustion on a path at 50 % attempt
+        success."""
         now = time.monotonic()
         healthy = [(now - 60 + i, True) for i in range(6)] + [(now - 10, False), (now - 5, False)]
-        current = _view("19", 1, samples=healthy, consecutive_misses=2, last_failure_at=now - 5)
+        # two missed sends = four missed attempts
+        current = _view("19", 1, samples=healthy, consecutive_misses=4, last_failure_at=now - 5)
         hex_, reason, _ = _choose(self.Iface, [current], "19", now)
         self.assertEqual((hex_, reason), ("19", "current_best"))
-        # a better-scoring alternative is still trialled after the two misses
+        # a better-scoring alternative is still trialled after those misses
         hex_, reason, _ = _choose(self.Iface, [current, _view("", 0, snr=12.0)], "19", now)
         self.assertEqual((hex_, reason), ("", "trial"))
-        # four misses exhaust it even with the good record
+        # four missed sends (eight attempts) exhaust it even with the good record
         four = healthy + [(now - 3, False), (now - 1, False)]
-        exhausted = _view("19", 1, samples=four, consecutive_misses=4, last_failure_at=now - 1)
+        exhausted = _view("19", 1, samples=four, consecutive_misses=8, last_failure_at=now - 1)
         self.assertEqual(_choose(self.Iface, [exhausted], "19", now)[1], "exhausted")
-        # an unhealthy one (no successes) is exhausted on two, as before
-        fresh = _view("19", 1, samples=[(now - 10, False), (now - 5, False)], consecutive_misses=2, last_failure_at=now - 5)
+        # an unhealthy one (no successes) is exhausted on two sends, as before
+        fresh = _view("19", 1, samples=[(now - 10, False), (now - 5, False)], consecutive_misses=4, last_failure_at=now - 5)
         self.assertEqual(_choose(self.Iface, [fresh], "19", now)[1], "exhausted")
-        self.assertEqual((self.module.PATH_HEALTHY_RATE, self.module.PATH_EXHAUST_MISSES), (0.5, 4))
+        self.assertEqual((self.module.PATH_HEALTHY_RATE, self.module.PATH_EXHAUST_MISSES), (0.5, 8))
 
     def test_trial_on_the_best_alternative_after_the_misses(self):
         now = time.monotonic()
@@ -463,6 +472,18 @@ class _Scaffold(SingleNodeCase):
 
 
 class ScoreboardOnTheInterface(_Scaffold):
+    def _missed_send(self, peer=None, attempts=None):
+        """One missed DIRECT send as production produces it (alpha 0.1.9,
+        item 4): each of its attempts recorded through
+        `_note_path_attempt_result`, then the send's own outcome. The miss
+        COUNT comes from the attempts now and the rate SAMPLE from the send,
+        so a test that drives only the send outcome no longer moves the
+        counter -- deliberately, since that would count the airtime twice."""
+        peer = peer or PEER
+        for _ in range(attempts if attempts is not None else self.iface.direct_send_attempts):
+            self.on_loop(lambda: self.iface._note_path_attempt_result(peer, False, True, "firmware"))
+        self.on_loop(self.iface.record_direct_send_result, peer, False, True)
+
     def test_at_most_path_candidates_kept_per_peer(self):
         iface = self.iface
         now = time.monotonic()
@@ -548,14 +569,15 @@ class ScoreboardOnTheInterface(_Scaffold):
         try:
             first = self._select()
             self.assertEqual(first.out_path_hex, "19", "the untried one-hop candidate scores best")
-            self.on_loop(iface.record_direct_send_result, PEER, False, True)
-            self.assertEqual(iface._resolved_paths[PEER].out_path_hex, "19", "one miss: nothing changes")
-            self.on_loop(iface.record_direct_send_result, PEER, False, True)
+            self._missed_send()
+            self.assertEqual(iface._resolved_paths[PEER].out_path_hex, "19", "one missed send: nothing changes")
+            self._missed_send()
             trial = self._select()
         finally:
             restore()
         board = self._board()
-        self.assertEqual(board.candidates["19"].consecutive_misses, 2)
+        # Two missed sends, now counted as their four attempts (item 4).
+        self.assertEqual(board.candidates["19"].consecutive_misses, 4)
         self.assertEqual(trial.out_path_hex, "1976")
         self.assertEqual(iface._resolved_paths[PEER].out_path_hex, "1976")
         self.assertEqual(iface._resolve_contact(PEER)["out_path"], "1976", "the trial goes to the radio")
@@ -580,10 +602,22 @@ class ScoreboardOnTheInterface(_Scaffold):
             self.on_loop(iface._record_query_path_evidence, PEER, [miss, miss])
             self.on_loop(iface._record_query_path_evidence, PEER, [miss, miss])
             self.assertEqual(self._board().candidates["19"].consecutive_misses, 0, "QUERY rounds are not samples")
+            self.assertEqual(len(self._board().candidates["19"].samples), 0)
+            # Alpha 0.1.9 (item 4) re-pin. A QUERY round is still not a rate
+            # SAMPLE of its own -- that is what this test is about and it is
+            # unchanged. What did change is that the round's individual
+            # ATTEMPTS are now counted, because each one is airtime spent on
+            # this path; `_record_query_path_evidence` does not make them, the
+            # QUERY's own `_send_direct_frame_and_wait_for_ack` calls do.
+            self.on_loop(lambda: iface._note_path_attempt_result(PEER, False, True, "firmware"))
+            self.assertEqual(self._board().candidates["19"].consecutive_misses, 1, "the attempt is")
             self.on_loop(iface.record_direct_send_result, PEER, False, True)
-            self.assertEqual(self._board().candidates["19"].consecutive_misses, 1, "the window's outcome is")
+            self.assertEqual(self._board().candidates["19"].consecutive_misses, 1,
+                             "the send outcome adds the sample, not a second miss for the same airtime")
+            self.assertEqual(len(self._board().candidates["19"].samples), 1, "the window's outcome is the sample")
             self.on_loop(lambda: iface.record_direct_send_result(PEER, False, True, path_sample=False))
             self.assertEqual(self._board().candidates["19"].consecutive_misses, 1)
+            self.assertEqual(len(self._board().candidates["19"].samples), 1)
         finally:
             restore()
 
@@ -593,8 +627,8 @@ class ScoreboardOnTheInterface(_Scaffold):
         sink, restore = self._capture()
         try:
             self._select()
-            self.on_loop(iface.record_direct_send_result, PEER, False, True)
-            self.on_loop(iface.record_direct_send_result, PEER, False, True)
+            self._missed_send()
+            self._missed_send()
             exhausted = self._select()
             again = self._select()
         finally:
@@ -627,7 +661,8 @@ class ShippedDefaults(unittest.TestCase):
         bare._configure_path_discovery({})
         self.assertTrue(bare.path_selection_enabled)
         self.assertEqual(bare.path_weak_snr_db, 3.0)
-        self.assertEqual(bare.path_switch_after_misses, 2)
+        # Alpha 0.1.9 (item 4): 4 attempts = the 2 sends this used to mean.
+        self.assertEqual(bare.path_switch_after_misses, 4)
         self.assertEqual(bare.path_switch_margin, 0.25)
         self.assertEqual(bare.path_switch_cooldown_s, 120.0)
         self.assertEqual((Iface.PATH_CANDIDATES_KEPT, Iface.PATH_SAMPLES_KEPT), (4, 8))
