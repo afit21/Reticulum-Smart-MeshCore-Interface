@@ -5435,3 +5435,110 @@ added, no wire change, the version stays alpha 0.1.9.
     attempt_0923.py` passes unchanged. MeshBench: `zero_hop`, `failover`,
     `repeater_returns`.
 
+ 2. **Path eligibility weighs the measured rate** (`_choose_path` in
+    `_paths.py`, still pure; PATH_EXHAUST_MISSES also becomes the "dead"
+    mark). No wire change, no config key, no default changed.
+
+    Defect B, session 1. During the 57-minute drive the desktop made 23
+    path decisions and the laptop 22 (6 to 11 per whole session before);
+    16 of the desktop's decisions that chose a path never delivered -- 84
+    attempts, 626 s of ACK waits, which is where its 201 s lock waits
+    came from -- three of them trials of the zero-hop path at 21:33:37,
+    21:41:43 and 21:46:17. The first of those was stale (its evidence
+    aged out, weak prior, four missed sends), the other two measured 0.0
+    over five and then ten missed sends. The first pass's evidence ageing
+    could not catch them: a candidate with fresh misses is not stale. Two
+    rules produced it. A candidate was re-admitted `path_switch_cooldown`
+    (120 s) after its last miss whatever its measured rate. And the
+    fourth cut's patience -- a current path keeps its eligibility through
+    its misses -- applied only at PATH_HEALTHY_RATE (0.5) or above, which
+    no path reaches when moving at two to four hops (every path was at
+    30 to 45 %). So the current path lost eligibility on its misses and
+    the board cycled through everything on cooldown, dead zero-hop path
+    included. With misses counted per attempt (item 1 restores that on
+    zero hop) the same trigger fires about twice as fast, which is why
+    this item lands before the counting goes back on a radio.
+
+    The rule now:
+      * DEAD: a candidate with PATH_EXHAUST_MISSES consecutive missed
+        attempts stays ineligible, whatever the cooldown says, until fresh
+        external evidence for it arrives -- a flood copy, a zero-hop peer
+        report, a discovery result: anything that refreshes `last_seen`
+        after its last failure (discovery also resets its count, so a
+        discovered path is never dead).
+      * After its cooldown a candidate is eligible only if its measured
+        rate is unknown, at least the current path's measured rate, or
+        fresh evidence has arrived since its last miss.
+      * Past the miss threshold the current path is KEPT ("current_best")
+        while it has delivered in the window (measured rate above 0) and
+        that rate beats every eligible alternative's -- its measured rate,
+        or the prior it is ranked with, or, when fresh evidence arrived
+        after its last miss, the prior that evidence gives it -- unless the
+        current path is itself dead. This generalises "above 50 %" to
+        "better than the alternatives". A path at 0.0 is not kept (alone it
+        exhausts at `path_switch_after_misses`, as before).
+      * Nothing eligible: "exhausted", and the caller runs discovery.
+
+    Two readings of the brief, stated so they can be checked. "Measured
+    at zero over PATH_EXHAUST_MISSES or more samples" is read as that many
+    consecutive missed attempts (the counter's unit since the first
+    pass): the rate samples are per send and at most eight are kept, and
+    a candidate is only ever dead with no success since those misses.
+    "Unless it has reached PATH_EXHAUST_MISSES with no success in the
+    window" is read the same way. Read literally ("no success anywhere in
+    the 600 s window"), a lone path that had delivered at home would be
+    kept until its last success aged out of the eight-sample deque --
+    about 16 attempts -- and defect A's delay would partly come back; with
+    this reading item 1's replay still exhausts at the eighth attempt.
+    The fresh-evidence prior in the third bullet was not in the brief: it
+    is what the alpha 0.1.6 replay (`FieldReplay.test_b`, 2026-09-21
+    22:10:24) needs, where a one-hop flood copy arrived 53 s after that
+    path's last miss and the trial of it is the pinned outcome; comparing
+    the current path's 0.47 against the one-hop path's superseded 0.19
+    would have kept the two-hop path instead.
+
+    The replays (`tests/fixtures/field_0923_path_decisions.json`: all 23
+    decisions of the desktop's drive capture, all 11 of the laptop's
+    21:15 capture, and alpha 0.1.8's desktop 11:41:22 / 11:41:37). Each
+    is the scoreboard as its `path_selected` record printed it, plus what
+    the record does not carry, rebuilt from the capture: `board.current`
+    (a trial does not move it), the miss count in attempts (the record's
+    per-send count times two, the first pass's exact rescale), the last
+    failure (charged the way the scoreboard charges it) and switch-back
+    cooldowns. Fidelity check made when the fixture was built: replayed
+    through the rule those builds ran, it reproduces every field decision
+    that came out of `_choose_path` (the `discovered` and `switch` records
+    come from discovery and `_note_path_result`, not from it). Through the
+    new rule:
+      * desktop 21:33:37 keeps `0276` at 0.31 (`current_best`); 21:41:43
+        trials `19be4f76`, the four-hop path measured at 0.43 against the
+        current 0.21 (the field trialled it 95 s later, after the dead
+        zero-hop path); 21:46:17 is "exhausted" -- discovery. No trial of
+        the zero-hop path at any of the three.
+      * laptop 21:28:20 to 21:32:21: one trial (`0219`, the two-hop path
+        the peer reported at 1.0), then `19` at 0.31 to 0.37 kept at every
+        decision; discovery follows when `19` dies.
+      * alpha 0.1.8 11:41:22 still trials the fresh candidate `1902` after
+        the dead `19d6`.
+      * the alpha 0.1.6 and 0.1.7 path tests pass unchanged.
+
+    What it costs, from the same replays: at the desktop's 20:54:39 and
+    21:32:53 the new rule keeps a current path measured at 0.40 and 0.36
+    over an untried candidate scored with the weak prior (0.25), and in
+    both cases the field's trial of that candidate delivered (it read
+    0.64 and 1.0 at the next decision). Patience against weak-evidence
+    candidates is the brief's rule; whether PATH_PRIOR_WEAK is too low for
+    candidates heard at two to four hops is a calibration question, not
+    taken here.
+
+    Tests: `tests/test_rate_aware_eligibility_0924.py` (the replays above;
+    a dead candidate stays out whatever the cooldown; fresh evidence
+    re-admits it after its cooldown and it competes on that evidence's
+    prior; after the cooldown only a candidate no worse than the current
+    path is eligible; the current path kept against a weak candidate, not
+    against an optimistic one, not once dead, and "current" unchanged
+    under the threshold; on the live scoreboard, a dead zero-hop
+    candidate not trialled until a zero-hop flood copy arrives). MeshBench:
+    `shortcut_appears` x3, `failover`, `repeater_returns`, `weak_direct`,
+    `two_hop` x2.
+

@@ -74,6 +74,19 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   Only a missing resolved path returns now. Replayed, the run reaches the trial threshold at its fourth
   attempt and exhausts at its eighth (69 s in), and discovery runs. Tests:
   `tests/test_zero_hop_attempts_count_0924.py` (fixture `field_0923_laptop_zero_hop_miss_run.json`).
+- **Second pass (2026-09-24), item 2: path eligibility weighs the measured rate.** On session 1's drive
+  (2026-09-23) the desktop made 23 path decisions, 16 of them never delivering (84 attempts, 626 s),
+  three of them trials of a zero-hop path measured dead: a candidate came back 120 s after its last miss
+  whatever its rate, and the patience that keeps a current path through its misses applied only above
+  50 %, which nothing reaches at two to four hops. Now a candidate with `PATH_EXHAUST_MISSES`
+  consecutive missed attempts is dead until fresh external evidence (a flood copy, a peer report, a
+  discovery result); after its cooldown a candidate must measure at least the current path's rate
+  (or be unmeasured, or have been heard since); and past its miss threshold the current path is kept
+  while its measured rate beats every eligible alternative. Replayed, none of the three zero-hop
+  trials happens, the laptop's four no-evidence trials become one, and alpha 0.1.6-0.1.8's replays
+  are unchanged. Cost, from the same replays: twice the new rule keeps a 0.36-0.40 path where the
+  field's trial of a weak-prior candidate delivered. Tests:
+  `tests/test_rate_aware_eligibility_0924.py` (fixture `field_0923_path_decisions.json`).
 - **Second pass (2026-09-24), item 5: `field_ab_compare.py` prints the path scoreboard's cost.**
   Per node: `path_selected` decisions, the longest run of consecutive counted misses on one path per
   hop count and what ended it, and the decisions that chose a path and got zero successes (count,

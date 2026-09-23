@@ -5151,6 +5151,11 @@ class _PeerStateMixin:
 # is at least PATH_HEALTHY_RATE stays eligible (a trial target and, alone,
 # the path still used) until PATH_EXHAUST_MISSES consecutive missed sends;
 # below the rate, `path_switch_after_misses` misses exhaust it as before.
+# Alpha 0.1.9 second pass (item 2): PATH_EXHAUST_MISSES is also the DEAD
+# mark -- a candidate with that many consecutive missed attempts stays
+# ineligible, cooldown or not, until fresh external evidence arrives for it
+# -- and the current path's patience no longer needs 0.5: it is kept while
+# its measured rate beats every eligible alternative (`_choose_path`).
 PATH_HEALTHY_RATE = 0.5
 # Alpha 0.1.9 (item 4): `consecutive_misses` counts ATTEMPTS, not sends, so
 # both thresholds are doubled -- a missed send is exactly
@@ -6014,43 +6019,67 @@ class _PathDiscoveryMixin:
     def _choose_path(cls, views, current_hex: Optional[str], now: float, switch_after_misses: int, cooldown_s: float,
                      weak_snr_db: float, window_s: float, half_life_s: float, **kw) -> "tuple[Optional[str], str, list]":
         """The switching rule (pure): (path hex or None, reason, ranked).
-        A candidate is eligible while it has missed fewer than
-        `switch_after_misses` consecutive sends, while its measured
-        delivery rate is at least PATH_HEALTHY_RATE and it has missed fewer
-        than PATH_EXHAUST_MISSES (a delivering path is not abandoned on two
-        misses at 50 % attempt success), or again once its last miss is
-        older than `cooldown_s` (the re-try the field lacked). With
-        no current path the best eligible candidate is "selected"; a current
-        path still under the miss threshold is kept ("current", whatever the
-        alternatives score -- a delivering path is not abandoned on hop
-        count); past it, the best eligible candidate is used: the current
-        one itself ("current_best") or another as a "trial". "exhausted":
-        every candidate has failed its last sends -- the caller runs
-        discovery; "none": nothing is known."""
+
+        Eligibility. A candidate that has missed PATH_EXHAUST_MISSES
+        consecutive attempts is DEAD and stays ineligible, whatever the
+        cooldown says, until fresh external evidence for it arrives -- a
+        flood copy, a zero-hop peer report or a discovery result, i.e.
+        anything that refreshes `last_seen` after its last failure (a
+        discovery result also resets the count). Otherwise a candidate is
+        eligible while it has missed fewer than `switch_after_misses`
+        consecutive attempts, while its measured delivery rate is at least
+        PATH_HEALTHY_RATE, or once its last miss is older than `cooldown_s`
+        -- and then only if its measured rate is unknown, or at least the
+        current path's measured rate, or fresh evidence has arrived since
+        that miss (alpha 0.1.9 second pass, item 2).
+
+        Choice. With no current path the best eligible candidate is
+        "selected". A current path under the miss threshold is kept
+        ("current", whatever the alternatives score -- a delivering path is
+        not abandoned on hop count). Past it, the current path is still
+        kept ("current_best") while it has delivered in the window and its
+        measured rate beats the rate of every eligible alternative --
+        measured, or the prior it is ranked with, or its prior when fresh
+        evidence has arrived since its last miss -- unless it is dead.
+        Otherwise the best eligible candidate is used: the current one
+        itself ("current_best") or another as a "trial". "exhausted":
+        nothing is eligible -- the caller runs discovery; "none": nothing is
+        known."""
         views = list(views)
         if not views:
             return None, "none", []
         ranked = cls._rank_paths(views, now, weak_snr_db, window_s, half_life_s, **kw)
         measured = {id(v): (rate if m else None) for _s, v, rate, m in ranked}
+        used_rate = {id(v): rate for _s, v, rate, _m in ranked}
+        by_hex = {v["path_hex"]: v for v in views}
+        current = by_hex.get(current_hex) if current_hex is not None else None
+        current_rate = measured.get(id(current)) if current is not None else None
+
+        def fresh_evidence(v) -> bool:
+            seen, failed = v.get("last_seen"), v.get("last_failure_at")
+            return seen is not None and failed is not None and float(seen) > float(failed)
+
+        def dead(v) -> bool:
+            return int(v.get("consecutive_misses") or 0) >= PATH_EXHAUST_MISSES and not fresh_evidence(v)
 
         def eligible(v) -> bool:
+            if dead(v):
+                return False
             misses = int(v.get("consecutive_misses") or 0)
             if misses < switch_after_misses:
                 return True
-            # Fourth cut (2026-09-22, the baseline suite): a path with a
-            # healthy measured record keeps its eligibility for a while
-            # longer -- at one hop's ~50 % attempt success two consecutive
-            # missed sends are common, and exhausting a delivering path on
-            # them meant a relayed discovery flood where alpha 0.1.5's
-            # detector had shown patience (its healthy-path multiplier).
             rate = measured.get(id(v))
-            if rate is not None and rate >= PATH_HEALTHY_RATE and misses < PATH_EXHAUST_MISSES:
+            # Fourth cut (2026-09-22): a healthy measured record keeps a
+            # candidate eligible through a run of misses short of dead.
+            if rate is not None and rate >= PATH_HEALTHY_RATE:
                 return True
             last = v.get("last_failure_at")
-            return last is not None and now - float(last) >= cooldown_s
+            if last is None or now - float(last) < cooldown_s:
+                return False
+            if v is current or current_rate is None or rate is None or fresh_evidence(v):
+                return True
+            return rate >= current_rate
 
-        by_hex = {v["path_hex"]: v for v in views}
-        current = by_hex.get(current_hex) if current_hex is not None else None
         if current is None:
             for _score, v, _rate, _m in ranked:
                 if eligible(v):
@@ -6058,6 +6087,23 @@ class _PathDiscoveryMixin:
             return None, "exhausted", ranked
         if int(current.get("consecutive_misses") or 0) < switch_after_misses:
             return current_hex, "current", ranked
+        def rival_rate(v) -> float:
+            # A candidate heard from since its last failure competes on what
+            # that evidence says (its prior), not on the misses it superseded
+            # -- the same reading that re-opens it above. The 2026-09-21
+            # replay (tests/test_path_selection_0922.py) is this case: a
+            # one-hop flood copy 53 s after that path's last miss.
+            if not fresh_evidence(v):
+                return used_rate[id(v)]
+            peer_rate, snr, stale = cls._path_evidence(v, now, window_s)
+            return cls._path_prior(int(v.get("hops") or 0), snr, weak_snr_db, peer_rate,
+                                   optimistic=kw.get("optimistic", 0.8), weak=kw.get("weak", 0.25), stale=stale,
+                                   peer_path_len=kw.get("peer_path_len"))
+
+        if current_rate is not None and current_rate > 0.0 and not dead(current):
+            rivals = [rival_rate(v) for _s, v, _r, _m in ranked if v is not current and eligible(v)]
+            if all(current_rate > r for r in rivals):
+                return current_hex, "current_best", ranked
         for _score, v, _rate, _m in ranked:
             if eligible(v):
                 return v["path_hex"], ("current_best" if v is current else "trial"), ranked
