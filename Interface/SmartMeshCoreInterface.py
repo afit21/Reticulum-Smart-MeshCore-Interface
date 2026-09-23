@@ -6253,7 +6253,16 @@ class _PathDiscoveryMixin:
             return
         resolved = self._resolved_paths.get(peer_prefix)
         path_hex = (resolved.out_path_hex or "").lower() if resolved is not None else None
-        if not path_hex:
+        # Alpha 0.1.9, second pass (item 1): "" IS a path -- the zero-hop
+        # one -- so only a missing resolved path returns here. The first
+        # pass wrote `if not path_hex`, which dropped every zero-hop attempt
+        # as "no path"; since `_note_path_result` no longer increments the
+        # counter, the zero-hop path's misses were then counted nowhere.
+        # Session 2 of 2026-09-23 evening: after the laptop drove off at
+        # 22:20 it missed 144 consecutive zero-hop attempts over 20 minutes
+        # with one `path_selected` record in the whole capture, and the
+        # desktop did the same, until the laptop was restarted.
+        if path_hex is None:
             return
         board = self._path_board(peer_prefix)
         cand = board.candidates.get(path_hex)

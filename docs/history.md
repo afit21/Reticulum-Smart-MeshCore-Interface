@@ -5384,3 +5384,54 @@ added, no wire change, the version stays alpha 0.1.9.
     the rows print; and, when the captures are present locally, the two
     sessions reading as above).
 
+ 1. **A zero-hop attempt counts** (`_note_path_attempt_result` in
+    `_paths.py`: `if not path_hex` -> `if path_hex is None`). No wire
+    change, no config key, no default changed.
+
+    Defect A, session 2. The zero-hop path's hex is the empty string, and
+    the first pass's item 4 returned on `if not path_hex`, so every
+    zero-hop attempt was dropped as "no path". Because the same item had
+    stopped `_note_path_result` from incrementing the count (so a missed
+    send is not billed twice), the zero-hop path's misses were counted
+    nowhere: it could not reach `path_switch_after_misses`, the exhausted
+    branch never ran, and discovery was never asked for. After its last
+    ACK at 22:18:00 the laptop missed 144 consecutive attempts on the
+    zero-hop path, 22:18:24 to 22:40:22, with one `path_selected` record
+    in the whole capture (the start-up "discovered" at 22:09); the
+    desktop did the same (a 27-attempt run to the end of its capture)
+    until the laptop was restarted, and nothing at one to three hops got
+    through meanwhile (0 of 28, `downstream_loss`) because each radio
+    spent the time keying 5 s timeouts into the void while the other's
+    relayed frames arrived. On the previous builds both nodes trialled
+    alternatives within a minute of leaving. The first pass's own test
+    for item 4 used a routed path, which is why it did not catch this.
+
+    Only a MISSING resolved path returns now. The same idiom was looked
+    for everywhere a path hex is tested: `_note_path_result`,
+    `record_direct_send_result`, `_note_path_signal` and `_select_path`
+    already test `is None` or normalise with `(hex or "").lower()`, and
+    the one other `if not path_hex` (`_note_raw_fallback_outcome` in
+    `_reconcile.py`) means zero hop on purpose -- no repeater to blame
+    for raw frames that did not arrive. So the fix is the one line.
+
+    Replayed at the field's own times (the fixture below), the laptop's
+    run passes `path_switch_after_misses` at its fourth attempt (26.6 s
+    in) and PATH_EXHAUST_MISSES at its eighth (68.8 s in, 22:19:33); the
+    zero-hop path's record from home is healthy, so the fourth cut's
+    patience keeps it until the eighth, and then the board exhausts and
+    the caller runs discovery -- about a minute after the first miss,
+    against never.
+
+    Tests: `tests/test_zero_hop_attempts_count_0924.py` with the fixture
+    `tests/fixtures/field_0923_laptop_zero_hop_miss_run.json` (every
+    attempt of the laptop's run, at its real offsets: all 144 zero-hop
+    `firmware` misses). A zero-hop miss counts and an ACK resets it; the
+    run reaches both thresholds at the fourth and eighth attempts, the
+    board exhausts and the resolved path is dropped so discovery runs;
+    the whole run counts 144; a peer with no resolved path is still a
+    no-op. Run against the first-pass deliverable (`65c26f1`, through
+    `SMCI_INTERFACE_PATH`) the test fails with the field symptom itself:
+    0 misses counted where 144 are expected. `tests/test_path_misses_per_
+    attempt_0923.py` passes unchanged. MeshBench: `zero_hop`, `failover`,
+    `repeater_returns`.
+

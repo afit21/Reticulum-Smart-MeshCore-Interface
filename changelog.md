@@ -65,6 +65,15 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   `testscripts/` and the hermetic unit tests, raised AttributeError on its first inbound packet on
   RNS 1.5.4. An instance value set by Reticulum still shadows the default, so a configured IFAC size
   is untouched. Tests: `tests/test_rns15_interface_contract_0923.py`.
+- **Second pass (2026-09-24), item 1: a zero-hop attempt counts.** The per-attempt miss count (first
+  pass, item 4) returned on `if not path_hex`, and the zero-hop path's hex is the empty string, so
+  every zero-hop attempt was dropped as "no path" -- and since the send result no longer increments
+  the count, the zero-hop path's misses were counted nowhere. Session 2 of 2026-09-23: after the laptop
+  left home it missed 144 consecutive zero-hop attempts over 22 minutes with one `path_selected`
+  record in the capture, the desktop likewise, and nothing at one to three hops got through meanwhile.
+  Only a missing resolved path returns now. Replayed, the run reaches the trial threshold at its fourth
+  attempt and exhausts at its eighth (69 s in), and discovery runs. Tests:
+  `tests/test_zero_hop_attempts_count_0924.py` (fixture `field_0923_laptop_zero_hop_miss_run.json`).
 - **Second pass (2026-09-24), item 5: `field_ab_compare.py` prints the path scoreboard's cost.**
   Per node: `path_selected` decisions, the longest run of consecutive counted misses on one path per
   hop count and what ended it, and the decisions that chose a path and got zero successes (count,
