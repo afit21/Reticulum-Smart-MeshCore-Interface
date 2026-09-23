@@ -45,6 +45,18 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   handshake queued mid-burst never registered as a lock waiter and waited out the whole window. No
   shipped configuration reaches a zero gap; nothing should depend on it being nonzero. Tests:
   `tests/test_raw_gap_own_airtime_0921.py` plus re-pins. Every MeshBench scenario is affected.
+- **Reverted in the second pass (2026-09-24): `direct_raw_gap_own_airtime` defaults to `yes` again.**
+  The flip above got no test: the A/B has still never run, MeshBench cannot judge this knob (no
+  listen-before-talk), and the only field time the `no` arm had -- the 2026-09-23 22:04-23:07
+  session -- was two raw parts at one hop and three at two, all while both nodes were stuck on a dead
+  zero-hop path. The default goes back to the arm the bench measured, `(1 + 2 x hops)` airtimes, and
+  the A/B decides; `direct_raw_gap_own_airtime = no` still selects the other arm with no rebuild.
+  The proof burst-tail hold and the burst-tail report suppression window return to their first-pass
+  values (3.18 s and 5.00 s hold at one and two hops). The unconditional await in the burst loop
+  stays. Tests: `tests/test_gap_default_restored_0924.py`; the re-pins of
+  `tests/test_raw_gap_own_airtime_0921.py`, `tests/test_raw_fragments.py` and
+  `tests/test_reconcile_m1_noack_reports_0920.py` reversed; shipped-default pin and golden config
+  re-pinned.
 - **RNS 1.5 compatibility: the interface defines `ifac_size`.** `Transport.preprocess_inbound` on
   RNS 1.5 sizes every inbound frame against `interface.HW_MTU + (interface.ifac_size or 0)`, and the
   base `Interface` class does not define that attribute -- `RNS.Reticulum` sets it when it

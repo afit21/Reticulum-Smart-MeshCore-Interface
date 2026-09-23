@@ -26,11 +26,7 @@ reach the death clock -- `path_switch_after_misses` 2 -> 4 and
 `PATH_EXHAUST_MISSES` 4 -> 8 are the same thresholds in the new unit. No
 wire change -- the golden wire snapshot is untouched and alpha 0.1.8 and
 0.1.9 nodes interoperate, although items 1 and 2 pay off only when the
-RECEIVER runs 0.1.9. Two further changes landed with the release: the
-inter-fragment gap through repeaters loses the frame's own airtime
-(`direct_raw_gap_own_airtime` defaults to `no`, the owner's decision --
-one hop 2.73 -> 1.82 s, two hops 4.55 -> 3.64 s, zero hop untouched), and
-the interface now defines `ifac_size`, which RNS 1.5 reads on every
+RECEIVER runs 0.1.9. The interface also defines `ifac_size`, which RNS 1.5 reads on every
 inbound frame and which only `RNS.Reticulum` used to set -- so building
 this interface without Reticulum, as the white-box hardware scripts do,
 works again on RNS 1.5.4); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
@@ -1555,36 +1551,18 @@ class _ConfigMixin:
         # `+1` -- the repeater's relay is audible to the sender). `no` drops
         # the `+1 x airtime` term through repeaters (zero hop is untouched);
         # every `raw_fragment_sent` record carries the `gap_s` actually used.
+        # DEFAULT UNCHANGED: `fieldtests/AB_PROTOCOL.md` decides.
         #
-        # Alpha 0.1.9 (2026-09-23): DEFAULT NOW `no`, by the owner's
-        # decision. Stated plainly, because this comment used to say the
-        # A/B decides and this is the A/B's `no` arm being adopted without
-        # it: the procedure in `fieldtests/AB_PROTOCOL.md` has still never
-        # been run, so this is a judgement about spending less airtime per
-        # burst, not a measured result. What it changes, at SF7 / BW
-        # 62.5 kHz / CR 4/8 (the field radios, airtime 0.91 s for a full
-        # 170-byte fragment): the gap through repeaters goes from
-        # `(1 + 2 x hops)` to `(2 x hops)` airtimes -- one hop 2.73 ->
-        # 1.82 s (-33 %), two hops 4.55 -> 3.64 s (-20 %), three hops
-        # 6.37 -> 5.46 s (-14 %). Zero hop is untouched.
-        #
-        # The risk the `+1` covered (MeshBench finding 2, 2026-09-20):
-        # `send_raw_data` returns when the frame is QUEUED, not sent, so
-        # without the term the fragment's own airtime comes out of the gap
-        # and the next fragment can key inside the repeater's relay of the
-        # previous one -- which cost 7/7 second fragments in
-        # `large_payload` and 7/9 QUERYs in `relay`. Against that: a real
-        # SX1262 has listen-before-talk and would defer on hearing that
-        # relay, which MeshBench's virtual radio cannot do, so MeshBench
-        # systematically overstates this risk. That asymmetry is exactly
-        # why the knob exists and why the A/B was specified for the field.
-        # Two derived values shrink with the gap and are the ones to
-        # watch: `_report_hold_s` (so alpha 0.1.9's proof burst-tail hold
-        # drops to 2.28 s at one hop and 4.09 s at two) and the burst-tail
-        # suppression window in `_report_recently_sent` (two spacings plus
-        # margin: 7.74 s at two hops, which now sits INSIDE the sender's
-        # 9.0 s report wait rather than just outside it).
-        self.direct_raw_gap_own_airtime = _cfg_bool(cfg.get("direct_raw_gap_own_airtime", "no"))
+        # Alpha 0.1.9's first pass flipped this to `no` without the A/B
+        # (2026-09-23, commit 5bbe1a8); the second pass (2026-09-24) put it
+        # back to `yes`, because the A/B has still never run and the only
+        # field time the `no` arm got was five raw parts, all during a
+        # dead-path period (docs/history.md, "Alpha 0.1.9, second pass").
+        # MeshBench cannot judge it: the `+1` guards against keying inside a
+        # repeater's relay of the previous fragment (MeshBench finding 2,
+        # 2026-09-20), and a real SX1262 defers on hearing that relay while
+        # MeshBench's virtual radio has no listen-before-talk.
+        self.direct_raw_gap_own_airtime = _cfg_bool(cfg.get("direct_raw_gap_own_airtime", "yes"))
         # Burst-then-ask rounds per packet, and QUERY tries per round.
         # Audit fix (2026-09-19): clamped to 4. The raw header carries the
         # round in 2 bits (`attempt & 0x03`), and the firmware dedups
@@ -8725,8 +8703,7 @@ class _ReconcileMixin:
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
         # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
-        # airtime from the gap through repeaters. Since alpha 0.1.9 that arm
-        # is the DEFAULT (the owner's decision, `direct_raw_gap_own_airtime`).
+        # airtime from the gap through repeaters; the default keeps it.
         own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
         return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
 
@@ -9532,12 +9509,13 @@ class _ReconcileMixin:
                         # `report_requested()` was False at every part
                         # boundary and the report waited out the entire
                         # window -- exactly what alpha 0.1.5's item 6 exists
-                        # to prevent. Surfaced by defaulting
-                        # `direct_raw_gap_own_airtime` to `no`, which leaves a
-                        # gap of zero wherever `direct_raw_hop_gap_factor` is
-                        # also 0; the shipped factor is 2.0 and the zero-hop
-                        # gap is 0.15, so no shipped configuration hits it,
-                        # but nothing should depend on the gap being nonzero.
+                        # to prevent. Surfaced while
+                        # `direct_raw_gap_own_airtime` briefly defaulted to
+                        # `no`, which leaves a gap of zero wherever
+                        # `direct_raw_hop_gap_factor` is also 0; the shipped
+                        # factor is 2.0 and the zero-hop gap is 0.15, so no
+                        # shipped configuration hits it, but nothing should
+                        # depend on the gap being nonzero.
                         await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1

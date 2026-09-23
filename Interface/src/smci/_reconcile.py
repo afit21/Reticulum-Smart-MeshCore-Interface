@@ -191,8 +191,7 @@ class _ReconcileMixin:
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
         # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
-        # airtime from the gap through repeaters. Since alpha 0.1.9 that arm
-        # is the DEFAULT (the owner's decision, `direct_raw_gap_own_airtime`).
+        # airtime from the gap through repeaters; the default keeps it.
         own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
         return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
 
@@ -998,12 +997,13 @@ class _ReconcileMixin:
                         # `report_requested()` was False at every part
                         # boundary and the report waited out the entire
                         # window -- exactly what alpha 0.1.5's item 6 exists
-                        # to prevent. Surfaced by defaulting
-                        # `direct_raw_gap_own_airtime` to `no`, which leaves a
-                        # gap of zero wherever `direct_raw_hop_gap_factor` is
-                        # also 0; the shipped factor is 2.0 and the zero-hop
-                        # gap is 0.15, so no shipped configuration hits it,
-                        # but nothing should depend on the gap being nonzero.
+                        # to prevent. Surfaced while
+                        # `direct_raw_gap_own_airtime` briefly defaulted to
+                        # `no`, which leaves a gap of zero wherever
+                        # `direct_raw_hop_gap_factor` is also 0; the shipped
+                        # factor is 2.0 and the zero-hop gap is 0.15, so no
+                        # shipped configuration hits it, but nothing should
+                        # depend on the gap being nonzero.
                         await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1

@@ -41,25 +41,11 @@ class GapArithmetic(SingleNodeCase):
         finally:
             iface.direct_raw_gap_own_airtime, iface.direct_raw_hop_gap_factor, iface.direct_raw_zero_hop_gap_s = saved
 
-    def test_shipped_default_drops_the_own_airtime(self):
-        # Re-pinned by alpha 0.1.9 (2026-09-23): the owner adopted the A/B's
-        # `no` arm as the default. The A/B in fieldtests/AB_PROTOCOL.md has
-        # still never been run, so this pins a decision, not a measurement.
-        # Through repeaters the gap is now `2 x hops` airtimes, not
-        # `1 + 2 x hops`; zero hop is untouched.
+    def test_shipped_default_keeps_the_own_airtime(self):
         module = load_interface_module()
         bare = module.SmartMeshCoreInterface.__new__(module.SmartMeshCoreInterface)
         bare._configure_retry({})
-        self.assertFalse(bare.direct_raw_gap_own_airtime)
-        # The arithmetic on a live interface (a bare object has no radio
-        # parameters, so it cannot estimate an airtime).
-        iface = self.iface
-        frag = 172
-        airtime = iface._estimate_tx_airtime_s("", on_air_bytes=frag)
-        self.assertFalse(iface.direct_raw_gap_own_airtime, "the shipped build, not a fixture")
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(1, frag), 2.0 * airtime, places=6)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(2, frag), 4.0 * airtime, places=6)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(0, frag), 0.15, places=6)
+        self.assertTrue(bare.direct_raw_gap_own_airtime)
         self.assertEqual(bare.direct_raw_hop_gap_factor, 2.0)
 
 

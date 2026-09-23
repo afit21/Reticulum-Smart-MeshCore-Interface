@@ -5206,6 +5206,10 @@ written to do -- reports arrive, and no stale candidate was trialled.
     no code change beyond the literal, no wire change), **and the burst
     loop always yields** (`_run_raw_window_rounds`).
 
+    [REVERTED by the alpha 0.1.9 second pass, item 4 (2026-09-24, entry
+    below): the default is `yes` again until the field A/B has run. The
+    unconditional await stays.]
+
     The owner's decision, 2026-09-23, and it is the A/B's `no` arm adopted
     WITHOUT the A/B: `fieldtests/AB_PROTOCOL.md` has still never been run,
     so this is a judgement that the burst should spend less airtime, not a
@@ -5293,3 +5297,47 @@ written to do -- reports arrive, and no stale candidate was trialled.
     `Transport.inbound` returns. That test had always failed when run on
     its own, on every build, and passed in a full suite only by incidental
     timing.
+
+**Alpha 0.1.9, second pass (2026-09-24, from the two field sessions of
+2026-09-23 evening).** Session 1 (17:41-21:47, `fieldtests/raw/
+Alpha0.1.9-drive/`, three captures recovered from commit 65c26f1, where
+they were committed under `fieldtests/raw/Alpha0.1.9/`) ran `cb4cd49` --
+alpha 0.1.8 plus the first pass's items 3 and 5 -- on RNS 1.5.4: three
+hours at zero hop at home, then a 57-minute drive out to four hops.
+Session 2 (22:04-23:07, `fieldtests/raw/Alpha0.1.9/`) ran `65c26f1`,
+the whole first pass including the gap flip: about 130 messages at zero
+hop at home in six minutes, all proved, then the laptop drove off at
+22:20. The owner installs from GitHub's `development`, so a build reaches
+a radio only when pushed. Every item here is a correction; nothing new is
+added, no wire change, the version stays alpha 0.1.9.
+
+ 4. **`direct_raw_gap_own_airtime` defaults to `yes` again**
+    (`_configure_retry`; the literal and its comment only). The first
+    pass's item 6 above adopted the A/B's `no` arm without the A/B, and
+    nothing since has tested it: `fieldtests/AB_PROTOCOL.md` has still
+    never run, MeshBench cannot judge this knob (the `+1` guards against
+    keying inside a repeater's relay of the previous fragment, which a
+    real SX1262's listen-before-talk defers on and MeshBench's virtual
+    radio cannot -- the 2026-09-21 entry), and the only field time the
+    `no` arm got is session 2's two raw parts at one hop and three at two,
+    all during the period both nodes were stuck on a dead zero-hop path
+    (defect A, item 1 below), so they say nothing about the gap. The
+    default returns to the arm the bench did measure and the A/B decides;
+    the config comment says so again. With it the two derived values the
+    first pass shrank return too: the proof burst-tail hold is one full
+    spacing plus margin (3.18 s at one hop, 5.00 s at two at the field
+    radios' settings, still inside the sender's report wait at every hop
+    count) and the burst-tail report suppression window is two spacings.
+    The unconditional `await` in the burst loop (the same first-pass
+    item) is a separate defect fix and stays.
+
+    Tests: `tests/test_gap_default_restored_0924.py` (the `_configure_
+    retry` default and an explicit `no` still honoured; the shipped
+    arithmetic `(1 + 2 x hops)` airtimes at one to three hops and 0.15 s
+    at zero; the report hold back to one full spacing plus margin and
+    inside `_completion_report_wait_s` at one to three hops). The
+    first pass's re-pins in `tests/test_raw_gap_own_airtime_0921.py`,
+    `tests/test_raw_fragments.py` and `tests/test_reconcile_m1_noack_
+    reports_0920.py` reversed; `tests/test_shipped_defaults.py` and
+    `tests/golden/config_defaults.json` re-pinned (one default). No
+    MeshBench run: the suite cannot judge this knob.

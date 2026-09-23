@@ -194,17 +194,13 @@ class RawGapAndPathEvidence(SingleNodeCase):
         airtime_small = iface._estimate_tx_airtime_s("", on_air_bytes=70)
         self.assertGreater(airtime_big, airtime_small)
         self.assertEqual(iface._raw_fragment_gap_s(0, 175), iface.direct_raw_zero_hop_gap_s)
-        # MeshBench finding 2 (2026-09-20) put the frame's own airtime on top
-        # of the hop-scaled term, because the gap starts when the firmware has
-        # only QUEUED the frame. Alpha 0.1.9 (2026-09-23) makes
-        # `direct_raw_gap_own_airtime = no` the default by the owner's
-        # decision, so that term is off and the gap is `factor x hops`
-        # airtimes; tests/test_raw_gap_own_airtime_0921.py pins both arms.
+        # MeshBench finding 2 (2026-09-20): the frame's own airtime is on top of
+        # the hop-scaled term, because the gap starts when the firmware has
+        # only QUEUED the frame.
         f = iface.direct_raw_hop_gap_factor
-        self.assertFalse(iface.direct_raw_gap_own_airtime)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(1, 175), f * airtime_big)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(4, 175), 4 * f * airtime_big)
-        self.assertAlmostEqual(iface._raw_fragment_gap_s(2, 70), 2 * f * airtime_small)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(1, 175), (1 + f) * airtime_big)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(4, 175), (1 + 4 * f) * airtime_big)
+        self.assertAlmostEqual(iface._raw_fragment_gap_s(2, 70), (1 + 2 * f) * airtime_small)
         self.assertLess(iface._raw_fragment_gap_s(2, 70), iface._raw_fragment_gap_s(2, 175))
 
     def test_query_round_outcomes_feed_the_stale_path_counter(self):

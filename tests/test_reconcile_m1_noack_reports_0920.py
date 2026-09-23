@@ -48,12 +48,8 @@ class PureTimingFunctions(SingleNodeCase):
             airtime = iface._estimate_tx_airtime_s("", on_air_bytes=40)
             self.assertAlmostEqual(iface._noack_frame_hold_s(40, 0), airtime + 0.15)
             self.assertAlmostEqual(iface._noack_frame_hold_s(40, 1), iface._raw_fragment_gap_s(1, 40))
-            # Alpha 0.1.9: `direct_raw_gap_own_airtime` now defaults to `no`,
-            # so the gap through repeaters is `factor x hops` airtimes, not
-            # `1 + factor x hops`. The `+1` arm is still pinned, with the
-            # knob set explicitly, in tests/test_raw_gap_own_airtime_0921.py.
-            self.assertAlmostEqual(iface._noack_frame_hold_s(40, 1), 2.0 * airtime)
-            self.assertAlmostEqual(iface._noack_frame_hold_s(40, 2), 4.0 * airtime)
+            self.assertAlmostEqual(iface._noack_frame_hold_s(40, 1), 3.0 * airtime)
+            self.assertAlmostEqual(iface._noack_frame_hold_s(40, 2), 5.0 * airtime)
         finally:
             iface.direct_raw_zero_hop_gap_s, iface.direct_raw_hop_gap_factor = saved
 
@@ -68,7 +64,7 @@ class PureTimingFunctions(SingleNodeCase):
             # (it was one airtime at zero hop, the relay gap through repeaters).
             margin = iface.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
             self.assertAlmostEqual(iface._report_hold_s(frag, 0), airtime + max(0.0, iface.direct_raw_zero_hop_gap_s) + margin)
-            self.assertAlmostEqual(iface._report_hold_s(frag, 1), 2.0 * airtime + margin)
+            self.assertAlmostEqual(iface._report_hold_s(frag, 1), 3.0 * airtime + margin)
             self.assertGreater(iface._report_hold_s(frag, 2), iface._report_hold_s(frag, 1))
         finally:
             iface.direct_raw_hop_gap_factor = saved
