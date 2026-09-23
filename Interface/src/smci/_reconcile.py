@@ -1806,6 +1806,10 @@ class _ReconcileMixin:
                 deadline = time.monotonic() + self.proof_report_grace_s
                 while True:
                     if self._proof_enqueued_at_for_key(proof_key) is not None:
+                        # Item 1 (alpha 0.1.9): the proof stands in for the
+                        # report, so the packet counts as reported and the
+                        # burst tail's flagged frames do not re-trigger one.
+                        self._note_complete_report_sent(sender_token, header.pkt_id)
                         self._capture_report_skipped_for_proof(sender_token, header, proof_key)
                         self._debug(
                             f"completion REPORT to {sender_token!r} (pkt_id={header.pkt_id}) skipped: RNS proved the "
@@ -1908,6 +1912,107 @@ class _ReconcileMixin:
         spacing = hold + (max(0.0, self.direct_raw_zero_hop_gap_s) if hops <= 0 else 0.0)
         spacings = self.RAW_ARRIVING_HOLD_SPACINGS if arriving else self.RAW_GAPS_HOLD_SPACINGS
         return spacings * spacing + self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+
+    def _proof_tail_hold_s(self, sender_token: str, header: "_FrameHeader", bucket_before,
+                           report_requested: bool, fragment_on_air_bytes: int) -> float:
+        """How long the PROOF that replaces this window's complete report
+        waits for the sender's burst tail (alpha 0.1.9, item 2). 0.0 when
+        the burst is demonstrably over.
+
+        The evidence. At the 2026-09-23 two-hop stop the report was skipped
+        13 times and the proof was keyed within a second of completion, yet
+        its first attempt succeeded 9 of 17 across the session against the
+        path's own 67-69 % -- and bare single-fragment packets' proofs,
+        which have no burst behind them, succeeded 6 of 7 and turned round
+        in 3.8 s against the raw window's 10.0 s. The collision partner is
+        the sender's own burst tail: `_run_raw_window_rounds` appends a
+        part's parity fragment AFTER its data fragments, one
+        `_raw_fragment_gap_s` later (4.63 s at two hops), so when the data
+        fragments complete the packet the parity is still to come. In the
+        four stop-2 cases where the rx-log shows a RAW frame 3.8 to 4.9 s
+        after completion, three of the proofs missed.
+
+        The wait is ONE of the sender's start-to-start spacings plus the
+        half-airtime margin -- `_report_hold_s(..., arriving=False)`, the
+        existing pure rule and its existing constant, not a new one. It is
+        deliberately not the still-arriving hold (`arriving=True`, TWO
+        spacings): that is 9.55 s at two hops against the sender's own
+        report wait of 9.0 s (`direct_raw_report_wait_base` 4.0 plus
+        `direct_raw_report_wait_per_hop` 2.5 per hop), so it would expire
+        the sender's window and provoke the QUERY that alpha 0.1.8's item 1
+        exists to remove. One spacing is 5.00 s at two hops and 3.18 s at
+        one, comfortably inside the wait at every hop count, and it is what
+        the tail actually costs -- we are waiting for one known frame, not
+        for silence.
+
+        This is a hold on a frame NOT YET SENT, so the 0.1.7 second cut is
+        untouched: no hold on a frame already on the air is cut or
+        shortened, and the radio lock is never held across the wait."""
+        if self.proof_report_grace_s <= 0:
+            return 0.0
+        hops = self._receiver_hops_to(sender_token)
+        # Did the sender put a parity fragment behind this part, and has it
+        # arrived? The raw header declares no parity count -- `frag_total`
+        # counts data fragments only -- so this reads the sender's own pure
+        # rules (`_raw_parity_fragments` / `_raw_parity_fits`, and the
+        # `len(idxs) >= 2` condition in `_run_raw_window_rounds`) at this
+        # hop count. `bucket.parity` is non-empty only once a parity frame
+        # has actually landed, which includes the case where the parity
+        # reconstructed the fragment that completed the part.
+        parity_arrived = bool(bucket_before is not None and bucket_before.parity)
+        parity_expected = bool(
+            header.frag_total >= 2
+            and self._raw_parity_fragments(hops) > 0
+            and self._raw_parity_fits(self._direct_raw_payload_budget(hops), hops)
+        )
+        if parity_expected and not parity_arrived:
+            return self._report_hold_s(fragment_on_air_bytes, hops, arriving=False)
+        if not report_requested:
+            # An unflagged fragment completed the part, so the burst has at
+            # least its two flagged frames still to come -- the same
+            # condition that makes the report path schedule rather than
+            # send. One spacing clears the next of them.
+            return self._report_hold_s(fragment_on_air_bytes, hops, arriving=False)
+        # The flagged last frame completed the part and any parity is
+        # already in: nothing of this burst is still due, so the proof goes
+        # now, exactly as in alpha 0.1.8.
+        return 0.0
+
+    def _note_proof_tail_hold(self, proof_key: bytes, sender_token: str, header: "_FrameHeader",
+                              bucket_before, report_requested: bool, fragment_on_air_bytes: int) -> None:
+        """Arm the burst-tail hold for the proof of this packet, keyed by
+        the value that proof carries in its destination field (alpha 0.1.9,
+        item 2). `_send_outgoing_packet` reads it once and clears it."""
+        wait_s = self._proof_tail_hold_s(sender_token, header, bucket_before, report_requested,
+                                         fragment_on_air_bytes)
+        if wait_s <= 0:
+            return
+        key = bytes(proof_key)
+        self._proof_tail_hold_until[key] = time.monotonic() + wait_s
+        while len(self._proof_tail_hold_until) > self.PROOF_TAIL_HOLD_MAX_KEYS:
+            self._proof_tail_hold_until.popitem(last=False)
+
+    def _note_complete_report_sent(self, sender_token: str, pkt_id: Optional[int]) -> None:
+        """The one place that stamps "the sender now knows this packet is
+        complete" -- `_report_recently_sent` reads it, and nothing else
+        does (alpha 0.1.9, item 1: the stamp used to be written inline by
+        `_send_completion_report` alone).
+
+        Alpha 0.1.8's item 1 replaces the complete report with RNS's PROOF
+        when it can, and captured that as `completion_report_skipped` --
+        but it never stamped it, so the parity fragment that follows the
+        completing data fragment one spacing later was treated as a fresh
+        trigger and `_send_completion_report` went out anyway: four times
+        at the 2026-09-23 two-hop stop, `held_s 0.0`, 3.8 to 4.9 s after
+        the skip, queued behind the proof's 11 s ACK timeout. Those skips
+        saved nothing. The proof is the sender's signal in exactly the
+        sense a complete report is, so it stamps the same way."""
+        if pkt_id is None:
+            return
+        self._last_complete_report_at[(sender_token, pkt_id)] = time.monotonic()
+        if len(self._last_complete_report_at) > 256:
+            for k in list(self._last_complete_report_at)[:64]:
+                self._last_complete_report_at.pop(k, None)
 
     def _report_recently_sent(self, sender_token: str, pkt_id: Optional[int], fragment_on_air_bytes: int) -> bool:
         """Alpha 0.1.6 (item 3): whether a complete report for this packet
@@ -2079,10 +2184,7 @@ class _ReconcileMixin:
         if complete:
             # Item 3 (alpha 0.1.6): a flagged frame of this packet within the
             # burst tail of this report is not reported again.
-            self._last_complete_report_at[(sender_token, header.pkt_id)] = time.monotonic()
-            if len(self._last_complete_report_at) > 256:
-                for k in list(self._last_complete_report_at)[:64]:
-                    self._last_complete_report_at.pop(k, None)
+            self._note_complete_report_sent(sender_token, header.pkt_id)
         nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
         self._debug(
             f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
@@ -2436,6 +2538,15 @@ class _ReconcileMixin:
                 rns_header = self._parse_rns_header(complete_data)
                 proof_key = self._proof_may_replace_report(complete_data, rns_header, sender_token, peer_prefix)
                 if proof_key is not None:
+                    # Item 2 (alpha 0.1.9): register the burst-tail hold
+                    # BEFORE handing the packet to RNS, because RNS queues
+                    # the proof synchronously inside `process_incoming` and
+                    # the outgoing worker may dispatch it at this callback's
+                    # next await. Nothing here transmits or holds the radio.
+                    self._note_proof_tail_hold(
+                        proof_key, sender_token, header, bucket_before, report_requested,
+                        len(payload) + self.RAW_HEADER_SIZE,
+                    )
                     pass          # decided below, after process_incoming
                 elif tail_seen or not self.direct_report_hold_during_burst:
                     self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
@@ -2466,6 +2577,8 @@ class _ReconcileMixin:
                 # first line); the grace covers RNS 1.5's inbound queue and
                 # a loaded host, and expires into the report as before.
                 if self._proof_enqueued_at_for_key(proof_key) is not None:
+                    # Item 1 (alpha 0.1.9): see `_note_complete_report_sent`.
+                    self._note_complete_report_sent(sender_token, header.pkt_id)
                     self._capture_report_skipped_for_proof(sender_token, header, proof_key)
                 else:
                     self._hold_report_for_proof(sender_token, header, proof_key)

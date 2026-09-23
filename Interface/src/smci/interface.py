@@ -431,6 +431,11 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # Alpha 0.1.7 (item 1): queue times of recent plain PROOFs
     # (`_proof_enqueued_at`); the field's worst backlog was 13 proofs.
     PROOF_ENQUEUED_MAX_KEYS = 64
+    # Alpha 0.1.9 (item 2): deadlines of proofs waiting out the sender's
+    # burst tail (`_proof_tail_hold_until`). Same order of magnitude as the
+    # proof backlog above; one entry per window whose report a proof
+    # replaced, cleared as each proof is dispatched.
+    PROOF_TAIL_HOLD_MAX_KEYS = 64
 
     # Audit fix (2026-09-19): how many post-bind path-discovery rounds
     # `_discover_path_after_bind` runs before leaving it to real traffic.
@@ -982,6 +987,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # Bounded; entries older than proof_max_age are swept with the
         # proof correlations.
         self._proof_enqueued_at = collections.OrderedDict()
+        # Alpha 0.1.9 (item 2): proof key (the value the PROOF carries in
+        # its destination field) -> the monotonic deadline until which that
+        # proof waits for the sender's burst tail, and, once it has waited,
+        # how long it actually waited so the attempt record can carry it
+        # (`proof_tail_hold_s`). Both bounded by PROOF_TAIL_HOLD_MAX_KEYS.
+        self._proof_tail_hold_until = collections.OrderedDict()
+        self._proof_tail_hold_waited = collections.OrderedDict()
 
         # Alpha 0.1.6 (item 4): the connection supervisor's state.
         self._supervisor_task = None

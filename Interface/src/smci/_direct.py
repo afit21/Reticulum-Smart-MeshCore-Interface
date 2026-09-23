@@ -570,6 +570,9 @@ class _DirectSendMixin:
                 # Alpha 0.1.7 (item 1): so does a plain PROOF while it is
                 # younger than proof_fresh_s (re-read at every attempt).
                 proof_enqueued_at=self._proof_enqueued_at_for(header),
+                # Alpha 0.1.9 (item 2): how long this proof waited for the
+                # sender's burst tail before it was dispatched, capture-only.
+                proof_tail_hold_s=self._proof_tail_hold_waited_for(header),
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -951,6 +954,7 @@ class _DirectSendMixin:
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
         expire_retries: bool = False, preempt: bool = False,
         proof_enqueued_at: Optional[float] = None,
+        proof_tail_hold_s: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -1095,6 +1099,7 @@ class _DirectSendMixin:
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
                     expire_retries=expire_retries, attempt_info=attempt_info, preempt=attempt_preempt,
                     proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                    proof_tail_hold_s=proof_tail_hold_s,
                 )
             except Exception as exc:
                 RNS.log(
@@ -1381,6 +1386,7 @@ class _DirectSendMixin:
         preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
         proof_age_s: Optional[float] = None,  # capture-only (alpha 0.1.7, item 1): a plain PROOF's age at this attempt
         proof_fresh: Optional[bool] = None,  # capture-only: whether that age made it pre-empt (proof_fresh_s)
+        proof_tail_hold_s: Optional[float] = None,  # capture-only (alpha 0.1.9, item 2): the burst tail this proof waited out
         report: bool = False,  # alpha 0.1.8 item 2: take the lock in the REPORT class, as the no-ACK carrier does
         ack_timeout_max_s: Optional[float] = None,  # alpha 0.1.8 item 2: ceiling on this frame's ACK wait
     ) -> "tuple[bool, bool]":
@@ -1698,7 +1704,8 @@ class _DirectSendMixin:
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
-                    kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh, hop1_abort_deadline_s=hop1_abort_deadline_s,
+                    kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                    proof_tail_hold_s=proof_tail_hold_s, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
                     on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)

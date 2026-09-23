@@ -814,6 +814,21 @@ class _RoutingMixin:
         # ESTABLISHMENT_TIMEOUT_PER_HOP/KEEPALIVE) has enormous headroom
         # over this delay, so it can never itself cause a link-
         # establishment failure.
+        # Alpha 0.1.9 (item 2): a PROOF that replaced a window's complete
+        # report waits out the sender's burst tail before it is dispatched.
+        # See `_proof_tail_hold_s` for why one fragment spacing and why
+        # this does not touch the 0.1.7 second cut (nothing is on the air
+        # yet, so no hold is being cut).
+        tail_hold_s = self._proof_tail_hold_remaining(header)
+        if tail_hold_s > 0:
+            self._capture_outgoing(header, data, "proof_tail_hold")
+            task = self._spawn_background_task(
+                self._send_proof_after_burst_tail(data, header, tail_hold_s, expires_at)
+            )
+            if spawned is not None:
+                spawned.append(task)
+            return
+
         if header is not None and header.context == RNS.Packet.LRPROOF:
             self._debug(
                 f"routing decision: LRPROOF -- delaying "
@@ -912,6 +927,50 @@ class _RoutingMixin:
                 )
 
         await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=spawned)
+
+    def _proof_tail_hold_remaining(self, header: Optional[_RnsHeader]) -> float:
+        """Seconds this plain PROOF still owes the sender's burst tail, and
+        0.0 for everything else (alpha 0.1.9, item 2). Reads the deadline
+        the receiver armed in `_note_proof_tail_hold` and CLEARS it, so one
+        proof waits once: a small-mesh DIRECT-to-all proof goes to several
+        peers off one queue entry, and the tail belongs to the one sender
+        whose window this proof completes."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return 0.0
+        deadline = self._proof_tail_hold_until.pop(bytes(header.destination_hash), None)
+        if deadline is None:
+            return 0.0
+        return max(0.0, deadline - time.monotonic())
+
+    async def _send_proof_after_burst_tail(
+        self, data: bytes, header: _RnsHeader, wait_s: float, expires_at: Optional[float] = None,
+    ) -> None:
+        """Sleep out the sender's burst tail, then dispatch the proof
+        normally (alpha 0.1.9, item 2). Shaped exactly like
+        `_send_delayed_link_proof`: the sleep happens in a spawned task so
+        the outgoing worker keeps draining, the radio lock is never held
+        across it, and whatever the dispatch spawns is awaited here so the
+        packet's in-flight entry covers the whole send.
+
+        The wait is recorded for the attempt record rather than passed
+        down, mirroring how `proof_enqueued_at` is looked up per attempt."""
+        key = bytes(header.destination_hash) if header.destination_hash else None
+        try:
+            await asyncio.sleep(wait_s)
+            if self.detached or not self.online:
+                return
+            if key is not None:
+                self._proof_tail_hold_waited[key] = round(wait_s, 3)
+                while len(self._proof_tail_hold_waited) > self.PROOF_TAIL_HOLD_MAX_KEYS:
+                    self._proof_tail_hold_waited.popitem(last=False)
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if key is not None:
+                self._proof_tail_hold_waited.pop(key, None)
 
     async def _send_delayed_link_proof(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,

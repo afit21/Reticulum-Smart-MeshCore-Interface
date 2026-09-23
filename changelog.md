@@ -7,6 +7,31 @@ two-hop stop). Every item corrects something alpha 0.1.8 shipped; nothing new is
 design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned by
 `tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
 
+- **A skipped completion report counts as reported.** Alpha 0.1.8's item 1 replaces a window's
+  complete report with RNS's PROOF, but never stamped `_last_complete_report_at`, so the parity
+  fragment arriving one fragment spacing later was treated as a fresh trigger and the report went
+  out anyway -- four times at the 2026-09-23 two-hop stop, `held_s 0.0`, 3.8 to 4.9 s after the
+  skip, queued behind the proof's 11 s ACK timeout. Those skips saved nothing. Both skip sites now
+  stamp through one new writer, `_note_complete_report_sent`, which `_send_completion_report` also
+  uses. Gaps reports, held reports and the QUERY's ANSWER are unaffected -- the stamp is read only
+  by `_report_recently_sent`, only for a flagged frame of an already-delivered packet, and only
+  inside the burst tail. Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`. MeshBench:
+  `two_hop`, `relay`.
+- **The proof waits for the sender's burst tail.** A proof that replaced a report won only 9 of 17
+  first attempts at two hops across the 2026-09-23 session, against 6 of 7 for proofs answering
+  bare single-fragment packets (3.8 s turnaround against 10.0 s) and the path's own 67-69 % attempt
+  success -- because the sender's parity fragment follows the completing data fragment by one
+  fragment spacing (4.63 s at two hops) and the proof is in the relay chain when it is transmitted.
+  When a window completes with its parity still outstanding, or on an unflagged fragment, the proof
+  is now held one fragment spacing plus the half-airtime margin (`_report_hold_s(...,
+  arriving=False)`, an existing rule and constant) before dispatch; if the parity is already in and
+  the flagged last frame completed the part, it goes at once as before, and a bare packet's proof
+  never waits. The wait is deliberately one spacing, not the two-spacing still-arriving hold, which
+  at two hops (9.55 s) exceeds the sender's own report wait (9.0 s) and would provoke the QUERY
+  alpha 0.1.8 removed. This delays a frame not yet sent, so alpha 0.1.7's second cut is untouched.
+  Capture: `proof_tail_hold_s` on the proof's attempt record and a `proof_tail_hold` decision
+  record. Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`. MeshBench: `two_hop`, `three_hop`,
+  `large_payload`, `relay`.
 - **Cache defaults that survive a field day** (`announce_cache_ttl` 3600 -> 604800,
   `path_request_local_answer_min_interval` 120 -> 600). The session's two stops were two hours
   apart and the announce cache's TTL was one hour, so every entry cached at the first stop had

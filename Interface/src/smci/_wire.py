@@ -693,6 +693,15 @@ class _WireFormatMixin:
             return None
         return self._proof_enqueued_at.get(bytes(key))
 
+    def _proof_tail_hold_waited_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
+        """How long this plain PROOF waited for the sender's burst tail
+        before it was dispatched, or None (alpha 0.1.9, item 2). Recorded
+        by `_send_proof_after_burst_tail` for the life of the send and read
+        here per attempt, the way `_proof_enqueued_at_for` is."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return None
+        return self._proof_tail_hold_waited.get(header.destination_hash)
+
     def _proof_enqueued_at_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
         """The queue time of this plain PROOF, or None for anything else."""
         if not self._plain_proof(header) or not header.destination_hash:

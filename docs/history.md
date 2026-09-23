@@ -4920,3 +4920,159 @@ written to do -- reports arrive, and no stale candidate was trialled.
     after a restart not pairing, while the two processes stay one node;
     the raw-window / bare-packet split; the report-skipped subset matched
     on `proof_key`).
+
+ 1. **The skip marks the packet as reported** (`_note_complete_report_sent`
+    in `_reconcile.py`, new and the single writer; both skip sites call it,
+    and `_send_completion_report`'s inline write becomes a call to it). No
+    config key, no wire change, no default changed.
+
+    Alpha 0.1.8's item 1 replaces a window's complete report with RNS's
+    PROOF when it can, and captures that as `completion_report_skipped`.
+    It never stamped `_last_complete_report_at`, which is the table
+    `_report_recently_sent` reads to decide whether a flagged frame of an
+    already-delivered packet is the same burst or a re-drive. So the
+    parity fragment that follows the completing data fragment one
+    `_raw_fragment_gap_s` later was treated as a fresh trigger and
+    `_send_completion_report` went out anyway: four times at the
+    2026-09-23 two-hop stop, `completion_report_sent` with `held_s 0.0`
+    at +3.8 to +4.9 s after the skip, queued behind the proof's 11 s ACK
+    timeout. Those skips saved nothing -- the frame they were meant to
+    remove was sent a moment later, at a worse moment.
+
+    A proof is the sender's signal in exactly the sense a complete report
+    is, so it stamps the same way. The write now has one home rather than
+    three copies, following the project's single-entry-point rule.
+
+    What this does NOT gate, checked rather than assumed:
+    `_last_complete_report_at` is read only by `_report_recently_sent`,
+    and `_report_recently_sent` is called from only two places -- the two
+    dedup branches of `_handle_direct_multifragment_frame` (a parity frame
+    and a data fragment for a packet already delivered). A GAPS report for
+    the same pkt_id, `_schedule_gaps_report`, `_schedule_sender_report`
+    and the QUERY's ANSWER are all untouched, so the sender can still be
+    told about missing fragments of its other parts. The suppression is
+    the burst tail only (`_report_hold_s(..., arriving=True)`), and a
+    re-drive after the sender's report wait is reported exactly as before
+    -- pinned by its own test.
+
+    The cost, stated because it is real: the second complete report that
+    the parity used to trigger was a free extra chance for a sender whose
+    proof was lost on air. It is now suppressed for the tail, and the
+    sender's recovery in that case is its QUERY round, which is not
+    gated. That is the trade this item makes -- one frame per window
+    against a rarer, slower recovery -- and `relay` / `two_hop` are where
+    it is read.
+
+    Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`
+    (`TheSkipCountsAsReported`). The headline test fails against the
+    alpha 0.1.8 deliverable with the field symptom itself -- a complete
+    report in the burst tail of a skip -- verified by running it with
+    `SMCI_INTERFACE_PATH` pointed at the frozen 0.1.8 build.
+
+ 2. **The proof waits for the burst tail** (`_proof_tail_hold_s` and
+    `_note_proof_tail_hold` in `_reconcile.py`, `_proof_tail_hold_remaining`
+    and `_send_proof_after_burst_tail` in `_routing.py`,
+    `_proof_tail_hold_waited_for` in `_wire.py`, `_proof_tail_hold_until` /
+    `_proof_tail_hold_waited` and `PROOF_TAIL_HOLD_MAX_KEYS` in
+    `interface.py`, `proof_tail_hold_s` on the attempt record). No config
+    key, no wire change, no default changed; `proof_report_grace = 0`
+    disables it with the rest of item 1.
+
+    The evidence. Item 1 of 0.1.8 fires and the proof keys within a second
+    of completion, but the proofs that replaced a report win only about
+    half their first attempts: across the 2026-09-23 session at two hops,
+    9 of 17 for that population against the path's own 67-69 % attempt
+    success -- while proofs answering BARE single-fragment packets, which
+    have no burst behind them, won 6 of 7 and turned round in 3.8 s median
+    against the raw window's 10.0 s. The collision partner is the sender's
+    own burst tail. `_run_raw_window_rounds` appends a part's parity
+    fragment AFTER its data fragments, so when the data fragments complete
+    the packet the parity is still one spacing away (4.63 s at two hops),
+    and the proof is in the relay chain as the parity is transmitted. In
+    the four stop-2 cases where the rx-log shows a RAW frame 3.8 to 4.9 s
+    after completion, three of the proofs missed. (Attempt records are
+    timestamped at the RESULT, so a `direct_attempt_result` at +12 s with
+    `ack_timeout_s` 11 is an attempt keyed at +1 s -- that is how these
+    were read back to their key times.)
+
+    So when a window completes and the proof replaces the report, but the
+    sender's burst is still on the air, the proof is held until the tail
+    is due. "Still on the air" is two cases: the part has a parity slot
+    that has not arrived, or the completing fragment was not the flagged
+    last one. If the parity has already arrived (including the case where
+    it reconstructed the completing fragment) and the flagged frame
+    completed the part, nothing of the burst is due and the proof goes at
+    once, as in 0.1.8. Bare single-fragment packets never arm a hold at
+    all, which is why their 3.8 s turnaround is untouched.
+
+    The wait is ONE of the sender's start-to-start spacings plus the
+    half-airtime margin -- `_report_hold_s(..., arriving=False)`, the
+    existing pure rule with its existing constant, not a new one. This is
+    a deliberate departure from the alpha 0.1.9 brief, which named
+    `arriving=True`: that is TWO spacings, 9.55 s at two hops, against the
+    sender's own report wait of 9.0 s (`_completion_report_wait_s`:
+    `direct_raw_report_wait_base` 4.0 plus `..._per_hop` 2.5 per hop), so
+    it would expire the sender's window and provoke precisely the QUERY
+    that 0.1.8's item 1 exists to remove. One spacing is 5.00 s at two
+    hops and 3.18 s at one, inside the sender's wait at every hop count,
+    and it is what the tail actually costs: this waits for one known
+    frame, not for the silence that says a burst is over. The brief's own
+    test specification ("one spacing plus margin at two hops") and its
+    expected effect ("keys about 5 s later") both describe one spacing,
+    so only the named argument differs. A test pins the inequality
+    against `_completion_report_wait_s` at one, two and three hops so the
+    constraint cannot be lost.
+
+    How it is held. The deadline is armed BEFORE `process_incoming`,
+    because RNS queues the proof synchronously inside it (`Transport.
+    inbound` is synchronous and LXMF proves on its first line) and the
+    outgoing worker can dispatch at this callback's next await; there is
+    no await between the two points. `_send_outgoing_packet` then reads
+    the deadline once, clears it -- a small-mesh DIRECT-to-all proof goes
+    to several peers off one queue entry and must wait once, not per peer
+    -- and spawns `_send_proof_after_burst_tail`, shaped exactly like the
+    existing `_send_delayed_link_proof`: the sleep is in a spawned task so
+    the outgoing worker keeps draining, the radio lock is never taken
+    across it, and what the dispatch spawns is awaited there so the
+    packet's in-flight entry covers the whole send.
+
+    **This does not touch alpha 0.1.7's second cut.** That cut forbids a
+    fresh proof from cutting a hold on a frame ALREADY SENT -- the no-ACK
+    report hold and the QUERY quiet hold are the repeater's relay window
+    for this node's own frame, and a proof keyed into one is a certain
+    miss (MeshBench `large_payload`, 22 s -> 45 s probe RTT). Item 2 is
+    the opposite operation: it delays a frame not yet sent. No
+    `handshake_only` and no pre-empt behaviour changes.
+
+    Deliberately not done: an early release when the awaited parity lands.
+    The deadline is one spacing plus half an airtime and the parity
+    arrives at one spacing, so early release would save about 0.4 s at two
+    hops for a second index and an extra cancellation path. Also not
+    done: a declared parity bit in the raw header. `frag_total` counts
+    data fragments only and the header says nothing about parity, so
+    whether a parity frame is coming is INFERRED from the sender's own
+    pure rules (`_raw_parity_fragments`, `_raw_parity_fits`, and the
+    "two or more fragments in the round" condition) evaluated at this
+    node's hop count. That inference can be wrong if the two ends are
+    configured differently; the failure mode is a proof that waits one
+    spacing for nothing, which costs latency and no frames. A declared
+    bit would be exact and is allowed during alpha, but it is a wire
+    change and no evidence yet demands it.
+
+    Capture: `proof_tail_hold_s` on the proof's `direct_attempt_result`
+    (None for every other frame and for a proof that owed no wait), and a
+    `proof_tail_hold` outgoing decision record.
+
+    Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`
+    (`TheProofWaitsForTheBurstTail`, `TheHoldIsReadOnceByTheOutgoingPath`):
+    one spacing plus margin at one, two and three hops and strictly inside
+    the sender's report wait at each; zero at zero hop; no wait when the
+    parity is already in and the flagged frame completed the part; a wait
+    when an unflagged fragment completed it; no wait for a one-fragment
+    part; the hold read once and cleared; only a plain PROOF reading it;
+    and the whole thing off when `proof_report_grace` is 0.
+
+    MeshBench: `two_hop`, `three_hop`, `large_payload`, `relay` -- probe
+    RTT must not rise at one hop, and the proof's first-attempt success
+    per hop is now printed by `field_ab_compare.py` (item 5) for the field
+    reading.

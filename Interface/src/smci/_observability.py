@@ -259,6 +259,7 @@ class _ObservabilityMixin:
         duty_cycle_ledger: Optional[str] = None,
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
         proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
+        proof_tail_hold_s: Optional[float] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -346,6 +347,10 @@ class _ObservabilityMixin:
             # (None for any other frame) and whether it pre-empted as fresh.
             "proof_age_s": round(proof_age_s, 3) if proof_age_s is not None else None,
             "proof_fresh": proof_fresh,
+            # Alpha 0.1.9 (item 2): the sender's burst tail this proof waited
+            # out before it was dispatched (None for any other frame, and for
+            # a proof that owed no wait).
+            "proof_tail_hold_s": proof_tail_hold_s,
             "ack_latency_s": round(ack_latency_s, 3) if ack_latency_s is not None else None,
             "send_cmd_latency_s": round(send_cmd_latency_s, 3) if send_cmd_latency_s is not None else None,
             **self._rtt_capture_fields(peer_prefix),
