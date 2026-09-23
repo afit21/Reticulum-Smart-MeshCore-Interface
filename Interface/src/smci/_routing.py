@@ -782,6 +782,21 @@ class _RoutingMixin:
             f"destination_hash={header.destination_hash.hex() if header and header.destination_hash else None}."
         )
 
+        # Alpha 0.1.9 (item 2): a PROOF that replaced a window's complete
+        # report waits out the sender's burst tail before it is dispatched.
+        # See `_proof_tail_hold_s` for why one fragment spacing and why
+        # this does not touch the 0.1.7 second cut (nothing is on the air
+        # yet, so no hold is being cut).
+        tail_hold_s = self._proof_tail_hold_remaining(header)
+        if tail_hold_s > 0:
+            self._capture_outgoing(header, data, "proof_tail_hold")
+            task = self._spawn_background_task(
+                self._send_proof_after_burst_tail(data, header, tail_hold_s, expires_at)
+            )
+            if spawned is not None:
+                spawned.append(task)
+            return
+
         # User-requested fix (2026-09-15, real NomadNet field testing):
         # RNS.Link's own keepalive/staleness timing (Link.py) is computed
         # exactly once, from the initial LINK_REQUEST<->LRPROOF handshake
@@ -814,21 +829,6 @@ class _RoutingMixin:
         # ESTABLISHMENT_TIMEOUT_PER_HOP/KEEPALIVE) has enormous headroom
         # over this delay, so it can never itself cause a link-
         # establishment failure.
-        # Alpha 0.1.9 (item 2): a PROOF that replaced a window's complete
-        # report waits out the sender's burst tail before it is dispatched.
-        # See `_proof_tail_hold_s` for why one fragment spacing and why
-        # this does not touch the 0.1.7 second cut (nothing is on the air
-        # yet, so no hold is being cut).
-        tail_hold_s = self._proof_tail_hold_remaining(header)
-        if tail_hold_s > 0:
-            self._capture_outgoing(header, data, "proof_tail_hold")
-            task = self._spawn_background_task(
-                self._send_proof_after_burst_tail(data, header, tail_hold_s, expires_at)
-            )
-            if spawned is not None:
-                spawned.append(task)
-            return
-
         if header is not None and header.context == RNS.Packet.LRPROOF:
             self._debug(
                 f"routing decision: LRPROOF -- delaying "
