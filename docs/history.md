@@ -5577,3 +5577,38 @@ added, no wire change, the version stays alpha 0.1.9.
     (`c5ce761`) the new tests and the re-pinned one fail. MeshBench:
     `zero_hop` (probe RTT must not rise).
 
+ 2b. **Item 2, second cut: an untried candidate always gets its trial**
+    (`_choose_path`, the `untried` test inside the current-path patience).
+    Found by item 2's own MeshBench gate. `shortcut_appears` on the first
+    cut (`c5ce761`) went 0 of 3: seed 11 never brought up (0 probes, the
+    three-hop bring-up coin flip the first pass also saw twice at seed 7),
+    and at seeds 7 and 17 A held its three-hop path until it was dead --
+    the trial of the one-hop shortcut came 4.5 and 6 minutes after B moved
+    (00:53:03 -> 00:57:28; 01:04:12 -> 01:10:04, with the three-hop path
+    at exactly 8 missed attempts), too late for the shorter path to prove
+    itself on the scenario's remaining probes ("a shorter selected path
+    delivered its next send": A 0 of 2 and 0 of 1). The reason is
+    MeshBench's, and the prompt named it in advance: every frame there
+    reads 0 dB, so every flood-learned candidate carries the weak prior
+    (0.25), and the first cut compared the current path's measured
+    0.27-0.33 against that prior and kept it. Since a rule that blocks or
+    starves that trial on the bench would do the same in the field to a
+    candidate heard below 3 dB, the rule changes, not the fixture.
+
+    The weak prior was introduced to ORDER candidates (a weak zero-hop
+    behind an untried two-hop), not to exclude one from ever being tried.
+    So the current path's patience now stands aside for any eligible
+    alternative that is untried: no send outcome recorded, no miss, and
+    evidence not aged out (a STALE candidate is not untried -- the laptop's
+    `be0219` and `76d60219` at 21:29-21:32 were stale, and stay excluded).
+    Replays: every field decision in `field_0923_path_decisions.json` comes
+    out as in the first cut (the candidates the first cut excluded there
+    were all stale or already tried: `0276` at 21:32:53 had one missed
+    send), so the one cost recorded for the first cut at 20:54:39 remains
+    (the one-hop `19` there was stale) and the one at 21:32:53 remains
+    (`0276` was tried). One unit test re-pinned: its "weak candidate" is
+    now one with a missed attempt; a new one pins the shortcut shape
+    (current 0.27 past its threshold, a one-hop candidate at 0 dB never
+    tried: trial; the same candidate stale or tried: kept). MeshBench:
+    `shortcut_appears` x3 on this build, and the close-out set.
+

@@ -27,6 +27,11 @@ The rule now (`_choose_path`, still pure):
     every eligible alternative -- measured, or the prior it is ranked with
     -- unless it is dead. This generalises the 0.5 patience to "better than
     the alternatives";
+  * second cut: an eligible alternative that is UNTRIED (no send outcome,
+    no miss, evidence not aged out) always gets its trial once the current
+    path is past its miss threshold -- its prior orders it, it does not
+    exclude it (MeshBench `shortcut_appears`, where every flood candidate
+    reads 0 dB and so carries the weak prior);
   * nothing eligible: "exhausted", and the caller runs discovery, as before.
 
 The replays read `tests/fixtures/field_0923_path_decisions.json`: every
@@ -198,11 +203,12 @@ class TheRules(_Pure):
 
     def test_the_current_path_is_kept_while_it_beats_every_eligible_alternative(self):
         """The generalised patience: 0.36 at two hops is kept against a
-        weak untried candidate (0.25), not against an optimistic one (0.8),
-        and not once it is dead."""
+        weak candidate that has been tried (one missed attempt, scored with
+        the weak prior 0.25, like the field's `0276` at 21:32:53), not
+        against an optimistic one (0.8), and not once it is dead."""
         now = time.monotonic()
         current = _view("1976", 2, samples=_rate_samples(now, 0.36), consecutive_misses=6, last_failure_at=now - 1)
-        weak = _view("0276", 2, snr=-4.0)
+        weak = _view("0276", 2, snr=-4.0, consecutive_misses=1, last_failure_at=now - 30)
         self.assertEqual(_choose(self.Iface, [current, weak], "1976", now)[:2], ("1976", "current_best"))
         optimistic = _view("19", 1)
         self.assertEqual(_choose(self.Iface, [current, weak, optimistic], "1976", now)[:2], ("19", "trial"))
@@ -212,6 +218,26 @@ class TheRules(_Pure):
         fresh = dict(current, consecutive_misses=1)
         self.assertEqual(_choose(self.Iface, [fresh, optimistic], "1976", now)[:2], ("1976", "current"))
 
+
+    def test_an_untried_candidate_always_gets_its_trial(self):
+        """Second cut, from MeshBench `shortcut_appears`: B moves within one
+        hop of R1, A's three-hop path (0.27 to 0.33 measured) starts
+        missing, and B's floods give A a one-hop candidate scored with the
+        weak prior -- every frame reads 0 dB there. The first cut kept the
+        three-hop path until it was dead (8 missed attempts), minutes after
+        the move; a candidate never tried gets its trial as soon as the
+        current path is past its miss threshold, as in alpha 0.1.8."""
+        now = time.monotonic()
+        current = _view("6a8be3", 3, samples=_rate_samples(now, 0.27), consecutive_misses=4, last_failure_at=now - 1)
+        shortcut = _view("6a", 1, snr=0.0, last_seen=now - 5)
+        hex_, reason, ranked = _choose(self.Iface, [current, shortcut], "6a8be3", now)
+        self.assertEqual((hex_, reason), ("6a", "trial"))
+        # ...but a STALE one (evidence aged out, the laptop's be0219 at
+        # 21:29:08) does not, and neither does one already tried.
+        stale = _view("be0219", 3, samples=[(now - WINDOW - 100, False)])
+        self.assertEqual(_choose(self.Iface, [current, stale], "6a8be3", now)[:2], ("6a8be3", "current_best"))
+        tried = dict(shortcut, consecutive_misses=1, last_failure_at=now - 30)
+        self.assertEqual(_choose(self.Iface, [current, tried], "6a8be3", now)[:2], ("6a8be3", "current_best"))
 
 class OnTheScoreboard(_Scaffold):
     def _board(self):

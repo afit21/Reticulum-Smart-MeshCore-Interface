@@ -87,6 +87,13 @@ design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned
   are unchanged. Cost, from the same replays: twice the new rule keeps a 0.36-0.40 path where the
   field's trial of a weak-prior candidate delivered. Tests:
   `tests/test_rate_aware_eligibility_0924.py` (fixture `field_0923_path_decisions.json`).
+- **Second pass (2026-09-24), item 2, second cut: an untried candidate always gets its trial.** Item 2's
+  first cut failed its own MeshBench gate: in `shortcut_appears` every flood candidate reads 0 dB and
+  carries the weak prior, the current three-hop path's 0.27-0.33 beat it, and the one-hop shortcut was
+  trialled only once the old path was dead, 4.5-6 minutes after the move. The current path's patience
+  now stands aside for an eligible candidate never tried (no outcome, no miss, evidence not stale); the
+  prior orders it but no longer excludes it. The field replays are unchanged (the candidates excluded
+  there were stale or already tried).
 - **Second pass (2026-09-24), item 3: no proof tail hold at zero hop.** The first pass's burst-tail
   hold still fired at zero hop -- session 2's desktop held zero-hop proofs 0.96 to 2.27 s -- through
   the unflagged-completion branch and a stale one-hop peer report. At zero hop the parity follows

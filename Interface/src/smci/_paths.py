@@ -902,7 +902,9 @@ class _PathDiscoveryMixin:
         kept ("current_best") while it has delivered in the window and its
         measured rate beats the rate of every eligible alternative --
         measured, or the prior it is ranked with, or its prior when fresh
-        evidence has arrived since its last miss -- unless it is dead.
+        evidence has arrived since its last miss -- unless it is dead, or an
+        eligible alternative is UNTRIED (no send outcome, no miss, evidence
+        not aged out): that one always gets its trial, in rank order.
         Otherwise the best eligible candidate is used: the current one
         itself ("current_best") or another as a "trial". "exhausted":
         nothing is eligible -- the caller runs discovery; "none": nothing is
@@ -962,9 +964,22 @@ class _PathDiscoveryMixin:
                                    optimistic=kw.get("optimistic", 0.8), weak=kw.get("weak", 0.25), stale=stale,
                                    peer_path_len=kw.get("peer_path_len"))
 
+        def untried(v) -> bool:
+            # Never sent over, never missed, and its evidence not aged out:
+            # a candidate the scoreboard knows nothing against. Its prior
+            # ORDERS it among the others but does not keep it from one trial
+            # -- second cut, from MeshBench `shortcut_appears` (item 2's
+            # first cut compared the current path's 0.27-0.33 against the
+            # 0.25 weak prior every flood-learned candidate gets at
+            # MeshBench's 0 dB, so the one-hop shortcut was trialled only
+            # once the three-hop path was dead, minutes after the move).
+            if v.get("samples") or int(v.get("consecutive_misses") or 0):
+                return False
+            return not cls._path_evidence(v, now, window_s)[2]
+
         if current_rate is not None and current_rate > 0.0 and not dead(current):
-            rivals = [rival_rate(v) for _s, v, _r, _m in ranked if v is not current and eligible(v)]
-            if all(current_rate > r for r in rivals):
+            alternatives = [v for _s, v, _r, _m in ranked if v is not current and eligible(v)]
+            if not any(untried(v) for v in alternatives) and all(current_rate > rival_rate(v) for v in alternatives):
                 return current_hex, "current_best", ranked
         for _score, v, _rate, _m in ranked:
             if eligible(v):
