@@ -95,7 +95,11 @@ Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The f
 This diagram isn't 100% accurate to how the interface works but should give you a basic idea :)
 <img width="1056" height="600" alt="senddiagram" src="https://github.com/user-attachments/assets/f5efbb53-4530-4287-ad89-6438dbd2a88f" />
 
-## Field Testing
+## Reliability in the field
+
+In the current state, you can expect up to 3 repeaters in a path to be usable at the following or similar settings SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz. (Data Rate 1.71kbps)
+The main issue with routing over MeshCore is latency. Latency quickly adds up over repeaters.
+Other radio settings are untested as of writing this, however, I suspect that settings with a higher resultant bitrate would work better in real scenarios. Please look at the contributing section if you'd like to test radio settings for me.
 
 This table summarizes the real world scenarios that I've tested the interface against.
 Hops in this table refer to MeshCore Hops. Note - These results were measured with airtime capped at 30% for everything (the alpha 0.1.4 cap); since alpha 0.1.5 zero-hop direct traffic may use 85% while anything a repeater relays stays at 30% (see the airtime section above).
