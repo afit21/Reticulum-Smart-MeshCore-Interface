@@ -192,7 +192,7 @@ If you'd like to contribute code, feel free to fork this repo and open a pull re
 TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
 
 
-This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.4) I have airtime capped at 30% which results in a usable experience.
+This project intentionally caps performance out of respect for the regular MeshCore users. In the current version I have airtime capped at 30% (85% for zero hop) which results in a usable experience.
 As more testing is done, the project will move towards dynamic airtime limiting, however please don't remove the limits unless you know what you're doing or your local user base is fine with it.
 
 ## AI Usage
