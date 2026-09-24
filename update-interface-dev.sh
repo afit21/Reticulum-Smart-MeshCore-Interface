@@ -9,12 +9,16 @@
 # checked before it replaces anything: a truncated download, an HTML error page
 # or a Python syntax error leaves the installed interface untouched, because a
 # broken interface file stops rnsd/MeshChat from starting at all.
+# The interface imports the `meshcore` python library at startup and panics
+# rnsd without it, so the script also makes sure that library is importable by
+# the python that runs rnsd, installing it with pip if it is not.
 #
 #   ./update-interface-dev.sh                  # development -> ~/.reticulum
 #   ./update-interface-dev.sh --branch main    # (or use update-interface.sh)
 #   ./update-interface-dev.sh --config-dir ~/.reticulum_test
 #   ./update-interface-dev.sh --check          # report only, install nothing
 #   ./update-interface-dev.sh --force          # reinstall even if unchanged
+#   ./update-interface-dev.sh --skip-deps      # don't check/install the meshcore library
 #
 # Remote hosts: run it over ssh, e.g.
 #   ssh -i ~/claudtolaptop afi@192.168.20.44 'bash -s' < update-interface-dev.sh
@@ -28,6 +32,7 @@ CONFIG_DIR="${RNS_CONFIG_DIR:-$HOME/.reticulum}"
 KEEP_BACKUPS=5
 CHECK_ONLY=0
 FORCE=0
+SKIP_DEPS=0
 
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -40,7 +45,8 @@ while [ $# -gt 0 ]; do
     -d|--config-dir) CONFIG_DIR="${2:?--config-dir needs a value}"; shift 2 ;;
     -c|--check)      CHECK_ONLY=1; shift ;;
     -f|--force)      FORCE=1; shift ;;
-    -h|--help)       sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -s|--skip-deps)  SKIP_DEPS=1; shift ;;
+    -h|--help)       sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)               die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -48,6 +54,56 @@ done
 command -v curl >/dev/null || die "curl is not installed"
 PYTHON="$(command -v python3 || true)"
 [ -n "$PYTHON" ] || die "python3 is not installed (needed to syntax-check the download)"
+
+# --- the meshcore python library --------------------------------------------
+# The interface does `import meshcore` when rnsd loads it and panics rnsd if
+# that fails, so check the python that actually runs rnsd (its shebang), not
+# just whichever python3 is first on PATH -- a pipx or venv rnsd has its own.
+RNSD_PY="$PYTHON"
+if command -v rnsd >/dev/null 2>&1; then
+  shebang="$(head -n1 "$(command -v rnsd)" 2>/dev/null || true)"
+  case "$shebang" in
+    '#!'*)
+      cand="$(printf '%s\n' "${shebang#\#!}" | awk '{ if ($1 ~ /\/env$/) print $2; else print $1 }')"
+      case "$cand" in
+        /*) [ -x "$cand" ] && RNSD_PY="$cand" ;;
+        ?*) cand="$(command -v "$cand" 2>/dev/null || true)"; [ -n "$cand" ] && RNSD_PY="$cand" ;;
+      esac ;;
+  esac
+fi
+
+meshcore_version() {
+  "$RNSD_PY" -c 'import importlib.metadata as m; print(m.version("meshcore"))' 2>/dev/null || echo "version unknown"
+}
+
+ensure_meshcore() {
+  if "$RNSD_PY" -c 'import meshcore' >/dev/null 2>&1; then
+    ok "meshcore library $(meshcore_version) importable by $RNSD_PY"
+    return 0
+  fi
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "the meshcore python library is NOT importable by $RNSD_PY -- the interface panics rnsd without it"
+    return 0
+  fi
+  info "meshcore library not importable by $RNSD_PY -- installing it"
+  case "$RNSD_PY" in
+    */pipx/venvs/*)
+      command -v pipx >/dev/null 2>&1 && pipx inject rns meshcore >/dev/null 2>&1 || true ;;
+  esac
+  "$RNSD_PY" -c 'import meshcore' >/dev/null 2>&1 \
+    || "$RNSD_PY" -m pip install --quiet meshcore >/dev/null 2>&1 \
+    || "$RNSD_PY" -m pip install --quiet --user meshcore >/dev/null 2>&1 \
+    || true
+  "$RNSD_PY" -c 'import meshcore' >/dev/null 2>&1 \
+    || die "could not install the meshcore library for $RNSD_PY -- install it by hand ('$RNSD_PY -m pip install meshcore', or 'pipx inject rns meshcore' for a pipx rnsd) and re-run"
+  ok "meshcore library $(meshcore_version) installed for $RNSD_PY"
+}
+
+if [ "$SKIP_DEPS" -eq 1 ]; then
+  info "--skip-deps given: not checking the meshcore library"
+else
+  ensure_meshcore
+fi
 
 DEST_DIR="$CONFIG_DIR/interfaces"
 DEST="$DEST_DIR/SmartMeshCoreInterface.py"

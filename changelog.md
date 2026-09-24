@@ -18,6 +18,10 @@ changed (`tests/test_shipped_defaults.py` is untouched).
   can be turned on without RNS core's DEBUG level.
 - **Two update scripts.** `update-interface.sh` now installs from the `main` branch (the release);
   `update-interface-dev.sh` is the same script defaulting to `development`. Both keep `--branch`.
+  Both now make sure the `meshcore` python library is importable by the python that runs rnsd
+  (read from rnsd's shebang, so a pipx or venv rnsd is checked in its own interpreter) and install
+  it with pip, or `pipx inject`, when it is not, since the interface panics rnsd without it.
+  `--check` only reports; `--skip-deps` skips the step.
 - **The 2026-09-23 home-session captures are back**, under `fieldtests/raw/Alpha0.1.9-home/`
   (they were removed from `Alpha0.1.9/` when the 2026-09-24 captures went in, and
   `test_field_ab_compare_path_rows_0924` had been skipping its 144-miss-run pin without them).
