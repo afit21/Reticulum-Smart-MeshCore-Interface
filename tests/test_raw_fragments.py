@@ -209,6 +209,8 @@ class RawGapAndPathEvidence(SingleNodeCase):
         miss = {"acked": False, "waited_full_timeout": True}
         cut_short = {"acked": False, "waited_full_timeout": False}
         hit = {"acked": True, "waited_full_timeout": True}
+        selection = iface.path_selection_enabled
+        iface.path_selection_enabled = False   # the threshold detector: selection off (alpha 0.1.6 item 1)
         try:
             iface._direct_path_failures.pop(peer, None)
             self.on_loop(iface._record_query_path_evidence, peer, [])
@@ -230,6 +232,7 @@ class RawGapAndPathEvidence(SingleNodeCase):
             self.on_loop(lambda: iface._record_query_path_evidence(peer, [miss, miss], answered=True))
             self.assertNotIn(peer, iface._direct_path_failures)
         finally:
+            iface.path_selection_enabled = selection
             iface._direct_path_failures.pop(peer, None)
 
 
@@ -300,10 +303,10 @@ class NightSessionFixes(SingleNodeCase):
         iface = self.iface
         captured = []
 
-        async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False):
+        async def fake_send(target, frame, attempt=0, time_critical=False, gate_telemetry=None, duty_cycle_exempt=False, **_kw):
             return {}
 
-        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=None, preemptible=False):
+        async def fake_ack(sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=None, preemptible=False, **_kw):
             await asyncio.sleep(0.05)      # a (short) ACK latency, so the window is measured from MSG_SENT
             return True, False, 1.0, "test", 0.05, None
 
@@ -614,7 +617,7 @@ def _raw_mesh(test, links, repeaters=(), seed=1, config=None):
     assert mesh.wait_bound(40.0), "bind-frame discovery never completed"
     assert mesh.wait_resolved(60.0), "DIRECT paths never resolved"
     a, b = mesh.nodes["A"], mesh.nodes["B"]
-    b.send(build_rns_packet("data", dest_hash=b.dest_hash, payload=b"prime"))
+    b.send(build_rns_packet("announce", dest_hash=b.dest_hash, payload=b"prime"))   # item 3 of 0.1.7: an announce teaches the token
     assert wait_until(lambda: b.dest_hash in a.iface._rns_token_peer, 30.0), "token never learned"
     assert a.iface._peers[b.prefix].raw_fragments is True, "bind frame did not carry the raw capability"
     return mesh, a, b
@@ -701,8 +704,12 @@ class RawFragmentScenarios(unittest.TestCase):
         """2026-09-19 morning field test: the desktop burst three whole raw
         sends down a dead zero-hop path before its stale-path reset fired,
         because the reconcile QUERYs recorded no evidence. Now each
-        unanswered round counts, and the send stops once the path is gone."""
-        _, a, b = _raw_mesh(self, ["A-B"], seed=61, config={"direct_path_reset_threshold": "2"})
+        unanswered round counts, and the send stops once the path is gone.
+        The threshold detector's regression: with path selection on (alpha
+        0.1.6 item 1) a window is one sample and a dead path is abandoned
+        after `path_switch_after_misses` windows for discovery (pinned in
+        tests/test_path_selection_0922.py), so this runs with it off."""
+        _, a, b = _raw_mesh(self, ["A-B"], seed=61, config={"direct_path_reset_threshold": "2", "path_selection_enabled": "no"})
         iface = a.iface
         time.sleep(max(0.0, iface.direct_path_reset_min_age_s - (time.monotonic() - iface._resolved_paths[b.prefix].resolved_at)))
         self.mesh.air.link_loss[("A", "B")] = 1.0
@@ -807,7 +814,7 @@ class ZeroHopBidirectionalPageTransfer(unittest.TestCase):
         self.assertTrue(mesh.wait_resolved(60.0))
         a, b = mesh.nodes["A"], mesh.nodes["B"]
         for x, y in ((a, b), (b, a)):
-            y.send(build_rns_packet("data", dest_hash=y.dest_hash, payload=b"prime"))
+            y.send(build_rns_packet("announce", dest_hash=y.dest_hash, payload=b"prime"))
             self.assertTrue(wait_until(lambda: y.dest_hash in x.iface._rns_token_peer, 30.0), "token never learned")
             self.assertTrue(x.iface._peers[y.prefix].raw_fragments)
         wait_until(lambda: not a.iface._direct_exchange_lock_impl.locked() and not b.iface._direct_exchange_lock_impl.locked(), 30.0)

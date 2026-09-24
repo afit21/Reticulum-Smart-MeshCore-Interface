@@ -116,6 +116,7 @@ class SimRadio:
         self._push: Optional[Callable[[str, dict, dict], None]] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.counters = collections.Counter()
+        self.tx_air_ms = 0.0   # item 8: the fake's measured transmit time
         self.log = getattr(air, "log", None) or (lambda msg: None)
 
     # -- wiring --------------------------------------------------------------
@@ -162,6 +163,10 @@ class SimRadio:
         self.loop.call_later(delay, fn, *args)
 
     def _tx(self, packet: SimPacket) -> None:
+        # Item 8 (alpha 0.1.5): what the firmware's CMD_GET_STATS would report.
+        self.counters["packets_sent"] += 1
+        self.counters["flood_tx" if packet.route == ROUTE_FLOOD else "direct_tx"] += 1
+        self.tx_air_ms += self.air.airtime_s(packet.size) * 1000.0
         self.air.transmit(self.name, packet)
 
     # -- contact helpers -------------------------------------------------------
@@ -543,6 +548,12 @@ class SimRadio:
             "payload_length": packet.size, "pkt_payload": pkt_payload,
             "pkt_hash": int(packet.pkt_id[:8], 16), "recv_time": int(time.time()),
         }
+        if packet.ptype == PTYPE_ADVERT:
+            # The library's parser exposes the advert's cleartext pubkey as
+            # `adv_key` (meshcore_parser.py); the interface's shorter-path
+            # adoption (alpha 0.1.5 item 3) attributes flood adverts by it.
+            payload["adv_key"] = packet.body.get("pubkey", "")
+            payload["adv_name"] = packet.body.get("name", "")
         self._push_event("RX_LOG_DATA", payload, {
             "route_type": payload["route_type"], "payload_type": packet.ptype,
             "path_len": len(packet.path), "path": path_hex, "recv_time": payload["recv_time"],

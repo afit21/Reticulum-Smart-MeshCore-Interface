@@ -20,8 +20,11 @@ class _ObservabilityMixin:
     # Packet capture (user-requested, 2026-09-15) -- off by default
     # (packet_capture_enabled). One JSON object per line (JSONL: easy to
     # tail -f, grep, or load with any per-line JSON reader) per in/out
-    # RNS packet, written to packet_capture_dir (default: a
-    # "packet_capture" subdirectory of this node's own RNS storage path).
+    # RNS packet, written to packet_capture_dir (default since 0.1.0:
+    # `meshcore_packet_capture` under this node's own RNS storage path,
+    # ~/.reticulum/storage/meshcore_packet_capture for a default install).
+    # The first record of every file is a `capture_header` (0.1.0): the
+    # interface's effective settings and the radio SELF_INFO reported.
     # Deliberately synchronous, unbuffered writes: this transport's own
     # real throughput ceiling (docs/reliability_engine_design.md's field
     # data: tens of bytes/sec) means packets are inherently rare relative
@@ -32,26 +35,113 @@ class _ObservabilityMixin:
     # analysis tool than avoiding a sub-millisecond stall ever would.
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _capture_filename(label: str, iface_name: str, stamp: str) -> str:
+        """The capture file's name (pure, alpha 0.1.5 item 7):
+        `<label>_capture_<interface>_<stamp>.jsonl` -- the field's own
+        convention for the desktop's files -- or the pre-0.1.5
+        `capture_<interface>_<stamp>.jsonl` when there is no label. Both
+        parts are reduced to [A-Za-z0-9-_]."""
+        def safe(text: str) -> str:
+            return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
+        base = f"capture_{safe(iface_name)}_{stamp}.jsonl"
+        label = safe(label.strip()) if label else ""
+        return f"{label}_{base}" if label else base
+
+    CAPTURE_DEFAULT_SUBDIR = "meshcore_packet_capture"
+    # Settings whose value is never written to a capture (captures get
+    # shared and committed): the name matches, the value is replaced.
+    CAPTURE_REDACTED_SETTINGS = ("secret", "password", "passphrase")
+    # The SELF_INFO fields a capture header keeps: the radio and the node,
+    # not the advertised position (adv_lat/adv_lon).
+    CAPTURE_SELF_INFO_FIELDS = (
+        "name", "public_key", "adv_type", "tx_power", "max_tx_power", "radio_freq", "radio_bw",
+        "radio_sf", "radio_cr", "multi_acks", "manual_add_contacts", "telemetry_mode_base",
+        "telemetry_mode_loc", "telemetry_mode_env",
+    )
+
+    def _capture_dir(self) -> str:
+        """Where capture files go (0.1.0): packet_capture_dir when set
+        (`~` expanded), else `meshcore_packet_capture` under the RNS
+        storage path -- ~/.reticulum/storage when RNS has none, so
+        `packet_capture_enabled = yes` is the only setting a capture needs."""
+        if self.packet_capture_dir:
+            return os.path.expanduser(str(self.packet_capture_dir))
+        base = getattr(RNS.Reticulum, "storagepath", None) or os.path.expanduser("~/.reticulum/storage")
+        return os.path.join(base, self.CAPTURE_DEFAULT_SUBDIR)
+
+    @classmethod
+    def _capture_safe_value(cls, name: str, value):
+        """A setting's value as a capture header writes it: redacted by
+        name, sets as sorted lists, anything not plain JSON as its repr."""
+        if any(word in name.lower() for word in cls.CAPTURE_REDACTED_SETTINGS):
+            return "<redacted>" if value else value
+        if isinstance(value, (set, frozenset)):
+            value = sorted(value, key=repr)
+        if isinstance(value, (list, tuple)):
+            return [v if isinstance(v, (str, int, float, bool)) or v is None else repr(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return repr(value)
+
+    def _settings_snapshot(self, before: set) -> dict:
+        """Every attribute the `_configure_*` calls set (the ones not in
+        `before`), as a capture header writes them. Callables, locks and
+        handles are dropped."""
+        out = {}
+        for key in sorted(set(vars(self)) - before):
+            value = getattr(self, key)
+            if callable(value) or hasattr(value, "acquire") or hasattr(value, "write"):
+                continue
+            out[key] = self._capture_safe_value(key, value)
+        return out
+
+    def _capture_self_info(self) -> dict:
+        info = self._self_info or {}
+        return {k: info[k] for k in self.CAPTURE_SELF_INFO_FIELDS if k in info}
+
+    def _capture_header_record(self) -> dict:
+        """The first record of every capture file (0.1.0): the settings the
+        interface runs with (`settings`, every value `_configure_*` set,
+        defaults included), the keys the config block gave (`config_given`),
+        what the radio reported at the handshake (`radio`) and the radio
+        parameters the airtime model uses (`radio_params`, which follow a
+        freq/bw/sf/cr override)."""
+        given = {}
+        for key, value in dict(self._config_given or {}).items():
+            given[str(key)] = self._capture_safe_value(str(key), value)
+        params = self._radio_params
+        return {
+            "event": "capture_header",
+            "interface": self.name,
+            "interface_class": type(self).__name__,
+            "rns_version": getattr(RNS, "__version__", None),
+            "radio": self._capture_self_info(),
+            "radio_override": bool(self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr),
+            "radio_params": list(params) if params is not None else None,
+            "config_given": given,
+            "settings": dict(self._settings_at_start or {}),
+        }
+
     def _open_packet_capture(self) -> None:
         try:
-            capture_dir = self.packet_capture_dir
-            if not capture_dir:
-                base = getattr(RNS.Reticulum, "storagepath", None)
-                if not base:
-                    RNS.log(
-                        f"{self}: packet_capture_enabled but no packet_capture_dir "
-                        f"configured and no RNS storage path available -- capture "
-                        f"disabled for this run.",
-                        RNS.LOG_WARNING,
-                    )
-                    return
-                capture_dir = os.path.join(base, "packet_capture")
+            capture_dir = self._capture_dir()
             os.makedirs(capture_dir, exist_ok=True)
-            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.name)
-            filename = f"capture_{safe_name}_{time.strftime('%Y%m%dT%H%M%S')}.jsonl"
+            # Item 7: the node label -- packet_capture_label, else the
+            # MeshCore node name SELF_INFO gave (known by now: the capture
+            # opens once the node is online).
+            label = self.packet_capture_label or (self._own_node_name or "")
+            filename = self._capture_filename(label, self.name, time.strftime('%Y%m%dT%H%M%S'))
             path = os.path.join(capture_dir, filename)
             self._packet_capture_file = open(path, "a", buffering=1)
             RNS.log(f"{self}: packet capture enabled -- writing to {path}", RNS.LOG_INFO)
+            self._capture_event("out", self._capture_header_record())
+            self._captured_radio = self._capture_self_info()
+            # Alpha 0.1.6 (item 4): connection_state records from before
+            # the node had a name (the capture needs the handshake).
+            pending, self._pending_capture_events = self._pending_capture_events, []
+            for record in pending:
+                self._capture_event("out", record)
         except Exception as exc:
             RNS.log(f"{self}: failed to open packet capture file: {exc} -- capture disabled for this run.", RNS.LOG_WARNING)
             self._packet_capture_file = None
@@ -235,7 +325,10 @@ class _ObservabilityMixin:
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
+        duty_cycle_ledger: Optional[str] = None,
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
+        proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
+        proof_tail_hold_s: Optional[float] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -319,6 +412,14 @@ class _ObservabilityMixin:
             # governed the wait. The `rx_*` fields are the correlation
             # window -- offsets in seconds after MSG_SENT.
             "ack_timeout_source": ack_timeout_source,
+            # Alpha 0.1.7 (item 1): a plain PROOF's age since RNS queued it
+            # (None for any other frame) and whether it pre-empted as fresh.
+            "proof_age_s": round(proof_age_s, 3) if proof_age_s is not None else None,
+            "proof_fresh": proof_fresh,
+            # Alpha 0.1.9 (item 2): the sender's burst tail this proof waited
+            # out before it was dispatched (None for any other frame, and for
+            # a proof that owed no wait).
+            "proof_tail_hold_s": proof_tail_hold_s,
             "ack_latency_s": round(ack_latency_s, 3) if ack_latency_s is not None else None,
             "send_cmd_latency_s": round(send_cmd_latency_s, 3) if send_cmd_latency_s is not None else None,
             **self._rtt_capture_fields(peer_prefix),
@@ -351,6 +452,10 @@ class _ObservabilityMixin:
             # User-requested (2026-09-18 evening): handshake-class frames
             # skip the duty-cycle wait (airtime still charged).
             "duty_cycle_exempt": duty_cycle_exempt,
+            # Alpha 0.1.5: the ledger a duty-cycle wait was charged to
+            # ("relayed" = the 30% cap, "total" = the zero-hop cap, None =
+            # no wait / not gated).
+            "duty_cycle_ledger": duty_cycle_ledger,
             # Field fix (2026-09-19 night): how long this attempt kept the
             # radio lock AFTER its listen delay waiting for the answer it
             # asked for -- the hidden-node quiet window, non-null only on a
@@ -444,6 +549,7 @@ class _ObservabilityMixin:
         self, peer_prefix: str, pkt_id: int, frag_total: int, outcome: str, complete: bool,
         stage: str = "final", timeout_s: Optional[float] = None,
         answer_version: Optional[int] = None, held: Optional[list] = None,
+        hop_count: Optional[int] = None,
     ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per
         `_check_remote_completion` call, so the next field test can
@@ -460,6 +566,11 @@ class _ObservabilityMixin:
             return
         self._capture_event("out", {
             "event": "completion_check_result",
+            # Alpha 0.1.8 (item 5): the hop count, so the field summary can
+            # stratify reconcile outcomes the way it stratifies everything
+            # else -- without it every window landed in an untyped bucket
+            # and "frames per completed window by hop" could not be built.
+            "hop_count": hop_count,
             "peer_prefix": peer_prefix,
             "pkt_id": pkt_id,
             "frag_total": frag_total,
@@ -519,7 +630,7 @@ class _ObservabilityMixin:
                     f"raw_fragments_rx={self._raw_fragments_received} raw_frames_ignored={self._raw_frames_ignored} "
                     f"raw_unsupported_paths={list(self._raw_unsupported_paths)} "
                     f"ack_rtt={{{', '.join(f'{p!r}: srtt={st['srtt']:.2f}s rttvar={st['rttvar']:.2f}s n={st['samples']}' for p, st in self._ack_rtt.items())}}}",
-                    RNS.LOG_INFO,
+                    RNS.LOG_DEBUG,
                 )
                 # Per-bucket fragment counts/ages (docs/interface_architecture.md's
                 # observability requirements ask for these specifically) --
@@ -572,6 +683,8 @@ class _ObservabilityMixin:
             "path_reply_seen_s": None,    # PATH from target to us (the flood-mode ACK carrier)
             "foreign_rx_count": 0,
             "foreign_rx": [],             # up to _RX_LOG_WINDOW_FOREIGN_CAP (typename, route, path_len, t, src_hash)
+            "ack_snr": None,              # the matched ACK's signal (alpha 0.1.6 item 1)
+            "ack_rssi": None,
         }
         self._rx_log_window = window
         return window
@@ -596,6 +709,9 @@ class _ObservabilityMixin:
         if ptype == self._RX_LOG_PAYLOAD_TYPE_ACK and w["expected_ack"] and fields.get("ack_code") == w["expected_ack"]:
             if w["ack_seen_on_air_s"] is None:
                 w["ack_seen_on_air_s"] = t
+                # Alpha 0.1.6 (item 1): the ACK's signal is the last leg of
+                # the path this frame went on (`_note_path_signal`).
+                w["ack_snr"], w["ack_rssi"] = fields.get("snr"), fields.get("rssi")
             return
         if (
             ptype == self._RX_LOG_PAYLOAD_TYPE_TEXT_MSG
@@ -630,7 +746,7 @@ class _ObservabilityMixin:
         with no `rx_log` records can be told apart from a mesh that was
         genuinely silent."""
         if not self.rx_log_observe_enabled:
-            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_INFO)
+            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_DEBUG)
             return
         if not hasattr(self._EventType, "RX_LOG_DATA"):
             RNS.log(
@@ -645,7 +761,7 @@ class _ObservabilityMixin:
             f"{self}: subscribed to the firmware's raw-RX log feed (RX_LOG_DATA) -- "
             f"observe-only; overheard packets are counted in [STATS] and, when "
             f"packet capture is on, recorded as 'rx_log' events.",
-            RNS.LOG_INFO,
+            RNS.LOG_DEBUG,
         )
 
     # -- Step 4 (2026-09-18): airtime model and predicted-busy holds -------
@@ -737,6 +853,101 @@ class _ObservabilityMixin:
             return hold, reason
         return 0.0, "unknown"
 
+    # -- Own-transmit busy accounting (alpha 0.1.5, 2a) ----------------------
+
+    def _note_radio_keyed(self, airtime_s: float, now: Optional[float] = None) -> float:
+        """One more frame handed to the firmware: the radio is busy until
+        the later of now and its previous busy-until, plus this frame's
+        estimated airtime (pure over its inputs; the firmware's own CAD
+        deferral and tx budget can only push the real end later, so this is
+        a floor). Returns the new busy-until."""
+        now = time.monotonic() if now is None else now
+        self._radio_busy_until = max(now, self._radio_busy_until) + max(0.0, airtime_s)
+        self._estimated_tx_air_total_s += max(0.0, airtime_s)   # item 8: the estimator's running sum
+        self._frames_keyed_total += 1
+        return self._radio_busy_until
+
+    def _radio_busy_remaining_s(self, now: Optional[float] = None) -> float:
+        """Seconds until this node's own queued frames are estimated to be
+        off the air (0.0 when idle)."""
+        now = time.monotonic() if now is None else now
+        return max(0.0, self._radio_busy_until - now)
+
+    # -- Radio transmit statistics (alpha 0.1.5, item 8) --------------------
+
+    def _radio_stats_record(self, reason: str, radio: Optional[dict], packets: Optional[dict]) -> dict:
+        """The `radio_stats` capture record (pure over its inputs): the
+        firmware's measured transmit / receive airtime and packet counts
+        beside this interface's own summed airtime estimate and frame count
+        since start, so a field summary can calibrate the estimator against
+        the radio (`tx_air_secs` is `Dispatcher::total_air_time` in whole
+        seconds, wall-clock from send start to send complete)."""
+        radio = radio or {}
+        packets = packets or {}
+        return {
+            "event": "radio_stats", "reason": reason,
+            "tx_air_secs": radio.get("tx_air_secs"), "rx_air_secs": radio.get("rx_air_secs"),
+            "noise_floor": radio.get("noise_floor"), "last_rssi": radio.get("last_rssi"), "last_snr": radio.get("last_snr"),
+            "packets_sent": packets.get("sent"), "packets_recv": packets.get("recv"),
+            "flood_tx": packets.get("flood_tx"), "direct_tx": packets.get("direct_tx"),
+            "flood_rx": packets.get("flood_rx"), "direct_rx": packets.get("direct_rx"),
+            "recv_errors": packets.get("recv_errors"),
+            "estimated_tx_air_s": round(self._estimated_tx_air_total_s, 3),
+            "frames_keyed": self._frames_keyed_total,
+            "uptime_s": round(time.time() - self._connected_since, 1) if self._connected_since else None,
+        }
+
+    async def _poll_radio_stats(self, reason: str) -> Optional[dict]:
+        """Read the firmware's radio and packet statistics (CMD_GET_STATS,
+        companion protocol v8+) and write one `radio_stats` record. Best
+        effort: a firmware or library without the command is logged once and
+        never asked again. Returns the record, or None."""
+        if self._radio_stats_unsupported or self._mc is None:
+            return None
+        commands = getattr(self._mc, "commands", None)
+        if commands is None or not hasattr(commands, "get_stats_radio") or not hasattr(commands, "get_stats_packets"):
+            self._radio_stats_unsupported = True
+            self._debug("radio stats: the meshcore library has no get_stats_radio/get_stats_packets -- not polled.")
+            return None
+        radio = packets = None
+        try:
+            async with self._command_lock:
+                ev = await asyncio.wait_for(commands.get_stats_radio(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                radio = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+                ev = await asyncio.wait_for(commands.get_stats_packets(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                packets = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+        except Exception as exc:
+            if not self._radio_stats_unsupported:
+                self._radio_stats_unsupported = True
+                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_DEBUG)
+            return None
+        record = self._radio_stats_record(reason, radio, packets)
+        self._debug(
+            f"radio stats ({reason}): firmware tx_air {record['tx_air_secs']}s rx_air {record['rx_air_secs']}s "
+            f"sent {record['packets_sent']} -- interface estimate {record['estimated_tx_air_s']}s over {record['frames_keyed']} frames."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", record)
+        return record
+
+    async def _radio_stats_loop(self):
+        """`radio_stats` on a fixed cadence (`radio_stats_interval`; 0 =
+        start and stop only)."""
+        try:
+            while not self.detached and self.radio_stats_interval_s > 0 and not self._radio_stats_unsupported:
+                await asyncio.sleep(self._loop_interval_s(self.radio_stats_interval_s, "radio_stats_interval"))
+                if self.detached:
+                    break
+                await self._poll_radio_stats("interval")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._debug(f"radio stats loop stopped: {exc}")
+
     def _extend_medium_busy(self, hold_s: float, reason: str, now: float) -> None:
         if hold_s <= 0:
             return
@@ -806,7 +1017,12 @@ class _ObservabilityMixin:
             payload = event.payload if isinstance(event.payload, dict) else {}
             now = time.monotonic()
             since_last_rx = (now - self._last_rx_log_at) if self._last_rx_log_at is not None else None
-            since_own_tx = (now - self._last_own_tx_at) if self._last_own_tx_at is not None else None
+            # Alpha 0.1.5 (2a): measured from the estimated END of this
+            # node's own last frame on air, not from the send command --
+            # negative while a queued burst is still estimated to be on air
+            # (the field's radio log read 9 s "idle" with ten queued
+            # fragments transmitting).
+            since_own_tx = (now - self._radio_busy_until) if self._last_own_tx_at is not None else None
             self._last_rx_log_at = now
             self._rx_log_feed_seen = True
             self._rx_log_events_total += 1
@@ -821,6 +1037,8 @@ class _ObservabilityMixin:
             fields["medium_busy_remaining_s"] = round(self._medium_busy_remaining_s(now), 3)
             if self._rx_log_window is not None:
                 self._classify_rx_log_for_window(fields, now)
+            # Alpha 0.1.5 (item 3): a bound peer's flood shows a route to it.
+            self._note_flood_route(payload, fields, now)
             if self._packet_capture_file is None and not self.debug_logs:
                 return
             if self._packet_capture_file is not None:

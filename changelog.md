@@ -1,5 +1,628 @@
 # Changelog
 
+## 0.1.0 (2026-09-24)
+
+The first release: the alpha 0.1.9 second-pass build (`35a6c22`), unchanged in behaviour, after its
+2026-09-24 field session (`fieldtests/raw/Alpha0.1.9/`) showed the two defects that pass targeted
+fixed in the field and the best two-hop numbers recorded on this project (the dated record is
+`docs/history.md`, "0.1.0"). No wire change; alpha 0.1.9 and 0.1.0 nodes interoperate. No default
+changed (`tests/test_shipped_defaults.py` is untouched).
+
+- **Routine logs moved from INFO to DEBUG.** The periodic `[STATS]` line, path discovery results and
+  path decisions (switches were INFO, trials already DEBUG), the peer and announce cache restores,
+  the raw-RX log feed subscription, the "no radio override" and telemetry-mode notes, "radio
+  statistics unavailable" and "handshake answered on attempt N". Still at INFO: connected, online,
+  detached, the reconnect countdown, node identity, a radio override applied, channel configured
+  and the default-channel notice, peer bound and peer expired, and where packet capture is writing.
+  The `debug_logs` flag is unchanged: it still emits the interface's own diagnostics at INFO so they
+  can be turned on without RNS core's DEBUG level.
+- **Two update scripts.** `update-interface.sh` now installs from the `main` branch (the release);
+  `update-interface-dev.sh` is the same script defaulting to `development`. Both keep `--branch`.
+  Both now make sure the `meshcore` python library is importable by the python that runs rnsd
+  (read from rnsd's shebang, so a pipx or venv rnsd is checked in its own interpreter) and install
+  it with pip, or `pipx inject`, when it is not, since the interface panics rnsd without it.
+  `--check` only reports; `--skip-deps` skips the step.
+- **The 2026-09-23 home-session captures are back**, under `fieldtests/raw/Alpha0.1.9-home/`
+  (they were removed from `Alpha0.1.9/` when the 2026-09-24 captures went in, and
+  `test_field_ab_compare_path_rows_0924` had been skipping its 144-miss-run pin without them).
+
+- **Packet capture opens with a header, and needs only `packet_capture_enabled = yes`** (user
+  request, same day). Every capture file's first record is now `event: "capture_header"`: `settings`
+  (every value the `_configure_*` calls set, defaults included, 165 of them), `config_given` (the
+  keys the config block gave), `radio` (what the radio's SELF_INFO reported: frequency, bandwidth,
+  SF, CR, TX power, node name and key -- not the advertised position) and `radio_params` (what the
+  airtime model uses, following a freq/bw/sf/cr override). Anything named like a secret, password
+  or passphrase is written as `<redacted>`, including `channel_secret_hex`. A later SELF_INFO with
+  different radio fields writes a `radio_settings` record. The default directory is now
+  `meshcore_packet_capture` under the RNS storage path (`~/.reticulum/storage/meshcore_packet_capture`
+  for a default install; it was `packet_capture`), with `~/.reticulum/storage` as the fallback when
+  RNS gives no storage path (capture used to switch itself off). `packet_capture_dir` still
+  overrides it, and `~` in it is now expanded. The analysis scripts select by `event` and are
+  unaffected. Tests: `tests/test_capture_header_0924.py`; `test_capture_label_0921` now expects the
+  header first.
+
+## alpha-0.1.9 (2026-09-23)
+
+From the alpha 0.1.8 field session (`fieldtests/raw/Alpha0.1.8/`, 2026-09-23: a three-hop stop and a
+two-hop stop). Every item corrects something alpha 0.1.8 shipped; nothing new is added. The dated
+design record is `docs/history.md` ("Alpha 0.1.9 pass"). Every default is pinned by
+`tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
+
+- **A skipped completion report counts as reported.** Alpha 0.1.8's item 1 replaces a window's
+  complete report with RNS's PROOF, but never stamped `_last_complete_report_at`, so the parity
+  fragment arriving one fragment spacing later was treated as a fresh trigger and the report went
+  out anyway -- four times at the 2026-09-23 two-hop stop, `held_s 0.0`, 3.8 to 4.9 s after the
+  skip, queued behind the proof's 11 s ACK timeout. Those skips saved nothing. Both skip sites now
+  stamp through one new writer, `_note_complete_report_sent`, which `_send_completion_report` also
+  uses. Gaps reports, held reports and the QUERY's ANSWER are unaffected -- the stamp is read only
+  by `_report_recently_sent`, only for a flagged frame of an already-delivered packet, and only
+  inside the burst tail. Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`. MeshBench:
+  `two_hop`, `relay`.
+- **The proof waits for the sender's burst tail.** A proof that replaced a report won only 9 of 17
+  first attempts at two hops across the 2026-09-23 session, against 6 of 7 for proofs answering
+  bare single-fragment packets (3.8 s turnaround against 10.0 s) and the path's own 67-69 % attempt
+  success -- because the sender's parity fragment follows the completing data fragment by one
+  fragment spacing (4.63 s at two hops) and the proof is in the relay chain when it is transmitted.
+  When a window completes with its parity still outstanding, or on an unflagged fragment, the proof
+  is now held one fragment spacing plus the half-airtime margin (`_report_hold_s(...,
+  arriving=False)`, an existing rule and constant) before dispatch; if the parity is already in and
+  the flagged last frame completed the part, it goes at once as before, and a bare packet's proof
+  never waits. The wait is deliberately one spacing, not the two-spacing still-arriving hold, which
+  at two hops (9.55 s) exceeds the sender's own report wait (9.0 s) and would provoke the QUERY
+  alpha 0.1.8 removed. This delays a frame not yet sent, so alpha 0.1.7's second cut is untouched.
+  Capture: `proof_tail_hold_s` on the proof's attempt record and a `proof_tail_hold` decision
+  record. Tests: `tests/test_proof_tail_and_skip_stamp_0923.py`. MeshBench: `two_hop`, `three_hop`,
+  `large_payload`, `relay`.
+- **`direct_raw_gap_own_airtime` now defaults to `no`** (the owner's decision). The gap between raw
+  fragments through repeaters drops from `(1 + 2 x hops)` to `(2 x hops)` airtimes -- at the field
+  radios' SF7/62.5/4:8, one hop 2.73 -> 1.82 s, two hops 4.55 -> 3.64 s, three hops 6.37 -> 5.46 s;
+  zero hop is untouched. This is the field A/B's `no` arm adopted without the A/B
+  (`fieldtests/AB_PROTOCOL.md` has still never been run), so it is a judgement about spending less
+  airtime per burst rather than a measured result. It also shrinks two derived values in this
+  release's favour: the proof burst-tail hold becomes 2.28 s at one hop and 4.09 s at two, and the
+  burst-tail report suppression window becomes 7.74 s at two hops, now inside the sender's 9.0 s
+  report wait rather than just outside it. **The burst loop now always awaits between fragments**,
+  even for a zero gap -- skipping the await starved the event loop, so a completion report or Link
+  handshake queued mid-burst never registered as a lock waiter and waited out the whole window. No
+  shipped configuration reaches a zero gap; nothing should depend on it being nonzero. Tests:
+  `tests/test_raw_gap_own_airtime_0921.py` plus re-pins. Every MeshBench scenario is affected.
+- **Reverted in the second pass (2026-09-24): `direct_raw_gap_own_airtime` defaults to `yes` again.**
+  The flip above got no test: the A/B has still never run, MeshBench cannot judge this knob (no
+  listen-before-talk), and the only field time the `no` arm had -- the 2026-09-23 22:04-23:07
+  session -- was two raw parts at one hop and three at two, all while both nodes were stuck on a dead
+  zero-hop path. The default goes back to the arm the bench measured, `(1 + 2 x hops)` airtimes, and
+  the A/B decides; `direct_raw_gap_own_airtime = no` still selects the other arm with no rebuild.
+  The proof burst-tail hold and the burst-tail report suppression window return to their first-pass
+  values (3.18 s and 5.00 s hold at one and two hops). The unconditional await in the burst loop
+  stays. Tests: `tests/test_gap_default_restored_0924.py`; the re-pins of
+  `tests/test_raw_gap_own_airtime_0921.py`, `tests/test_raw_fragments.py` and
+  `tests/test_reconcile_m1_noack_reports_0920.py` reversed; shipped-default pin and golden config
+  re-pinned.
+- **RNS 1.5 compatibility: the interface defines `ifac_size`.** `Transport.preprocess_inbound` on
+  RNS 1.5 sizes every inbound frame against `interface.HW_MTU + (interface.ifac_size or 0)`, and the
+  base `Interface` class does not define that attribute -- `RNS.Reticulum` sets it when it
+  configures an interface (None with no IFAC). Under `rnsd` nothing was wrong, but every path that
+  builds a `SmartMeshCoreInterface` directly, including the white-box hardware scripts in
+  `testscripts/` and the hermetic unit tests, raised AttributeError on its first inbound packet on
+  RNS 1.5.4. An instance value set by Reticulum still shadows the default, so a configured IFAC size
+  is untouched. Tests: `tests/test_rns15_interface_contract_0923.py`.
+- **Second pass (2026-09-24), item 1: a zero-hop attempt counts.** The per-attempt miss count (first
+  pass, item 4) returned on `if not path_hex`, and the zero-hop path's hex is the empty string, so
+  every zero-hop attempt was dropped as "no path" -- and since the send result no longer increments
+  the count, the zero-hop path's misses were counted nowhere. Session 2 of 2026-09-23: after the laptop
+  left home it missed 144 consecutive zero-hop attempts over 22 minutes with one `path_selected`
+  record in the capture, the desktop likewise, and nothing at one to three hops got through meanwhile.
+  Only a missing resolved path returns now. Replayed, the run reaches the trial threshold at its fourth
+  attempt and exhausts at its eighth (69 s in), and discovery runs. Tests:
+  `tests/test_zero_hop_attempts_count_0924.py` (fixture `field_0923_laptop_zero_hop_miss_run.json`).
+- **Second pass (2026-09-24), item 2: path eligibility weighs the measured rate.** On session 1's drive
+  (2026-09-23) the desktop made 23 path decisions, 16 of them never delivering (84 attempts, 626 s),
+  three of them trials of a zero-hop path measured dead: a candidate came back 120 s after its last miss
+  whatever its rate, and the patience that keeps a current path through its misses applied only above
+  50 %, which nothing reaches at two to four hops. Now a candidate with `PATH_EXHAUST_MISSES`
+  consecutive missed attempts is dead until fresh external evidence (a flood copy, a peer report, a
+  discovery result); after its cooldown a candidate must measure at least the current path's rate
+  (or be unmeasured, or have been heard since); and past its miss threshold the current path is kept
+  while its measured rate beats every eligible alternative. Replayed, none of the three zero-hop
+  trials happens, the laptop's four no-evidence trials become one, and alpha 0.1.6-0.1.8's replays
+  are unchanged. Cost, from the same replays: twice the new rule keeps a 0.36-0.40 path where the
+  field's trial of a weak-prior candidate delivered. Tests:
+  `tests/test_rate_aware_eligibility_0924.py` (fixture `field_0923_path_decisions.json`).
+- **Second pass (2026-09-24), close-out.** MeshBench on the final build: 16 of 16 PASS over the eight
+  reference scenarios (alpha 0.1.8 on the same RNS 1.5.4: 14 of 16), recorded in
+  `tests/baselines/2026-09-24-meshbench-ac637dd.md`; the alpha 0.1.8 reference on RNS 1.5.4 is
+  `tests/baselines/2026-09-24-meshbench-2b968d0-rns154.md`. No wire change; the version stays alpha 0.1.9.
+- **Second pass (2026-09-24), item 2, second cut: an untried candidate always gets its trial.** Item 2's
+  first cut failed its own MeshBench gate: in `shortcut_appears` every flood candidate reads 0 dB and
+  carries the weak prior, the current three-hop path's 0.27-0.33 beat it, and the one-hop shortcut was
+  trialled only once the old path was dead, 4.5-6 minutes after the move. The current path's patience
+  now stands aside for an eligible candidate never tried (no outcome, no miss, evidence not stale); the
+  prior orders it but no longer excludes it. The field replays are unchanged (the candidates excluded
+  there were stale or already tried).
+- **Second pass (2026-09-24), item 3: no proof tail hold at zero hop.** The first pass's burst-tail
+  hold still fired at zero hop -- session 2's desktop held zero-hop proofs 0.96 to 2.27 s -- through
+  the unflagged-completion branch and a stale one-hop peer report. At zero hop the parity follows
+  within 0.15 s and there is no relay chain, so the hold is now zero whenever this node's own path to
+  the sender is zero hop, whatever the peer last reported. Through repeaters nothing changes. Tests:
+  `tests/test_no_proof_tail_hold_at_zero_hop_0924.py`; the first pass's zero-hop test re-pinned to
+  assert zero in both branches.
+- **Second pass (2026-09-24), item 5: `field_ab_compare.py` prints the path scoreboard's cost.**
+  Per node: `path_selected` decisions, the longest run of consecutive counted misses on one path per
+  hop count and what ended it, and the decisions that chose a path and got zero successes (count,
+  attempts, ACK-wait seconds). The 2026-09-23 evening sessions read: session 1, 45 decisions and 16
+  zero-success decisions on the desktop (84 attempts, 626 s); session 2, a 144-attempt zero-hop miss
+  run on the laptop that no decision ended. Tests: `tests/test_field_ab_compare_path_rows_0924.py`.
+- **Path misses count per attempt** (`path_switch_after_misses` 2 -> 4, `PATH_EXHAUST_MISSES` 4 -> 8;
+  both are the old thresholds expressed in the new unit, since a missed send is exactly
+  `direct_send_attempts` = 2 consecutive missed attempts). Airtime is spent per attempt but the
+  scoreboard learned per send, and the two paths that spend the most recorded nothing: a fragmented
+  send's per-fragment attempts pass `record_result=False` and a QUERY round's evidence passes
+  `path_sample=False`. On 2026-09-23 the desktop spent nine raw-fragment attempts and two QUERY
+  attempts on a dead two-hop path between 11:29:35 and 11:31:26 with no `direct_send_result` at all,
+  did not reach its trial threshold until 11:41:22 and never exhausted; replayed per attempt it
+  stops being current 29 s in and exhausts 85 s in. The delivery-rate samples stay one per send --
+  that number goes on the wire and is read by the peer as a prior, and four constants are calibrated
+  against it -- so only the miss count changes unit. Which attempts count is an allow-list
+  (`firmware`, `hop1_abort`): a locally shortened ceiling, a pre-empted or superseded wait, an
+  expiry in the lock queue, a reply that arrived another way and a no-ACK frame are all excluded,
+  and 6 of the 21 failed attempts in that field window were the excluded `report_window` class.
+  Tests: `tests/test_path_misses_per_attempt_0923.py`. MeshBench: `failover`, `repeater_returns`,
+  `shortcut_appears`, `two_hop`, `weak_direct`.
+- **Cache defaults that survive a field day** (`announce_cache_ttl` 3600 -> 604800,
+  `path_request_local_answer_min_interval` 120 -> 600). The session's two stops were two hours
+  apart and the announce cache's TTL was one hour, so every entry cached at the first stop had
+  expired before the second and eight announces went over the air again at two hops for
+  destinations already held that morning; persistence across a restart, added in 0.1.8, bought
+  nothing across that gap because the load-time age cap is the same TTL. A week is what RNS itself
+  keeps: this interface is MODE_FULL, so a path learned over it is stamped
+  `Transport.PATHFINDER_E` and the path table culled at `Transport.DESTINATION_TIMEOUT`, both
+  60*60*24*7 (`RNS/Transport.py`) -- the cache now expires exactly when the answering node's own
+  record of the same announce would, and never later. A long TTL is bounded by liveness rather than
+  age: an entry answers only while the peer that delivered it is still bound and out of
+  path-discovery backoff, the periodic on-air verification still runs, and the cache stays
+  LRU-capped at 256 keys. The verification interval moves for its own evidence -- at 120 s it put
+  six requests on the air for three destinations in the three and a half minutes from 11:40:51 to
+  11:44:16, each a relayed DIRECT request answered with a multi-fragment announce window. Tests:
+  `tests/test_field_day_cache_defaults_0923.py`. MeshBench: `companion_restart`, `bring_up`.
+- **The field comparison script's part-time pairing, and two proof readings it was missing**
+  (`testscripts/field_ab_compare.py`; no interface change). `pkt_id` is per-process, so a node that
+  restarted mid-session paired a fragment of one process with a completion of the next and the
+  017-vs-018 hop-3 part time read 7434 s; part timing (and the round-0/round-1 position table and
+  the parity-reconstruction lookup, which shared the key) is now keyed per capture file, one file
+  being one interface start. That row now reads 110.6 s. Proof turnaround is split into raw-window,
+  bare-packet and report-skipped rows, because the first two differ by about a factor of two at two
+  hops (10.0 s against 3.8 s) and a combined median hides it, and the proof's first-attempt success
+  is printed per hop and population for the first time. Tests:
+  `tests/test_field_ab_compare_restart_0923.py`.
+
+## alpha-0.1.8 (unreleased, 2026-09-23)
+
+From the alpha 0.1.7 field session (`fieldtests/raw/Alpha0.1.7/`, 2026-09-22 evening: zero hop at
+home, a two-hop stop, a one-hop stop). The release is about frames per exchange. The dated design
+record is `docs/history.md` ("Alpha 0.1.8 pass"). New config keys, both optional:
+`proof_report_grace = 0.25`, `direct_report_ack_min_hops = 2`, `announce_cache_path` (empty). Every default is pinned by
+`tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`.
+
+- **The proof is the completion** (`proof_report_grace = 0.25`). RNS proves every
+  single-destination DATA packet, so for a raw window whose packets it will prove, the PROOF already
+  tells the sender what the completion report would -- "I have it" -- and it has to be sent anyway.
+  The receiver now holds that window's complete report for `proof_report_grace` and drops it if RNS
+  proves the packet inside it (the packet is handed to RNS first, so there is a proof to wait for);
+  the sender treats an inbound PROOF for a packet in an open window as that packet's completion, and
+  a window whose packets are all proved ends with the new outcome `proved` -- no report wait past
+  the proof, no QUERY. Four gates keep it to the case the evidence is about: RNS must prove the
+  packet per packet (a Resource part, anything inside a Link and every announce are excluded), the
+  destination must be served by this node's own RNS, nothing else of that sender's recent raw
+  packets may be incomplete (the report's per-fragment bitmaps for the other parts are worth more
+  than the proof's latency), and the sender must be a bound peer with a resolved path so the proof
+  routes back DIRECT. Field motivation at two hops: the receiver sent 22 complete reports and the
+  sender got 3 inside its report wait plus 2 stale -- the report is a no-ACK frame, one
+  transmission, never retried -- so the sender waited out its 10-18 s report wait and ran a QUERY
+  (23 in 17 minutes, 0.93 QUERY attempts per raw send against 0.22 at one hop in 0.1.6), and every
+  answered one said the data had already arrived; and because the report went first and the radio
+  was then held for its relay window, the proof keyed about 8 s after the packet landed, first
+  attempt succeeding 3 times of 14, proof turnaround 17.9 s median / 30.6 s p90 / 45 s max.
+  Nothing here cuts a hold: alpha 0.1.7's second cut stands untouched and this works by not sending
+  a frame. `proof_report_grace = 0` disables the item. Capture: a `completion_report_skipped` record
+  with `report_skipped_for_proof`, and `outcome: "proved"` with `proved_by` on
+  `completion_check_result`. Tests: `tests/test_proof_is_the_completion_0923.py`. MeshBench:
+  `relay`, `two_hop`, `large_payload`, `page_transfer`.
+- **The announce cache survives a restart, and one path-request verification per interval goes on
+  the air instead of most of them.** The cache of announces that answers RNS path requests locally
+  (`path_request_answered_locally`) is now persisted to `smci_announces.json` under
+  `RNS.Reticulum.storagepath` -- beside the peer cache, written by the same atomic tmp-file rule,
+  aged in wall-clock so a restart can read it, capped on load at the existing `announce_cache_ttl`
+  (an hour; RNS's own restored paths live 6 hours to a week, so this is far inside it). A restored
+  entry counts as verified at the restore instant, so the first path request after a restart is
+  answered from the cache. New optional key: `announce_cache_path` (empty = the default location;
+  `announce_cache_ttl = 0` still disables the cache and its file).
+  And the local-answer rule is inverted. It capped the LOCAL answers at one per
+  `path_request_local_answer_min_interval` and let every other request transmit; with RNS
+  re-requesting every 30-70 s the periodic verification had become the common case. It now caps the
+  ON-AIR verification at one per interval and answers everything in between from the cache, which
+  is what the rule was meant to do. Field motivation: the laptop restarted three times that
+  evening, and each restart at two hops cost about three minutes of path requests -- 8 transmitted
+  and 9 rate-limited between 22:29:07 and 22:32:33, answered by the desktop with three-fragment
+  announce windows through two repeaters -- all for one destination the desktop had announced
+  before 22:20. Over the hour that one destination took about 20 transmitted requests against 12
+  answered locally; the pair at 22:37:02 and 22:37:38 went out 70 s and 106 s after a local answer.
+  No wire change. Tests: `tests/test_announce_cache_restart_0923.py`; two assertions of
+  `tests/test_local_announce_cache_0920.py` re-pinned, since the rule is reversed on purpose.
+  MeshBench: `companion_restart`, `bring_up`.
+- **The completion report is acknowledged where the no-ACK frame does not arrive**
+  (`direct_report_ack_min_hops = 2`). From that hop count up, a completion REPORT goes through the
+  acknowledged send path with one retry instead of the no-ACK frame; a firmware ACK counts as
+  delivered. Below the threshold the no-ACK frame and its relay hold are untouched. The frame's
+  CONTENT does not change -- only its MeshCore carrier -- so the golden wire snapshot is unaffected.
+  Field motivation: at two hops the receiver's report reached the sender 3 times out of 22 (it is
+  one transmission, never retried), and each miss cost the sender its whole 10-18 s report wait and
+  then a QUERY round -- about 2.1-2.4 s of channel time at two hops -- to learn what the report had
+  already said. The ACK costs about 0.42 s there, so it pays for itself if it saves roughly one
+  QUERY round in five. At one hop reports arrived 33 times of 48 in alpha 0.1.6 and the ACK would
+  cost more than it saves. Two details that matter: the acknowledged carrier now takes the radio
+  lock in the REPORT class, as the no-ACK carrier always has (without it, alpha 0.1.5 item 6 and
+  alpha 0.1.7 item 3c would be silently lost), and the report's ACK wait is bounded by the sender's
+  own report window rather than the miss ceiling (~9.4-11 s at two hops against a 9 s report wait,
+  which would have put the retry on the air only after the sender had already started a QUERY
+  round). The retry re-encodes the bitmap from the live buckets, keeps the round nonce and varies
+  the firmware attempt byte; no path evidence is recorded either way. `direct_report_ack_min_hops =
+  0` disables the item. Capture: `report_acked` on `completion_report_sent`. Tests:
+  `tests/test_report_ack_at_multihop_0923.py`. MeshBench: `two_hop`, `three_hop`, `relay`.
+- **Capture and field summary for the above.** New capture fields: `report_skipped_for_proof` on a
+  `completion_report_skipped` record and `outcome: "proved"` with `proved_by` on
+  `completion_check_result` (item 1), `report_acked` on `completion_report_sent` (item 2), `stale` /
+  `snr_fresh` / `peer_rate_fresh` on every candidate of `path_selected` (item 3), and `hop_count` on
+  `completion_check_result` -- without that last one every reconcile outcome landed in an untyped
+  bucket and could not be stratified by hop the way everything else is. `field_ab_compare.py` gained
+  two tables: frames per completed raw window by hop (data fragments, reports, QUERYs, ANSWERs,
+  proof/data attempts and firmware ACKs, which is this release's metric in frames) and report
+  carrier and arrival by hop (sent, acknowledged, no-ACK, skipped for a proof, against the sender's
+  own outcomes). The duplicate-delivery window is now 60 s rather than 30: the two-hop copies of one
+  211-byte message were spaced up to 50 s by the interface's own queue and ACK timeouts, so a 30 s
+  link broke exactly the chains this release is about.
+- **`shortcut_appears`'s hard check reads both scoreboards** (`testscripts/meshbench_scenarios.py`;
+  no interface change). The alpha 0.1.7 close-out left this check open after it passed 1 of 9 on that
+  build against 5 of 6 on 0.1.6. The 2026-09-23 isolation settled it: alpha 0.1.7 with item 3 (token
+  learning) reverted passed **1 of 3**, against the shipped build's **2 of 3** on the same seeds --
+  reverting made it worse, so no 0.1.7 code change was responsible. The mechanism the close-out
+  described is a property of the scenario: A's trial window on the one-hop route does reach B, but
+  B's report, answer and proof travel back over B's OWN path, which stays three hops until B's board
+  also trials, and B trials only after two consecutive misses of its own -- so reading only A's
+  `direct_send_result` made the check a coin flip on B's unrelated luck. The check now accepts a
+  shorter path adopted and confirmed on **either** node, which is the adoption being tested. Replayed
+  over the eight runs available, this converts one false negative (a run where B confirmed 3 of 3 and
+  A none) and leaves the two runs where neither node adopted-and-delivered failing, as they should.
+- **The path scoreboard ages its evidence.** A candidate's peer-reported delivery rate and its
+  last-leg SNR now count only while those readings are inside `PATH_SAMPLE_WINDOW_S` (600 s), the
+  same window the send outcomes are weighed over; older readings are kept for the capture and score
+  as unknown. A candidate whose evidence has *all* aged out is STALE: it scores with
+  `PATH_PRIOR_WEAK` rather than the optimistic prior and ranks behind every candidate with evidence
+  inside the window. A candidate that never had evidence is untried, not stale, and keeps the
+  optimistic prior, so bring-up is unchanged. The weak-signal prior now applies at **any** hop
+  count, not only at zero hops; the peer's own reported rate still comes first. And while the peer's
+  reported path length is itself inside the window, an untried candidate claiming fewer hops than
+  that scores weak. Field motivation (desktop, 22:49:42): a `path_selected` trial of the dead
+  zero-hop path while the laptop was two hops away, scored `rate 1.0, measured False, misses 3, snr
+  11.75` -- its own send outcomes had aged out, but a peer-reported rate from 22:07 and an SNR
+  reading from the zero-hop period never aged, so a dead path outranked a one-hop candidate heard at
+  12.25 dB; six more misses and 70 s. And (laptop, 22:30:26) a trial of a three-hop candidate heard
+  once at -9 dB, because the weak prior read `hops == 0` only; two misses, "exhausted", rediscovery,
+  26 s. No config key and no wire change. Capture: `stale`, `snr_fresh` and `peer_rate_fresh` on
+  every candidate of a `path_selected` record. Tests: `tests/test_path_evidence_ageing_0923.py`
+  (each of the three field records replayed through the pure rules); one assertion of
+  `tests/test_path_selection_0922.py` re-pinned, since the weak-last-leg rule is reversed on
+  purpose. MeshBench: `shortcut_appears`, `failover`, `repeater_returns`, `weak_direct`, `two_hop`.
+
+## alpha-0.1.7 (unreleased, 2026-09-22)
+
+A small release from the alpha 0.1.6 field session (`fieldtests/raw/Alpha0.1.6/`, 2026-09-22, one
+hop then zero hop): no wire change -- alpha 0.1.6 and 0.1.7 nodes interoperate and the golden wire
+snapshot is untouched. The dated design record is `docs/history.md` ("Alpha 0.1.7 pass"). New config
+key, optional: `proof_fresh_s = 8`. Every default is pinned by `tests/test_shipped_defaults.py` and
+`tests/golden/config_defaults.json`.
+
+- **Young plain proofs go ahead of bulk** (`proof_fresh_s = 8`). A plain delivery PROOF younger than
+  eight seconds (from the moment RNS queued it, within milliseconds of the DATA it answers) pre-empts
+  idle holds of the radio and is taken at the raw window's existing yield points, exactly as a Link
+  proof and the receiver's own completion report already are; its tier, attempt budget and airtime
+  accounting are unchanged, older proofs stay bulk-tier and still expire at `proof_max_age`. Field
+  motivation: at one hop the desktop proved each of six copies of one LXMF message the second it
+  arrived, but each proof left the radio 5-20 s later behind the page windows it was serving, past
+  LXMF's 10 s re-send. Capture: `proof_age_s` and `proof_fresh` on `direct_attempt_result`. Tests:
+  `tests/test_fresh_proof_0922.py`. MeshBench: `large_payload`, `relay`, `page_transfer_bidir`, below.
+- **Token learning never maps a local destination.** The desktop's rnsd learned a route to its own
+  LXMF delivery destination seven times, from the inbound LXMF packets addressed to it. Inbound DATA
+  and LINKREQUESTs name their recipient, not a source, so they no longer teach a `destination -> peer`
+  token (announces, path responses and packets carried on a Link still do; a LINKREQUEST's link_id
+  is still learned; the proof for an inbound DATA still routes); and the single learning entry point
+  refuses a token for one of this node's own destinations, including those a shared-instance client
+  such as MeshChat registered (RNS's own local-client test). On a transport node the old learn had
+  overwritten the announce-learned token for a destination beyond another peer. Tests:
+  `tests/test_token_learning_0922.py`.
+- **Capture and summary hygiene.** `completion_report_sent`, `completion_query_received` and
+  `path_selected` (for a peer-reported candidate) carry `peer_path_len`, `peer_rate` and the node's
+  own `hop_count`; `meshbench_report.py`'s reports-per-window key no longer double-counts a peer
+  whose pkt_id counter restarted (the desktop's "1.33" was that, every report was one per window);
+  `field_ab_compare.py` prints proof turnaround per hop and LXMF-style duplicate deliveries (the
+  0.1.6 set: 13.5 s median, six proofs, one message delivered five times inside 30 s chains at one
+  hop). Tests: `tests/test_capture_fields_0922.py`.
+- **The two-hop reading, attributed -- no change.** Twelve MeshBench `two_hop` runs on the shipped
+  0.1.6 build, four each with the defaults, with `path_selection_enabled = no` and with
+  `direct_raw_window_max_rounds = 3`: 81 % [62-100], 75 % [50-88] and 56 % [38-75] delivered, the
+  responder's two-hop attempt rate 65 / 68 / 61 %. Neither suspect of the 0.1.6 close-out (phantom
+  flood candidates, the round cap) moves the number: a phantom candidate appeared in one run of
+  twelve, and a third round costs airtime without deliveries. The full table is in `docs/history.md`.
+- **Procedure** (`fieldtests/AB_PROTOCOL.md`): the one-hop gap A/B written out step by step, how to
+  keep MeshChat's own RNS log (its link requests are validated there, not in rnsd), and one two-hop
+  stop with capture on.
+
+**MeshBench, alpha 0.1.7 (`tests/baselines/2026-09-22-meshbench-84097b1.md`, ten scenarios x seeds
+7/11/17 on the final build, run with commit hooks and gate runs sharing the machine) against alpha
+0.1.6 (`tests/baselines/2026-09-22-meshbench-09105ae.md`), medians [ranges]:**
+
+- `zero_hop`: 100 % [100-100] at 2.90 B/B, RTT 2.8 s (was 100 % [88-100] at 2.85, 2.8).
+  `relay`: 75 % [62-88] at 7.98 [5.58-9.24], RTT 12.7 [12.4-15.4] (was 88 % [62-88] at 5.79, 15.0
+  [12.7-15.3]); seed 17's sender never resolved a MeshCore path in the run (bring-up; 5/8 through
+  the bootstrap). `two_hop`: 75 % [75-88] at 11.59, RTT 29.9 [17.6-31.3], responder two-hop attempt
+  rate 68 % [63-77] (was 50 % [50-75] at 11.37, 16.8 [12.3-19.3], 50 % [37-53]) -- in line with the
+  twelve attribution runs. `duty_cycle_pages`: 75 % [75-100] at 2.18, resources 100 % complete
+  (was 75 % [50-75] at 1.76). `weak_direct`: 81 % [81-81], 3 of 3 on the `path_selected` check
+  (was 88 % [81-88]). `link_setup`: 88 % [75-100] delivered, handshakes inside 15 s 38 % [25-62],
+  links median 22.9 s (was 100 %, 62 % [50-62], 11.6 s) -- the 38 % <-> 62 % swing the 0.1.6
+  close-out saw between two suites on the same build; RNS path times were 70-195 s this suite
+  against 22-97. `page_transfer` 0 % [0-33] and `page_transfer_bidir` 0 % [0-33] (were 0 %).
+- `large_payload`: 50 % [0-50] at 7.03, RTT 47.9 s [45.4-50.4] (was 33 % [17-50] at 6.36, 22.3
+  [20.6-31.9]); seed 17 a bring-up failure. A same-conditions pair against the 0.1.6 deliverable
+  read this build at 58 % / 36.4 s and 0.1.6 at 42 % / 42.5 s -- the evening's machine, not the
+  change (`docs/history.md`, close-out).
+- `shortcut_appears`: 40 % [30-50] delivered (was 30 %); the hard check 1 of 3 (was 2 of 3), and 1
+  of 9 across the evening against 5 of 6 for the 0.1.6 build in same-conditions pairs. Reverting
+  item 1 did not change it (0 of 2). Read as a race between the two nodes' scoreboards -- B's
+  replies stay on its own three-hop path until B's path has missed twice -- not attributed to any
+  item; open, with the reading in `docs/history.md`.
+
+**MeshBench gates per item (against `tests/baselines/2026-09-22-meshbench-09105ae.md`):**
+
+- Item 1, first cut (`/tmp/mb/017/item1/`): `large_payload` x3 delivered 17 % [17-33] (baseline 33 %
+  [17-50]) but probe RTT 44.9 s [43.3-46.5] against 22.3 [20.6-31.9] on every run -- the fresh
+  proof cut the receiver's no-ACK report hold and keyed into the repeater's relay of the report,
+  was missed there, and its 8 s timeout delayed the next report (`reported` windows 3/13 against
+  9/13). `relay` x2 held (69 % [62-75], RTT 13.7 [12.8-14.6]). Revised: the two relay-window holds
+  are cut by a handshake only. Second cut (`/tmp/mb/017/item1-cut2/`): `large_payload` 5/6 and 3/6
+  (67 % [50-83]), RTT 28.7 s [27.0-30.3], reports per window 1.0, `reported` 6/15 and 9/12;
+  `relay` 6/8 and 6/8 (75 %), RTT 11.0 s [9.2-12.9], responder one-hop attempt rate 65 % (63 %),
+  proof turnaround 10.7 / 4.2 s median (baseline 10.0-15.6); `page_transfer_bidir` 0/3 (baseline
+  0 %), 22.5 B/B (12.1 [9.7-32.5]), informational. MeshBench's responder never queues its proofs
+  behind its own windows (lock waits under a second in the baseline too), so the field's 5-20 s
+  is not reproduced there; the gates read as no regression.
+- Item 2: the twelve `two_hop` attribution runs above, no change.
+- Items 3, 4, 5: no MeshBench (unit tests only, as specified).
+
+## alpha-0.1.6 (2026-09-22)
+
+The items of the alpha 0.1.6 pass, each from the alpha 0.1.5 field session's captures
+(`fieldtests/raw/Alpha0.1.5/`, desktop `afipc_` + laptop `a_`, the 2026-09-21 evening drive).
+**Wire change: the "Q" completion frame is protocol v5 (it carries the sender's path view), so both
+nodes must run alpha 0.1.6.** The dated design record is `docs/history.md` ("Alpha 0.1.6 pass");
+MeshBench results per item are at the end of this section. New config keys, all optional (defaults
+shown): `path_selection_enabled = yes` (the old `path_adopt_enabled` is accepted as an alias),
+`path_weak_snr_db = 3.0`, `path_switch_after_misses = 2`, `path_switch_margin = 0.25`,
+`path_switch_cooldown = 120`, `direct_raw_window_max_rounds = 2`, `connect_retry_min = 5`, `connect_retry_max = 60`, `serial_open_settle = 2`, `handshake_attempts = 5`, `handshake_timeout = 5`, `command_timeout = 15`, `serial_noise_warn_per_min = 5`; `max_reconnect_attempts` now defaults to 0 (forever). Removed: `path_adopt_window`. Every default is pinned by
+`tests/test_shipped_defaults.py` and `tests/golden/config_defaults.json`; the wire golden gained the
+v5 cases (the v4 cases are byte-identical under their new names).
+
+- **Path selection by measured reliability** (replaces shorter-path adoption; `_paths.py`). Every
+  route this node learns to a peer -- the discovered path, the reverse of each flood copy the peer's
+  own floods took, the zero-hop option once the peer has been heard directly, and the path the peer
+  itself reports -- is a candidate on a per-peer scoreboard (at most four), scored as expected
+  transmissions per delivered frame times (hops + 1): airtime per delivered byte, lower is better,
+  from its delivery rate over its last eight sends (older ones weighted down, nothing older than ten
+  minutes). An untried path scores with an optimistic prior (0.8) so the shortest untried path is
+  tried first, except a zero-hop candidate heard below `path_weak_snr_db`, which scores with a weak
+  prior (0.25 -- below the 0.4 first proposed, because at 0.4 it would tie an untried one-hop path
+  and the hop tiebreak would choose the weak direct path). The current path is kept while it
+  delivers; after `path_switch_after_misses` consecutive missed sends the next real packet goes on
+  the best-scoring alternative (a trial, no probe); a trial that delivers becomes current for good
+  only when it beats the current path's score by `path_switch_margin`, and a path switched away from
+  is not switched back to for `path_switch_cooldown`. Discovery runs only when every candidate has
+  missed its last sends; a candidate whose last miss is older than the cooldown is tried again --
+  the re-try the field lacked. Field motivation: at 22:00:49 the old rule adopted a 504 s old
+  zero-hop route over a one-hop path confirmed 2 s earlier, and the desktop then sat on a two-hop
+  path for 32 minutes while the laptop reached it in one, with only three usable floods in that
+  half hour. Capture: `path_selected` (reason selected / trial / switch / exhausted, every
+  candidate's score). Tests: `tests/test_path_selection_0922.py` (the pure rules, the field replay
+  from `tests/fixtures/field_0921_desktop_22h.json`, the v5 codec, the scoreboard on the fake node).
+  MeshBench: `shortcut_appears`'s hard check reads `path_selected`; new scenario `weak_direct`.
+- **Bounded multi-hop window hold** (new key `direct_raw_window_max_rounds = 2`). Through repeaters a
+  raw window runs at most two burst-and-reconcile rounds (zero hop keeps `direct_raw_reconcile_rounds`,
+  3) before falling back to the text path or failing; a newer LINKREQUEST from a peer supersedes the
+  LRPROOF still pending for its earlier link (no further attempts, an in-flight ACK wait cut, captured
+  as `superseded` / `lrproof_superseded`, not path evidence); and the QUERY's quiet hold yields to a
+  queued completion report as it already did to a handshake. Field motivation: at two hops 23 sends
+  waited more than 30 s for the radio (worst 182 s), and at 22:25-22:28 answers and reports waited
+  50-125 s behind six LRPROOFs of four 11 s attempts each for links MeshChat had already re-requested.
+  The window's between-parts yields and its release before every QUERY round were already
+  hop-independent; they are now pinned at two hops. Tests: `tests/test_multihop_window_hold_0922.py`.
+- **A resilient serial connection** (new keys `connect_retry_min = 5`, `connect_retry_max = 60`,
+  `serial_open_settle = 2`, `handshake_attempts = 5`, `handshake_timeout = 5`, `command_timeout = 15`,
+  `serial_noise_warn_per_min = 5`; `max_reconnect_attempts` now defaults to 0 = forever). The
+  interface owns the connection: it opens the port, settles (opening a serial port resets a Heltec V3
+  through DTR/RTS), flushes the boot text, retries the handshake, runs the full device setup, and on a
+  disconnect tears down and reconnects with backoff forever -- the library sent one handshake right
+  after the reset and gave up, and after three one-second reconnect attempts stayed dead for good.
+  The constructor returns once the port is open (or could not be) instead of blocking rnsd's startup.
+  A garbled inbound frame no longer fails the in-flight command (the reader's own ERROR events are
+  counted as noise and the reply is still waited for); above five a minute it warns "serial stream
+  corrupted; is another process reading the port?", and before opening a serial port the interface
+  names any other process holding it (`/proc/*/fd`). Capture: `connection_state` records. Tests:
+  `tests/test_connection_supervisor_0922.py` against the fake `meshcore`, which now models the
+  library's connection lifecycle with fault injection.
+- **One report per window, finished.** The receiver's gaps hold is one sender spacing plus half an
+  airtime (~1.5 s at zero hop; the hop gap plus 0.45 s through repeaters), its holds scale by the
+  larger of its own hop count and the path length the sender reports in its v5 frames, and a
+  flagged frame for a packet already delivered is not reported again within the burst tail of a
+  report just sent (a late re-drive still is). Field: 6 of 15 zero-hop reports were a gaps report and
+  the complete report 0.01 s apart, and seven packets were reported complete twice on the parity
+  fragment behind the completing one. `held_s` is on every report record (0.0 = at once);
+  `meshbench_report.py` prints reports per reported packet. Tests:
+  `tests/test_one_report_per_window_0922.py`.
+- **Calibration line corrected** (`field_ab_compare.py --radio SF,BW,CR`). The estimator ratio is now
+  computed per capture file (the interface's counters restart with the process, the firmware's run
+  on) and printed twice: raw, and corrected for the frames the radio sent on its own (packet counters
+  minus frames keyed, priced as ACKs). On the 2026-09-21 captures: laptop 0.92 raw / 0.98 corrected,
+  desktop 0.93 / 1.00 -- the estimator is calibrated. `fieldtests/AB_PROTOCOL.md`: start rnsd with
+  its output redirected to a log file (RNS buffers it). Tests: `tests/test_calibration_summary_0922.py`.
+- **"Q" protocol v5.** Every QUERY, ANSWER and REPORT carries the sender's current path length to
+  the receiver and its measured delivery rate on it (two header bytes, 0xFF unknown); the receiver
+  adds a reported zero-hop path as a candidate and uses the reported rate as the prior for untried
+  candidates of that hop count. v1-v4 frames still decode; a v4 QUERY is answered in v4.
+
+**MeshBench, alpha 0.1.6 (`tests/baselines/2026-09-22-meshbench-09105ae.md`, ten scenarios x seeds
+7/11/17 on the final build, run with the desktop otherwise idle) against alpha 0.1.5
+(`tests/baselines/2026-09-21-meshbench-7dcc232.md`), medians [ranges]:**
+
+- `zero_hop`: 100 % [88-100] at 2.85 B/B (was 100 % at 2.72), RTT 2.8 s (same); `relay`: 88 %
+  [62-88] at 5.79 (was 88 % [75-100] at 5.96); `duty_cycle_pages`: 75 % [50-75] at 1.76 (was 75 %
+  at 1.84); `link_setup`: 100 % delivered, handshakes inside 15 s 62 % [50-62], links median
+  11.6 s (was 88 %, 62 % [25-75], 8.8 s) -- the fourth cut restored this from 38 % on every seed
+  before it.
+- `two_hop`: 50 % [50-75] at 11.37 B/B [8.62-12.43], RTT 16.8 s (was 75 % [62-100] at 9.75
+  [7.24-12.62], RTT 10.9 [10.9-29.1]); the responder's two-hop attempt success 50 % [37-53]
+  against 85 % [60-95]. Ten two-hop runs on the 0.1.6 builds tonight delivered 38-100 %, mean
+  67 %; mechanics PASS on every one. Below the 0.1.5 range on two seeds -- the number to read
+  first in the field, where the 2026-09-21 session's two-hop path was the problem this pass
+  set out to fix.
+- `large_payload`: 33 % [17-50] at 6.36 [6.22-7.11] (was 50 % [33-67] at 5.61); the item-3 gate's
+  two runs on 18059a2 delivered 6/6 and 6/6 at 4.7. `page_transfer`: 0 % [0-0] (was 33 %
+  [0-33]; the 9aa4b7d suite an hour earlier 0 % [0-67]); `page_transfer_bidir`: 0 % (was 0 %
+  [0-33]) at 12.1 B/B (was 29.5).
+- `shortcut_appears`: 2 of 3 seeds passed the hard check (the sender selected a shorter path from
+  its scoreboard after the move and its next send on it delivered), as in 0.1.5; seed 11's sender
+  never left three hops in the run (no flood copy of B's reached it over the one-hop route).
+- `weak_direct` (new): 3 of 3 PASS on the `path_selected` check; the +3 dB direct link delivered
+  88 % [81-88] -- MeshBench does not make it weak, and the one-hop expectation is informational.
+
+Mechanics FAILs in the suite: none other than the delivery floors above and one `link_setup`
+run whose sender never resolved a MeshCore path in the run (bring-up; it delivered 8/8 links
+through the bootstrap). Per-item gates, the cuts they forced (item 1 four times) and the bench
+results are in `docs/history.md`'s "Alpha 0.1.6 pass" entry.
+
+## alpha-0.1.5 (2026-09-21)
+
+The items of the alpha 0.1.5 pass, each from the alpha 0.1.4 field session's captures
+(`fieldtests/raw/Alpha0.1.4/`, desktop `afipc_` + laptop). No wire change: a 0.1.4 node interoperates
+(both nodes should still run the same build). The dated design record is `docs/history.md`
+("Alpha 0.1.5 pass"); the MeshBench results and the baseline file are recorded at the end of this
+section. New config keys, all optional (defaults shown): `duty_cycle_max_fraction_zero_hop = 0.85`,
+`direct_raw_burst_queue_ahead = 1`, `direct_report_hold_during_burst = yes`, `packet_capture_label`
+(default: the MeshCore node name), `path_adopt_enabled = yes`, `path_adopt_window = 600`,
+`direct_raw_gap_own_airtime = yes`, `radio_stats_interval = 300`; `direct_raw_window_collect` (0.75)
+is now a maximum. Every default is pinned by `tests/test_shipped_defaults.py` and
+`tests/golden/config_defaults.json`; the wire golden did not move.
+
+- **Hop-aware airtime cap** (new key `duty_cycle_max_fraction_zero_hop = 0.85`; `duty_cycle_max_fraction`
+  stays 0.30). Two ledgers over the same 60 s window: everything a repeater relays (multi-hop DIRECT,
+  every CHANNEL flood) is charged to both and waits on both, so it stays at 30%; a zero-hop DIRECT
+  frame is charged to the total ledger only and waits on 85%. Field motivation: the zero-hop 12-part
+  page of 2026-09-21 spent 109 of its 147 s in duty-cycle waits at 30%. Capture: `duty_cycle_ledger`
+  on `direct_attempt_result` / `raw_fragment_sent`. Tests: `tests/test_duty_cycle_hop_aware_0921.py`;
+  shipped-default pin and `tests/golden/config_defaults.json` re-pinned for the new key.
+- **Radio-busy accounting (2a)** (new key `direct_raw_burst_queue_ahead = 1`). The firmware queues a
+  frame and returns at once, so a zero-hop window of 15 fragments was "sent" in 2.6 s against ~14 s of
+  air, and a report arriving meanwhile ended the sender's wait. Every keyed frame now extends a
+  per-interface busy-until by its estimated airtime; the raw window's burst end, report wait and
+  report-latency estimator anchor to it, `since_own_tx_s` in the radio log is measured from it
+  (negative while our own queue is still on air), and a zero-hop burst hands the next fragment over
+  only when at most one frame is queued ahead of the one on air. Tests:
+  `tests/test_radio_busy_until_0921.py`; the unit fake's radio block is SF8/BW250 so its estimate
+  matches its air model.
+- **The receiver holds reports while a window is still arriving (2b)** (new key
+  `direct_report_hold_during_burst = yes`). A part completed by an unflagged fragment is reported only
+  once the sender's fragments have stopped arriving (one fragment spacing plus half an airtime,
+  re-armed by every fragment); a flagged fragment -- or a bucket that has already seen one -- reports
+  at once. One report per window instead of one per part; the mid-burst reports that ended the
+  field sender's wait early and collided with its own queue are gone. The silence spans two sender
+  spacings (second cut: MeshBench `page_transfer` showed a one-spacing hold firing mid-burst after a
+  single lost fragment, 8 reports sent into the sender's burst, none received). Tests:
+  `tests/test_report_hold_during_burst_0921.py`.
+- **An early report is progress, not the end of the wait (2c).** A report that lands before the
+  burst has ended on air is applied to the parts it names and the sender keeps waiting until
+  burst end + report window; parts absent from any report are re-burst only after that wait has
+  expired (the field's part-8 report ended the wait with parts 9-12 unmentioned and re-burst them
+  behind the sender's own queue). The `completion_check_result` record gains `early_reports` and the
+  report's `entries`. Tests: `tests/test_early_report_is_progress_0921.py` (the 08:38 sequence
+  re-sends nothing).
+- **Capture filename carries a node label** (new key `packet_capture_label`, default the MeshCore
+  node name from SELF_INFO): `<label>_capture_<interface>_<stamp>.jsonl`. The capture readers accept
+  both forms. `fieldtests/AB_PROTOCOL.md`: laptop files need the label; MeshChat's RNS at loglevel 6.
+  Tests: `tests/test_capture_label_0921.py`.
+- **Adaptive window collect.** `direct_raw_window_collect` (0.75 s) is now the maximum: a window
+  keeps collecting only while packets are still queued from RNS or a part joined within the
+  transfer's observed inter-part spacing (floor 40 ms). A lone packet starts within 50 ms instead
+  of 0.75 s; a window of parts still batches. Capture: `raw_window_collect`. Tests:
+  `tests/test_adaptive_window_collect_0921.py`.
+- **A raw window yields to a pending completion report between its parts.** Under both-ways load a
+  node's own report queued behind its whole outgoing window (12-15 s); reports now have their own
+  pre-emption class on the radio lock and the window lets one out between two parts (never inside a
+  part), resuming ahead of ordinary waiters, and a queued report also releases the window's
+  radio-free report wait (second cut: MeshBench `page_transfer_bidir` showed RNS shrinking the
+  Resource window to one part, so reports waited 11-13 s behind that wait, never behind a part
+  boundary). Capture: `report_yields` on `raw_fragment_sent`. Tests:
+  `tests/test_report_yield_between_parts_0921.py`.
+- **Shorter-path adoption** (new keys `path_adopt_enabled = yes`, `path_adopt_window = 600`; no wire
+  change). A bound peer's floods (its adverts; its path requests and text floods addressed to us)
+  carry the route they took; when that route, reversed, is at least one hop shorter than the peer's
+  resolved path -- or when no path is resolved at all, after a stale-path reset -- it is set on the
+  contact and used instead of running discovery. Provisional: two missed sends before a success
+  drop it for discovery. Field motivation: 35 minutes on a four-hop
+  path while the peer's floods arrived over two. Capture: `path_adopted`, `path_adoption_confirmed`,
+  `path_adoption_failed`. MeshBench: new scenario `shortcut_appears`. Tests:
+  `tests/test_shorter_path_adoption_0921.py`.
+- **One-hop gap A/B knob** (new key `direct_raw_gap_own_airtime = yes`, default unchanged): `no` drops
+  the frame's own airtime from the raw gap through repeaters for the field A/B; `gap_s` on every
+  `raw_fragment_sent`; `field_ab_compare.py` prints the A/B's safety signals per hop (gap used,
+  round-1 fragments per part, round-0 re-sends per position, parity sent / reconstructed). MeshBench
+  cannot judge this one. Tests: `tests/test_raw_gap_own_airtime_0921.py`.
+- **Radio transmit statistics for estimator calibration** (new key `radio_stats_interval = 300`).
+  Firmware v1.17.1's `CMD_GET_STATS` reports the radio's measured transmit airtime and packet counts
+  (`get_stats_radio` / `get_stats_packets` in the library); the interface records them at start,
+  stop and on the cadence as `radio_stats`, next to its own summed airtime estimate, and
+  `field_ab_compare.py` prints the estimate / firmware ratio per node. The estimator itself is
+  unchanged. Tests: `tests/test_radio_stats_0921.py`.
+
+**MeshBench, alpha 0.1.5 (`tests/baselines/2026-09-21-meshbench-7dcc232.md`, nine scenarios x seeds
+7/11/17, run with nothing else on the machine) against alpha 0.1.4
+(`tests/baselines/2026-09-20-meshbench-6cf0876.md`, parity off; the parity-on reference in
+`docs/history.md` for large_payload / relay), medians [ranges]:**
+
+- `duty_cycle_pages` (new to the baseline; the cap's scenario): 3/4 pages on every seed, page median
+  124 s [104-371], duty-cycle waits 0 on every run where the alpha 0.1.3 reference runs waited
+  105-163 s each; on-air 1.84 B/B.
+- `zero_hop`: 100 % [88-100] (was 100 %), RTT median 2.8 s [2.8-9.1] (was 4.9 [3.5-14.1] -- the
+  0.75 s collect wait gone), on-air 2.72 (was 2.79).
+- `relay`: 88 % [75-100] (was 88 % [75-88]), RTT 14.1 s (parity-off 10.6 [7.9-12.6]; parity-on
+  reference 13.0-16.4, the right comparator), on-air 5.96 [4.98-9.03] (parity-on 5.54-6.52).
+- `two_hop`: 75 % [62-100] (was 88 % [38-100]), RTT 10.9 s [10.9-29.1] (was 29.6 [17.6-36.0]),
+  on-air 9.75 (was 9.31).
+- `large_payload`: 50 % [33-67] against parity-off 83 % [50-100] and the parity-on reference's
+  67 %, 83 %, 17 %; every 0.1.5 build today that bound its peers scored 2-4 of 6 (mean 3.0/6, the
+  parity-on 0.1.4 reference's mean 3.3/6). On-air 5.61 [5.15-10.62] (parity-on 5.00-7.52), RTT 33.4
+  (was 32.9). Not outside the parity-on spread, and not better; the one-hop lossy regime is where
+  MeshBench's alternating relay loss punishes parity (M4 gate) and where this pass changed the
+  least. Reported fraction 50 % [47-62] against 69 % [56-71]: fewer rounds resolved by a report.
+- `page_transfer`: 33 % [0-33] (was 33 % [0-67]), page median 473 s [432-514] (was 534 [472-596]),
+  0 re-sent parts; `page_transfer_bidir`: 0 % [0-33] (was 0 %; one seed delivered a page for the
+  first time on this machine); `link_setup`: 88 % [75-100] (same), handshakes inside MeshChat's 15 s:
+  62 % [25-75] (was 25 % [12-62]), links median 8.8 s (was 26.5).
+- `shortcut_appears` (new): 2 of 3 seeds passed the hard check (the sender adopted the one-hop route
+  from the peer's flood after the move and confirmed it by delivery); seed 7 never resolved a
+  three-hop path before the move (the start gate timed out) and so had nothing to shorten.
+
+Mechanics FAILs in the suite: none other than the delivery floors above and that seed-7 bring-up.
+Per-item gates (two runs each on each item's own build, `/tmp/mb/015/<item>/`), the second cuts
+they forced (2b, 6, 3 x3) and the four bring-up failures under pre-commit-hook CPU load are in
+`docs/history.md`'s "Alpha 0.1.5 pass" entry.
+
 ## alpha-0.1.4 (2026-09-21)
 
 Everything since alpha-0.1.1 (2026-09-18 night), released as one version: the raw binary DIRECT

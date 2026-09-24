@@ -13,8 +13,70 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.4 (alpha 0.1.3 plus the 2026-09-20 airtime / throughput
-pass; both nodes must run it, the "Q" and raw wire formats changed); the
+STATUS -- 0.1.0 (2026-09-24): the first release. It is the alpha 0.1.9
+second-pass build (`35a6c22`, RNS 1.5.4) after its field session of
+2026-09-24 morning (`fieldtests/raw/Alpha0.1.9/`: zero hop at home, a
+one-hop trial, then a two-and-a-half-hour two-hop stop) showed both
+defects that pass targeted fixed in the field -- 7 path decisions in four
+hours against 45 on the 0.1.9 drive, one of them wasted, the longest
+zero-hop miss run 12 against 144, no proof held at zero hop -- and the
+best two-hop numbers this project has recorded (attempt success 73 %,
+part time 18 s median, 0.20 QUERY attempts per raw send, 2.24 on-air bytes
+per delivered byte). The release itself changes no behaviour: the
+routine INFO logs (the periodic [STATS] line, path discovery and path
+decisions, cache restores, feature availability notes) moved to DEBUG so
+rnsd's log shows only connection state, identity, radio and channel
+setup, peers binding and expiring, and packet capture; the update script
+installs from `main` and `update-interface-dev.sh` from `development`.
+No wire change -- alpha 0.1.9 and 0.1.0 nodes interoperate. Alpha 0.1.9
+was alpha 0.1.8 plus the corrections its own first
+field session, 2026-09-23, asked for: a completion report that was skipped
+because RNS's PROOF replaces it now counts as reported, so the parity
+fragment in the sender's burst tail no longer sends it after all; that
+proof waits one fragment spacing for the tail before it is dispatched,
+instead of being keyed into it; the announce cache's TTL and the
+path-request verification interval are sized for a field day rather than
+an hour; and a path's miss count is kept per ATTEMPT rather than per send,
+so the raw-fragment and QUERY attempts that dominate the airtime finally
+reach the death clock -- `path_switch_after_misses` 2 -> 4 and
+`PATH_EXHAUST_MISSES` 4 -> 8 are the same thresholds in the new unit. No
+wire change -- the golden wire snapshot is untouched and alpha 0.1.8 and
+0.1.9 nodes interoperate, although items 1 and 2 pay off only when the
+RECEIVER runs 0.1.9. The interface also defines `ifac_size`, which RNS 1.5 reads on every
+inbound frame and which only `RNS.Reticulum` used to set -- so building
+this interface without Reticulum, as the white-box hardware scripts do,
+works again on RNS 1.5.4. A second pass on 2026-09-24, from the release's
+own two field sessions of 2026-09-23 evening, corrected it: a zero-hop
+attempt counts toward the path's miss count (the empty hex is the
+zero-hop path, not the absence of one); a candidate dead over
+PATH_EXHAUST_MISSES attempts stays out until something is heard over it
+again, a candidate re-admitted after its cooldown must measure no worse
+than the current path, and the current path is kept while its measured
+rate beats every eligible alternative; the proof waits for no burst tail
+at zero hop; and `direct_raw_gap_own_airtime` defaults to `yes` again
+until the field A/B has run); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
+build's 2026-09-22 evening field session, which had a two-hop stop: for a
+raw window whose packets RNS proves, the PROOF is the completion and the
+report is not sent; at two hops and beyond a report that IS sent goes on
+the acknowledged carrier with one retry; the path scoreboard ages its
+peer-reported rate and signal readings and scores a candidate whose
+evidence has all expired as weak; the announce cache is persisted across a
+restart and one path-request verification per interval goes on the air
+instead of most of them. No wire change -- the golden wire snapshot is
+untouched and alpha 0.1.7 and 0.1.8 nodes interoperate, although the two
+sides get the benefit only when both run 0.1.8); alpha 0.1.7 was alpha
+0.1.6 plus the 2026-09-22 afternoon pass
+from that build's field session: young plain proofs pre-empt bulk like a
+handshake, token learning never maps a local destination, the peer's
+reported path view on the capture records; no wire change, alpha 0.1.6
+and 0.1.7 nodes interoperate); alpha 0.1.6 was alpha 0.1.5 plus the
+2026-09-22 pass (path selection by measured reliability, the bounded
+multi-hop window hold, the connection supervisor, one report per window,
+the corrected calibration line -- the "Q" wire format changed to v5, the
+sender's path view, so both nodes must run alpha 0.1.6 or later);
+alpha 0.1.5 was alpha 0.1.4 plus the 2026-09-21 pass (the hop-aware
+airtime cap, the burst / report collision fixes, shorter-path adoption,
+the adaptive window collect, the report yield); the
 dated account of every design decision and field-driven fix from alpha
 0.1.0 (2026-09-15) onward is `docs/history.md` (moved out of this
 docstring on 2026-09-20, phase 2 of that pass, unchanged), with the
@@ -60,13 +122,19 @@ change regenerates it in the same commit):
     v2+ ANSWER adds the have-bitmap, ceil(frag_total / 8) bytes, bit i = fragment i held
   Version 4 (2026-09-20, one report per window), multi-part:
     [4][type][n: 1..8][nonce] then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
-  COMPLETION_PROTOCOL_VERSION is 4; v1-v3 frames still decode and a
-  v1 / v3 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
+  Version 5 (2026-09-22, alpha 0.1.6: the sender's path view for the
+  receiver's path scoreboard), the v4 entries behind two more header bytes:
+    [5][type][n: 1..8][nonce][path_len: hops to the receiver, 0xFF none]
+    [rate: delivery rate on that path in 1/250 steps, 0xFF untried]
+    then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
+  COMPLETION_PROTOCOL_VERSION is 5; v1-v4 frames still decode and a
+  v1 / v3 / v4 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
   (COMPLETION_QUERY_NONCE_MAX) and its ANSWER echoes it; a receiver-
   initiated REPORT is an ANSWER with nonce 0xF0 | round
   (COMPLETION_REPORT_NONCE_BASE), round being the raw header's attempt
-  bits. A pre-v3 peer drops a v3 QUERY and a pre-v4 peer a v4 frame, so
-  both nodes must run the same build for reconciliation to work. Reports
+  bits. A pre-v3 peer drops a v3 QUERY, a pre-v4 peer a v4 frame and a
+  pre-v5 peer a v5 frame, so both nodes must run the same build for
+  reconciliation to work (alpha 0.1.6: both nodes must run alpha 0.1.6). Reports
   and answers are sent as MeshCore TXT_TYPE_CLI_DATA (encrypted, never
   ACKed by the firmware) since 2026-09-20; the QUERY is a plain ACKed
   text message.
@@ -296,7 +364,7 @@ class _ReassemblyBucket:
     staleness metric, and also the sort key §5.3's oldest-by-last-progress
     capacity eviction uses."""
 
-    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity")
+    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity", "flagged_seen")
 
     def __init__(self, frag_total: int, coop: bool):
         self.frag_total = frag_total
@@ -306,6 +374,10 @@ class _ReassemblyBucket:
         # Phase 3 M4 (2026-09-20): coverage mask -> (last_covered_len, xor
         # bytes) of the raw parity fragments held for this bucket.
         self.parity: dict = {}
+        # Alpha 0.1.5 (2b): a report-flagged frame (data or parity) of this
+        # packet has arrived -- the burst's tail is here, so a completion
+        # reports at once rather than waiting out the "still arriving" hold.
+        self.flagged_seen = False
 
 
 class _RnsHeader(NamedTuple):
@@ -360,6 +432,53 @@ class _BindFrame(NamedTuple):
     pubkey_prefix: str
 
 
+class _PathCandidate:
+    """One candidate path to a peer on its scoreboard (alpha 0.1.6, item 1,
+    `_paths.py`): the route, where it was learned, when, its send outcomes
+    (the delivery rate is computed over `samples` at scoring time), the
+    signal of the last frame received over it (the last leg only for a
+    relayed path), and the switching bookkeeping."""
+
+    __slots__ = ("path_hex", "hops", "hash_size", "source", "first_seen", "last_seen", "samples", "ack_latencies",
+                 "last_success_at", "last_failure_at", "consecutive_misses", "snr", "rssi", "signal_at",
+                 "cooldown_until", "peer_rate", "peer_rate_at", "trials")
+
+    def __init__(self, path_hex: str, hops: int, hash_size: int, source: str, now: float):
+        self.path_hex = path_hex
+        self.hops = hops
+        self.hash_size = hash_size
+        self.source = source
+        self.first_seen = now
+        self.last_seen = now
+        self.samples = collections.deque(maxlen=8)      # (monotonic time, ok)
+        self.ack_latencies = collections.deque(maxlen=8)
+        self.last_success_at = None
+        self.last_failure_at = None
+        self.consecutive_misses = 0
+        self.snr = None
+        self.rssi = None
+        self.signal_at = None
+        self.cooldown_until = 0.0
+        self.peer_rate = None
+        self.peer_rate_at = None
+        self.trials = 0
+
+
+class _PathBoard:
+    """A peer's scoreboard of candidate paths (`_paths.py`)."""
+
+    __slots__ = ("candidates", "current", "device_path", "last_reason", "peer_path_len", "peer_rate", "peer_report_at")
+
+    def __init__(self):
+        self.candidates = {}        # path hex -> _PathCandidate
+        self.current = None         # the primary path's hex
+        self.device_path = None     # what change_contact_path last set on the contact (None: unknown)
+        self.last_reason = ""
+        self.peer_path_len = None   # the peer's reported path length to us (a "Q" v5 header)
+        self.peer_rate = None
+        self.peer_report_at = None
+
+
 class _CompletionFrame(NamedTuple):
     """The decoded `"Q"`-marker DIRECT-delivery-completion-check control
     frame (see `_encode_completion_frame`'s own docstring for why this
@@ -386,6 +505,12 @@ class _CompletionFrame(NamedTuple):
     # also mirrored into pkt_id / frag_total / complete / held above so
     # single-part code reads a v4 frame unchanged. Empty below v4.
     entries: tuple = ()
+    # v5 (2026-09-22, alpha 0.1.6 item 1): the sender's current path length
+    # to this node and its measured delivery rate on it -- its view of the
+    # symmetric path, evidence for the receiver's scoreboard. None below
+    # v5, or when the sender had no path / no measurement.
+    peer_path_len: Optional[int] = None
+    peer_rate: Optional[float] = None
 
 
 class _PeerRecord:
@@ -466,14 +591,33 @@ class _PriorityAsyncLock:
     # the yielded exchange resumes ahead of everything but the handshakes
     # that pre-empted it (tiers are compared numerically; a float sorts).
     YIELDED_PRIORITY = 0.5
+    # Alpha 0.1.5 (item 6): the tier a raw window resumes at after yielding
+    # between two of its parts to a queued completion REPORT -- behind the
+    # report's own ANSWER tier (1), ahead of every ordinary waiter (2), so
+    # the report goes out and the window continues before anything else.
+    REPORT_YIELDED_PRIORITY = 1.5
 
     def __init__(self):
         self._locked = False
         self._waiters: "dict[int, collections.deque]" = {}
         # Pre-emption (phase 1, 2026-09-20): futures of waiters that asked
         # to pre-empt an idle holder, and the event an idle holder watches.
-        self._preempt_waiters: set = set()
+        # Alpha 0.1.7 (item 1): waiter -> its tier, so a yielding holder
+        # can resume BEHIND the tier that pre-empted it (a fresh plain PROOF
+        # pre-empts from the ANSWER tier, a handshake from tier 0).
+        self._preempt_waiters: dict = {}
         self._preempt_event: "Optional[asyncio.Event]" = None
+        # Alpha 0.1.7 (item 1, second cut): the same for tier-0 pre-emptors
+        # only -- the holds that keep this node silent while a repeater
+        # relays its own frame (the no-ACK report hold, the QUERY quiet
+        # hold) are cut for a Link handshake, not for a fresh plain PROOF.
+        self._handshake_event: "Optional[asyncio.Event]" = None
+        # Alpha 0.1.5 (item 6): a second class -- completion REPORTs this
+        # node owes the far sender -- that a raw window yields to between
+        # its parts (never inside a part's burst, never at the other idle
+        # points a handshake pre-empts).
+        self._report_waiters: set = set()
+        self._report_event: "Optional[asyncio.Event]" = None
 
     def locked(self) -> bool:
         return self._locked
@@ -482,43 +626,101 @@ class _PriorityAsyncLock:
         """A waiter that may pre-empt idle holds is queued (2026-09-20)."""
         return bool(self._preempt_waiters)
 
-    def preempt_event(self) -> "asyncio.Event":
+    def preempt_event(self, handshake_only: bool = False) -> "asyncio.Event":
         """The event set while a pre-empting waiter is queued; created on
-        the running loop the first time it is asked for."""
+        the running loop the first time it is asked for. With
+        `handshake_only` (alpha 0.1.7, item 1), the event set only while a
+        TIER-0 pre-emptor (a Link handshake) is queued: a fresh plain PROOF
+        at the ANSWER tier does not set it."""
+        if handshake_only:
+            if self._handshake_event is None:
+                self._handshake_event = asyncio.Event()
+                if self._handshake_waiting():
+                    self._handshake_event.set()
+            return self._handshake_event
         if self._preempt_event is None:
             self._preempt_event = asyncio.Event()
             if self._preempt_waiters:
                 self._preempt_event.set()
         return self._preempt_event
 
-    def _preempt_add(self, fut) -> None:
-        self._preempt_waiters.add(fut)
+    def _handshake_waiting(self) -> bool:
+        return any(p <= 0 for p in self._preempt_waiters.values())
+
+    def _preempt_add(self, fut, priority) -> None:
+        self._preempt_waiters[fut] = priority
         if self._preempt_event is not None:
             self._preempt_event.set()
+        if priority <= 0 and self._handshake_event is not None:
+            self._handshake_event.set()
 
     def _preempt_remove(self, fut) -> None:
-        self._preempt_waiters.discard(fut)
+        self._preempt_waiters.pop(fut, None)
         if not self._preempt_waiters and self._preempt_event is not None:
             self._preempt_event.clear()
+        if self._handshake_event is not None and not self._handshake_waiting():
+            self._handshake_event.clear()
 
-    async def yield_to_preempt(self) -> None:
+    def preempt_resume_priority(self) -> float:
+        """The tier a holder resumes at after yielding to whatever is
+        pre-empting it (alpha 0.1.7, item 1): half a step behind the
+        highest-priority pre-empting waiter -- YIELDED_PRIORITY 0.5 behind a
+        handshake (tier 0), REPORT_YIELDED_PRIORITY 1.5 behind a fresh plain
+        PROOF (the ANSWER tier, 1). A resume at 0.5 would put the holder
+        back ahead of a tier-1 pre-emptor still queued behind another
+        waiter, so the yield would buy that proof nothing."""
+        if not self._preempt_waiters:
+            return self.YIELDED_PRIORITY
+        return min(self._preempt_waiters.values()) + 0.5
+
+    def report_requested(self) -> bool:
+        """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
+        return bool(self._report_waiters)
+
+    def report_event(self) -> "asyncio.Event":
+        """The event set while a REPORT waiter is queued (item 6), for the
+        holder's radio-free idle phases -- created on the running loop the
+        first time it is asked for, like `preempt_event`."""
+        if self._report_event is None:
+            self._report_event = asyncio.Event()
+            if self._report_waiters:
+                self._report_event.set()
+        return self._report_event
+
+    def _report_add(self, fut) -> None:
+        self._report_waiters.add(fut)
+        if self._report_event is not None:
+            self._report_event.set()
+
+    def _report_remove(self, fut) -> None:
+        self._report_waiters.discard(fut)
+        if not self._report_waiters and self._report_event is not None:
+            self._report_event.clear()
+
+    async def yield_to_preempt(self, resume_priority: Optional[float] = None) -> None:
         """Called by a holder at an idle point when `preempt_requested()`:
         hands the lock over and re-acquires it at YIELDED_PRIORITY, so
         the pre-empting handshake goes first and this exchange resumes
         before any ordinary waiter that queued meanwhile (review,
         2026-09-20: a plain release + re-acquire at NORMAL would splice a
-        whole other exchange into a raw burst)."""
+        whole other exchange into a raw burst). `resume_priority` lets a
+        holder yielding to a REPORT (item 6) resume behind the report's
+        tier instead."""
+        if resume_priority is None:
+            resume_priority = self.preempt_resume_priority()
         self.release()
-        await self.acquire(self.YIELDED_PRIORITY)
+        await self.acquire(resume_priority)
 
-    async def acquire(self, priority: int, preempt: bool = False) -> None:
+    async def acquire(self, priority: int, preempt: bool = False, report: bool = False) -> None:
         if not self._locked:
             self._locked = True
             return
         fut = asyncio.get_running_loop().create_future()
         self._waiters.setdefault(priority, collections.deque()).append(fut)
         if preempt:
-            self._preempt_add(fut)
+            self._preempt_add(fut, priority)
+        if report:
+            self._report_add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -547,6 +749,8 @@ class _PriorityAsyncLock:
         finally:
             if preempt:
                 self._preempt_remove(fut)
+            if report:
+                self._report_remove(fut)
 
     def release(self) -> None:
         if not self._wake_next():
@@ -568,8 +772,8 @@ class _PriorityAsyncLock:
             del self._waiters[tier]
         return False
 
-    def __call__(self, priority: int, preempt: bool = False) -> "_PriorityLockContext":
-        return _PriorityLockContext(self, priority, preempt)
+    def __call__(self, priority: int, preempt: bool = False, report: bool = False) -> "_PriorityLockContext":
+        return _PriorityLockContext(self, priority, preempt, report)
 
 
 class _PriorityLockContext:
@@ -580,15 +784,16 @@ class _PriorityLockContext:
     `async with` block despite `acquire`/`release` being its own real
     methods."""
 
-    __slots__ = ("_lock", "_priority", "_preempt")
+    __slots__ = ("_lock", "_priority", "_preempt", "_report")
 
-    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False):
+    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False, report: bool = False):
         self._lock = lock
         self._priority = priority
         self._preempt = preempt
+        self._report = report
 
     async def __aenter__(self) -> None:
-        await self._lock.acquire(self._priority, preempt=self._preempt)
+        await self._lock.acquire(self._priority, preempt=self._preempt, report=self._report)
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._lock.release()
@@ -733,37 +938,82 @@ class _DutyCycleLimiter:
     oldest sample is due to age out of the window (not a fixed poll
     interval), so it wakes only as often as actually necessary."""
 
-    def __init__(self, window_s: float, max_fraction: float):
+    def __init__(self, window_s: float, max_fraction: float, max_fraction_total: Optional[float] = None):
+        """`max_fraction` caps the RELAYED ledger -- every frame a repeater
+        will relay (any DIRECT frame with a routed path, every CHANNEL
+        flood); `max_fraction_total` caps the TOTAL ledger, which every
+        frame is charged to. Alpha 0.1.5 (2026-09-21, the owner's decision):
+        two budgets over the same window, 30% for what touches a
+        repeater and 85% for zero-hop DIRECT traffic -- the second
+        number is what the field's zero-hop page transfer was actually
+        limited by (109 of 147 s were duty-cycle waits), and a frame
+        between two adjacent radios costs nobody else's repeater any air.
+        Omitting `max_fraction_total` gives the pre-0.1.5 behaviour: one
+        cap for everything."""
         self._window_s = window_s
         self._max_busy_s = window_s * max_fraction
-        self._samples: "collections.deque" = collections.deque()
+        self._max_total_s = window_s * (max_fraction if max_fraction_total is None else max_fraction_total)
+        self._samples: "collections.deque" = collections.deque()          # every frame: (start, duration)
+        self._relayed: "collections.deque" = collections.deque()          # relayed frames only
+
+    @staticmethod
+    def _prune_deque(samples: "collections.deque", cutoff: float) -> None:
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._window_s
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
+        self._prune_deque(self._samples, cutoff)
+        self._prune_deque(self._relayed, cutoff)
 
     def _busy_s(self, now: float) -> float:
+        """Total busy time in the trailing window (every frame)."""
         self._prune(now)
         return sum(duration for _start, duration in self._samples)
 
-    async def wait_for_budget(self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None) -> float:
+    def _relayed_busy_s(self, now: float) -> float:
+        """Relayed busy time in the trailing window."""
+        self._prune(now)
+        return sum(duration for _start, duration in self._relayed)
+
+    def limiting_ledger(self, estimated_duration_s: float, relayed: bool, now: Optional[float] = None) -> Optional[str]:
+        """Which budget would hold `estimated_duration_s` of airtime back
+        right now: "relayed" (the 30% cap, checked first because it is the
+        stricter one and the one the frame class exists for), "total" (the
+        zero-hop cap), or None when the frame may go. Pure: no waiting."""
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        if relayed and self._relayed and self._relayed_busy_s(now) + estimated_duration_s > self._max_busy_s:
+            return "relayed"
+        if self._samples and self._busy_s(now) + estimated_duration_s > self._max_total_s:
+            return "total"
+        return None
+
+    async def wait_for_budget(
+        self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None, relayed: bool = True,
+    ) -> "tuple[float, Optional[str]]":
         """Sleeps until sending for `estimated_duration_s` would not push
-        the trailing window's cumulative busy time over the cap. Returns
-        the total delay actually applied (0.0 if none was needed) --
-        capture/debug-only, never affects whether the send itself
-        proceeds. A single transmission longer than the entire cap on its
-        own (shouldn't happen in practice -- every real frame this
-        interface sends is small) is let through once the window is
-        otherwise empty, rather than waiting forever for room that will
-        never exist."""
+        the trailing window's cumulative busy time over the cap -- the
+        relayed cap when `relayed`, and the total cap always. Returns
+        `(delay, ledger)`: the total delay actually applied (0.0 if none
+        was needed) and which ledger held the frame back longest-ago
+        ("relayed" / "total" / None) -- capture/debug-only, never affects
+        whether the send itself proceeds. A single transmission longer than
+        the entire cap on its own (shouldn't happen in practice -- every
+        real frame this interface sends is small) is let through once the
+        window is otherwise empty, rather than waiting forever for room
+        that will never exist."""
         total_wait = 0.0
+        charged_to: Optional[str] = None
         while True:
             now = time.monotonic()
-            self._prune(now)
-            if self._busy_s(now) + estimated_duration_s <= self._max_busy_s or not self._samples:
-                return total_wait
-            oldest_start, _oldest_duration = self._samples[0]
+            ledger = self.limiting_ledger(estimated_duration_s, relayed, now)
+            if ledger is None:
+                return total_wait, charged_to
+            if charged_to is None:
+                charged_to = ledger
+            samples = self._relayed if ledger == "relayed" else self._samples
+            oldest_start, _oldest_duration = samples[0]
             wait_s = max(0.01, (oldest_start + self._window_s) - now)
             if interrupt is not None:
                 # Phase 1 (2026-09-20): a raw burst's throttle wait is the
@@ -783,8 +1033,13 @@ class _DutyCycleLimiter:
             await asyncio.sleep(wait_s)
             total_wait += wait_s
 
-    def record(self, duration_s: float) -> None:
-        self._samples.append((time.monotonic(), duration_s))
+    def record(self, duration_s: float, relayed: bool = True) -> None:
+        """Charge `duration_s` of airtime: to the total ledger always, and
+        to the relayed ledger when a repeater will relay the frame."""
+        now = time.monotonic()
+        self._samples.append((now, duration_s))
+        if relayed:
+            self._relayed.append((now, duration_s))
 
 
 # ---- _config.py ----
@@ -820,7 +1075,29 @@ class _ConfigMixin:
         # should try to recover from a USB re-enumeration or a brief BLE
         # range loss rather than sitting dead until rnsd is restarted.
         self.auto_reconnect = _cfg_bool(cfg.get("auto_reconnect", "yes"))
-        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 3))
+        # Alpha 0.1.6 (item 4, 2026-09-22): the interface's own connection
+        # supervisor replaces the library's reconnect (which retried three
+        # times a second apart and then stayed dead). `max_reconnect_
+        # attempts` is now the supervisor's cap, 0 = forever (was the
+        # library's 3); `auto_reconnect = no` stays offline after a drop.
+        # The retry delay starts at `connect_retry_min` and doubles to
+        # `connect_retry_max`. Opening a serial port asserts DTR / RTS,
+        # which resets a Heltec V3 (boot text on the UART for a second or
+        # two), so the handshake waits `serial_open_settle` after the open,
+        # flushes the input and tries `handshake_attempts` times at
+        # `handshake_timeout` each. `command_timeout` is how long a command
+        # is owed its reply while the reader's own ERROR events for garbled
+        # frames are ignored (the library's 15 s default); more than
+        # `serial_noise_warn_per_min` of those in a minute is logged as a
+        # corrupted stream (two processes on one port, typically).
+        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 0))
+        self.connect_retry_min_s = max(1.0, float(cfg.get("connect_retry_min", 5.0)))
+        self.connect_retry_max_s = max(self.connect_retry_min_s, float(cfg.get("connect_retry_max", 60.0)))
+        self.serial_open_settle_s = max(0.0, float(cfg.get("serial_open_settle", 2.0)))
+        self.handshake_attempts = max(1, int(cfg.get("handshake_attempts", 5)))
+        self.handshake_timeout_s = max(1.0, float(cfg.get("handshake_timeout", 5.0)))
+        self.command_timeout_s = max(1.0, float(cfg.get("command_timeout", 15.0)))
+        self.serial_noise_warn_per_min = max(1, int(cfg.get("serial_noise_warn_per_min", 5)))
 
         # RNS-facing nominal bitrate. Deliberately NOT the base class's
         # 62500 default (`reliability_engine_design.md`'s base-class
@@ -859,6 +1136,18 @@ class _ConfigMixin:
         self.duty_cycle_enabled = _cfg_bool(cfg.get("duty_cycle_enabled", "yes"))
         self.duty_cycle_window_s = float(cfg.get("duty_cycle_window", 60.0))
         self.duty_cycle_max_fraction = float(cfg.get("duty_cycle_max_fraction", 0.30))
+        # Alpha 0.1.5 (2026-09-21, the owner's decision after the alpha
+        # 0.1.4 field session): two ledgers over the same window. Every
+        # frame a repeater will relay -- any DIRECT frame with a routed
+        # path, every CHANNEL flood (announces, path requests, bind frames)
+        # -- is charged to both and waits on both budgets, so what touches
+        # a repeater stays at `duty_cycle_max_fraction` (30%). A zero-hop
+        # DIRECT frame (the target's out_path_len is 0) is charged to the
+        # total ledger only and waits on this cap: 85%, because the
+        # zero-hop 12-part page of that session took 147 s of which 109 s
+        # were waits at 30%, and a frame between two adjacent radios costs
+        # nobody else's repeater any air. Never loosen the 30%.
+        self.duty_cycle_max_fraction_zero_hop = float(cfg.get("duty_cycle_max_fraction_zero_hop", 0.85))
         # User-requested (2026-09-18 evening, see module docstring): link-
         # maintenance traffic (PRIORITY_HANDSHAKE -- LINKREQUEST, PROOF,
         # KEEPALIVE..LRPROOF, RESOURCE_PRF/ICL/RCL) never waits for budget;
@@ -1251,6 +1540,22 @@ class _ConfigMixin:
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
+        # Alpha 0.1.5 (2a, 2026-09-21): how many frames a zero-hop raw burst
+        # may hold queued in the firmware ahead of the one on air. The
+        # firmware queues a frame and returns OK at once, so the pre-0.1.5
+        # loop handed a whole window (15 fragments, ~14 s of air) to the
+        # radio in 2.6 s: the burst was "over" before the radio had started
+        # on most of it, a report arriving meanwhile was read as the end of
+        # the wait, handshake yields between fragments yielded nothing (the
+        # handshake queued behind the burst), and the companion's packet
+        # pool is 16 entries shared with reception (StaticPoolPacketManager
+        # in MyMesh.cpp). Now the next fragment is handed over when the
+        # radio is estimated to have at most this many frames ahead of it
+        # (`_raw_burst_next_send_wait_s`); 1 keeps the air back to back
+        # with one frame queued. Through repeaters the hop-scaled gap
+        # already exceeds the airtime, so this never binds there. 0 = off
+        # (the pre-0.1.5 behaviour).
+        self.direct_raw_burst_queue_ahead = int(cfg.get("direct_raw_burst_queue_ahead", 1))
         # Quiet time after each fragment of a burst (the last one included):
         # a flat gap at zero hop (the receiver sends no ACK, so only its own
         # processing needs covering), or this factor x hop count x the
@@ -1260,6 +1565,29 @@ class _ConfigMixin:
         # _raw_fragment_gap_s for the 2026-09-19 field evidence.
         self.direct_raw_zero_hop_gap_s = float(cfg.get("direct_raw_zero_hop_gap", 0.15))
         self.direct_raw_hop_gap_factor = float(cfg.get("direct_raw_hop_gap_factor", 2.0))
+        # Alpha 0.1.5 (item 4, 2026-09-21): the field A/B knob for the one-hop
+        # gap. MeshBench finding 2 (2026-09-20) added the frame's own airtime
+        # to the hop-scaled gap -- `(1 + factor x hops) x airtime` -- because
+        # `send_raw_data` returns when the frame is queued, not sent. At one
+        # hop that gap is two thirds of a three-fragment part's time, and
+        # MeshBench cannot judge it (its frames are ~30% slower than the
+        # field's, so its one-hop loss alternates at any gap; and it has no
+        # listen-before-talk, which is what would let a real radio drop the
+        # `+1` -- the repeater's relay is audible to the sender). `no` drops
+        # the `+1 x airtime` term through repeaters (zero hop is untouched);
+        # every `raw_fragment_sent` record carries the `gap_s` actually used.
+        # DEFAULT UNCHANGED: `fieldtests/AB_PROTOCOL.md` decides.
+        #
+        # Alpha 0.1.9's first pass flipped this to `no` without the A/B
+        # (2026-09-23, commit 5bbe1a8); the second pass (2026-09-24) put it
+        # back to `yes`, because the A/B has still never run and the only
+        # field time the `no` arm got was five raw parts, all during a
+        # dead-path period (docs/history.md, "Alpha 0.1.9, second pass").
+        # MeshBench cannot judge it: the `+1` guards against keying inside a
+        # repeater's relay of the previous fragment (MeshBench finding 2,
+        # 2026-09-20), and a real SX1262 defers on hearing that relay while
+        # MeshBench's virtual radio has no listen-before-talk.
+        self.direct_raw_gap_own_airtime = _cfg_bool(cfg.get("direct_raw_gap_own_airtime", "yes"))
         # Burst-then-ask rounds per packet, and QUERY tries per round.
         # Audit fix (2026-09-19): clamped to 4. The raw header carries the
         # round in 2 bits (`attempt & 0x03`), and the firmware dedups
@@ -1270,6 +1598,17 @@ class _ConfigMixin:
         # burst of airtime for nothing.
         self.direct_raw_reconcile_rounds = max(1, min(4, int(cfg.get("direct_raw_reconcile_rounds", 3))))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
+        # Alpha 0.1.6 (item 2, 2026-09-22): through repeaters a window's
+        # rounds are capped lower than `direct_raw_reconcile_rounds` (which
+        # zero hop keeps). Every round at two hops is a burst (three
+        # fragments at ~0.9 s plus 4.5 s gaps), a report wait and up to two
+        # QUERY exchanges of ~18 s each, and the 2026-09-21 session's
+        # two-hop windows ran all three while link proofs and answers
+        # queued behind them (23 sends waited more than 30 s for the
+        # radio). After this many rounds the window falls back to the
+        # existing text path (per-fragment ACKs) or fails, exactly as it
+        # does when the rounds are exhausted today. 0: no separate cap.
+        self.direct_raw_window_max_rounds = max(0, int(cfg.get("direct_raw_window_max_rounds", 2)))
         # Receiver-initiated completion report (2026-09-20, module docstring
         # entry of that date). After a raw burst the sender used to key its
         # reconcile QUERY the instant the last fragment's gap ended -- which
@@ -1304,6 +1643,22 @@ class _ConfigMixin:
         # zero-hop session were the previous report's ACK wait). `no`
         # restores ACKed reports and answers.
         self.direct_report_noack = _cfg_bool(cfg.get("direct_report_noack", "yes"))
+        # Alpha 0.1.8 (item 2): from this hop count up, a completion REPORT
+        # goes through the ACKNOWLEDGED send path instead, with one retry.
+        # The no-ACK frame is one transmission and is never retried, and at
+        # two hops the 2026-09-22 field session had it reach the sender 3
+        # times out of 22 -- the sender then waited out its 10-18 s report
+        # wait and spent a whole QUERY round (a QUERY, its ACK and an
+        # ANSWER, 2.1-2.4 s of channel time at two hops) to learn what the
+        # report already said. The ACK costs about 0.42 s of channel time
+        # at two hops, so it pays for itself if it saves roughly one QUERY
+        # round in five. At ONE hop it does not: reports arrived 33 times
+        # of 48 there in alpha 0.1.6 and the ACK would cost more than it
+        # saves, so below the threshold the no-ACK frame and its hold are
+        # untouched. The frame's CONTENT is identical either way -- only
+        # its carrier changes -- so the golden wire snapshot is unaffected.
+        # 0 disables the item entirely.
+        self.direct_report_ack_min_hops = max(0, int(cfg.get("direct_report_ack_min_hops", 2)))
         # Phase 3 M1: a flagged fragment that leaves gaps no longer reports
         # at once -- the second-last fragment is flagged too, so at zero hop
         # the receiver sent a gaps report and, 0.2-0.4 s later, the complete
@@ -1313,6 +1668,25 @@ class _ConfigMixin:
         # (`_report_hold_s`) and dropped if the bucket completes first. `no`
         # reports immediately as before.
         self.direct_report_debounce = _cfg_bool(cfg.get("direct_report_debounce", "yes"))
+        # Alpha 0.1.5 (2b, 2026-09-21): the receiver sends no per-part
+        # complete report while fragments of the same sender's window are
+        # still arriving. The field (zero-hop 12-part page, 08:38): the
+        # laptop reported each part the moment it completed, while the
+        # desktop's radio was still transmitting the rest of the window --
+        # the report for part 8 reached the desktop mid-burst and ended its
+        # wait early, the reports for parts 9 and 10 were transmitted into
+        # the desktop's own queue and never heard, and every one of the
+        # four on-air losses of that page sat within 2 s of one of those
+        # reports. Now a completed part that arrived UNFLAGGED (not one of
+        # the burst's last two fragments) is reported after a silence of one
+        # fragment's start-to-start spacing at this hop count plus half an
+        # airtime (`_report_hold_s(..., arriving=True)`), re-armed by every
+        # further fragment from that sender; a flagged fragment reports at
+        # once (complete) or after the M1 debounce (gaps), as before, and
+        # every report lists the sender's recent packets, so one report
+        # covers the window. A lone single-part burst is unchanged: its last
+        # two fragments are flagged. `no` reports every completion at once.
+        self.direct_report_hold_during_burst = _cfg_bool(cfg.get("direct_report_hold_during_burst", "yes"))
         # Phase 3 M2 (2026-09-20): one report per WINDOW. RNS hands the
         # sender a window of 4-6 Resource parts within milliseconds; each
         # used to be its own burst-and-report exchange (two in flight per
@@ -1324,6 +1698,12 @@ class _ConfigMixin:
         # bitmap per part; re-drives are batched the same way and the v4
         # QUERY asks about the whole window. `direct_raw_window_enabled =
         # no` sends each part as a window of one, with no collect wait.
+        # Alpha 0.1.5 (item 5): `direct_raw_window_collect` is the MAXIMUM
+        # -- the collect ends as soon as nothing is queued from RNS and no
+        # part has joined within the transfer's observed inter-part spacing
+        # (floor 40 ms), so a lone packet starts within that floor instead
+        # of paying the whole 0.75 s (every zero-hop probe did), while a
+        # window of parts arriving together still batches.
         self.direct_raw_window_enabled = _cfg_bool(cfg.get("direct_raw_window_enabled", "yes"))
         self.direct_raw_window_collect_s = float(cfg.get("direct_raw_window_collect", 0.75))
         self.direct_raw_window_max_parts = int(cfg.get("direct_raw_window_max_parts", 6))
@@ -1480,6 +1860,40 @@ class _ConfigMixin:
         # the first: a proof is one bare frame, so a stale retry wastes
         # nothing already spent. 0 disables.
         self.proof_max_age_s = float(cfg.get("proof_max_age", 45.0))
+        # Alpha 0.1.7 (item 1): a plain PROOF younger than this (measured
+        # from the moment RNS handed it to this interface, which is within
+        # milliseconds of the DATA it answers arriving) is treated like a
+        # Link handshake for the RADIO LOCK only: it pre-empts idle holds
+        # and is taken at the raw window's existing yield points, exactly
+        # as an LRPROOF and the receiver's own completion report are. Its
+        # tier (ANSWER), attempt budget and duty-cycle accounting do not
+        # change, and it still expires at proof_max_age. The 2026-09-22
+        # one-hop session: one 211 B LXMF message arrived six times in 70 s
+        # because each proof left the radio 5-20 s after its DATA, queued
+        # behind the page windows this node was serving, and LXMF re-sends
+        # an unproved opportunistic message after DELIVERY_RETRY_WAIT 10 s
+        # (checked every 4 s, up to 5 attempts). 8 s: the far side's retry
+        # is due at 10-14 s after its send, minus ~2 s of transit at one
+        # hop. Past it the proof is bulk-tier as before. 0 disables.
+        self.proof_fresh_s = float(cfg.get("proof_fresh_s", 8.0))
+        # Alpha 0.1.8 (item 1): how long a raw window's COMPLETE report is
+        # held while RNS decides whether to prove the packet that window
+        # delivered. RNS proves every single-destination DATA packet, and
+        # its PROOF tells the sender exactly what the report would --
+        # "I have it" -- so when the proof appears inside the grace the
+        # report is dropped and the sender's window ends on the proof
+        # instead. Measured on the installed RNS 1.4.2 the proof reaches
+        # `process_outgoing` within a millisecond of the packet being
+        # handed over (`Transport.inbound` is synchronous and LXMF's
+        # `delivery_packet` calls `prove()` on its first line); the grace
+        # is set two orders of magnitude above that to cover RNS 1.5's
+        # inbound queue (`USE_INBOUND_QUEUE`, one thread hop) and a loaded
+        # host. It is only ever spent when a proof is genuinely plausible
+        # -- see `_proof_may_replace_report`'s four gates -- so it costs
+        # nothing on Resource parts, Link traffic, announces or a transport
+        # node's relayed packets. 0 disables the whole item and every such
+        # window reports as it did in alpha 0.1.7.
+        self.proof_report_grace_s = max(0.0, float(cfg.get("proof_report_grace", 0.25)))
         # How many times the same bytes may be suppressed as "already in
         # flight" before the packet is forced through with a fresh in-flight
         # entry (field fix 2026-09-19: a stuck entry deadlocked a transfer for
@@ -1506,6 +1920,52 @@ class _ConfigMixin:
         self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 20.0))
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
         self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 1.8))
+        # Alpha 0.1.6 (item 1, 2026-09-22): path selection by measured
+        # reliability, replacing alpha 0.1.5's shorter-path adoption. Every
+        # route this node learns to a peer -- the discovered path, the
+        # reverse of each distinct flood copy the peer's own floods took,
+        # the zero-hop option when the peer has been heard directly, and the
+        # path the peer itself reports in every "Q" v5 frame -- is a
+        # candidate on a per-peer scoreboard (`_PathBoard`, `_paths.py`).
+        # Each candidate is scored as expected transmissions per delivered
+        # frame times (hops + 1): airtime per delivered byte, lower is
+        # better, from its delivery rate over its last PATH_SAMPLES_KEPT
+        # sends (older ones weighted down, nothing older than
+        # PATH_SAMPLE_WINDOW_S counted). An untried path scores with the
+        # optimistic prior PATH_PRIOR_OPTIMISTIC, except a zero-hop candidate
+        # whose last direct frame from the peer was below `path_weak_snr_db`
+        # (the owner's repeater assumption: a two-hop path via a well-placed
+        # repeater beats a weak direct one), which scores with
+        # PATH_PRIOR_WEAK. The current path is kept while it delivers; after
+        # `path_switch_after_misses` consecutive missed sends the next real
+        # packet goes on the best-scoring alternative (a trial, no dedicated
+        # probe); the switch is made for good only when the alternative's
+        # score beats the current one by `path_switch_margin`, and a path
+        # switched away from is not switched back to for
+        # `path_switch_cooldown` seconds. Discovery runs only when every
+        # candidate has missed its last `path_switch_after_misses` sends
+        # (and a candidate whose last miss is older than the cooldown is
+        # tried again). The field (2026-09-21 evening, 22:00-22:35): the
+        # shortest-in-window rule adopted a 504 s old zero-hop route over a
+        # one-hop path confirmed 2 s earlier, missed twice, reset, and the
+        # desktop then sat on a two-hop path for 32 minutes while the
+        # laptop reached it in one, because the one-hop route was never
+        # re-tried without a fresh flood. The old key `path_adopt_enabled`
+        # is accepted as an alias of `path_selection_enabled`.
+        legacy = cfg.get("path_adopt_enabled")
+        self.path_selection_enabled = _cfg_bool(cfg.get("path_selection_enabled", "yes" if legacy is None else legacy))
+        self.path_weak_snr_db = float(cfg.get("path_weak_snr_db", 3.0))
+        # Alpha 0.1.9 (item 4): 2 -> 4 because the unit changed. This
+        # counts consecutive missed ATTEMPTS now, not missed sends, and a
+        # missed send is exactly `direct_send_attempts` (2) consecutive
+        # missed attempts -- so 4 is the same patience 2 used to buy, while
+        # a send with a larger budget (a four-attempt handshake, a pass-1
+        # finish) finally costs what it spends. See
+        # `_note_path_attempt_result` for the field evidence and for why
+        # the delivery-rate samples stay per send.
+        self.path_switch_after_misses = max(1, int(cfg.get("path_switch_after_misses", 4)))
+        self.path_switch_margin = max(0.0, float(cfg.get("path_switch_margin", 0.25)))
+        self.path_switch_cooldown_s = max(0.0, float(cfg.get("path_switch_cooldown", 120.0)))
 
         # Stale cached-DIRECT-path detection (§8). Built and unit-tested in
         # Milestone 4; since Milestone 5 every live DIRECT send path feeds it
@@ -1583,8 +2043,40 @@ class _ConfigMixin:
         # nothing: the next request for the same destination inside the
         # interval goes over the air, which is how a genuinely dead
         # destination is re-verified. 0 disables either.
-        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 3600.0))
-        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 120.0))
+        #
+        # Alpha 0.1.9 (item 3): the TTL was 3600 s, which is shorter than
+        # a field day. The 2026-09-23 session had two stops two hours
+        # apart; every entry cached at the first stop had expired by the
+        # second, so eight announces went over the air again at two hops
+        # (the laptop's 11:28 capture, `direct_raw_multifragment`) for
+        # destinations it had already held. A week matches what RNS
+        # itself keeps: a path learned over a MODE_FULL interface expires
+        # at `Transport.PATHFINDER_E` (60*60*24*7) and the path table is
+        # culled at `Transport.DESTINATION_TIMEOUT` (also a week) --
+        # `RNS/Transport.py`, verified 2026-09-23 -- so the cache now
+        # expires exactly when the answering node's OWN record of the
+        # same announce would, and never later. Serving a week-old entry
+        # is bounded by liveness rather than by age: the entry answers
+        # only while the peer that delivered it is still bound and out of
+        # path-discovery backoff (`_answer_path_request_locally`), and
+        # one on-air verification per destination per
+        # `path_request_local_answer_min_interval` still runs. The cache
+        # is LRU-bounded at ANNOUNCE_CACHE_MAX_KEYS (256), so the longer
+        # TTL costs bounded memory and a bounded file.
+        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 604800.0))
+        # Alpha 0.1.8 (item 4): where the cache is persisted. Empty means
+        # `smci_announces.json` beside the peer cache under
+        # RNS.Reticulum.storagepath; `announce_cache_ttl = 0` disables
+        # both the cache and its file.
+        self.announce_cache_path = str(cfg.get("announce_cache_path", "") or "")
+        # Alpha 0.1.9 (item 3): 120 s put six verification requests on the
+        # air for three destinations in the 3 1/2 minutes between
+        # 11:40:51 and 11:44:16 of the 2026-09-23 two-hop stop, each one a
+        # relayed DIRECT request answered with a multi-fragment announce
+        # window. Ten minutes keeps the re-verification of a genuinely
+        # dead destination (0.1.6's purpose for the rule) while costing
+        # one request per destination per interval instead of five.
+        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 600.0))
 
     def _configure_peer_discovery(self, cfg):
         # Master on/off switch for the entire bind-frame subsystem (both
@@ -1896,6 +2388,29 @@ class _ConfigMixin:
         # storage path is known).
         self.packet_capture_enabled = _cfg_bool(cfg.get("packet_capture_enabled", "no"))
         self.packet_capture_dir = cfg.get("packet_capture_dir", None)
+        # Alpha 0.1.5 (item 7, 2026-09-21): the capture file carries a node
+        # label so two machines' captures of one session tell apart at a
+        # glance -- the MeshCore node name from SELF_INFO by default (the
+        # field's `afipc` and `a`; the desktop's 2026-09-21 file had to be
+        # renamed by hand), or this value. Empty and no node name gives the
+        # pre-0.1.5 filename. `_capture_filename` is the pure rule.
+        self.packet_capture_label = str(cfg.get("packet_capture_label", "") or "").strip()
+        # Alpha 0.1.5 (item 8, 2026-09-21): airtime estimator calibration,
+        # instrumentation only. Firmware v1.17.1's CMD_GET_STATS (56,
+        # companion protocol v8+; `MyMesh.cpp`) returns the radio's measured
+        # transmit time -- `Dispatcher::checkSend` adds the wall-clock
+        # duration of every completed send to `total_air_time`; reported as
+        # whole seconds -- and per-type packet counts; the library exposes
+        # them as `get_stats_radio()` (tx_air_secs, rx_air_secs, noise floor,
+        # last RSSI/SNR) and `get_stats_packets()` (recv, sent, flood/direct
+        # tx/rx). The interface reads both at start, at stop and every
+        # `radio_stats_interval` seconds (0 = start and stop only) into a
+        # `radio_stats` capture record next to its own summed airtime
+        # estimate and frame count since start, so a field summary can
+        # compare the estimator against the radio. The estimator itself is
+        # unchanged. A firmware without the command (an ERROR reply) is
+        # logged once and the poll stops.
+        self.radio_stats_interval_s = float(cfg.get("radio_stats_interval", 300.0))
 
         # User-requested (2026-09-18, "lessen our reliance on arbitrary
         # wait times" -- step 1 of that plan, see module docstring): tap
@@ -2068,8 +2583,11 @@ class _ObservabilityMixin:
     # Packet capture (user-requested, 2026-09-15) -- off by default
     # (packet_capture_enabled). One JSON object per line (JSONL: easy to
     # tail -f, grep, or load with any per-line JSON reader) per in/out
-    # RNS packet, written to packet_capture_dir (default: a
-    # "packet_capture" subdirectory of this node's own RNS storage path).
+    # RNS packet, written to packet_capture_dir (default since 0.1.0:
+    # `meshcore_packet_capture` under this node's own RNS storage path,
+    # ~/.reticulum/storage/meshcore_packet_capture for a default install).
+    # The first record of every file is a `capture_header` (0.1.0): the
+    # interface's effective settings and the radio SELF_INFO reported.
     # Deliberately synchronous, unbuffered writes: this transport's own
     # real throughput ceiling (docs/reliability_engine_design.md's field
     # data: tens of bytes/sec) means packets are inherently rare relative
@@ -2080,26 +2598,113 @@ class _ObservabilityMixin:
     # analysis tool than avoiding a sub-millisecond stall ever would.
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _capture_filename(label: str, iface_name: str, stamp: str) -> str:
+        """The capture file's name (pure, alpha 0.1.5 item 7):
+        `<label>_capture_<interface>_<stamp>.jsonl` -- the field's own
+        convention for the desktop's files -- or the pre-0.1.5
+        `capture_<interface>_<stamp>.jsonl` when there is no label. Both
+        parts are reduced to [A-Za-z0-9-_]."""
+        def safe(text: str) -> str:
+            return "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
+        base = f"capture_{safe(iface_name)}_{stamp}.jsonl"
+        label = safe(label.strip()) if label else ""
+        return f"{label}_{base}" if label else base
+
+    CAPTURE_DEFAULT_SUBDIR = "meshcore_packet_capture"
+    # Settings whose value is never written to a capture (captures get
+    # shared and committed): the name matches, the value is replaced.
+    CAPTURE_REDACTED_SETTINGS = ("secret", "password", "passphrase")
+    # The SELF_INFO fields a capture header keeps: the radio and the node,
+    # not the advertised position (adv_lat/adv_lon).
+    CAPTURE_SELF_INFO_FIELDS = (
+        "name", "public_key", "adv_type", "tx_power", "max_tx_power", "radio_freq", "radio_bw",
+        "radio_sf", "radio_cr", "multi_acks", "manual_add_contacts", "telemetry_mode_base",
+        "telemetry_mode_loc", "telemetry_mode_env",
+    )
+
+    def _capture_dir(self) -> str:
+        """Where capture files go (0.1.0): packet_capture_dir when set
+        (`~` expanded), else `meshcore_packet_capture` under the RNS
+        storage path -- ~/.reticulum/storage when RNS has none, so
+        `packet_capture_enabled = yes` is the only setting a capture needs."""
+        if self.packet_capture_dir:
+            return os.path.expanduser(str(self.packet_capture_dir))
+        base = getattr(RNS.Reticulum, "storagepath", None) or os.path.expanduser("~/.reticulum/storage")
+        return os.path.join(base, self.CAPTURE_DEFAULT_SUBDIR)
+
+    @classmethod
+    def _capture_safe_value(cls, name: str, value):
+        """A setting's value as a capture header writes it: redacted by
+        name, sets as sorted lists, anything not plain JSON as its repr."""
+        if any(word in name.lower() for word in cls.CAPTURE_REDACTED_SETTINGS):
+            return "<redacted>" if value else value
+        if isinstance(value, (set, frozenset)):
+            value = sorted(value, key=repr)
+        if isinstance(value, (list, tuple)):
+            return [v if isinstance(v, (str, int, float, bool)) or v is None else repr(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return repr(value)
+
+    def _settings_snapshot(self, before: set) -> dict:
+        """Every attribute the `_configure_*` calls set (the ones not in
+        `before`), as a capture header writes them. Callables, locks and
+        handles are dropped."""
+        out = {}
+        for key in sorted(set(vars(self)) - before):
+            value = getattr(self, key)
+            if callable(value) or hasattr(value, "acquire") or hasattr(value, "write"):
+                continue
+            out[key] = self._capture_safe_value(key, value)
+        return out
+
+    def _capture_self_info(self) -> dict:
+        info = self._self_info or {}
+        return {k: info[k] for k in self.CAPTURE_SELF_INFO_FIELDS if k in info}
+
+    def _capture_header_record(self) -> dict:
+        """The first record of every capture file (0.1.0): the settings the
+        interface runs with (`settings`, every value `_configure_*` set,
+        defaults included), the keys the config block gave (`config_given`),
+        what the radio reported at the handshake (`radio`) and the radio
+        parameters the airtime model uses (`radio_params`, which follow a
+        freq/bw/sf/cr override)."""
+        given = {}
+        for key, value in dict(self._config_given or {}).items():
+            given[str(key)] = self._capture_safe_value(str(key), value)
+        params = self._radio_params
+        return {
+            "event": "capture_header",
+            "interface": self.name,
+            "interface_class": type(self).__name__,
+            "rns_version": getattr(RNS, "__version__", None),
+            "radio": self._capture_self_info(),
+            "radio_override": bool(self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr),
+            "radio_params": list(params) if params is not None else None,
+            "config_given": given,
+            "settings": dict(self._settings_at_start or {}),
+        }
+
     def _open_packet_capture(self) -> None:
         try:
-            capture_dir = self.packet_capture_dir
-            if not capture_dir:
-                base = getattr(RNS.Reticulum, "storagepath", None)
-                if not base:
-                    RNS.log(
-                        f"{self}: packet_capture_enabled but no packet_capture_dir "
-                        f"configured and no RNS storage path available -- capture "
-                        f"disabled for this run.",
-                        RNS.LOG_WARNING,
-                    )
-                    return
-                capture_dir = os.path.join(base, "packet_capture")
+            capture_dir = self._capture_dir()
             os.makedirs(capture_dir, exist_ok=True)
-            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.name)
-            filename = f"capture_{safe_name}_{time.strftime('%Y%m%dT%H%M%S')}.jsonl"
+            # Item 7: the node label -- packet_capture_label, else the
+            # MeshCore node name SELF_INFO gave (known by now: the capture
+            # opens once the node is online).
+            label = self.packet_capture_label or (self._own_node_name or "")
+            filename = self._capture_filename(label, self.name, time.strftime('%Y%m%dT%H%M%S'))
             path = os.path.join(capture_dir, filename)
             self._packet_capture_file = open(path, "a", buffering=1)
             RNS.log(f"{self}: packet capture enabled -- writing to {path}", RNS.LOG_INFO)
+            self._capture_event("out", self._capture_header_record())
+            self._captured_radio = self._capture_self_info()
+            # Alpha 0.1.6 (item 4): connection_state records from before
+            # the node had a name (the capture needs the handshake).
+            pending, self._pending_capture_events = self._pending_capture_events, []
+            for record in pending:
+                self._capture_event("out", record)
         except Exception as exc:
             RNS.log(f"{self}: failed to open packet capture file: {exc} -- capture disabled for this run.", RNS.LOG_WARNING)
             self._packet_capture_file = None
@@ -2283,7 +2888,10 @@ class _ObservabilityMixin:
         medium_hold_wait_s: Optional[float] = None, miss_diagnosis: Optional[str] = None,
         medium_busy_remaining_s: Optional[float] = None, kind: Optional[str] = None,
         hop1_abort_deadline_s: Optional[float] = None, duty_cycle_exempt: bool = False,
+        duty_cycle_ledger: Optional[str] = None,
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
+        proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
+        proof_tail_hold_s: Optional[float] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -2367,6 +2975,14 @@ class _ObservabilityMixin:
             # governed the wait. The `rx_*` fields are the correlation
             # window -- offsets in seconds after MSG_SENT.
             "ack_timeout_source": ack_timeout_source,
+            # Alpha 0.1.7 (item 1): a plain PROOF's age since RNS queued it
+            # (None for any other frame) and whether it pre-empted as fresh.
+            "proof_age_s": round(proof_age_s, 3) if proof_age_s is not None else None,
+            "proof_fresh": proof_fresh,
+            # Alpha 0.1.9 (item 2): the sender's burst tail this proof waited
+            # out before it was dispatched (None for any other frame, and for
+            # a proof that owed no wait).
+            "proof_tail_hold_s": proof_tail_hold_s,
             "ack_latency_s": round(ack_latency_s, 3) if ack_latency_s is not None else None,
             "send_cmd_latency_s": round(send_cmd_latency_s, 3) if send_cmd_latency_s is not None else None,
             **self._rtt_capture_fields(peer_prefix),
@@ -2399,6 +3015,10 @@ class _ObservabilityMixin:
             # User-requested (2026-09-18 evening): handshake-class frames
             # skip the duty-cycle wait (airtime still charged).
             "duty_cycle_exempt": duty_cycle_exempt,
+            # Alpha 0.1.5: the ledger a duty-cycle wait was charged to
+            # ("relayed" = the 30% cap, "total" = the zero-hop cap, None =
+            # no wait / not gated).
+            "duty_cycle_ledger": duty_cycle_ledger,
             # Field fix (2026-09-19 night): how long this attempt kept the
             # radio lock AFTER its listen delay waiting for the answer it
             # asked for -- the hidden-node quiet window, non-null only on a
@@ -2492,6 +3112,7 @@ class _ObservabilityMixin:
         self, peer_prefix: str, pkt_id: int, frag_total: int, outcome: str, complete: bool,
         stage: str = "final", timeout_s: Optional[float] = None,
         answer_version: Optional[int] = None, held: Optional[list] = None,
+        hop_count: Optional[int] = None,
     ) -> None:
         """Field-data-analysis fix (2026-09-17): one record per
         `_check_remote_completion` call, so the next field test can
@@ -2508,6 +3129,11 @@ class _ObservabilityMixin:
             return
         self._capture_event("out", {
             "event": "completion_check_result",
+            # Alpha 0.1.8 (item 5): the hop count, so the field summary can
+            # stratify reconcile outcomes the way it stratifies everything
+            # else -- without it every window landed in an untyped bucket
+            # and "frames per completed window by hop" could not be built.
+            "hop_count": hop_count,
             "peer_prefix": peer_prefix,
             "pkt_id": pkt_id,
             "frag_total": frag_total,
@@ -2567,7 +3193,7 @@ class _ObservabilityMixin:
                     f"raw_fragments_rx={self._raw_fragments_received} raw_frames_ignored={self._raw_frames_ignored} "
                     f"raw_unsupported_paths={list(self._raw_unsupported_paths)} "
                     f"ack_rtt={{{', '.join(f'{p!r}: srtt={st['srtt']:.2f}s rttvar={st['rttvar']:.2f}s n={st['samples']}' for p, st in self._ack_rtt.items())}}}",
-                    RNS.LOG_INFO,
+                    RNS.LOG_DEBUG,
                 )
                 # Per-bucket fragment counts/ages (docs/interface_architecture.md's
                 # observability requirements ask for these specifically) --
@@ -2620,6 +3246,8 @@ class _ObservabilityMixin:
             "path_reply_seen_s": None,    # PATH from target to us (the flood-mode ACK carrier)
             "foreign_rx_count": 0,
             "foreign_rx": [],             # up to _RX_LOG_WINDOW_FOREIGN_CAP (typename, route, path_len, t, src_hash)
+            "ack_snr": None,              # the matched ACK's signal (alpha 0.1.6 item 1)
+            "ack_rssi": None,
         }
         self._rx_log_window = window
         return window
@@ -2644,6 +3272,9 @@ class _ObservabilityMixin:
         if ptype == self._RX_LOG_PAYLOAD_TYPE_ACK and w["expected_ack"] and fields.get("ack_code") == w["expected_ack"]:
             if w["ack_seen_on_air_s"] is None:
                 w["ack_seen_on_air_s"] = t
+                # Alpha 0.1.6 (item 1): the ACK's signal is the last leg of
+                # the path this frame went on (`_note_path_signal`).
+                w["ack_snr"], w["ack_rssi"] = fields.get("snr"), fields.get("rssi")
             return
         if (
             ptype == self._RX_LOG_PAYLOAD_TYPE_TEXT_MSG
@@ -2678,7 +3309,7 @@ class _ObservabilityMixin:
         with no `rx_log` records can be told apart from a mesh that was
         genuinely silent."""
         if not self.rx_log_observe_enabled:
-            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_INFO)
+            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_DEBUG)
             return
         if not hasattr(self._EventType, "RX_LOG_DATA"):
             RNS.log(
@@ -2693,7 +3324,7 @@ class _ObservabilityMixin:
             f"{self}: subscribed to the firmware's raw-RX log feed (RX_LOG_DATA) -- "
             f"observe-only; overheard packets are counted in [STATS] and, when "
             f"packet capture is on, recorded as 'rx_log' events.",
-            RNS.LOG_INFO,
+            RNS.LOG_DEBUG,
         )
 
     # -- Step 4 (2026-09-18): airtime model and predicted-busy holds -------
@@ -2785,6 +3416,101 @@ class _ObservabilityMixin:
             return hold, reason
         return 0.0, "unknown"
 
+    # -- Own-transmit busy accounting (alpha 0.1.5, 2a) ----------------------
+
+    def _note_radio_keyed(self, airtime_s: float, now: Optional[float] = None) -> float:
+        """One more frame handed to the firmware: the radio is busy until
+        the later of now and its previous busy-until, plus this frame's
+        estimated airtime (pure over its inputs; the firmware's own CAD
+        deferral and tx budget can only push the real end later, so this is
+        a floor). Returns the new busy-until."""
+        now = time.monotonic() if now is None else now
+        self._radio_busy_until = max(now, self._radio_busy_until) + max(0.0, airtime_s)
+        self._estimated_tx_air_total_s += max(0.0, airtime_s)   # item 8: the estimator's running sum
+        self._frames_keyed_total += 1
+        return self._radio_busy_until
+
+    def _radio_busy_remaining_s(self, now: Optional[float] = None) -> float:
+        """Seconds until this node's own queued frames are estimated to be
+        off the air (0.0 when idle)."""
+        now = time.monotonic() if now is None else now
+        return max(0.0, self._radio_busy_until - now)
+
+    # -- Radio transmit statistics (alpha 0.1.5, item 8) --------------------
+
+    def _radio_stats_record(self, reason: str, radio: Optional[dict], packets: Optional[dict]) -> dict:
+        """The `radio_stats` capture record (pure over its inputs): the
+        firmware's measured transmit / receive airtime and packet counts
+        beside this interface's own summed airtime estimate and frame count
+        since start, so a field summary can calibrate the estimator against
+        the radio (`tx_air_secs` is `Dispatcher::total_air_time` in whole
+        seconds, wall-clock from send start to send complete)."""
+        radio = radio or {}
+        packets = packets or {}
+        return {
+            "event": "radio_stats", "reason": reason,
+            "tx_air_secs": radio.get("tx_air_secs"), "rx_air_secs": radio.get("rx_air_secs"),
+            "noise_floor": radio.get("noise_floor"), "last_rssi": radio.get("last_rssi"), "last_snr": radio.get("last_snr"),
+            "packets_sent": packets.get("sent"), "packets_recv": packets.get("recv"),
+            "flood_tx": packets.get("flood_tx"), "direct_tx": packets.get("direct_tx"),
+            "flood_rx": packets.get("flood_rx"), "direct_rx": packets.get("direct_rx"),
+            "recv_errors": packets.get("recv_errors"),
+            "estimated_tx_air_s": round(self._estimated_tx_air_total_s, 3),
+            "frames_keyed": self._frames_keyed_total,
+            "uptime_s": round(time.time() - self._connected_since, 1) if self._connected_since else None,
+        }
+
+    async def _poll_radio_stats(self, reason: str) -> Optional[dict]:
+        """Read the firmware's radio and packet statistics (CMD_GET_STATS,
+        companion protocol v8+) and write one `radio_stats` record. Best
+        effort: a firmware or library without the command is logged once and
+        never asked again. Returns the record, or None."""
+        if self._radio_stats_unsupported or self._mc is None:
+            return None
+        commands = getattr(self._mc, "commands", None)
+        if commands is None or not hasattr(commands, "get_stats_radio") or not hasattr(commands, "get_stats_packets"):
+            self._radio_stats_unsupported = True
+            self._debug("radio stats: the meshcore library has no get_stats_radio/get_stats_packets -- not polled.")
+            return None
+        radio = packets = None
+        try:
+            async with self._command_lock:
+                ev = await asyncio.wait_for(commands.get_stats_radio(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                radio = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+                ev = await asyncio.wait_for(commands.get_stats_packets(), timeout=5.0)
+                if ev is not None and ev.type == self._EventType.ERROR:
+                    raise RuntimeError(f"ERROR {ev.payload}")
+                packets = ev.payload if ev is not None and isinstance(ev.payload, dict) else None
+        except Exception as exc:
+            if not self._radio_stats_unsupported:
+                self._radio_stats_unsupported = True
+                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_DEBUG)
+            return None
+        record = self._radio_stats_record(reason, radio, packets)
+        self._debug(
+            f"radio stats ({reason}): firmware tx_air {record['tx_air_secs']}s rx_air {record['rx_air_secs']}s "
+            f"sent {record['packets_sent']} -- interface estimate {record['estimated_tx_air_s']}s over {record['frames_keyed']} frames."
+        )
+        if self._packet_capture_file is not None:
+            self._capture_event("out", record)
+        return record
+
+    async def _radio_stats_loop(self):
+        """`radio_stats` on a fixed cadence (`radio_stats_interval`; 0 =
+        start and stop only)."""
+        try:
+            while not self.detached and self.radio_stats_interval_s > 0 and not self._radio_stats_unsupported:
+                await asyncio.sleep(self._loop_interval_s(self.radio_stats_interval_s, "radio_stats_interval"))
+                if self.detached:
+                    break
+                await self._poll_radio_stats("interval")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._debug(f"radio stats loop stopped: {exc}")
+
     def _extend_medium_busy(self, hold_s: float, reason: str, now: float) -> None:
         if hold_s <= 0:
             return
@@ -2854,7 +3580,12 @@ class _ObservabilityMixin:
             payload = event.payload if isinstance(event.payload, dict) else {}
             now = time.monotonic()
             since_last_rx = (now - self._last_rx_log_at) if self._last_rx_log_at is not None else None
-            since_own_tx = (now - self._last_own_tx_at) if self._last_own_tx_at is not None else None
+            # Alpha 0.1.5 (2a): measured from the estimated END of this
+            # node's own last frame on air, not from the send command --
+            # negative while a queued burst is still estimated to be on air
+            # (the field's radio log read 9 s "idle" with ten queued
+            # fragments transmitting).
+            since_own_tx = (now - self._radio_busy_until) if self._last_own_tx_at is not None else None
             self._last_rx_log_at = now
             self._rx_log_feed_seen = True
             self._rx_log_events_total += 1
@@ -2869,6 +3600,8 @@ class _ObservabilityMixin:
             fields["medium_busy_remaining_s"] = round(self._medium_busy_remaining_s(now), 3)
             if self._rx_log_window is not None:
                 self._classify_rx_log_for_window(fields, now)
+            # Alpha 0.1.5 (item 3): a bound peer's flood shows a route to it.
+            self._note_flood_route(payload, fields, now)
             if self._packet_capture_file is None and not self.debug_logs:
                 return
             if self._packet_capture_file is not None:
@@ -3135,9 +3868,9 @@ class _WireFormatMixin:
     def _encode_completion_frame(
         self, frame_type: int, pkt_id: int, frag_total: int, complete: bool = False,
         held: "Optional[set]" = None, version: Optional[int] = None,
-        nonce: Optional[int] = None,
+        nonce: Optional[int] = None, path_len: Optional[int] = None, rate: Optional[float] = None,
     ) -> str:
-        """`version` defaults to this build's own (v3 since 2026-09-19). Passing
+        """`version` defaults to this build's own (v5 since 2026-09-22). Passing
         `COMPLETION_PROTOCOL_VERSION_V1` produces the pre-step-3 fixed-body
         frame -- used to answer a v1 QUERY in kind. `held` is only encoded
         on a v2 ANSWER; `complete` is carried by both versions (redundant
@@ -3145,6 +3878,10 @@ class _WireFormatMixin:
         infer it)."""
         if version is None:
             version = self.COMPLETION_PROTOCOL_VERSION
+        if version >= 5:
+            # v5: a single-entry multi-part frame with the sender's path view.
+            return self._encode_completion_frame_v5(frame_type, [(pkt_id, frag_total, complete, held)], nonce=nonce,
+                                                    path_len=path_len, rate=rate)
         if version >= 4:
             # v4: a single-entry multi-part frame (phase 3 M2).
             return self._encode_completion_frame_v4(frame_type, [(pkt_id, frag_total, complete, held)], nonce=nonce)
@@ -3175,8 +3912,14 @@ class _WireFormatMixin:
         every entry so the layout is one rule). At most
         COMPLETION_V4_MAX_ENTRIES entries; 8 x (5 + 1) + 4 = 52 bytes,
         66 Z85 chars plus the marker, inside the 160-char text limit."""
+        return self.COMPLETION_MARKER + _z85_encode(bytes(
+            bytearray([self.COMPLETION_PROTOCOL_VERSION_V4, frame_type]) + self._completion_entries_bytes(entries, nonce)))
+
+    def _completion_entries_bytes(self, entries, nonce: Optional[int]) -> bytes:
+        """`[n][nonce]` then the v4 entries (shared by the v4 and v5
+        encoders)."""
         entries = list(entries)[: self.COMPLETION_V4_MAX_ENTRIES]
-        body = bytearray([self.COMPLETION_PROTOCOL_VERSION, frame_type, len(entries), (nonce or 0) & 0xFF])
+        body = bytearray([len(entries), (nonce or 0) & 0xFF])
         for pkt_id, frag_total, complete, held in entries:
             frag_total = max(1, min(255, int(frag_total)))
             body += bytes([(pkt_id >> 8) & 0xFF, pkt_id & 0xFF, frag_total, 1 if complete else 0])
@@ -3185,18 +3928,46 @@ class _WireFormatMixin:
                 if 0 <= idx < frag_total:
                     bitmap[idx // 8] |= 1 << (idx % 8)
             body += bytes(bitmap)
+        return bytes(body)
+
+    def _encode_completion_frame_v5(self, frame_type: int, entries, nonce: Optional[int] = None,
+                                    path_len: Optional[int] = None, rate: Optional[float] = None) -> str:
+        """The v5 frame (alpha 0.1.6, item 1, 2026-09-22): `[5][type][n]
+        [nonce][path_len][rate]` then the v4 entries unchanged. `path_len`
+        is the sender's current path length to the receiver
+        (COMPLETION_PATH_UNKNOWN when it has none) and `rate` its measured
+        delivery rate on that path in 1/COMPLETION_RATE_SCALE steps
+        (COMPLETION_PATH_UNKNOWN while untried): the peer's view of the
+        symmetric path, which floods are too rare to give. Two bytes more
+        than v4; 8 entries of frag_total 3 are 46 bytes, 58 Z85 chars plus
+        the marker, inside the 160-char text limit."""
+        entries = list(entries)[: self.COMPLETION_V4_MAX_ENTRIES]
+        path_byte = self.COMPLETION_PATH_UNKNOWN if path_len is None or path_len < 0 else min(0xFE, int(path_len))
+        rate_byte = (self.COMPLETION_PATH_UNKNOWN if rate is None
+                     else max(0, min(self.COMPLETION_RATE_SCALE, int(round(float(rate) * self.COMPLETION_RATE_SCALE)))))
+        body = bytearray([self.COMPLETION_PROTOCOL_VERSION, frame_type]) + self._completion_entries_bytes(entries, nonce)
+        body[4:4] = bytes([path_byte, rate_byte])
         return self.COMPLETION_MARKER + _z85_encode(bytes(body))
 
     def _decode_completion_frame_v4(self, raw: bytes) -> _CompletionFrame:
-        """See `_encode_completion_frame_v4`. Raises ValueError on a length
-        that does not match its own entry count. The first entry is
-        mirrored into the single-part fields."""
-        if len(raw) < self.COMPLETION_V4_HEADER_SIZE:
-            raise ValueError("v4 completion frame too short for its header")
+        """See `_encode_completion_frame_v4` / `_v5`: one decoder for both,
+        the header size by version. Raises ValueError on a length that
+        does not match its own entry count. The first entry is mirrored
+        into the single-part fields."""
+        version = raw[0]
+        header_size = self.COMPLETION_V5_HEADER_SIZE if version >= 5 else self.COMPLETION_V4_HEADER_SIZE
+        if len(raw) < header_size:
+            raise ValueError(f"v{version} completion frame too short for its header")
         frame_type, n, nonce = raw[1], raw[2], raw[3]
+        peer_path_len = peer_rate = None
+        if version >= 5:
+            if raw[4] != self.COMPLETION_PATH_UNKNOWN:
+                peer_path_len = int(raw[4])
+            if raw[5] != self.COMPLETION_PATH_UNKNOWN:
+                peer_rate = min(1.0, raw[5] / float(self.COMPLETION_RATE_SCALE))
         if n < 1 or n > self.COMPLETION_V4_MAX_ENTRIES:
-            raise ValueError(f"v4 completion frame with {n} entries")
-        i = self.COMPLETION_V4_HEADER_SIZE
+            raise ValueError(f"v{version} completion frame with {n} entries")
+        i = header_size
         entries = []
         for _ in range(n):
             if len(raw) < i + 4:
@@ -3217,9 +3988,10 @@ class _WireFormatMixin:
         # A QUERY's bitmaps carry no information (see the encoder): held None.
         held_first = first[3] if frame_type == self.COMPLETION_TYPE_ANSWER else None
         return _CompletionFrame(
-            version=self.COMPLETION_PROTOCOL_VERSION, type=frame_type, complete=first[2],
+            version=version, type=frame_type, complete=first[2],
             pkt_id=first[0], frag_total=first[1], held=held_first, nonce=nonce,
             entries=tuple((p, t, c, (h if frame_type == self.COMPLETION_TYPE_ANSWER else None)) for p, t, c, h in entries),
+            peer_path_len=peer_path_len, peer_rate=peer_rate,
         )
 
     def _decode_completion_frame(self, marker_and_body: str) -> _CompletionFrame:
@@ -3232,7 +4004,7 @@ class _WireFormatMixin:
         version, frame_type, complete_byte = raw[0], raw[1], raw[2]
         if version not in (
             self.COMPLETION_PROTOCOL_VERSION_V1, self.COMPLETION_PROTOCOL_VERSION_V2,
-            self.COMPLETION_PROTOCOL_VERSION_V3, self.COMPLETION_PROTOCOL_VERSION,
+            self.COMPLETION_PROTOCOL_VERSION_V3, self.COMPLETION_PROTOCOL_VERSION_V4, self.COMPLETION_PROTOCOL_VERSION,
         ):
             raise ValueError(f"unsupported completion-frame version {version}")
         if frame_type not in (self.COMPLETION_TYPE_QUERY, self.COMPLETION_TYPE_ANSWER):
@@ -3576,6 +4348,45 @@ class _WireFormatMixin:
         (`proof_max_age` applies; phase 1, 2026-09-20)."""
         return header is not None and header.packet_type == RNS.Packet.PROOF and not self._proof_is_link_class(header)
 
+    def _note_proof_enqueued(self, destination_hash: bytes, now: float) -> None:
+        """Remember when a plain PROOF was queued (alpha 0.1.7, item 1), so
+        `_send_direct_with_attempts` can tell a young proof from an old one
+        at every attempt. Not popped on dispatch: a small-mesh DIRECT-to-all
+        proof is sent to several peers."""
+        self._proof_enqueued_at.pop(destination_hash, None)
+        self._proof_enqueued_at[destination_hash] = now
+        while len(self._proof_enqueued_at) > self.PROOF_ENQUEUED_MAX_KEYS:
+            self._proof_enqueued_at.popitem(last=False)
+
+    def _proof_enqueued_at_for_key(self, key: Optional[bytes]) -> Optional[float]:
+        """When RNS queued a plain PROOF whose destination field is `key`
+        -- i.e. the proof for one particular packet this node received
+        (alpha 0.1.8, item 1). The table is the one alpha 0.1.7 item 1
+        already fills from `process_outgoing`."""
+        if key is None:
+            return None
+        return self._proof_enqueued_at.get(bytes(key))
+
+    def _proof_tail_hold_waited_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
+        """How long this plain PROOF waited for the sender's burst tail
+        before it was dispatched, or None (alpha 0.1.9, item 2). Recorded
+        by `_send_proof_after_burst_tail` for the life of the send and read
+        here per attempt, the way `_proof_enqueued_at_for` is."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return None
+        return self._proof_tail_hold_waited.get(header.destination_hash)
+
+    def _proof_enqueued_at_for(self, header: Optional[_RnsHeader]) -> Optional[float]:
+        """The queue time of this plain PROOF, or None for anything else."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return None
+        return self._proof_enqueued_at.get(header.destination_hash)
+
+    def _proof_is_fresh(self, proof_age_s: Optional[float]) -> bool:
+        """Whether a plain PROOF of this age still pre-empts like a handshake
+        (item 1 of alpha 0.1.7): younger than `proof_fresh_s`; 0 disables."""
+        return proof_age_s is not None and self.proof_fresh_s > 0 and proof_age_s < self.proof_fresh_s
+
     def _proof_is_link_class(self, header: _RnsHeader) -> bool:
         """Whether a PROOF packet is one a Link (or a Resource transfer)
         hangs on -- LRPROOF, RESOURCE_PRF, or any context in RNS core's own
@@ -3756,7 +4567,7 @@ class _PeerStateMixin:
                     raw_fragments=entry.get("raw_fragments"),
                 )
                 count += 1
-            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_INFO)
+            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_DEBUG)
         except Exception as exc:
             RNS.log(
                 f"{self}: failed to load peer cache ({path}): {exc} -- "
@@ -4110,6 +4921,12 @@ class _PeerStateMixin:
         # risking an InvalidStateError from cancelling a future that
         # coroutine still intends to resolve normally.
         self._pending_path_discoveries.pop(pubkey_prefix, None)
+        # Alpha 0.1.5 (2b): a held complete report for this sender.
+        self._cancel_sender_report(pubkey_prefix)
+        self._cancel_proof_grace(pubkey_prefix)
+        self._raw_part_arrivals.pop(pubkey_prefix, None)   # item 5
+        self._path_boards.pop(pubkey_prefix, None)   # alpha 0.1.6 item 1: the path scoreboard
+        self._pending_link_proofs.pop(pubkey_prefix, None)   # alpha 0.1.6 item 2
 
     # -- Opportunistic RNS-token learning (§7) -----------------------------
 
@@ -4176,12 +4993,51 @@ class _PeerStateMixin:
             return None
         return full_key[: self.BIND_PUBKEY_PREFIX_BYTES * 2]
 
+    def _is_local_destination(self, destination_hash: bytes) -> bool:
+        """Whether `destination_hash` is served by this node's own RNS
+        (alpha 0.1.7, item 3): a destination registered in this process
+        (`RNS.Transport.destinations_map`, IN destinations only --
+        `Transport.register_destination`), or one a shared-instance client
+        of this rnsd registered -- RNS's own test for that is a path_table
+        entry at zero hops (`Transport.inbound`'s `for_local_client`) or
+        received on a local client interface (`is_local_client_interface`;
+        the entry indices IDX_PT_HOPS 2 / IDX_PT_RVCD_IF 5 are module
+        constants in RNS/Transport.py). The field's `d4c70c4b` was the
+        second kind: MeshChat's LXMF delivery destination, registered in
+        MeshChat's process, not in rnsd's."""
+        transport = getattr(RNS, "Transport", None)
+        if transport is None or not destination_hash:
+            return False
+        try:
+            if destination_hash in (getattr(transport, "destinations_map", None) or {}):
+                return True
+            entry = (getattr(transport, "path_table", None) or {}).get(destination_hash)
+            if entry is None:
+                return False
+            if entry[2] == 0:
+                return True
+            is_local_if = getattr(transport, "is_local_client_interface", None)
+            return bool(is_local_if(entry[5])) if callable(is_local_if) else False
+        except Exception:
+            return False
+
     def _learn_rns_token(self, token: bytes, sender_peer_prefix: str) -> None:
         """The one place `_rns_token_peer` grows (audit fix, 2026-09-19 --
         added so the capacity bound cannot be bypassed by a future call
         site, in the spirit of `_register_peer` being the single entry point
         for peer state). Re-learning an existing token also refreshes its
-        position, so the eviction below targets genuinely idle tokens."""
+        position, so the eviction below targets genuinely idle tokens.
+
+        Alpha 0.1.7 (item 3): a token for one of this node's own
+        destinations is never learned -- this node never routes to itself,
+        and the 2026-09-22 desktop learned `d4c70c4b -> laptop` seven times
+        from inbound LXMF DATA to its own delivery destination."""
+        if self._is_local_destination(token):
+            self._debug(
+                f"_learn_rns_token: {token.hex()} is one of this node's own destinations -- "
+                f"not mapped to {sender_peer_prefix!r}."
+            )
+            return
         self._rns_token_peer.pop(token, None)
         self._rns_token_peer[token] = sender_peer_prefix
         while len(self._rns_token_peer) > self.RNS_TOKEN_PEER_MAX_KEYS:
@@ -4236,6 +5092,26 @@ class _PeerStateMixin:
             )
             return
         self._observe_incoming_rns_packet(data, claimed_peer_prefix)
+
+    def _token_learnable_from(self, header: _RnsHeader) -> bool:
+        """Which inbound packets teach `destination_hash -> sender` (alpha
+        0.1.7, item 3). An ANNOUNCE (any context; a path response is an
+        ANNOUNCE with context PATH_RESPONSE, `RNS.Destination.announce`)
+        names a destination that lives in the sender's direction -- the
+        same inference RNS's own path table makes from it. A packet carried
+        on a Link puts the link_id in that field, and a Link is one
+        bidirectional session between two nodes, so the peer that delivered
+        it is the peer this node's own packets on that Link go to. Every
+        other packet -- DATA to a SINGLE destination, a LINKREQUEST (its
+        link_id is learned separately below), a PLAIN path request -- is
+        addressed TO a destination that is either this node's own or lies
+        beyond some other interface; "outgoing to this hash -> this peer"
+        is wrong either way, and on a transport node it overwrote the
+        announce-learned token. The 2026-09-22 desktop learned its own LXMF
+        delivery destination from every inbound LXMF packet this way."""
+        if header.packet_type == RNS.Packet.ANNOUNCE or header.context == RNS.Packet.PATH_RESPONSE:
+            return True
+        return header.destination_type == RNS.Destination.LINK
 
     def _observe_incoming_rns_packet(self, data: bytes, sender_peer_prefix: Optional[str]) -> None:
         """§7: populated only from the DIRECT receive path -- a CHANNEL
@@ -4317,16 +5193,23 @@ class _PeerStateMixin:
             )
             return
 
-        self._learn_rns_token(header.destination_hash, sender_peer_prefix)
-        self._debug(
-            f"_observe_incoming_rns_packet: learned token "
-            f"{header.destination_hash.hex()} -> {sender_peer_prefix!r} "
-            f"(rns_tokens_learned now {len(self._rns_token_peer)})."
-        )
-        # A real token learned for this exact destination proves it IS
-        # reachable through this peer after all -- clear any backoff
-        # immediately rather than waiting for it to expire on its own.
-        self._clear_unknown_dest_backoff(header.destination_hash)
+        if self._token_learnable_from(header):
+            self._learn_rns_token(header.destination_hash, sender_peer_prefix)
+            self._debug(
+                f"_observe_incoming_rns_packet: learned token "
+                f"{header.destination_hash.hex()} -> {sender_peer_prefix!r} "
+                f"(rns_tokens_learned now {len(self._rns_token_peer)})."
+            )
+            # A real token learned for this exact destination proves it IS
+            # reachable through this peer after all -- clear any backoff
+            # immediately rather than waiting for it to expire on its own.
+            self._clear_unknown_dest_backoff(header.destination_hash)
+        else:
+            self._debug(
+                f"_observe_incoming_rns_packet: {sender_peer_prefix!r}'s packet (type {header.packet_type}) "
+                f"is addressed TO {header.destination_hash.hex()}, which is this node's or beyond another "
+                f"interface -- nothing learned from its destination field (item 3, alpha 0.1.7)."
+            )
 
         if header.packet_type == RNS.Packet.LINKREQUEST:
             # Code review (2026-09-18): this node's own LRPROOF answering
@@ -4336,6 +5219,9 @@ class _PeerStateMixin:
             link_id = self._compute_link_id(data)
             if link_id is not None:
                 self._learn_rns_token(link_id, sender_peer_prefix)
+                # Alpha 0.1.6 (item 2): the peer asked again -- any LRPROOF
+                # still pending for its earlier link is pure airtime.
+                self._supersede_link_proofs(sender_peer_prefix, link_id)
                 self._debug(
                     f"_observe_incoming_rns_packet: LINKREQUEST from {sender_peer_prefix!r} -- "
                     f"learned link_id {link_id.hex()} -> {sender_peer_prefix!r} for the LRPROOF reply."
@@ -4353,6 +5239,35 @@ class _PeerStateMixin:
 """Path discovery and per-peer path state: the MeshCore contact refresh and telemetry grant, discover_path with its coalescing and backoff, the stale-path detector (record_direct_send_result, _reset_stale_path -- the one place a cached path is dropped), and the per-peer estimators a path change resets: ACK RTT (Jacobson/Karels, Karn backoff), echo timing for the hop-1 abort, the QUERY round trip."""
 
 
+
+
+# Alpha 0.1.6 (item 1, fourth cut): a candidate whose weighted delivery rate
+# is at least PATH_HEALTHY_RATE stays eligible (a trial target and, alone,
+# the path still used) until PATH_EXHAUST_MISSES consecutive missed sends;
+# below the rate, `path_switch_after_misses` misses exhaust it as before.
+# Alpha 0.1.9 second pass (item 2): PATH_EXHAUST_MISSES is also the DEAD
+# mark -- a candidate with that many consecutive missed attempts stays
+# ineligible, cooldown or not, until fresh external evidence arrives for it
+# -- and the current path's patience no longer needs 0.5: it is kept while
+# its measured rate beats every eligible alternative (`_choose_path`).
+PATH_HEALTHY_RATE = 0.5
+# Alpha 0.1.9 (item 4): `consecutive_misses` counts ATTEMPTS, not sends, so
+# both thresholds are doubled -- a missed send is exactly
+# `direct_send_attempts` (2) consecutive missed attempts, so 8 attempts is
+# the 4 missed sends this was before, and `path_switch_after_misses` 4 is
+# the 2 it was. See `_note_path_attempt_result` for why the unit changed.
+PATH_EXHAUST_MISSES = 8
+# The only two missed-attempt reasons that are evidence about the PATH.
+# Everything else in `ack_timeout_source` is this node's own decision or a
+# reply that arrived another way, and must not kill a path: "measured" (the
+# engine's own tightened ceiling, which already sets waited_full_timeout
+# False), "report_window" (alpha 0.1.8 item 2's deliberately short local
+# ceiling on a report/answer -- 6 of the 21 failed attempts in the desktop's
+# 2026-09-23 11:20-11:45 window were these), "preempted", "superseded",
+# "answered", "answered_before_send", "expired" and "noack" (a no-ACK frame
+# has no outcome at all). "hop1_abort" IS included deliberately: its premise
+# is silence where a forward was due, which is exactly a path failure.
+PATH_ATTEMPT_MISS_SOURCES = ("firmware", "hop1_abort")
 
 
 class _PathDiscoveryMixin:
@@ -4836,12 +5751,38 @@ class _PathDiscoveryMixin:
                     # measured over the previous one doesn't carry over.
                     self._invalidate_ack_rtt(pubkey_prefix, "path (re)discovered")
                     self._record_path_discovery_success(pubkey_prefix)
+                    if self.path_selection_enabled:
+                        # Alpha 0.1.6 (item 1): a candidate on the scoreboard,
+                        # with the PATH_RESPONSE that just came back over it
+                        # as its first delivery; current when nothing is.
+                        board = self._path_board(pubkey_prefix)
+                        cand = self._add_path_candidate(
+                            pubkey_prefix, resolved.out_path_hex, resolved.out_path_len,
+                            resolved.out_path_hash_len, "discovered", now=resolved.resolved_at,
+                        )
+                        cand.consecutive_misses = 0
+                        cand.samples.append((resolved.resolved_at, True))
+                        cand.last_success_at = resolved.resolved_at
+                        previous = board.candidates.get(board.current) if board.current is not None else None
+                        if board.current is None or board.current not in board.candidates \
+                                or board.candidates[board.current].consecutive_misses >= self.path_switch_after_misses:
+                            board.current = cand.path_hex
+                        board.last_reason = "discovered"
+                        # A `path_selected` record for the field: how the
+                        # scoreboard stood when discovery set (or refreshed)
+                        # the path.
+                        self._capture_path_selected(
+                            pubkey_prefix, "discovered", cand, previous if previous is not cand else None,
+                            self._rank_paths([self._path_view(c) for c in board.candidates.values()],
+                                             resolved.resolved_at,
+                                             **self._path_rank_kwargs(pubkey_prefix, now=resolved.resolved_at)),
+                            now=resolved.resolved_at)
                     RNS.log(
                         f"{self}: path discovered to {pubkey_prefix!r} in "
                         f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
-                        RNS.LOG_INFO,
+                        RNS.LOG_DEBUG,
                     )
-                    await self._persist_resolved_path(contact, resolved)
+                    await self._persist_resolved_path(contact, resolved, peer_prefix=pubkey_prefix)
                     return resolved
 
             self._debug(f"discover_path({pubkey_prefix!r}) attempt {attempt}: no response.")
@@ -4897,13 +5838,16 @@ class _PathDiscoveryMixin:
                 # until the 600s sweep.
                 future.cancel()
 
-    async def _persist_resolved_path(self, contact, resolved: _ResolvedPath) -> None:
+    async def _persist_resolved_path(self, contact, resolved: _ResolvedPath, peer_prefix: Optional[str] = None) -> None:
         """docs/path_discovery_spec.md's persistence fix: a successful
         discovery is NOT written to the device's own persistent contact
         record by the firmware itself (CMD_SEND_PATH_DISCOVERY_REQ's
         handler returns before reaching the code path that would). Skip
         this and this interface's own idea of "resolved" silently
-        diverges from what the official app / device flash state show."""
+        diverges from what the official app / device flash state show.
+        Since alpha 0.1.6 it is also how a selected path reaches the
+        radio for text frames (`_select_path`); the scoreboard remembers
+        what the contact holds (`device_path`) so a path is set once."""
         try:
             await self._run_command(
                 self._mc_ready.commands.change_contact_path(
@@ -4912,6 +5856,8 @@ class _PathDiscoveryMixin:
                 "change_contact_path",
                 self._EventType.OK,
             )
+            if peer_prefix is not None:
+                self._path_board(peer_prefix).device_path = (resolved.out_path_hex or "").lower()
         except Exception as exc:
             RNS.log(
                 f"{self}: persisting discovered path to the device contact "
@@ -4922,6 +5868,744 @@ class _PathDiscoveryMixin:
                 RNS.LOG_WARNING,
             )
 
+    # -- Path selection by measured reliability (alpha 0.1.6, item 1) ------
+    # Every route this node learns to a peer is a candidate on the peer's
+    # scoreboard (`_PathBoard`): the discovered path, the reverse of each
+    # distinct flood copy the peer's own floods took (`_note_flood_route`,
+    # from the rx-log tap), the zero-hop option once the peer has been heard
+    # directly, and the path the peer reports in every "Q" v5 frame
+    # (`_note_peer_reported_path`). Each candidate is scored as expected
+    # transmissions per delivered frame times (hops + 1) -- airtime per
+    # delivered byte in frame units, lower is better -- from its measured
+    # delivery rate (`_note_path_result`, fed by `record_direct_send_result`)
+    # or, untried, a prior. `_select_path` is the one decision, consumed by
+    # `_send_direct_packet` and `_send_direct_supplement` where alpha 0.1.5's
+    # `_maybe_adopt_shorter_path` was; the pure functions below hold every
+    # rule and are tested directly (`tests/test_path_selection_0922.py`,
+    # replaying the 2026-09-21 22:00-22:35 desktop sequence).
+    #
+    # Why this replaced the shortest-route-in-window rule: at 22:00:49 that
+    # rule adopted a zero-hop route the laptop had shown 504 s earlier --
+    # before it drove off -- over a one-hop path confirmed 2 s earlier; two
+    # misses, a reset, and discovery returned a two-hop path the desktop
+    # then kept for 32 minutes while the laptop reached it in one hop the
+    # whole time, because the one-hop route was never re-tried without a
+    # fresh flood (three usable floods in half an hour). Here a delivering
+    # path is kept, a missing one is trialled against the best alternative
+    # on the next real packet, and a candidate that failed is eligible
+    # again once its last miss is older than the switch cooldown.
+
+    @staticmethod
+    def _reverse_flood_path(path_hex: str, hash_size: int = 1) -> str:
+        """The route back along a flood's recorded path (pure): the hashes
+        in reverse order, `hash_size` bytes each. The firmware appends each
+        relaying repeater's hash at the end (`Mesh::routeRecvPacket`), and
+        `sendDirect` consumes `path[0]` first, so the reverse is exactly the
+        out_path a DIRECT frame to the originator needs. Never reversed by
+        the firmware itself: a PATH return carries the received path
+        unreversed to its originator, for whom it is already forward."""
+        size = max(1, int(hash_size)) * 2
+        chunks = [path_hex[i:i + size] for i in range(0, len(path_hex) - len(path_hex) % size, size)]
+        return "".join(reversed(chunks))
+
+    def _attribute_flood_to_peer(self, payload: dict, fields: dict) -> "Optional[tuple]":
+        """Which bound peer originated this overheard FLOOD, and how
+        ("advert" / "addressed"), or None. Conservative on purpose (the
+        rx-log window's docstring forbids promoting the 1-byte hashes to a
+        routing decision without a stronger check): an ADVERT names its
+        full public key in the clear; a REQ / RESPONSE / TEXT_MSG / PATH
+        flood is attributed only when it is addressed to THIS node
+        (`dst_hash` is our own first byte) and its 1-byte source hash
+        matches exactly one bound peer and no other contact on the
+        device."""
+        if fields.get("route_type") not in self._RX_LOG_ROUTE_FLOOD:
+            return None
+        ptype = fields.get("payload_type")
+        if ptype == self._RX_LOG_PAYLOAD_TYPE_ADVERT:
+            key = str(payload.get("adv_key") or "").lower()
+            if len(key) >= 12 and key[:12] in self._peers:
+                return key[:12], "advert"
+            return None
+        if ptype in self._RX_LOG_ADDRESSED_PAYLOAD_TYPES:
+            own = (self._own_pubkey_hex or "")[:2].lower()
+            src, dst = fields.get("src_hash"), fields.get("dst_hash")
+            if not own or not src or dst != own:
+                return None
+            candidates = [p for p in self._peers if p[:2].lower() == src]
+            if len(candidates) != 1:
+                return None
+            contacts = self._mc.contacts if self._mc is not None and getattr(self._mc, "contacts", None) else {}
+            others = [k for k in contacts if str(k)[:2].lower() == src and not str(k).lower().startswith(candidates[0])]
+            if others:
+                return None
+            return candidates[0], "addressed"
+        return None
+
+    def _note_flood_route(self, payload: dict, fields: dict, now: float) -> None:
+        """Record the route an overheard flood from a bound peer took as a
+        candidate path (cheap: runs inline on the rx-log tap). Every copy of
+        a flood is logged -- one per repeater that relayed it -- so one
+        flood can add several candidates. The record's SNR / RSSI is the
+        signal of the LAST leg (the relaying repeater's transmission for a
+        relayed copy, the peer's own for a zero-hop one)."""
+        if not self.path_selection_enabled:
+            return
+        try:
+            who = self._attribute_flood_to_peer(payload, fields)
+            if who is None:
+                return
+            peer_prefix, source = who
+            hops = int(fields.get("path_len") or 0)
+            hash_size = int(payload.get("path_hash_size") or 1)
+            reversed_hex = self._reverse_flood_path(str(fields.get("path") or ""), hash_size)
+            if hops > 0 and len(reversed_hex) != hops * hash_size * 2:
+                return
+            self._add_path_candidate(
+                peer_prefix, reversed_hex, hops, hash_size, "flood", now=now,
+                snr=fields.get("snr"), rssi=fields.get("rssi"),
+            )
+        except Exception as exc:
+            self._debug(f"flood route observer: ignored an rx-log record: {exc}")
+
+    # The pure rules. `views` are plain dicts so the tests drive them from
+    # a field replay without an interface: {path_hex, hops, samples
+    # [(t, ok)], snr, peer_rate, cooldown_until, consecutive_misses,
+    # last_failure_at, last_seen}.
+
+    @staticmethod
+    def _path_delivery_rate(samples, now: float, window_s: float, half_life_s: float) -> Optional[float]:
+        """The weighted delivery rate over `samples` [(t, ok)] (pure): each
+        outcome weighs 0.5 ** (age / half_life_s), outcomes older than
+        `window_s` count for nothing. None when nothing counts."""
+        num = den = 0.0
+        for t, ok in samples:
+            age = now - t
+            if age < 0 or age > window_s:
+                continue
+            w = 0.5 ** (age / max(1e-6, half_life_s))
+            den += w
+            if ok:
+                num += w
+        return (num / den) if den > 0 else None
+
+    @staticmethod
+    def _path_evidence(view, now: float, window_s: float) -> "tuple[Optional[float], Optional[float], bool]":
+        """What a candidate's record still says (pure): `(peer_rate, snr,
+        stale)`, the peer-reported rate and the last-leg signal only while
+        those readings are inside `window_s`, and whether the candidate is
+        STALE -- evidence it once had, every piece of it now aged out.
+
+        Alpha 0.1.8 (item 3), from the 2026-09-22 field session: the
+        desktop's 22:49:42 record trialled the zero-hop path while the
+        laptop was two hops away, scored `rate 1.0, measured False, misses
+        3, snr 11.75`. Its own send outcomes HAD aged out of the window
+        (hence `measured False`), but the peer-reported rate of 22:07 and
+        the SNR reading of the zero-hop period never aged, so the dead path
+        still scored 1.0 and outranked a one-hop candidate heard at
+        12.25 dB. A reading only counts while it is inside the same window
+        the samples are weighed over.
+
+        A reading with no timestamp is NOT aged: the pure-rule replays in
+        `tests/` and every candidate built before this release carry the
+        value alone, and ageing those would silently turn a known-good
+        candidate into a weak one. A candidate that never had any evidence
+        is UNTRIED, not stale, and keeps the optimistic prior -- staleness
+        is evidence that expired, not evidence that never existed."""
+        expired = False
+        fresh_any = False
+
+        def keep(value, at):
+            nonlocal expired, fresh_any
+            if value is None:
+                return None
+            if at is not None:
+                age = now - float(at)
+                if age < 0 or age > window_s:
+                    expired = True
+                    return None
+            fresh_any = True
+            return value
+
+        peer_rate = keep(view.get("peer_rate"), view.get("peer_rate_at"))
+        snr = keep(view.get("snr"), view.get("signal_at"))
+        for t, _ok in (view.get("samples") or ()):
+            age = now - t
+            if 0 <= age <= window_s:
+                fresh_any = True
+            else:
+                expired = True
+        return peer_rate, snr, (expired and not fresh_any)
+
+    @staticmethod
+    def _path_prior(hops: int, snr: Optional[float], weak_snr_db: float, peer_rate: Optional[float] = None,
+                    optimistic: float = 0.8, weak: float = 0.25, stale: bool = False,
+                    peer_path_len: Optional[int] = None) -> float:
+        """The delivery rate an UNTRIED candidate is scored with (pure): the
+        weak prior for a candidate whose evidence has all aged out, else the
+        peer's own reported rate on a path of this length when it sent one,
+        else the weak prior for a candidate whose last direct frame was
+        below `weak_snr_db`, else the weak prior for a candidate claiming
+        FEWER hops than the peer says it needs to reach us, else the
+        optimistic prior -- so the shortest untried path with honest
+        evidence behind it scores best and is tried first.
+
+        Alpha 0.1.8 (item 3): the weak-signal rule applies at ANY hop count.
+        It was written for `hops == 0` alone, and the laptop's 22:30:26
+        field record is what that cost: a three-hop candidate `4fbe02`
+        heard once at -9 dB was scored with the optimistic prior (0.8,
+        score 5.0) and trialled ahead of the current two-hop path, for two
+        misses and 26 s before the board gave up and rediscovered. A weak
+        last leg is weak evidence whatever precedes it; the zero-hop rule
+        is a special case of this, not an exception to it. The peer's own
+        reported rate still comes FIRST: the same session's 22:51:37 trial
+        of `d619` read -9.5 dB and a fresh peer rate of 0.668, was
+        trialled on that rate, delivered, and became the current path."""
+        if stale:
+            return weak
+        if peer_rate is not None:
+            return max(0.0, min(1.0, float(peer_rate)))
+        if snr is not None and float(snr) < weak_snr_db:
+            return weak
+        if peer_path_len is not None and int(hops) < int(peer_path_len):
+            return weak
+        return optimistic
+
+    @staticmethod
+    def _path_score(hops: int, rate: float, rate_floor: float = 0.05) -> float:
+        """Expected transmissions per delivered frame times (hops + 1)
+        (pure): airtime per delivered byte in frame units, lower is
+        better."""
+        return (max(0, int(hops)) + 1) / max(rate_floor, float(rate))
+
+    @classmethod
+    def _rank_paths(cls, views, now: float, weak_snr_db: float, window_s: float, half_life_s: float,
+                    optimistic: float = 0.8, weak: float = 0.25, rate_floor: float = 0.05,
+                    peer_path_len: Optional[int] = None) -> list:
+        """Every candidate scored (pure): [(score, view, rate, measured)]
+        sorted best first -- a candidate on switch-back cooldown ranks
+        behind every other, then a STALE candidate behind every one with
+        evidence inside `window_s` (alpha 0.1.8, item 3), then by score,
+        then fewer hops (the tiebreak), then most recently seen.
+
+        The peer-reported rate and the signal reading are aged the same way
+        the samples are (`_path_evidence`); `peer_path_len` is the peer's
+        own reported path length to us while that report is itself inside
+        the window, which makes an untried candidate claiming fewer hops
+        than that score weak rather than optimistic."""
+        ranked = []
+        stale_by_id = {}
+        for v in views:
+            rate = cls._path_delivery_rate(v.get("samples") or (), now, window_s, half_life_s)
+            measured = rate is not None
+            peer_rate, snr, stale = cls._path_evidence(v, now, window_s)
+            stale_by_id[id(v)] = stale
+            if not measured:
+                rate = cls._path_prior(int(v.get("hops") or 0), snr, weak_snr_db, peer_rate,
+                                       optimistic=optimistic, weak=weak, stale=stale,
+                                       peer_path_len=peer_path_len)
+            score = cls._path_score(int(v.get("hops") or 0), rate, rate_floor=rate_floor)
+            ranked.append((score, v, rate, measured))
+        ranked.sort(key=lambda r: ((r[1].get("cooldown_until") or 0.0) > now, stale_by_id[id(r[1])], r[0],
+                                   int(r[1].get("hops") or 0), -float(r[1].get("last_seen") or 0.0)))
+        return ranked
+
+    @classmethod
+    def _choose_path(cls, views, current_hex: Optional[str], now: float, switch_after_misses: int, cooldown_s: float,
+                     weak_snr_db: float, window_s: float, half_life_s: float, **kw) -> "tuple[Optional[str], str, list]":
+        """The switching rule (pure): (path hex or None, reason, ranked).
+
+        Eligibility. A candidate that has missed PATH_EXHAUST_MISSES
+        consecutive attempts is DEAD and stays ineligible, whatever the
+        cooldown says, until fresh external evidence for it arrives -- a
+        flood copy, a zero-hop peer report or a discovery result, i.e.
+        anything that refreshes `last_seen` after its last failure (a
+        discovery result also resets the count). Otherwise a candidate is
+        eligible while it has missed fewer than `switch_after_misses`
+        consecutive attempts, while its measured delivery rate is at least
+        PATH_HEALTHY_RATE, or once its last miss is older than `cooldown_s`
+        -- and then only if its measured rate is unknown, or at least the
+        current path's measured rate, or fresh evidence has arrived since
+        that miss (alpha 0.1.9 second pass, item 2).
+
+        Choice. With no current path the best eligible candidate is
+        "selected". A current path under the miss threshold is kept
+        ("current", whatever the alternatives score -- a delivering path is
+        not abandoned on hop count). Past it, the current path is still
+        kept ("current_best") while it has delivered in the window and its
+        measured rate beats the rate of every eligible alternative --
+        measured, or the prior it is ranked with, or its prior when fresh
+        evidence has arrived since its last miss -- unless it is dead, or an
+        eligible alternative is UNTRIED (no send outcome, no miss, evidence
+        not aged out): that one always gets its trial, in rank order.
+        Otherwise the best eligible candidate is used: the current one
+        itself ("current_best") or another as a "trial". "exhausted":
+        nothing is eligible -- the caller runs discovery; "none": nothing is
+        known."""
+        views = list(views)
+        if not views:
+            return None, "none", []
+        ranked = cls._rank_paths(views, now, weak_snr_db, window_s, half_life_s, **kw)
+        measured = {id(v): (rate if m else None) for _s, v, rate, m in ranked}
+        used_rate = {id(v): rate for _s, v, rate, _m in ranked}
+        by_hex = {v["path_hex"]: v for v in views}
+        current = by_hex.get(current_hex) if current_hex is not None else None
+        current_rate = measured.get(id(current)) if current is not None else None
+
+        def fresh_evidence(v) -> bool:
+            seen, failed = v.get("last_seen"), v.get("last_failure_at")
+            return seen is not None and failed is not None and float(seen) > float(failed)
+
+        def dead(v) -> bool:
+            return int(v.get("consecutive_misses") or 0) >= PATH_EXHAUST_MISSES and not fresh_evidence(v)
+
+        def eligible(v) -> bool:
+            if dead(v):
+                return False
+            misses = int(v.get("consecutive_misses") or 0)
+            if misses < switch_after_misses:
+                return True
+            rate = measured.get(id(v))
+            # Fourth cut (2026-09-22): a healthy measured record keeps a
+            # candidate eligible through a run of misses short of dead.
+            if rate is not None and rate >= PATH_HEALTHY_RATE:
+                return True
+            last = v.get("last_failure_at")
+            if last is None or now - float(last) < cooldown_s:
+                return False
+            if v is current or current_rate is None or rate is None or fresh_evidence(v):
+                return True
+            return rate >= current_rate
+
+        if current is None:
+            for _score, v, _rate, _m in ranked:
+                if eligible(v):
+                    return v["path_hex"], "selected", ranked
+            return None, "exhausted", ranked
+        if int(current.get("consecutive_misses") or 0) < switch_after_misses:
+            return current_hex, "current", ranked
+        def rival_rate(v) -> float:
+            # A candidate heard from since its last failure competes on what
+            # that evidence says (its prior), not on the misses it superseded
+            # -- the same reading that re-opens it above. The 2026-09-21
+            # replay (tests/test_path_selection_0922.py) is this case: a
+            # one-hop flood copy 53 s after that path's last miss.
+            if not fresh_evidence(v):
+                return used_rate[id(v)]
+            peer_rate, snr, stale = cls._path_evidence(v, now, window_s)
+            return cls._path_prior(int(v.get("hops") or 0), snr, weak_snr_db, peer_rate,
+                                   optimistic=kw.get("optimistic", 0.8), weak=kw.get("weak", 0.25), stale=stale,
+                                   peer_path_len=kw.get("peer_path_len"))
+
+        def untried(v) -> bool:
+            # Never sent over, never missed, and its evidence not aged out:
+            # a candidate the scoreboard knows nothing against. Its prior
+            # ORDERS it among the others but does not keep it from one trial
+            # -- second cut, from MeshBench `shortcut_appears` (item 2's
+            # first cut compared the current path's 0.27-0.33 against the
+            # 0.25 weak prior every flood-learned candidate gets at
+            # MeshBench's 0 dB, so the one-hop shortcut was trialled only
+            # once the three-hop path was dead, minutes after the move).
+            if v.get("samples") or int(v.get("consecutive_misses") or 0):
+                return False
+            return not cls._path_evidence(v, now, window_s)[2]
+
+        if current_rate is not None and current_rate > 0.0 and not dead(current):
+            alternatives = [v for _s, v, _r, _m in ranked if v is not current and eligible(v)]
+            if not any(untried(v) for v in alternatives) and all(current_rate > rival_rate(v) for v in alternatives):
+                return current_hex, "current_best", ranked
+        for _score, v, _rate, _m in ranked:
+            if eligible(v):
+                return v["path_hex"], ("current_best" if v is current else "trial"), ranked
+        return None, "exhausted", ranked
+
+    @staticmethod
+    def _switch_for_good(current_score: float, candidate_score: float, margin: float,
+                         candidate_cooldown_until: float, now: float) -> bool:
+        """Whether a trial that delivered becomes the current path (pure):
+        its score must beat the current path's by `margin` and it must not
+        be on switch-back cooldown."""
+        if candidate_cooldown_until > now:
+            return False
+        return candidate_score <= current_score * (1.0 - margin)
+
+    # The scoreboard.
+
+    def _path_board(self, peer_prefix: str) -> "_PathBoard":
+        board = self._path_boards.get(peer_prefix)
+        if board is None:
+            board = _PathBoard()
+            self._path_boards[peer_prefix] = board
+        return board
+
+    def _path_view(self, cand: "_PathCandidate") -> dict:
+        return {
+            "path_hex": cand.path_hex, "hops": cand.hops, "samples": list(cand.samples), "snr": cand.snr,
+            "peer_rate": cand.peer_rate, "cooldown_until": cand.cooldown_until,
+            "consecutive_misses": cand.consecutive_misses, "last_failure_at": cand.last_failure_at,
+            "last_seen": cand.last_seen, "source": cand.source,
+            # Alpha 0.1.8 (item 3): when each reading was taken, so the
+            # pure rules can age it. The values stay on the view whatever
+            # their age -- the capture prints them either way.
+            "peer_rate_at": cand.peer_rate_at, "signal_at": cand.signal_at,
+        }
+
+    def _path_rank_kwargs(self, peer_prefix: Optional[str] = None, now: Optional[float] = None) -> dict:
+        """The tuning the pure rules read. With a peer, also that peer's own
+        reported path length to us while the report is inside the sample
+        window (alpha 0.1.8, item 3) -- an untried candidate shorter than
+        the peer says it needs scores weak, not optimistic."""
+        kwargs = {
+            "weak_snr_db": self.path_weak_snr_db, "window_s": self.PATH_SAMPLE_WINDOW_S,
+            "half_life_s": self.PATH_SAMPLE_HALF_LIFE_S, "optimistic": self.PATH_PRIOR_OPTIMISTIC,
+            "weak": self.PATH_PRIOR_WEAK, "rate_floor": self.PATH_RATE_FLOOR,
+        }
+        if peer_prefix is not None:
+            board = self._path_boards.get(peer_prefix)
+            if board is not None and board.peer_path_len is not None and board.peer_report_at is not None:
+                age = (time.monotonic() if now is None else now) - float(board.peer_report_at)
+                if 0 <= age <= self.PATH_SAMPLE_WINDOW_S:
+                    kwargs["peer_path_len"] = int(board.peer_path_len)
+        return kwargs
+
+    def _add_path_candidate(self, peer_prefix: str, path_hex: str, hops: int, hash_size: int, source: str,
+                            now: Optional[float] = None, snr: Optional[float] = None,
+                            rssi: Optional[float] = None) -> "_PathCandidate":
+        """Create or refresh a candidate path to `peer_prefix`. A known
+        route keeps its statistics and first source and gains the fresher
+        last-seen time (and signal, when given); a fifth candidate evicts
+        the worst-ranked one that is not current."""
+        now = time.monotonic() if now is None else now
+        board = self._path_board(peer_prefix)
+        path_hex = (path_hex or "").lower()
+        cand = board.candidates.get(path_hex)
+        if cand is None:
+            if len(board.candidates) >= self.PATH_CANDIDATES_KEPT:
+                ranked = self._rank_paths([self._path_view(c) for c in board.candidates.values()], now,
+                                          **self._path_rank_kwargs(peer_prefix, now=now))
+                for _score, v, _rate, _m in reversed(ranked):
+                    if v["path_hex"] != board.current:
+                        board.candidates.pop(v["path_hex"], None)
+                        break
+            cand = _PathCandidate(path_hex, int(hops), max(1, int(hash_size)), source, now)
+            board.candidates[path_hex] = cand
+        cand.last_seen = now
+        if snr is not None or rssi is not None:
+            cand.snr, cand.rssi, cand.signal_at = snr, rssi, now
+        return cand
+
+    def _note_path_signal(self, peer_prefix: str, path_hex: Optional[str], snr: Optional[float],
+                          rssi: Optional[float], now: Optional[float] = None) -> None:
+        """The signal of the last frame received over a candidate path --
+        for a relayed path that is its LAST leg only (the repeater's
+        transmission), the only leg this radio hears; for the zero-hop
+        path it is the peer's own signal, which is what the weak-direct
+        prior reads. Fed with the ACK the rx-log matched to our own send
+        (`_classify_rx_log_for_window`)."""
+        if path_hex is None or (snr is None and rssi is None):
+            return
+        cand = self._path_board(peer_prefix).candidates.get((path_hex or "").lower())
+        if cand is not None:
+            cand.snr, cand.rssi, cand.signal_at = snr, rssi, (time.monotonic() if now is None else now)
+
+    def _note_peer_reported_path(self, peer_prefix: str, hops: Optional[int], rate: Optional[float],
+                                 now: Optional[float] = None) -> None:
+        """The peer's own view, from a "Q" v5 frame: its current path
+        length to us and its delivery rate on it. A zero-hop report makes
+        (or refreshes) the zero-hop candidate -- the peer hears us
+        directly; a reported rate is evidence for the symmetric path: every
+        candidate of that hop count scores with it while untried."""
+        if hops is None or not self.path_selection_enabled:
+            return
+        now = time.monotonic() if now is None else now
+        board = self._path_board(peer_prefix)
+        board.peer_path_len, board.peer_rate, board.peer_report_at = int(hops), rate, now
+        if hops == 0:
+            self._add_path_candidate(peer_prefix, "", 0, 1, "peer_report", now=now)
+        if rate is not None:
+            for cand in board.candidates.values():
+                if cand.hops == hops:
+                    cand.peer_rate, cand.peer_rate_at = float(rate), now
+
+    def _path_rate_for_wire(self, peer_prefix: Optional[str]) -> "tuple[Optional[int], Optional[float]]":
+        """What this node tells the peer in a "Q" v5 header: the hop count
+        of its current path to the peer and the measured delivery rate on
+        it (None while untried)."""
+        if peer_prefix is None:
+            return None, None
+        resolved = self._resolved_paths.get(peer_prefix)
+        board = self._path_boards.get(peer_prefix)
+        if resolved is None:
+            return None, None
+        cand = board.candidates.get((resolved.out_path_hex or "").lower()) if board is not None else None
+        rate = None
+        if cand is not None:
+            rate = self._path_delivery_rate(cand.samples, time.monotonic(), self.PATH_SAMPLE_WINDOW_S,
+                                            self.PATH_SAMPLE_HALF_LIFE_S)
+        return int(resolved.out_path_len), rate
+
+    def _note_path_attempt_result(self, peer_prefix: Optional[str], ok: bool, waited_full_timeout: bool,
+                                  ack_timeout_source: str, ack_latency_s: Optional[float] = None) -> None:
+        """One ATTEMPT's outcome on the path it went over (alpha 0.1.9,
+        item 4). Moves `consecutive_misses` only: the delivery-rate samples
+        stay one per send.
+
+        The defect this fixes. Airtime is spent per attempt, but the
+        scoreboard learned per send -- and a fragmented send's per-fragment
+        attempts were not recorded at all (`record_result=False` on the
+        fragment passes), while a QUERY round's were deliberately not a
+        sample (`path_sample=False`, alpha 0.1.6's second cut). The
+        desktop's 2026-09-23 capture shows what that costs: between
+        11:29:35 and 11:31:26 it spent nine raw-fragment attempts and two
+        QUERY attempts on a two-hop path that was dead, every one a
+        `firmware` miss, and no `direct_send_result` at all in that span --
+        so almost nothing reached the scoreboard, the board did not reach
+        its trial threshold until 11:41:22 and never reached "exhausted".
+        The same shape cost 14 attempts and 2.5 minutes on 2026-09-22
+        between 22:28 and 22:31, where 14 attempts registered as 3 misses.
+        Counting attempts, the 11:29 burst passes `path_switch_after_misses`
+        at its fourth attempt and `PATH_EXHAUST_MISSES` at its eighth, so
+        discovery runs about a minute in rather than ten.
+
+        Why the count and not the rate (design (B), written down as the
+        release asked). The delivery rate is not a local number: it is
+        computed from `samples`, put on the wire in the "Q" v5 rate byte by
+        `_path_rate_for_wire`, and read by the peer as the FIRST rule of
+        `_path_prior`. `PATH_PRIOR_OPTIMISTIC` (0.8), `PATH_PRIOR_WEAK`
+        (0.25), `PATH_HEALTHY_RATE` (0.5) and `PATH_RATE_FLOOR` are all
+        calibrated against per-send rates, and so is the replay fixture
+        `tests/fixtures/field_0921_desktop_22h.json`. A per-attempt rate
+        would settle near 0.65 at one hop and 0.51 at two (the measured
+        field figures), below the 0.8 optimistic prior, so every untried
+        candidate would outscore every measured one -- the churn alpha
+        0.1.8's item 3 was written to stop -- and all four constants would
+        have to be re-derived first. `consecutive_misses` is purely local
+        and is the quantity the death clock actually reads, so it is the
+        one that changes unit.
+
+        The thresholds are rescaled by `direct_send_attempts` so today's
+        patience is preserved exactly: a missed send IS two consecutive
+        missed attempts (any successful attempt both ends the send and
+        resets the counter), so 2 -> 4 and 4 -> 8. On a healthy path at
+        50 % attempt success that still means about 20 sends to a trial and
+        about 340 to exhaustion, as before -- the "fourth cut" patience in
+        `_choose_path` is untouched. What changes is that a send with a
+        LARGER budget now costs what it spends: a four-attempt handshake or
+        pass-1 finish counts four, not one.
+
+        Which attempts count is deliberately an allow-list, not a
+        deny-list (`PATH_ATTEMPT_MISS_SOURCES`): a miss is evidence about
+        the path only when this node transmitted and waited the full miss
+        ceiling and the silence is the path's. A locally shortened ceiling,
+        a pre-empted wait, a supersession, an expiry in the lock queue, a
+        reply that arrived another way and a no-ACK frame are all excluded,
+        and so, as before, is anything with `waited_full_timeout` False."""
+        if not self.path_selection_enabled or not peer_prefix:
+            return
+        if ok:
+            if ack_timeout_source == "noack" or ack_latency_s is None:
+                return          # no real ACK came back: not evidence either way
+        elif not (waited_full_timeout and ack_timeout_source in PATH_ATTEMPT_MISS_SOURCES):
+            return
+        resolved = self._resolved_paths.get(peer_prefix)
+        path_hex = (resolved.out_path_hex or "").lower() if resolved is not None else None
+        # Alpha 0.1.9, second pass (item 1): "" IS a path -- the zero-hop
+        # one -- so only a missing resolved path returns here. The first
+        # pass wrote `if not path_hex`, which dropped every zero-hop attempt
+        # as "no path"; since `_note_path_result` no longer increments the
+        # counter, the zero-hop path's misses were then counted nowhere.
+        # Session 2 of 2026-09-23 evening: after the laptop drove off at
+        # 22:20 it missed 144 consecutive zero-hop attempts over 20 minutes
+        # with one `path_selected` record in the whole capture, and the
+        # desktop did the same, until the laptop was restarted.
+        if path_hex is None:
+            return
+        board = self._path_board(peer_prefix)
+        cand = board.candidates.get(path_hex)
+        if cand is None:
+            return              # nothing known about this path yet; the send outcome adds it
+        now = time.monotonic()
+        if ok:
+            cand.consecutive_misses = 0
+            cand.last_success_at = now
+        else:
+            cand.consecutive_misses += 1
+            cand.last_failure_at = now
+
+    def _note_path_result(self, peer_prefix: str, path_hex: Optional[str], ok: bool,
+                          ack_latency_s: Optional[float] = None, now: Optional[float] = None) -> None:
+        """One send's outcome on a candidate path (a send = its whole
+        attempt budget, as `record_direct_send_result` counts). A success
+        on a trial path that beats the current one by `path_switch_margin`
+        makes it current for good and puts the old current on switch-back
+        cooldown (`path_switch_cooldown`)."""
+        if path_hex is None:
+            return
+        now = time.monotonic() if now is None else now
+        board = self._path_board(peer_prefix)
+        path_hex = (path_hex or "").lower()
+        cand = board.candidates.get(path_hex)
+        if cand is None:
+            hops = len(path_hex) // 2
+            cand = self._add_path_candidate(peer_prefix, path_hex, hops, 1, "discovered", now=now)
+        cand.samples.append((now, bool(ok)))
+        if ok:
+            cand.consecutive_misses = 0
+            cand.last_success_at = now
+            if ack_latency_s is not None and ack_latency_s > 0:
+                cand.ack_latencies.append(float(ack_latency_s))
+        else:
+            # Alpha 0.1.9 (item 4): the miss COUNT is kept per attempt by
+            # `_note_path_attempt_result`, which has already counted every
+            # attempt behind this send; incrementing again here would
+            # double-count it. The delivery-rate SAMPLE stays per send --
+            # that number is published on the wire and read by the peer as
+            # a prior, so its unit must not change.
+            #
+            # The invariant that makes this safe: every send that reaches
+            # here with `succeeded=False` has at least one counted attempt
+            # behind it. `record_direct_send_result` is only reached on a
+            # failure with `waited_full_timeout` True, and an attempt that
+            # waited the full miss ceiling has `ack_timeout_source`
+            # "firmware" or "hop1_abort" -- the two in
+            # PATH_ATTEMPT_MISS_SOURCES. Every other source either returns
+            # before recording (expired, superseded, answered) or sets
+            # `waited_full_timeout` False (measured), and "report_window"
+            # belongs to the report/answer sends, which never record a send
+            # result at all. A miss counted here as well would be the same
+            # airtime counted twice.
+            cand.last_failure_at = now
+        if board.current is None:
+            board.current = path_hex
+            return
+        if ok and path_hex != board.current:
+            ranked = self._rank_paths([self._path_view(c) for c in board.candidates.values()], now,
+                                      **self._path_rank_kwargs(peer_prefix, now=now))
+            scores = {v["path_hex"]: s for s, v, _r, _m in ranked}
+            if board.current in scores and self._switch_for_good(
+                    scores[board.current], scores[path_hex], self.path_switch_margin, cand.cooldown_until, now):
+                previous = board.candidates.get(board.current)
+                if previous is not None:
+                    previous.cooldown_until = now + self.path_switch_cooldown_s
+                board.current = path_hex
+                self._capture_path_selected(peer_prefix, "switch", cand, previous, ranked, now=now)
+                RNS.log(
+                    f"{self}: path to {peer_prefix!r} switched to {path_hex or '<zero-hop>'} ({cand.hops} hop(s), "
+                    f"score {scores[path_hex]:.2f}) from {previous.path_hex or '<zero-hop>' if previous else '?'} "
+                    f"(score {scores.get(previous.path_hex, 0.0) if previous else 0.0:.2f}) for good.",
+                    RNS.LOG_DEBUG,
+                )
+
+    def _capture_path_selected(self, peer_prefix: str, reason: str, cand: "Optional[_PathCandidate]",
+                               previous: "Optional[_PathCandidate]", ranked, now: Optional[float] = None) -> None:
+        if self._packet_capture_file is None:
+            return
+        # `now` is the instant `ranked` was scored at, so the freshness
+        # flags below read the same ages the decision did (alpha 0.1.8).
+        now = time.monotonic() if now is None else now
+        board = self._path_boards.get(peer_prefix)
+        peer_reported = any(v.get("source") == "peer_report" for _s, v, _r, _m in ranked)
+        self._capture_event("out", {
+            "event": "path_selected", "peer_prefix": peer_prefix, "reason": reason,
+            "path_hex": cand.path_hex if cand is not None else None,
+            "path_len": cand.hops if cand is not None else None,
+            "previous_path_hex": previous.path_hex if previous is not None else None,
+            "previous_path_len": previous.hops if previous is not None else None,
+            # Alpha 0.1.7 (item 4): the peer's reported view when one of the
+            # candidates came from its report (the v5 header).
+            "peer_path_len": board.peer_path_len if peer_reported and board is not None else None,
+            "peer_rate": (round(board.peer_rate, 3) if peer_reported and board is not None and board.peer_rate is not None else None),
+            # Alpha 0.1.8 (item 3): `stale` (every piece of this candidate's
+            # evidence aged out of PATH_SAMPLE_WINDOW_S) and `snr_fresh` /
+            # `peer_rate_fresh` (whether each reading still counted), so a
+            # field capture shows WHY a candidate scored as it did. The
+            # readings themselves are printed whatever their age.
+            "scores": [dict({
+                "path_hex": v["path_hex"], "hops": v["hops"], "score": round(score, 3), "rate": round(rate, 3),
+                "measured": measured, "misses": v["consecutive_misses"], "snr": v.get("snr"), "source": v.get("source"),
+            }, **(lambda pr, sn, st: {
+                "stale": st, "snr_fresh": sn is not None, "peer_rate_fresh": pr is not None,
+                "peer_rate": round(v["peer_rate"], 3) if v.get("peer_rate") is not None else None,
+            })(*self._path_evidence(v, now, self.PATH_SAMPLE_WINDOW_S)))
+                for score, v, rate, measured in ranked],
+        })
+
+    async def _select_path(self, peer_prefix: str) -> "Optional[_ResolvedPath]":
+        """The one path decision for a DIRECT send to `peer_prefix`: the
+        `_ResolvedPath` to use, set on the device contact when it differs
+        from what the contact holds (text frames are routed by the contact's
+        stored path; raw fragments carry theirs explicitly), or None when
+        every candidate is exhausted (the caller runs discovery, exactly
+        where it did before) or nothing is known.
+
+        A raw window in flight to the peer does not hold the decision
+        (second cut, from MeshBench `shortcut_appears` on the first cut:
+        under continuous traffic the next part always arrived while the
+        previous window was still running, so a guard that stood aside
+        for an in-flight window never let a trial happen -- six missed
+        sends in a row on a dead three-hop path and no `path_selected`
+        at all). While the current path delivers nothing changes and the
+        window is untouched; when a trial or selection is due the
+        window on the failing path is aborted by its own mid-send check
+        (`_raw_path_reset_mid_send`, the parts remembered for resume) and
+        the next sends go on the chosen path."""
+        resolved = self._resolved_paths.get(peer_prefix)
+        if not self.path_selection_enabled:
+            return resolved
+        now = time.monotonic()
+        board = self._path_board(peer_prefix)
+        if resolved is not None and (resolved.out_path_hex or "").lower() not in board.candidates:
+            cand = self._add_path_candidate(peer_prefix, resolved.out_path_hex, resolved.out_path_len,
+                                            resolved.out_path_hash_len, "discovered", now=resolved.resolved_at)
+            if board.current is None:
+                board.current = cand.path_hex
+        views = [self._path_view(c) for c in board.candidates.values()]
+        chosen_hex, reason, ranked = self._choose_path(
+            views, board.current, now, self.path_switch_after_misses, self.path_switch_cooldown_s,
+            **self._path_rank_kwargs(peer_prefix, now=now),
+        )
+        previous = board.candidates.get((resolved.out_path_hex or "").lower()) if resolved is not None else None
+        if chosen_hex is None:
+            if reason != board.last_reason:
+                self._capture_path_selected(peer_prefix, reason, None, previous, ranked, now=now)
+                if reason == "exhausted":
+                    RNS.log(
+                        f"{self}: every candidate path to {peer_prefix!r} has missed its last "
+                        f"{self.path_switch_after_misses} attempt(s) -- running path discovery.",
+                        RNS.LOG_WARNING,
+                    )
+            board.last_reason = reason
+            if resolved is not None:
+                self._resolved_paths.pop(peer_prefix, None)
+                self._invalidate_ack_rtt(peer_prefix, "candidate paths exhausted")
+            return None
+        cand = board.candidates[chosen_hex]
+        if reason == "selected":
+            board.current = chosen_hex
+        elif reason == "trial":
+            cand.trials += 1
+        changed = resolved is None or (resolved.out_path_hex or "").lower() != chosen_hex
+        if changed or reason != board.last_reason and reason in ("selected", "trial", "switch"):
+            self._capture_path_selected(peer_prefix, reason, cand, previous, ranked, now=now)
+            RNS.log(
+                f"{self}: path to {peer_prefix!r}: {reason} {chosen_hex or '<zero-hop>'} ({cand.hops} hop(s), "
+                f"{cand.source}" + (f", {cand.consecutive_misses} miss(es)" if cand.consecutive_misses else "") + ")"
+                + (f" instead of {previous.path_hex or '<zero-hop>'} ({previous.hops} hop(s), "
+                   f"{previous.consecutive_misses} miss(es))" if previous is not None and previous is not cand else "")
+                + ".",
+                RNS.LOG_DEBUG,
+            )
+        board.last_reason = reason
+        if changed:
+            resolved = _ResolvedPath(out_path_hex=chosen_hex, out_path_len=cand.hops,
+                                     out_path_hash_len=cand.hash_size, resolved_at=now)
+            self._resolved_paths[peer_prefix] = resolved
+            self._invalidate_ack_rtt(peer_prefix, "path selected")
+        if board.device_path != chosen_hex:
+            contact = self._resolve_contact(peer_prefix)
+            if contact is not None:
+                await self._persist_resolved_path(contact, resolved, peer_prefix=peer_prefix)
+        return resolved
+
     # -- Stale cached-path detection and reset (§8) ------------------------
 
     def record_direct_send_result(
@@ -4930,6 +6614,9 @@ class _PathDiscoveryMixin:
         succeeded: bool,
         waited_full_timeout: bool,
         rssi: Optional[float] = None,
+        path_hex: Optional[str] = None,
+        ack_latency_s: Optional[float] = None,
+        path_sample: bool = True,
     ) -> None:
         """docs/path_discovery_spec.md §8 / reliability_engine_design.md
         §8: call this after every DIRECT send attempt made against an
@@ -4962,6 +6649,24 @@ class _PathDiscoveryMixin:
         feed this floor honestly. Left as configured/tested-but-unreached
         rather than deleted or faked with a converted value that hasn't
         been validated against real hardware."""
+        # Alpha 0.1.6 (item 1): with path selection on, every send outcome
+        # is a sample on the path it went over (`path_hex`, else the current
+        # resolved path) and the scoreboard's exhaustion rule -- every
+        # candidate missed its last sends -> discovery -- replaces the
+        # threshold detector below, whose min-age and healthy-patience
+        # guards belong to a world with one path per peer.
+        # `path_sample=False` (item 1, second cut): the raw window's per-
+        # round QUERY evidence is not a sample of its own -- one failing
+        # window counted four or five misses (each QUERY round and the
+        # give-up), exhausting a path on one send; the window's outcome is
+        # the one sample.
+        if self.path_selection_enabled:
+            if path_hex is None:
+                resolved = self._resolved_paths.get(pubkey_prefix)
+                path_hex = resolved.out_path_hex if resolved is not None else None
+            if path_sample and (succeeded or waited_full_timeout):
+                self._note_path_result(pubkey_prefix, path_hex, succeeded, ack_latency_s=ack_latency_s)
+            return
         if succeeded:
             self._direct_path_failures.pop(pubkey_prefix, None)
             # Field fix (2026-09-19): remember that this path just worked --
@@ -5084,10 +6789,25 @@ class _DirectSendMixin:
         (see duty_cycle_exempt_handshake). Its airtime is still recorded."""
         return self.duty_cycle_exempt_handshake and priority == self.PRIORITY_HANDSHAKE
 
+    def _relayed_frame(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> bool:
+        """Whether a DIRECT frame will be relayed by a repeater -- the hop
+        class the duty-cycle limiter's two ledgers key on (alpha 0.1.5,
+        2026-09-21). `hop_count` is the target's `out_path_len` when the
+        caller has it; otherwise the peer's resolved path is consulted; a
+        frame whose route is unknown is charged as relayed (the stricter
+        budget), never the other way round."""
+        if hop_count is not None:
+            return hop_count > 0
+        if peer_prefix is not None:
+            resolved = self._resolved_paths.get(peer_prefix)
+            if resolved is not None:
+                return resolved.out_path_len > 0
+        return True
+
     async def _throttle_for_duty_cycle(
         self, frame: str, exempt: bool = False, on_air_bytes: Optional[int] = None,
-        interrupt: "Optional[asyncio.Event]" = None,
-    ) -> float:
+        interrupt: "Optional[asyncio.Event]" = None, relayed: bool = True,
+    ) -> "tuple[float, Optional[str]]":
         """User-requested fix (2026-09-16): called at every actual radio-
         keying call site (`_send_channel_fastpath_frame`, one iteration
         of `_send_channel_multifragment_pass`'s per-fragment loop,
@@ -5099,15 +6819,26 @@ class _DirectSendMixin:
         shipped -- reusing `bitrate` massively overestimated real per-
         frame airtime and forced an artificial ~10s wait on every single
         exchange), waits out whatever `_DutyCycleLimiter` says is needed,
-        then records the estimate as consumed. Returns the delay actually
-        applied -- logged at debug level and available to the caller for
-        capture, never gates *whether* the send proceeds, only *when*
-        it's allowed to start. A no-op returning 0.0 immediately when
-        `duty_cycle_enabled` is off."""
+        then records the estimate as consumed. Returns `(delay, ledger)`:
+        the delay actually applied and the ledger that held the frame
+        ("relayed" / "total" / None) -- logged at debug level and available
+        to the caller for capture, never gates *whether* the send
+        proceeds, only *when* it's allowed to start. `(0.0, None)`
+        immediately when `duty_cycle_enabled` is off.
+
+        Alpha 0.1.5 (2026-09-21): `relayed` is the frame's hop class. A
+        frame a repeater will relay -- any DIRECT frame with a routed path,
+        every CHANNEL flood -- is charged to both ledgers and waits on both
+        budgets (`duty_cycle_max_fraction`, 30%, and the total cap); a
+        zero-hop DIRECT frame is charged to the total ledger only and waits
+        on `duty_cycle_max_fraction_zero_hop` (85%). The owner's rule: what
+        touches a repeater stays at 30%, two adjacent radios may use the
+        channel between them."""
         if not self.duty_cycle_enabled or self.duty_cycle_estimate_bitrate <= 0:
-            return 0.0
+            return 0.0, None
         estimated_s = self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes)
-        budget_s = self.duty_cycle_window_s * self.duty_cycle_max_fraction
+        budget_s = self.duty_cycle_window_s * (
+            self.duty_cycle_max_fraction if relayed else self.duty_cycle_max_fraction_zero_hop)
         if estimated_s > budget_s and not getattr(self, "_duty_cycle_overrun_warned", False):
             # MeshBench finding 1 (2026-09-20): one absurd radio parameter
             # turned into one frame per window with nothing in the log.
@@ -5121,22 +6852,22 @@ class _DirectSendMixin:
             )
         if exempt:
             # Link-maintenance traffic: charged, never delayed.
-            self._duty_cycle.record(estimated_s)
+            self._duty_cycle.record(estimated_s, relayed=relayed)
             self._debug(
                 f"duty-cycle: handshake-class {len(frame)}-char frame sent without waiting "
-                f"for budget ({estimated_s:.2f}s airtime still charged to the window)."
+                f"for budget ({estimated_s:.2f}s airtime still charged to the {'relayed and total' if relayed else 'total'} ledger)."
             )
-            return 0.0
-        delay = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt)
-        self._duty_cycle.record(estimated_s)
+            return 0.0, None
+        delay, ledger = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt, relayed=relayed)
+        self._duty_cycle.record(estimated_s, relayed=relayed)
         if delay > 0:
             self._debug(
-                f"duty-cycle throttle: waited {delay:.2f}s before this "
-                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} frame "
-                f"(estimated {estimated_s:.2f}s airtime, "
+                f"duty-cycle throttle: waited {delay:.2f}s on the {ledger} ledger before this "
+                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} "
+                f"{'relayed' if relayed else 'zero-hop'} frame (estimated {estimated_s:.2f}s airtime, "
                 f"{'LoRa model' if self._radio_params is not None else f'duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps'})."
             )
-        return delay
+        return delay, ledger
 
     async def _wait_for_incoming_quiet(self) -> float:
         """User-requested fix (2026-09-16): "if we hear a message come in
@@ -5209,6 +6940,7 @@ class _DirectSendMixin:
     async def _pre_transmit_gate(
         self, frame: str, skip_quiet_defer: bool = False, duty_cycle_exempt: bool = False,
         on_air_bytes: Optional[int] = None, interrupt: "Optional[asyncio.Event]" = None,
+        relayed: bool = True, telemetry: Optional[dict] = None,
     ) -> "tuple[float, float, float]":
         """Code-review fix: `await self._wait_for_incoming_quiet()` then
         `await self._throttle_for_duty_cycle(frame)`, in that order, used
@@ -5258,58 +6990,89 @@ class _DirectSendMixin:
         quiet_defer_wait_s = 0.0
         if not skip_quiet_defer:
             quiet_defer_wait_s = await self._wait_for_incoming_quiet()
-        duty_cycle_wait_s = await self._throttle_for_duty_cycle(
-            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt,
+        duty_cycle_wait_s, duty_cycle_ledger = await self._throttle_for_duty_cycle(
+            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt, relayed=relayed,
         )
+        if telemetry is not None:
+            # Alpha 0.1.5: which ledger a wait was charged to ("relayed" /
+            # "total" / None), and the frame's hop class, for the capture.
+            telemetry["duty_cycle_ledger"] = duty_cycle_ledger
+            telemetry["duty_cycle_relayed"] = relayed
         # Step 4 (2026-09-18): last, so it reflects whatever was overheard
         # during the two waits above. A no-op unless rx_log_holds_enabled.
         medium_hold_wait_s = await self._wait_for_medium_clear()
         # Stamped here, not at the send_msg/send_chan_msg call itself: this
         # is the last common point every radio-keying path passes through,
         # and the command is issued immediately after this returns.
-        self._last_own_tx_at = time.monotonic()
+        now = time.monotonic()
+        self._last_own_tx_at = now
+        # Alpha 0.1.5 (2a): the frame is about to be QUEUED in the firmware;
+        # the radio is busy for its airtime after whatever it already holds.
+        busy_until = self._note_radio_keyed(self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes), now)
+        if telemetry is not None:
+            telemetry["radio_busy_until"] = busy_until
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
-    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":
+    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float,
+                                      also_reports: bool = False, handshake_only: bool = False,
+                                      extra_events=None) -> "tuple[bool, bool]":
         """Await `fut` (shielded: it outlives this wait) for up to
         `timeout_s`, ending early when a Link handshake queues for the
-        radio lock (phase 1, 2026-09-20). Returns `(future_done, cut_by_a
-        _handshake)`; the future's own exception is the caller's."""
+        radio lock (phase 1, 2026-09-20) -- or, with `also_reports` (item
+        6, alpha 0.1.5), when a completion REPORT this node owes the far
+        sender does: the report wait is radio-free, so the holder loses
+        nothing by letting the report out. Returns `(future_done, cut)`;
+        the future's own exception is the caller's. `handshake_only`
+        (alpha 0.1.7, item 1): only a Link handshake cuts this wait, not a
+        fresh plain PROOF -- for the QUERY quiet hold, which keeps this
+        node silent while the ANSWER transits the repeater.
+        `extra_events` (alpha 0.1.8, item 1): further events that end
+        the wait, reported as `cut`; the caller checks its own
+        condition first to tell them apart from a pre-emptor. The raw
+        window passes the event its packets' PROOFs set."""
         if fut.done():
             return True, False
-        event = self._direct_exchange_lock.preempt_event()
-        if event.is_set():
+        lock = self._direct_exchange_lock
+        events = ([lock.preempt_event(handshake_only=handshake_only)]
+                  + ([lock.report_event()] if also_reports else [])
+                  + list(extra_events or ()))
+        if any(e.is_set() for e in events):
             return False, True
         if timeout_s <= 0:
             return False, False
         loop = asyncio.get_running_loop()
         fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
-        preempt_wait = loop.create_task(event.wait())
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
         try:
-            done, _pending = await asyncio.wait({fut_wait, preempt_wait}, return_when=asyncio.FIRST_COMPLETED)
+            done, _pending = await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 if not t.done():
                     t.cancel()
             # Retrieve the timed-out / cancelled task's exception so asyncio
             # does not log "Task exception was never retrieved".
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 try:
                     await t
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
         if fut.done():
             return True, False
-        return False, preempt_wait in done
+        return False, any(w in done for w in waits[1:])
 
-    async def _idle_hold(self, seconds: float, floor_s: float = 0.0) -> bool:
+    async def _idle_hold(self, seconds: float, floor_s: float = 0.0, handshake_only: bool = False) -> bool:
         """Sleep `seconds` with the radio lock held, but return early
         (True) once a link handshake is queued for the lock and at least
         `floor_s` has passed (phase 1, 2026-09-20). The lock's pre-empt
-        event is the signal; False when the whole time elapsed."""
+        event is the signal; False when the whole time elapsed. With
+        `handshake_only` (alpha 0.1.7, item 1) a fresh plain PROOF does not
+        cut the hold -- the no-ACK report hold is the repeater's relay
+        window for this node's own frame, and a proof keyed into it was
+        missed at the repeater in MeshBench `large_payload` (proof success
+        4/23 against 9/24, every report behind an 8 s timeout)."""
         if seconds <= 0:
             return False
-        event = self._direct_exchange_lock.preempt_event()
+        event = self._direct_exchange_lock.preempt_event(handshake_only=handshake_only)
         started = time.monotonic()
         if floor_s > 0:
             await asyncio.sleep(min(seconds, floor_s))
@@ -5347,6 +7110,13 @@ class _DirectSendMixin:
             return None
         if header.packet_type == RNS.Packet.LINKREQUEST:
             return self._compute_link_id(data)
+        if header.packet_type == RNS.Packet.PROOF and header.context == RNS.Packet.LRPROOF \
+                and header.destination_hash:
+            # Alpha 0.1.6 (item 2): an LRPROOF is keyed by its link_id so a
+            # newer LINKREQUEST from the same peer can supersede it
+            # (`_supersede_link_proofs`); its retries stop like an answered
+            # send's, but as a drop, not a success.
+            return self.LRPROOF_KEY_PREFIX + bytes(header.destination_hash)
         if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
                 and header.destination_type == RNS.Destination.SINGLE):
             # Review (2026-09-20): every plain DATA to a SINGLE destination,
@@ -5368,6 +7138,7 @@ class _DirectSendMixin:
             event = asyncio.Event()
             if key in self._send_answered_at:
                 event.set()
+            event.superseded = self._send_answered_how.get(key) == "superseded"
             self._send_answered_events[key] = (event, time.monotonic())
             return event
         return entry[0]
@@ -5392,10 +7163,48 @@ class _DirectSendMixin:
         if key is None:
             return
         self._send_answered_at[key] = (time.monotonic(), sender_peer_prefix)
+        self._send_answered_how[key] = how
         entry = self._send_answered_events.get(key)
         if entry is not None and not entry[0].is_set():
+            entry[0].superseded = how == "superseded"
             entry[0].set()
             self._debug(f"send {key.hex()} answered ({how}) while its retry loop was live -- no further attempts.")
+
+    def _send_superseded(self, key: Optional[bytes]) -> bool:
+        """Whether the send with this key was superseded (alpha 0.1.6 item 2:
+        an LRPROOF whose peer has since sent a newer LINKREQUEST) rather
+        than answered."""
+        return key is not None and self._send_answered_how.get(key) == "superseded"
+
+    def _supersede_link_proofs(self, peer_prefix: str, new_link_id: Optional[bytes]) -> int:
+        """A new LINKREQUEST from `peer_prefix` supersedes every LRPROOF
+        still pending for an earlier link of that peer (alpha 0.1.6, item
+        2): RNS on the far side has abandoned that link after its client's
+        window (MeshChat gives a link 15 s), so the frame is pure airtime.
+        The 2026-09-21 session at two hops: six LINKREQUESTs in 2.5 minutes,
+        each answered by an LRPROOF of four attempts at 11 s ACK timeouts,
+        queued at the handshake tier ahead of everything -- completion
+        answers and reports waited up to 125 s behind them. Returns how
+        many were superseded."""
+        pending = self._pending_link_proofs.get(peer_prefix)
+        if not pending:
+            return 0
+        superseded = 0
+        for link_id in list(pending):
+            if new_link_id is not None and link_id == new_link_id:
+                continue
+            key = self.LRPROOF_KEY_PREFIX + link_id
+            if not self._send_superseded(key):
+                self._signal_send_answered(key, "superseded")
+                superseded += 1
+        if superseded:
+            self._outgoing_dropped_total += superseded
+            RNS.log(
+                f"{self}: {superseded} queued LRPROOF(s) for {peer_prefix!r} expired -- superseded by its newer "
+                f"LINKREQUEST (the far side abandoned that link); not (re)sent.",
+                RNS.LOG_DEBUG,
+            )
+        return superseded
 
     def _send_answered_sweep(self, now: float) -> None:
         ttl = self.proof_correlation_ttl_s
@@ -5403,6 +7212,8 @@ class _DirectSendMixin:
             del self._send_answered_at[k]
         for k in [k for k, (_ev, t) in self._send_answered_events.items() if now - t > ttl]:
             del self._send_answered_events[k]
+        for k in [k for k in self._send_answered_how if k not in self._send_answered_at]:
+            del self._send_answered_how[k]
 
     async def _send_direct_packet(
         self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str,
@@ -5416,7 +7227,12 @@ class _DirectSendMixin:
         interface's own record being out of sync with the device contact
         table can cause -- see path_discovery_spec.md's persistence
         note)."""
-        resolved = self._resolved_paths.get(peer_prefix)
+        # Alpha 0.1.6 (item 1): the scoreboard's one decision -- the current
+        # path while it delivers, a trial of the best-scoring alternative
+        # after it misses, None once every candidate has failed -- inside
+        # the one place that decides resolved-versus-discover, never beside
+        # it (alpha 0.1.5's shorter-path adoption stood here before).
+        resolved = await self._select_path(peer_prefix)
         if resolved is None:
             # Milestone 6: docs/reliability_engine_design.md §8's "next
             # send attempt for this peer goes through discover_path()
@@ -5524,6 +7340,12 @@ class _DirectSendMixin:
                 expire_retries=self._plain_proof(header) and self.proof_max_age_s > 0,
                 # A Link handshake pre-empts idle holds of the radio lock.
                 preempt=self._is_link_handshake(header),
+                # Alpha 0.1.7 (item 1): so does a plain PROOF while it is
+                # younger than proof_fresh_s (re-read at every attempt).
+                proof_enqueued_at=self._proof_enqueued_at_for(header),
+                # Alpha 0.1.9 (item 2): how long this proof waited for the
+                # sender's burst tail before it was dispatched, capture-only.
+                proof_tail_hold_s=self._proof_tail_hold_waited_for(header),
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -5904,6 +7726,8 @@ class _DirectSendMixin:
         attempts_override: Optional[int] = None, record_result: bool = True,
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
         expire_retries: bool = False, preempt: bool = False,
+        proof_enqueued_at: Optional[float] = None,
+        proof_tail_hold_s: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -5974,6 +7798,24 @@ class _DirectSendMixin:
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            # Alpha 0.1.7 (item 1): a plain PROOF's age at THIS attempt --
+            # fresh, it pre-empts idle holds like a handshake; a retry after
+            # a miss at the hop cap has usually aged past proof_fresh_s and
+            # queues as bulk again. Capture-only otherwise.
+            proof_age_s = (time.monotonic() - proof_enqueued_at) if proof_enqueued_at is not None else None
+            proof_fresh = self._proof_is_fresh(proof_age_s) if proof_age_s is not None else None
+            attempt_preempt = preempt or bool(proof_fresh)
+            if cancel_event is not None and cancel_event.is_set() and self._send_superseded(cancel_key):
+                # Alpha 0.1.6 (item 2): an LRPROOF superseded by the peer's
+                # newer LINKREQUEST -- expired, like a stale plain proof.
+                self._outgoing_dropped_total += 1
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
+                    pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                    time_critical=time_critical, pass_number=pass_number,
+                    ack_timeout_source="superseded", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                )
+                return False
             if cancel_event is not None and cancel_event.is_set():
                 self._debug(
                     f"DIRECT send to {peer_prefix!r} answered before attempt {attempt} -- "
@@ -5985,7 +7827,7 @@ class _DirectSendMixin:
                     peer_prefix, attempt, True, self._direct_exchange_queue_depth, 0.0, None,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                     time_critical=time_critical, pass_number=pass_number,
-                    ack_timeout_source="answered",
+                    ack_timeout_source="answered", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
                 # Path evidence only when THIS peer delivered the reply
                 # (review, 2026-09-20): a DIRECT-to-all copy cancelled by a
@@ -6017,6 +7859,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number, ack_timeout_source="expired",
+                        proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                 return False
             frame = frame_builder(attempt)
@@ -6027,7 +7870,9 @@ class _DirectSendMixin:
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
-                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=preempt,
+                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=attempt_preempt,
+                    proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                    proof_tail_hold_s=proof_tail_hold_s,
                 )
             except Exception as exc:
                 RNS.log(
@@ -6036,11 +7881,17 @@ class _DirectSendMixin:
                     RNS.LOG_WARNING,
                 )
                 ok, waited_full_timeout = False, False
+            if ok and self._send_superseded(cancel_key):
+                # Cut mid-wait by the supersession: the frame went out, no
+                # ACK came before the newer LINKREQUEST; not path evidence.
+                self._outgoing_dropped_total += 1
+                return False
             if ok:
                 if record_result and not (
                         cancel_event is not None and cancel_event.is_set()
                         and self._send_answered_by(cancel_key) != peer_prefix):
-                    self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                    self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True,
+                                                   ack_latency_s=attempt_info.get("ack_latency_s"))
                 return True
             # No per-attempt delay here anymore -- the post-send listen
             # window (outcome-dependent range, 2026-09-16) fires inside
@@ -6108,6 +7959,7 @@ class _DirectSendMixin:
     async def _await_direct_ack(
         self, sent, peer_prefix: Optional[str], hop_count: Optional[int], rx_window: dict, ack_wait_start: float,
         cancel_event: "Optional[asyncio.Event]" = None, preemptible: bool = False,
+        ack_timeout_max_s: Optional[float] = None,
     ) -> "tuple[bool, bool, Optional[float], str, Optional[float], Optional[float]]":
         """The ACK wait for one transmitted DIRECT frame (refactor,
         2026-09-19: lifted verbatim out of `_send_direct_frame_and_wait_
@@ -6146,6 +7998,16 @@ class _DirectSendMixin:
             if peer_prefix is not None:
                 self._last_firmware_ack_timeout_s[peer_prefix] = timeout_s
             timeout_s, ack_timeout_source = self._adaptive_ack_timeout(peer_prefix, timeout_s)
+            if ack_timeout_max_s is not None and ack_timeout_max_s > 0 and ack_timeout_max_s < timeout_s:
+                # Alpha 0.1.8 (item 2): a completion REPORT's ACK wait is
+                # bounded by how long its answer is still USEFUL to the
+                # sender, not by the miss ceiling. At two hops the cap is
+                # 11 s (adaptively ~9.4 s) while the sender's whole report
+                # wait is 9 s, so an unbounded first attempt would hold
+                # this radio past the moment the sender gave up and would
+                # put the retry on the air after the QUERY round had
+                # already started.
+                timeout_s, ack_timeout_source = ack_timeout_max_s, "report_window"
 
             # Field fix (2026-09-18 evening): early abort on a
             # dead first hop -- see _hop1_abort_deadline_s. Wait
@@ -6166,7 +8028,7 @@ class _DirectSendMixin:
                 floor_s = min(timeout_s, self._ack_preempt_floor_s(peer_prefix, hop_count))
                 ack_event, answered = await self._wait_for_ack_event(ack_filters, floor_s, cancel_event)
                 if ack_event is None and not answered and timeout_s > floor_s:
-                    preempt_event = self._direct_exchange_lock.preempt_event()
+                    preempt_event = self._direct_exchange_lock.preempt_event(handshake_only=True)
                     if preempt_event.is_set():
                         return False, False, timeout_s, "preempted", None, None
                     ack_event, answered = await self._wait_for_ack_event(
@@ -6295,6 +8157,11 @@ class _DirectSendMixin:
         attempt_info: Optional[dict] = None,  # out-param: "expired" True when the attempt aged out in the lock wait and never transmitted
         preempt: bool = False,  # a Link handshake: may pre-empt an idle hold of the lock (phase 1, 2026-09-20)
         preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
+        proof_age_s: Optional[float] = None,  # capture-only (alpha 0.1.7, item 1): a plain PROOF's age at this attempt
+        proof_fresh: Optional[bool] = None,  # capture-only: whether that age made it pre-empt (proof_fresh_s)
+        proof_tail_hold_s: Optional[float] = None,  # capture-only (alpha 0.1.9, item 2): the burst tail this proof waited out
+        report: bool = False,  # alpha 0.1.8 item 2: take the lock in the REPORT class, as the no-ACK carrier does
+        ack_timeout_max_s: Optional[float] = None,  # alpha 0.1.8 item 2: ceiling on this frame's ACK wait
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -6372,7 +8239,13 @@ class _DirectSendMixin:
         wait_start = time.monotonic()
         preempted = False
         try:
-            async with self._direct_exchange_lock(priority, preempt=preempt):
+            # Alpha 0.1.8 (item 2): `report=True` takes the lock in the
+            # REPORT class, exactly as `_send_direct_noack_frame` does for
+            # the same frame -- without it, moving a report onto this
+            # carrier would silently lose alpha 0.1.5 item 6 (a raw window
+            # yields the radio between its parts to a report this node
+            # owes) and alpha 0.1.7 item 3c.
+            async with self._direct_exchange_lock(priority, preempt=preempt, report=report):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 if quiet_wait is not None and quiet_wait.done():
@@ -6384,7 +8257,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, True, self._direct_exchange_queue_depth, time.monotonic() - wait_start, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="answered_before_send", kind=kind,
+                        ack_timeout_source="answered_before_send", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     if quiet_info is not None:
                         quiet_info["answered_at"] = time.monotonic()
@@ -6401,7 +8274,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, queue_depth_at_acquire, lock_wait_s, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="expired", kind=kind,
+                        ack_timeout_source="expired", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     return False, False
                 # Code-review fix: a local exception raised anywhere in this
@@ -6434,6 +8307,7 @@ class _DirectSendMixin:
                     sent = await self._send_direct_frame(
                         target, frame, attempt, time_critical=time_critical, gate_telemetry=gate_telemetry,
                         duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                        hop_count=hop_count, peer_prefix=peer_prefix,
                     )
                     ack_wait_start = time.monotonic()
                     rx_window["tx_at"] = ack_wait_start
@@ -6443,9 +8317,12 @@ class _DirectSendMixin:
                     (ok, waited_full_timeout, ack_timeout_s, ack_timeout_source,
                      ack_latency_s, hop1_abort_deadline_s) = await self._await_direct_ack(
                         sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=cancel_event,
-                        preemptible=preemptible,
+                        preemptible=preemptible, ack_timeout_max_s=ack_timeout_max_s,
                     )
                     preempted = ack_timeout_source == "preempted"
+                    if ack_timeout_source == "answered" and getattr(cancel_event, "superseded", False):
+                        # Alpha 0.1.6 (item 2): cut by a supersession, not a reply.
+                        ok, ack_timeout_source = False, "superseded"
                     ack_done_at = time.monotonic()
                 except Exception as exc:
                     send_exc = exc
@@ -6559,13 +8436,17 @@ class _DirectSendMixin:
                         # the hold early; the caller keeps waiting for the
                         # answer with the radio free, as it does after the
                         # window.
-                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s)
+                        # Alpha 0.1.6 (item 2): and so does a completion
+                        # REPORT this node owes the far sender (the item-6
+                        # class), as the window's report wait already did.
+                        answered, cut = await self._wait_future_or_preempt(
+                            quiet_wait, quiet_remaining_s, also_reports=True, handshake_only=True)
                         if answered and quiet_info is not None:
                             quiet_info["answered_at"] = time.monotonic()
                         if cut:
                             self._debug(
                                 f"quiet window for {peer_prefix!r} cut at {time.monotonic() - quiet_started:.2f}s "
-                                f"of {quiet_remaining_s:.2f}s -- a Link handshake is waiting for the radio."
+                                f"of {quiet_remaining_s:.2f}s -- a Link handshake or a completion report is waiting for the radio."
                             )
                         quiet_hold_s = time.monotonic() - quiet_started
                     if quiet_info is not None:
@@ -6585,17 +8466,27 @@ class _DirectSendMixin:
                     f"quiet_hold={quiet_hold_s if quiet_hold_s is None else round(quiet_hold_s, 2)}"
                     + (f" (local send exception: {send_exc})" if send_exc is not None else "") + "."
                 )
+                # Alpha 0.1.9 (item 4): one attempt's evidence about the
+                # path, recorded here because this is the single place that
+                # knows both the outcome and WHY -- every caller of this
+                # method reaches it, including the raw fragments and the
+                # QUERY/ANSWER sends that bypass `_send_direct_with_attempts`
+                # and were therefore never counted at all.
+                self._note_path_attempt_result(peer_prefix, ok, waited_full_timeout,
+                                               ack_timeout_source, ack_latency_s=ack_latency_s)
                 self._capture_direct_attempt_result(
                     peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,
                     hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
                     quiet_defer_wait_s=gate_telemetry.get("quiet_defer_wait_s"),
                     duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
+                    duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
                     ack_timeout_source=ack_timeout_source, ack_latency_s=ack_latency_s,
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
-                    kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
+                    kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                    proof_tail_hold_s=proof_tail_hold_s, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
                     on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)
@@ -6607,6 +8498,15 @@ class _DirectSendMixin:
                     # (_send_direct_with_attempts) see and log this exactly
                     # as it did before this fix.
                     raise send_exc
+                if attempt_info is not None:
+                    attempt_info["ack_latency_s"] = ack_latency_s
+                if ok and peer_prefix is not None and rx_window.get("ack_snr") is not None:
+                    # Alpha 0.1.6 (item 1): the ACK the radio log matched to
+                    # this frame is the last frame received over the path
+                    # it went on -- its signal is the candidate's.
+                    _r = self._resolved_paths.get(peer_prefix)
+                    self._note_path_signal(peer_prefix, _r.out_path_hex if _r is not None else None,
+                                           rx_window.get("ack_snr"), rx_window.get("ack_rssi"))
                 return ok, waited_full_timeout
         finally:
             self._direct_exchange_queue_depth -= 1
@@ -6644,7 +8544,10 @@ class _DirectSendMixin:
         self._direct_exchange_queue_depth += 1
         wait_start = time.monotonic()
         try:
-            async with self._direct_exchange_lock(priority):
+            # Item 6 (alpha 0.1.5): a completion REPORT queues as the report
+            # class, which a raw window this node is sending yields to
+            # between two of its parts (`_run_raw_window_rounds`).
+            async with self._direct_exchange_lock(priority, report=(kind == "completion_report")):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 gate_telemetry: dict = {}
@@ -6653,10 +8556,12 @@ class _DirectSendMixin:
                 send_exc = None
                 hold_s = 0.0
                 try:
-                    await self._pre_transmit_gate(
+                    _q, duty_cycle_wait_s, _m = await self._pre_transmit_gate(
                         frame, skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                        on_air_bytes=on_air_bytes, relayed=hop_count > 0, telemetry=gate_telemetry,
                     )
                     gate_telemetry["duty_cycle_exempt"] = self._duty_cycle_exempt(priority)
+                    gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
                     dst = bytes.fromhex(str(target)[:12])
                     data = (
                         bytes([0x02, self.TXT_TYPE_CLI_DATA, attempt & 0xFF])
@@ -6671,9 +8576,10 @@ class _DirectSendMixin:
                     hold_s = self._noack_frame_hold_s(on_air_bytes, hop_count)
                     # The frame is on air / in the chain: keep the radio
                     # quiet for its hold, yielding to a Link handshake only
-                    # once the frame itself is off the air.
+                    # once the frame itself is off the air (and to nothing
+                    # else: alpha 0.1.7, item 1, second cut).
                     airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-                    await self._idle_hold(hold_s, floor_s=airtime_s)
+                    await self._idle_hold(hold_s, floor_s=airtime_s, handshake_only=True)
                 except Exception as exc:
                     send_exc = exc
                 self._debug(
@@ -6685,6 +8591,8 @@ class _DirectSendMixin:
                     hop_count=hop_count, time_critical=True, listen_delay_s=hold_s,
                     ack_timeout_source="noack", kind=kind,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
+                    duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
+                    duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
                     on_air_bytes=on_air_bytes if ok else None,
                 )
                 return ok
@@ -6713,6 +8621,7 @@ class _DirectSendMixin:
     async def _send_direct_frame(
         self, target, frame: str, attempt: int = 0, time_critical: bool = False,
         gate_telemetry: Optional[dict] = None, duty_cycle_exempt: bool = False,
+        hop_count: Optional[int] = None, peer_prefix: Optional[str] = None,
     ):
         """Sends one already-encoded DIRECT frame string (bare or
         multi-fragment shape -- this method doesn't care which) via
@@ -6747,11 +8656,17 @@ class _DirectSendMixin:
         below then raises -- the gate already ran and cost real time
         either way, and that's exactly the case a field-tuning analysis
         most wants visible."""
+        # Alpha 0.1.5: the frame's hop class for the duty-cycle ledgers --
+        # `hop_count` from the caller (the target's out_path_len) or the
+        # peer's resolved path; unknown counts as relayed.
+        gate_info: dict = {}
         quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s = await self._pre_transmit_gate(
             frame, skip_quiet_defer=time_critical, duty_cycle_exempt=duty_cycle_exempt,
+            relayed=self._relayed_frame(hop_count, peer_prefix), telemetry=gate_info,
         )
         if gate_telemetry is not None:
             gate_telemetry["duty_cycle_exempt"] = duty_cycle_exempt
+            gate_telemetry["duty_cycle_ledger"] = gate_info.get("duty_cycle_ledger")
             gate_telemetry["quiet_defer_wait_s"] = quiet_defer_wait_s
             gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
             gate_telemetry["medium_hold_wait_s"] = medium_hold_wait_s
@@ -6769,6 +8684,12 @@ class _DirectSendMixin:
 """Raw fragmentation and the reconcile: the raw burst-then-report/QUERY sender with its resume and text-fallback verdicts, the report window and QUERY answer budgets, the completion QUERY / ANSWER / REPORT handling on both sides, and the per-sender reassembly buckets, dedup cache and their sweeps. Phase 3 of the 2026-09-20 pass redesigns this module around one burst-and-report state machine."""
 
 
+
+
+# Alpha 0.1.8 (item 1): what `_await_completion_report` returns when the
+# far side's RNS proved every packet of the window -- the proof is the
+# completion, so there is no report to wait for and nothing to QUERY.
+_WINDOW_PROVED = object()
 
 
 class _ReconcileMixin:
@@ -6902,9 +8823,11 @@ class _ReconcileMixin:
         receiver's reassembly clock), then CMD_SEND_RAW_DATA. Returns
         whether the firmware accepted it; never waits for anything after."""
         on_air = 2 + len(path) + len(frame)
+        # A source-routed raw fragment is relayed once per path byte; an
+        # empty path is the zero-hop class (alpha 0.1.5 duty-cycle ledgers).
         gate = await self._pre_transmit_gate(
             "", skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority), on_air_bytes=on_air,
-            interrupt=interrupt,
+            interrupt=interrupt, relayed=len(path) > 0, telemetry=telemetry,
         )
         if telemetry is not None:
             telemetry["quiet_defer_wait_s"], telemetry["duty_cycle_wait_s"], telemetry["medium_hold_wait_s"] = gate
@@ -6943,7 +8866,28 @@ class _ReconcileMixin:
         # in large_payload, 7/9 QUERYs in relay. The frame's own airtime is
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-        return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
+        # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
+        # airtime from the gap through repeaters; the default keeps it.
+        own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
+        return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
+
+    def _raw_burst_next_send_wait_s(self, hops: int, gap_s: float, airtime_s: float, now: float,
+                                    busy_until: float, queue_ahead: Optional[int] = None) -> float:
+        """How long the burst loop sleeps before handing the firmware the
+        NEXT fragment (pure function, alpha 0.1.5 2a). Through repeaters the
+        hop-scaled gap (which contains the frame's airtime) is the answer, as
+        before. At zero hop the flat gap alone let the loop queue a whole
+        window into the firmware in seconds; the loop now also waits until
+        the radio is estimated to have at most `direct_raw_burst_queue_ahead`
+        frames of air left ahead of it -- `busy_until - queue_ahead x
+        airtime` -- so the air stays back to back with a bounded queue and
+        the loop's own clock tracks the radio's. 0 frames ahead disables
+        the pacing (the pre-0.1.5 loop)."""
+        wait_s = max(0.0, gap_s)
+        queue_ahead = self.direct_raw_burst_queue_ahead if queue_ahead is None else queue_ahead
+        if hops <= 0 and queue_ahead > 0:
+            wait_s = max(wait_s, (busy_until - queue_ahead * max(0.0, airtime_s)) - now)
+        return max(0.0, wait_s)
 
     def _completion_report_wait_s(self, hops: int, peer_prefix: str) -> float:
         """How long a raw sender keeps its radio quiet after a burst for the
@@ -6984,8 +8928,40 @@ class _ReconcileMixin:
         if burst_end is None:
             return None
         latency_s = time.monotonic() - burst_end
+        if latency_s < 0:
+            # 2a: a report that lands before the burst's estimated end on air
+            # measures the airtime estimate's pessimism, not the report path;
+            # it does not train the window.
+            return None
         self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
         return latency_s
+
+    async def _wait_future_or_proof(self, fut: "asyncio.Future", timeout_s: float, events):
+        """The report future against the events this window's PROOFs set,
+        with the radio already released (alpha 0.1.8, item 1). Returns the
+        report if it arrived, else None -- the caller re-checks whether a
+        proof completed the window and, if not, keeps waiting."""
+        if fut.done():
+            return fut.result()
+        if timeout_s <= 0:
+            return None
+        if any(e.is_set() for e in events):
+            return None
+        loop = asyncio.get_running_loop()
+        fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
+        try:
+            await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in waits:
+                if not t.done():
+                    t.cancel()
+            for t in waits:
+                try:
+                    await t
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+        return fut.result() if fut.done() else None
 
     def _expect_report(self, peer_prefix: str, pkt_id: int, burst_end: Optional[float]) -> None:
         """Register (or, with None, withdraw) the burst end time a report
@@ -6999,7 +8975,8 @@ class _ReconcileMixin:
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
         last_sent_idx: Optional[int] = None, rearm=None, release_lock=None, window_pkts=None,
-    ) -> Optional[_CompletionFrame]:
+        burst_end: Optional[float] = None, on_early=None, proved_check=None, proved_events=None,
+    ):
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
         `_completion_report_wait_s`, in which case the caller falls back to
@@ -7025,11 +9002,40 @@ class _ReconcileMixin:
         was lost this costs at most that extra half window; today's
         behaviour (re-drive it at once) is the fallback either way."""
         wait_s = self._completion_report_wait_s(hops, peer_prefix)
-        started = time.monotonic()
+        # 2a (alpha 0.1.5): the window is measured from the burst's
+        # estimated end on air (`burst_end`, the radio's busy-until when the
+        # last fragment was queued), which may still be in the future.
+        started = time.monotonic() if burst_end is None else max(burst_end, 0.0)
         provisional: Optional[_CompletionFrame] = None
         deadline_s = wait_s
+        # 2c (alpha 0.1.5): a report that arrives BEFORE the burst has ended
+        # on air -- the future already resolved when this wait starts, or a
+        # report landing while `time.monotonic() < burst_end` -- is progress,
+        # not the end of the wait: `on_early(frame)` applies it to the parts
+        # it mentions and says whether anything is still missing; the wait
+        # then continues to burst_end + window for the receiver's word on
+        # the rest. Only when that expires is the last early report acted
+        # on (captured as `reported_stale`), so parts absent from any report
+        # are re-burst only after the wait has actually expired -- the
+        # field's part-8 report ended the wait with parts 9-12 unmentioned
+        # and still in the sender's own radio queue. With nothing missing
+        # after an early report the wait ends at once.
+        early: Optional[_CompletionFrame] = None
+        early_reports = 0
+        done_at_entry = fut.done()
         released = release_lock is None
         while True:
+            # Alpha 0.1.8 (item 1): RNS proves every single-destination DATA
+            # packet, and the proof says the same thing the report would --
+            # "I have it" -- with none of the report's own frame, hold or
+            # QUERY behind it. Checked before the wait and again after every
+            # wakeup, since a proof may have landed during the burst.
+            if proved_check is not None and proved_check():
+                self._debug(
+                    f"RAW window to {peer_prefix!r} ({stage}): every packet proved by the far side's RNS "
+                    f"{max(0.0, time.monotonic() - started):.1f}s after the burst -- no report wait, no QUERY."
+                )
+                return _WINDOW_PROVED
             remaining = deadline_s - (time.monotonic() - started)
             if remaining <= 0:
                 got = None
@@ -7038,17 +9044,33 @@ class _ReconcileMixin:
                     if not released:
                         # Phase 1 (2026-09-20): a queued Link handshake takes
                         # the radio; the rest of this wait is radio-free (the
-                        # report future outlives the wait either way).
-                        done, cut = await self._wait_future_or_preempt(fut, remaining)
+                        # report future outlives the wait either way). Item 6
+                        # (alpha 0.1.5): so does a completion REPORT this
+                        # node owes the far sender -- under both-ways load
+                        # it waited 11-13 s behind this very wait.
+                        done, cut = await self._wait_future_or_preempt(
+                            fut, remaining, also_reports=True, extra_events=proved_events)
+                        if cut and proved_check is not None and proved_check():
+                            continue
                         if cut:
                             release_lock()
                             released = True
                             self._debug(
                                 f"report wait ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) released the radio to a "
-                                f"Link handshake after {time.monotonic() - started:.2f}s; still listening for the report."
+                                f"queued Link handshake or completion report after {time.monotonic() - started:.2f}s; "
+                                f"still listening for the report."
                             )
                             continue
                         got = fut.result() if done else None
+                    elif proved_events:
+                        # Radio-free, so no lock event is consulted here
+                        # (one that stayed set would spin): the report
+                        # future against the proof events, whichever first.
+                        got = await self._wait_future_or_proof(fut, remaining, proved_events)
+                        if got is None and (time.monotonic() - started) < deadline_s - 0.001:
+                            # A proof woke this, not the deadline: re-check
+                            # at the top of the loop.
+                            continue
                     else:
                         got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
                 except (asyncio.TimeoutError, Exception):
@@ -7057,11 +9079,31 @@ class _ReconcileMixin:
                 if provisional is not None:
                     got = provisional
                     break
+                if early is not None:
+                    got = early
+                    break
                 self._debug(
                     f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
                     f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
                 )
                 return None
+            arrived_early = on_early is not None and rearm is not None and (
+                done_at_entry or (burst_end is not None and time.monotonic() < burst_end))
+            done_at_entry = False
+            if arrived_early:
+                early_reports += 1
+                early = got
+                still_missing = on_early(got)
+                if not still_missing:
+                    # Everything this window sent is held: nothing to wait for.
+                    break
+                fut = rearm()
+                self._debug(
+                    f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) arrived before the burst "
+                    f"ended on air ({self._radio_busy_remaining_s():.1f}s of own air left) -- applied as progress, "
+                    f"waiting for the receiver's word on the rest."
+                )
+                continue
             if got.entries and window_pkts is not None:
                 # v4 window report (M2): the gaps of every entry that belongs
                 # to this window, as (pkt_id, frag_idx) pairs.
@@ -7086,8 +9128,9 @@ class _ReconcileMixin:
                 )
                 continue
             break
-        waited_s = time.monotonic() - started
+        waited_s = max(0.0, time.monotonic() - started)
         is_provisional = got is provisional
+        acted_on_early = early is not None and got is early and (time.monotonic() - started) >= deadline_s - 0.001
         self._debug(
             f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
             f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
@@ -7097,10 +9140,13 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result",
                 "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
-                "outcome": "reported", "complete": got.complete, "stage": stage,
+                "hop_count": hops,
+                "outcome": "reported_stale" if acted_on_early else "reported", "complete": got.complete, "stage": stage,
                 "timeout_s": round(wait_s, 3), "answer_version": got.version,
                 "held": sorted(got.held) if got.held is not None else None,
+                "entries": [(e[0], e[1], e[2], sorted(e[3]) if e[3] is not None else None) for e in got.entries] or None,
                 "report_wait_s": round(waited_s, 3), "provisional": is_provisional,
+                "early_reports": early_reports,
             })
         return got
 
@@ -7121,9 +9167,9 @@ class _ReconcileMixin:
             return
         if answered or any(i.get("acked") for i in infos):
             # An ANSWER proves the path even if the QUERY's own ACK was lost.
-            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True, path_sample=False)
         elif all(i.get("waited_full_timeout") for i in infos):
-            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True, path_sample=False)
 
     async def _raw_path_reset_mid_send(
         self, peer_prefix: str, path: bytes, pkt_id: int, rnd: int, acked: list, frag_total: int, remember,
@@ -7164,7 +9210,7 @@ class _ReconcileMixin:
 
     class _RawPart:
         __slots__ = ("data", "pkt_id", "chunks", "frag_total", "acked", "resume_key", "expires_at",
-                     "future", "last_progress_at", "resumed", "hop_count", "priority")
+                     "future", "last_progress_at", "resumed", "hop_count", "priority", "proof_key")
 
         def __init__(self, data, pkt_id, expires_at, resume_key, hop_count, priority):
             self.data = data
@@ -7179,9 +9225,13 @@ class _ReconcileMixin:
             self.resumed = False
             self.hop_count = hop_count
             self.priority = priority
+            # Alpha 0.1.8 (item 1): the truncated hash the PROOF for this
+            # packet will carry in its destination field, or None when RNS
+            # does not prove this packet per packet (`_answered_send_key`).
+            self.proof_key = None
 
     class _RawWindow:
-        __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed")
+        __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed", "last_join_at")
 
         def __init__(self, peer_prefix, target):
             self.peer_prefix = peer_prefix
@@ -7190,16 +9240,61 @@ class _ReconcileMixin:
             self.opened_at = time.monotonic()
             self.leader = None
             self.closed = False
+            self.last_join_at = self.opened_at   # item 5: the collect's silence clock
+
+    # Alpha 0.1.5 (item 5): the shortest silence after which a window stops
+    # waiting for more parts -- RNS's Resource sender emits a window's parts
+    # in one loop and the outgoing worker hands them over within a few
+    # loop turns, so a lone packet starts within this.
+    RAW_WINDOW_COLLECT_FLOOR_S = 0.04
+    # How many recent part arrivals per peer feed the spacing estimate.
+    RAW_PART_ARRIVALS_KEPT = 8
 
     def _window_collect_s(self) -> float:
-        """How long a window stays open for further parts after its first
-        (pure function): RNS's Resource sender emits a window's parts within
-        milliseconds and the outgoing worker dequeues one per loop turn, so
-        `direct_raw_window_collect` (0.75 s) gathers a whole RNS window;
-        0 when window batching is off (a single part never waits)."""
+        """The LONGEST a window stays open for further parts after its first
+        (pure function): `direct_raw_window_collect` (0.75 s), the maximum
+        since alpha 0.1.5 (item 5) -- the collect ends earlier once nothing
+        is queued from RNS and no part has joined within the observed
+        inter-part spacing (`_window_collect_continue`); 0 when window
+        batching is off (a single part never waits)."""
         if not self.direct_raw_window_enabled:
             return 0.0
         return max(0.0, self.direct_raw_window_collect_s)
+
+    def _note_raw_part_arrival(self, peer_prefix: str, now: float) -> None:
+        """A raw-eligible part for this peer reached the window machine."""
+        arrivals = self._raw_part_arrivals.setdefault(peer_prefix, collections.deque(maxlen=self.RAW_PART_ARRIVALS_KEPT))
+        arrivals.append(now)
+
+    def _observed_part_spacing_s(self, peer_prefix: str, max_s: float) -> float:
+        """The inter-part spacing of this peer's current transfer (pure over
+        the recorded arrivals, alpha 0.1.5 item 5): twice the median gap
+        between consecutive recent arrivals that fell inside `max_s` (gaps
+        longer than the collect maximum are between windows, not between a
+        window's parts), never below RAW_WINDOW_COLLECT_FLOOR_S nor above
+        `max_s`; the floor alone when nothing has been observed yet."""
+        floor = self.RAW_WINDOW_COLLECT_FLOOR_S
+        arrivals = list(self._raw_part_arrivals.get(peer_prefix, ()))
+        gaps = sorted(b - a for a, b in zip(arrivals, arrivals[1:]) if 0.0 <= b - a < max_s)
+        if not gaps:
+            return min(max_s, floor) if max_s > 0 else 0.0
+        median = gaps[len(gaps) // 2]
+        return max(floor, min(max_s, 2.0 * median))
+
+    def _window_collect_continue(self, now: float, opened_at: float, last_join_at: float, n_parts: int,
+                                 max_parts: int, queue_depth: int, spacing_s: float, max_s: float) -> bool:
+        """Whether the window keeps collecting (pure function, alpha 0.1.5
+        item 5): never past `max_s` from opening or `max_parts` parts; while
+        the outgoing queue still holds packets (RNS's next part may be one
+        of them) or a part joined within the observed inter-part spacing.
+        A lone part -- nothing queued, no join within the spacing -- stops
+        within the floor instead of the 0.75 s maximum, which the
+        zero-hop probe RTT paid on every single packet."""
+        if now - opened_at >= max_s or n_parts >= max_parts:
+            return False
+        if queue_depth > 0:
+            return True
+        return (now - last_join_at) < spacing_s
 
     async def _send_direct_raw_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
@@ -7231,11 +9326,19 @@ class _ReconcileMixin:
             RNS.log(f"{self}: dropping raw DIRECT send to {peer_prefix!r} -- packet expired before its first transmission.", RNS.LOG_WARNING)
             return False
         part = self._RawPart(payload, pkt_id, expires_at, resume_key, hop_count, priority)
+        # Alpha 0.1.8 (item 1): the same key the bare DIRECT path already
+        # uses to stop retrying once the proof lands (`_answered_send_key`,
+        # `_direct.py`) -- a plain DATA to a SINGLE destination only, so a
+        # Link packet's proof (which carries the link_id and so names no
+        # particular packet), a Resource part and an announce all leave it
+        # None and those windows keep reporting as they do today.
+        part.proof_key = self._answered_send_key(payload, self._parse_rns_header(payload))
         part.chunks = chunks
         part.frag_total = len(chunks)
         part.acked, part.resumed = self._resume_state(resume, part.frag_total, pkt_id, peer_prefix, raw=True)
         part.last_progress_at = time.monotonic() if part.resumed else None
         part.future = asyncio.get_running_loop().create_future()
+        self._note_raw_part_arrival(peer_prefix, time.monotonic())
         window = self._raw_windows.get(peer_prefix)
         max_parts = max(1, self.direct_raw_window_max_parts)
         if window is None or window.closed or len(window.parts) >= max_parts or window.target != target:
@@ -7255,8 +9358,72 @@ class _ReconcileMixin:
                         p.future.set_result(None)
             return part.future.result()
         window.parts.append(part)
+        window.last_join_at = time.monotonic()
         self._debug(f"RAW part pkt_id={pkt_id} joined the open window to {peer_prefix!r} ({len(window.parts)} parts).")
         return await part.future
+
+    def _frame_entries(self, frame: "_CompletionFrame") -> tuple:
+        """A completion frame's per-part entries: the v4 list, or the single
+        v1-v3 part as one entry (held None when it carried no bitmap)."""
+        if frame.entries:
+            return tuple(frame.entries)
+        return ((frame.pkt_id, frame.frag_total, frame.complete, self._held_from_answer(frame, frame.frag_total)),)
+
+    def _capture_window_proved(self, peer_prefix: str, parts, stage: str) -> None:
+        """The `proved` outcome, recorded in the same record type the
+        report and the QUERY answer use, so the reconcile accounting stays
+        in one place (alpha 0.1.8, item 1)."""
+        if self._packet_capture_file is None:
+            return
+        for part in parts:
+            self._capture_event("out", {
+                "event": "completion_check_result", "peer_prefix": peer_prefix,
+                "pkt_id": part.pkt_id, "frag_total": part.frag_total,
+                "hop_count": self._receiver_hops_to(peer_prefix),
+                "outcome": "proved", "complete": True, "stage": stage,
+                "timeout_s": None, "answer_version": None, "held": None, "entries": None,
+                "report_wait_s": None, "provisional": False, "early_reports": 0,
+                "proved_by": self._send_answered_by(part.proof_key) if part.proof_key is not None else None,
+            })
+
+    def _mark_part_proved(self, window, part, peer_prefix: str) -> None:
+        """One part of a window completed by the PROOF its packet drew from
+        the far side's RNS, rather than by a completion report (alpha
+        0.1.8, item 1). The same three steps `_apply_window_entries` takes
+        for a part a report completed."""
+        part.acked = [True] * part.frag_total
+        part.last_progress_at = time.monotonic()
+        self._resumable_sends.pop(part.resume_key, None)
+        if not part.future.done():
+            part.future.set_result(True)
+        self._debug(f"RAW part pkt_id={part.pkt_id} to {peer_prefix!r} complete (proof).")
+
+    def _window_proved_parts(self, parts, peer_prefix: str) -> list:
+        """The parts of this window whose packet the far side's RNS has
+        proved, from the signal `_signal_send_answered` already raises for
+        every inbound DIRECT PROOF (`_peers.py`). `proof_key` is None for
+        anything RNS does not prove per packet -- a Resource part, anything
+        inside a Link, an announce -- so those parts never appear here and
+        the window keeps waiting for its report."""
+        proved = []
+        for part in parts:
+            key = getattr(part, "proof_key", None)
+            if key is None or part.future.done():
+                continue
+            if self._answered_send_event(key).is_set():
+                proved.append(part)
+        return proved
+
+    def _window_all_proved(self, parts, peer_prefix: str) -> bool:
+        """True when every part still outstanding has been proved -- the
+        window is complete and neither the report wait nor a QUERY has
+        anything left to ask about."""
+        outstanding = [p for p in parts if not p.future.done()]
+        if not outstanding:
+            return False
+        if any(getattr(p, "proof_key", None) is None for p in outstanding):
+            return False
+        return all(self._answered_send_event(p.proof_key).is_set() for p in outstanding)
 
     def _window_missing(self, parts) -> list:
         """[(part, frag_idx)] still to send, in part order."""
@@ -7297,9 +9464,21 @@ class _ReconcileMixin:
         peer_prefix, target = window.peer_prefix, window.target
         collect_s = self._window_collect_s()
         if collect_s > 0:
-            deadline = time.monotonic() + collect_s
-            while time.monotonic() < deadline and len(window.parts) < max(1, self.direct_raw_window_max_parts):
-                await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            # Item 5 (alpha 0.1.5): adaptive collect -- stop as soon as
+            # nothing is queued from RNS and no part has joined within the
+            # transfer's observed inter-part spacing; `collect_s` is the cap.
+            spacing_s = self._observed_part_spacing_s(peer_prefix, collect_s)
+            while self._window_collect_continue(
+                time.monotonic(), window.opened_at, window.last_join_at, len(window.parts),
+                max(1, self.direct_raw_window_max_parts), self._outqueue.qsize(), spacing_s, collect_s,
+            ):
+                await asyncio.sleep(0.01)
+            if self._packet_capture_file is not None:
+                self._capture_event("out", {
+                    "event": "raw_window_collect", "peer_prefix": peer_prefix, "parts": len(window.parts),
+                    "collect_s": round(time.monotonic() - window.opened_at, 3), "spacing_s": round(spacing_s, 3),
+                    "max_s": collect_s,
+                })
         window.closed = True
         parts = window.parts
         hop_count = parts[0].hop_count
@@ -7325,6 +9504,21 @@ class _ReconcileMixin:
             if slot_held:
                 slot.release()
 
+    @staticmethod
+    def _raw_window_rounds_rule(reconcile_rounds: int, max_rounds_relayed: int, hops: int) -> int:
+        """Burst-and-reconcile rounds a window gets (pure, alpha 0.1.6 item
+        2): `reconcile_rounds` at zero hop; through repeaters the smaller
+        of that and `max_rounds_relayed` (0: no separate cap). The field's
+        two-hop windows ran three rounds of a burst, a report wait and up
+        to two ~18 s QUERY exchanges each while link proofs waited."""
+        rounds = max(1, int(reconcile_rounds))
+        if hops >= 1 and max_rounds_relayed > 0:
+            rounds = max(1, min(rounds, int(max_rounds_relayed)))
+        return rounds
+
+    def _raw_window_rounds(self, gap_hops: int) -> int:
+        return self._raw_window_rounds_rule(self.direct_raw_reconcile_rounds, self.direct_raw_window_max_rounds, gap_hops)
+
     async def _run_raw_window_rounds(self, window, parts, path: bytes, own_prefix: str, hop_count, priority: int, gap_hops: int) -> None:
         peer_prefix, target = window.peer_prefix, window.target
         self._debug(
@@ -7348,7 +9542,7 @@ class _ReconcileMixin:
                 if not p.future.done():
                     p.future.set_result(value)
 
-        rounds = max(1, self.direct_raw_reconcile_rounds)
+        rounds = self._raw_window_rounds(gap_hops)
         query_unanswered_rounds = 0
         empty_answered_bursts = 0
         burst_allowed = True
@@ -7394,6 +9588,7 @@ class _ReconcileMixin:
                 await lock.acquire(priority)
                 lock_held = True
                 yields = 0
+                report_yields = 0
 
                 def release_for_handshake() -> None:
                     nonlocal lock_held
@@ -7452,46 +9647,119 @@ class _ReconcileMixin:
                                 "frag_idx": frag_idx, "frag_total": part.frag_total, "round": rnd, "ok": sent_ok,
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
+                                "gap_s": round(self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame)), 3),
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
+                                "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
-                                "handshake_yields": yields, "window_parts": len(parts),
+                                "handshake_yields": yields, "report_yields": report_yields, "window_parts": len(parts),
                                 "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
-                        gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
-                        if gap_s > 0:
-                            await asyncio.sleep(gap_s)
+                        on_air_bytes = 2 + len(path) + len(frame)
+                        gap_s = self._raw_fragment_gap_s(gap_hops, on_air_bytes)
+                        # 2a: at zero hop, also wait for the radio to catch
+                        # up (bounded firmware queue, loop clock = air clock).
+                        wait_s = self._raw_burst_next_send_wait_s(
+                            gap_hops, gap_s, self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes),
+                            time.monotonic(), self._radio_busy_until,
+                        )
+                        # Always await, even for a zero wait (alpha 0.1.9,
+                        # 2026-09-23). `asyncio.sleep(0)` yields to the loop
+                        # once, which is what lets a report or handshake that
+                        # was queued while this fragment was in flight
+                        # actually register as a waiter before the two checks
+                        # below ask whether one is queued. Skipping the await
+                        # on a zero gap starved them: the loop ran the whole
+                        # burst without ever giving the event loop a turn, so
+                        # `report_requested()` was False at every part
+                        # boundary and the report waited out the entire
+                        # window -- exactly what alpha 0.1.5's item 6 exists
+                        # to prevent. Surfaced while
+                        # `direct_raw_gap_own_airtime` briefly defaulted to
+                        # `no`, which leaves a gap of zero wherever
+                        # `direct_raw_hop_gap_factor` is also 0; the shipped
+                        # factor is 2.0 and the zero-hop gap is 0.15, so no
+                        # shipped configuration hits it, but nothing should
+                        # depend on the gap being nonzero.
+                        await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()
                             if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
                                 fail_rest(False)
                                 return
-                    if yields:
-                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
+                        elif n < len(burst) - 1 and burst[n + 1][0] is not part and lock.report_requested():
+                            # Item 6 (alpha 0.1.5): between two PARTS of the
+                            # window (never inside a part's burst) a
+                            # completion REPORT this node owes the far
+                            # sender goes out first -- under both-ways load
+                            # its report otherwise waits behind the whole
+                            # window (12-15 s observed in the phase-4 slow
+                            # scenario) while the far sender's report wait
+                            # expires and it re-queries. Resumes behind the
+                            # report's tier, ahead of ordinary waiters.
+                            report_yields += 1
+                            await lock.yield_to_preempt(lock.REPORT_YIELDED_PRIORITY)
+                            if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
+                                fail_rest(False)
+                                return
+                    if yields or report_yields:
+                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake "
+                                    f"{yields} time(s) and to a completion report {report_yields} time(s).")
                     if report_fut is not None:
-                        stale_report = None
-                        if report_fut.done() and not report_fut.result().complete:
-                            stale_report = report_fut.result()
-                            report_fut = rearm()
+                        # 2a: the burst ends when the radio is estimated to
+                        # have finished the last queued fragment, not when
+                        # the last send command returned -- the report wait
+                        # and the report-latency estimator both anchor here.
+                        burst_end = max(time.monotonic(), self._radio_busy_until)
                         for p, _ in missing:
-                            self._expect_report(peer_prefix, p.pkt_id, time.monotonic())
+                            self._expect_report(peer_prefix, p.pkt_id, burst_end)
                         last_part, last_idx = missing[-1]
+
+                        def apply_early(frame) -> bool:
+                            # 2c: a report from before the burst's end on
+                            # air (the field's part-8 report) is applied to
+                            # the parts it names; True while parts of this
+                            # window are still missing.
+                            self._apply_window_entries(window, self._frame_entries(frame), "early report")
+                            return bool(self._window_missing(parts))
+
+                        # Alpha 0.1.8 (item 1): the PROOFs this window's own
+                        # packets will draw. `_signal_send_answered` already
+                        # sets these for every inbound DIRECT PROOF; nothing
+                        # was listening on the raw path until now.
+                        proof_keys = [p.proof_key for p, _ in missing if p.proof_key is not None]
+                        proved_events = [self._answered_send_event(k) for k in dict.fromkeys(proof_keys)]
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, last_part.pkt_id, last_part.frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=last_idx, rearm=rearm, release_lock=release_for_handshake,
-                            window_pkts=live_pkts,
+                            window_pkts=live_pkts, burst_end=burst_end, on_early=apply_early,
+                            proved_check=(lambda: self._window_all_proved(parts, peer_prefix)) if proved_events else None,
+                            proved_events=proved_events or None,
                         )
-                        if report is None and stale_report is not None:
-                            report = stale_report
-                            self._capture_completion_check_result(
-                                peer_prefix, last_part.pkt_id, last_part.frag_total, "reported_stale", stale_report.complete,
-                                stage=f"raw{rnd}", answer_version=stale_report.version,
-                                held=sorted(stale_report.held) if stale_report.held is not None else None,
-                            )
                 finally:
                     release_for_handshake()
                 for p, _ in missing:
                     self._completion_query_waiters.pop((peer_prefix, p.pkt_id), None)
+                if report is _WINDOW_PROVED:
+                    # Alpha 0.1.8 (item 1): the window ends here. No report
+                    # wait was spent past the proof, no QUERY is sent, and
+                    # the parts are marked exactly as a report would mark
+                    # them. Path evidence only from a proof the PEER this
+                    # window was addressed to delivered -- the same rule the
+                    # bare path's `answered` outcome applies, since a proof
+                    # relayed by another peer or over CHANNEL says nothing
+                    # about this peer's path.
+                    proved_parts = list(dict.fromkeys(p for p, _ in missing))
+                    for part in proved_parts:
+                        self._mark_part_proved(window, part, peer_prefix)
+                    for p, _ in missing:
+                        self._expect_report(peer_prefix, p.pkt_id, None)
+                    if any(self._send_answered_by(p.proof_key) == peer_prefix
+                           for p in proved_parts if p.proof_key is not None):
+                        self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                    self._raw_incomplete_strikes.pop(peer_prefix, None)
+                    self._capture_window_proved(peer_prefix, proved_parts, stage=f"raw{rnd}")
+                    return
             held_before = sum(sum(p.acked) for p in parts)
             answer = report
             query_infos: list = []
@@ -7523,8 +9791,7 @@ class _ReconcileMixin:
                     fail_rest(False)
                     return
                 continue
-            entries = answer.entries if answer.entries else ((answer.pkt_id, answer.frag_total, answer.complete,
-                                                              self._held_from_answer(answer, answer.frag_total)),)
+            entries = self._frame_entries(answer)
             if all(e[3] is None for e in entries):
                 query_unanswered_rounds += 1
                 consecutive_unanswered += 1
@@ -7795,8 +10062,10 @@ class _ReconcileMixin:
         answer: Optional[_CompletionFrame] = None
         timeout_s = self._completion_query_timeout_s(peer_prefix, hop_count)
         try:
-            frame = self._encode_completion_frame_v4(
+            wire_path_len, wire_rate = self._path_rate_for_wire(peer_prefix)
+            frame = self._encode_completion_frame_v5(
                 self.COMPLETION_TYPE_QUERY, [(p, t, False, None) for p, t in query_entries], nonce=query_nonce,
+                path_len=wire_path_len, rate=wire_rate,
             )
             # First raw field test (2026-09-18 night): the QUERY is one
             # ordinary ACKed exchange -- lock held through its transmit and
@@ -7930,7 +10199,7 @@ class _ReconcileMixin:
             self._capture_completion_check_result(
                 peer_prefix, pkt_id, frag_total, outcome,
                 answer.complete if answer is not None else False,
-                stage=stage, timeout_s=timeout_s,
+                stage=stage, timeout_s=timeout_s, hop_count=hop_count,
                 answer_version=answer.version if answer is not None else None,
                 held=sorted(answer.held) if answer is not None and answer.held is not None else None,
             )
@@ -7956,6 +10225,12 @@ class _ReconcileMixin:
         except ValueError as exc:
             self._debug(f"discarding malformed completion-check frame from {sender_token!r}: {exc}")
             return
+        if frame.peer_path_len is not None:
+            # v5 (alpha 0.1.6, item 1): the sender's path view feeds this
+            # node's scoreboard for the symmetric path.
+            _peer = self._canonical_peer_prefix(sender_token)
+            if _peer is not None:
+                self._note_peer_reported_path(_peer, frame.peer_path_len, frame.peer_rate)
 
         if frame.type == self.COMPLETION_TYPE_QUERY:
             # Step 3 (2026-09-18): answer with what we actually hold, not
@@ -7970,7 +10245,7 @@ class _ReconcileMixin:
                 # one v4 ANSWER lists every part's state.
                 entries = [(p, t) + self._bucket_state(sender_token, p, t) for p, t, _c, _h in frame.entries]
                 self._debug(
-                    f"completion QUERY (v4) from {sender_token!r} for {[(p, t) for p, t, _c, _h in frame.entries]}: "
+                    f"completion QUERY (v{frame.version}) from {sender_token!r} for {[(p, t) for p, t, _c, _h in frame.entries]}: "
                     f"answering {[(p, c, sorted(h)) for p, _t, c, h in entries]}."
                 )
                 if self._packet_capture_file is not None:
@@ -7979,6 +10254,10 @@ class _ReconcileMixin:
                         "pkt_id": frame.pkt_id, "frag_total": frame.frag_total, "query_version": frame.version,
                         "answering_complete": entries[0][2], "answering_held": sorted(entries[0][3]),
                         "entries": [(p, t, c, sorted(h)) for p, t, c, h in entries],
+                        # alpha 0.1.7 (item 4): the v5 header as received
+                        "peer_path_len": frame.peer_path_len,
+                        "peer_rate": round(frame.peer_rate, 3) if frame.peer_rate is not None else None,
+                        "hop_count": self._peer_view_fields(sender_token)["hop_count"],
                     })
                 self._spawn_background_task(
                     self._send_completion_answer(
@@ -8001,6 +10280,9 @@ class _ReconcileMixin:
                     "query_version": frame.version,
                     "answering_complete": complete,
                     "answering_held": sorted(held),
+                    "peer_path_len": frame.peer_path_len,
+                    "peer_rate": round(frame.peer_rate, 3) if frame.peer_rate is not None else None,
+                    "hop_count": self._peer_view_fields(sender_token)["hop_count"],
                 })
             self._spawn_background_task(
                 self._send_completion_answer(
@@ -8139,6 +10421,124 @@ class _ReconcileMixin:
             for k in sorted(table, key=table.get)[: len(table) - 2 * self.COMPLETION_V4_MAX_ENTRIES]:
                 table.pop(k, None)
 
+    # -- Item 1 (alpha 0.1.8): the proof is the completion ---------------
+
+    def _proof_expected_key(self, data: bytes, header) -> Optional[bytes]:
+        """The value the PROOF for this just-delivered packet will carry in
+        its destination field, when RNS proves it per packet at all: a
+        plain DATA to a SINGLE destination, which is what `_answered_send_
+        key` keys the sender's side on. None for everything RNS does not
+        prove one packet at a time -- a Resource part (context RESOURCE;
+        a Resource is proved once, whole, as RESOURCE_PRF), anything else
+        carried inside a Link, and every announce."""
+        if header is None or not data:
+            return None
+        if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
+                and header.destination_type == RNS.Destination.SINGLE):
+            return self._compute_truncated_hash(data, header.header_type)
+        return None
+
+    def _proof_may_replace_report(self, complete_data: bytes, header, sender_token: str,
+                                  peer_prefix: Optional[str]) -> Optional[bytes]:
+        """The proof key to wait for before sending this window's complete
+        report, or None to report exactly as before (alpha 0.1.8, item 1).
+
+        Four gates, each of which would otherwise cost the sender its only
+        signal:
+
+        1. RNS proves this packet per packet (`_proof_expected_key`).
+        2. Its destination is served by this node's own RNS
+           (`_is_local_destination`). On a transport node relaying the
+           packet onward nothing proves it, so no proof is ever coming.
+        3. Nothing else of this sender's recent raw packets is incomplete.
+           The complete report is NOT about one packet: it carries a
+           per-fragment bitmap for every recent pkt_id of this sender
+           (`_recent_raw_entries`), and those bitmaps are how the sender
+           re-drives exactly the missing fragments of its OTHER parts
+           without a QUERY first. A proof says only "this one packet
+           arrived", so while anything else is incomplete the report is
+           worth far more than the proof's latency.
+        4. The sender is a bound peer with a resolved path, so the proof
+           routes back to it DIRECT (`_proof_correlation`'s own gate in
+           `_observe_raw_received_packet`). Without that the proof may go
+           out over CHANNEL, to every peer, or not at all."""
+        if self.proof_report_grace_s <= 0:
+            return None
+        key = self._proof_expected_key(complete_data, header)
+        if key is None:
+            return None
+        if header.destination_hash is None or not self._is_local_destination(header.destination_hash):
+            return None
+        if any(not complete for _pkt, _total, complete, _held in self._recent_raw_entries(sender_token)):
+            return None
+        if peer_prefix is None or peer_prefix not in self._peers or peer_prefix not in self._resolved_paths:
+            return None
+        return key
+
+    def _cancel_proof_grace(self, sender_token: str) -> None:
+        task = self._pending_proof_graces.pop(sender_token, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _hold_report_for_proof(self, sender_token: str, header: "_FrameHeader", proof_key: bytes) -> None:
+        """Hold this window's complete report for `proof_report_grace_s`.
+        If RNS hands the proof over inside it, the proof IS the completion
+        and the report is dropped -- one frame instead of two, and the
+        proof no longer queues behind the report's own relay hold, which at
+        two hops in the 2026-09-22 field session put it on the air about
+        8 s after the packet landed (proof turnaround 17.9 s median, 30.6 s
+        p90). If the grace expires, the report goes exactly as before.
+
+        Nothing here bypasses a hold or shortens one. The 0.1.7 second cut
+        stands untouched: this works by not sending a frame, never by
+        cutting the relay window of one already sent."""
+        self._cancel_proof_grace(sender_token)
+
+        async def grace():
+            try:
+                deadline = time.monotonic() + self.proof_report_grace_s
+                while True:
+                    if self._proof_enqueued_at_for_key(proof_key) is not None:
+                        # Item 1 (alpha 0.1.9): the proof stands in for the
+                        # report, so the packet counts as reported and the
+                        # burst tail's flagged frames do not re-trigger one.
+                        self._note_complete_report_sent(sender_token, header.pkt_id)
+                        self._capture_report_skipped_for_proof(sender_token, header, proof_key)
+                        self._debug(
+                            f"completion REPORT to {sender_token!r} (pkt_id={header.pkt_id}) skipped: RNS proved the "
+                            f"packet inside the {self.proof_report_grace_s:.2f}s grace, and the proof says the same "
+                            f"thing with one frame instead of two."
+                        )
+                        return
+                    if time.monotonic() >= deadline or self.detached or not self.online:
+                        break
+                    await asyncio.sleep(min(self.PROOF_GRACE_POLL_S, max(0.0, deadline - time.monotonic())))
+                self._send_completion_report(
+                    sender_token, header, complete=True, held=set(range(header.frag_total)),
+                    held_s=round(self.proof_report_grace_s, 3),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                RNS.log(f"{self}: proof grace for {sender_token!r} failed: {exc}", RNS.LOG_WARNING)
+            finally:
+                if self._pending_proof_graces.get(sender_token) is task_holder.get("task"):
+                    self._pending_proof_graces.pop(sender_token, None)
+
+        task_holder = {}
+        task_holder["task"] = asyncio.get_running_loop().create_task(grace())
+        self._pending_proof_graces[sender_token] = task_holder["task"]
+
+    def _capture_report_skipped_for_proof(self, sender_token: str, header: "_FrameHeader", proof_key: bytes) -> None:
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", dict({
+            "event": "completion_report_skipped", "peer_prefix": self._canonical_peer_prefix(sender_token),
+            "pkt_id": header.pkt_id, "frag_total": header.frag_total,
+            "report_skipped_for_proof": True, "proof_key": proof_key.hex(),
+            "grace_s": round(self.proof_report_grace_s, 3),
+        }, **self._peer_view_fields(self._canonical_peer_prefix(sender_token))))
+
     def _recent_raw_entries(self, sender_token: str) -> list:
         """The v4 report entries for this sender: (pkt_id, frag_total,
         complete, held) for its recent raw packets, newest first."""
@@ -8151,17 +10551,267 @@ class _ReconcileMixin:
             entries.append((pkt_id, frag_total, complete, held))
         return entries
 
-    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int) -> float:
-        """How long a receiver holds a gaps report after a flagged fragment
-        that left gaps (pure function, phase 3 M1): the time the burst's
-        LAST fragment needs to arrive -- one fragment's airtime plus, through
-        repeaters, the hop-scaled relay gap the sender itself observes
-        between fragments (`_raw_fragment_gap_s`). Field: the complete
-        report followed the gaps report by 0.22-0.43 s at the receiver at
-        zero hop, one fragment airtime (~0.9 s at SF7/BW62.5) covers it."""
+    # Alpha 0.1.5 (2b): the margin, in fragment airtimes, a "still arriving"
+    # hold adds to the sender's spacing for relay and host jitter before the
+    # receiver concludes the burst has ended.
+    RAW_ARRIVING_HOLD_MARGIN_AIRTIMES = 0.5
+    # How many of the sender's start-to-start spacings the hold spans: TWO,
+    # so one lost fragment does not end the silence. MeshBench
+    # `page_transfer` on the first cut (one spacing + the margin, 3.19 s at
+    # one hop against a 2.74 s spacing): the hold fired 8 times, 7 of them
+    # while the sender still had 1-7 frames of its re-drive to send -- the
+    # fragment after the completing one had been lost at the repeater, so
+    # the receiver's silence ran past one spacing mid-burst -- and 0 of the
+    # 8 reports reached the sender (MeshBench: half-duplex / collision at
+    # the repeater). Exactly the collision 2b exists to remove.
+    RAW_ARRIVING_HOLD_SPACINGS = 2.0
+    # Alpha 0.1.6 (item 3): the gaps hold spans ONE sender spacing plus the
+    # margin (it was one airtime at zero hop, the relay gap through
+    # repeaters, with no margin). The 2026-09-21 session: the completing
+    # fragment landed 0.01 s after the 0.91 s hold at zero hop and 0.1-1.55 s
+    # after the 1.93 s hold at two hops, so 6 of 15 receiver reports were a
+    # gaps report and a complete report back to back.
+    RAW_GAPS_HOLD_SPACINGS = 1.0
+
+    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int, arriving: bool = False) -> float:
+        """How long a receiver holds a report (pure function, phase 3 M1;
+        generalised in alpha 0.1.5 2b; the gaps hold widened in alpha 0.1.6
+        item 3).
+
+        Gaps case (`arriving=False`): after a flagged fragment that left
+        gaps, the time the burst's LAST fragment needs to arrive -- one of
+        the sender's start-to-start spacings at this hop count (a fragment's
+        airtime plus `direct_raw_zero_hop_gap` at zero hop; the hop-scaled
+        relay gap, which contains the airtime, through repeaters) plus half
+        an airtime of margin. Field: the complete report followed the gaps
+        report by 0.22-0.43 s at zero hop in the 2026-09-20 session, but in
+        the 2026-09-21 session the completing fragment landed just outside
+        the one-airtime hold (0.01 s at zero hop, up to 1.55 s past the
+        relay-gap hold at two hops).
+
+        Still-arriving case (`arriving=True`): after an UNFLAGGED fragment
+        completed a part, the silence that says the sender's window burst
+        is over -- RAW_ARRIVING_HOLD_SPACINGS (two) of the sender's start-
+        to-start spacings at this hop count (airtime + `direct_raw_zero_
+        hop_gap` at zero hop; the hop-scaled gap, which contains the
+        airtime, through repeaters), so one lost fragment does not end the
+        silence, plus half an airtime for relay and host jitter. Re-armed
+        by every fragment."""
+        airtime = self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
         if hops > 0:
-            return self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
-        return self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
+            hold = self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
+        else:
+            hold = airtime
+        spacing = hold + (max(0.0, self.direct_raw_zero_hop_gap_s) if hops <= 0 else 0.0)
+        spacings = self.RAW_ARRIVING_HOLD_SPACINGS if arriving else self.RAW_GAPS_HOLD_SPACINGS
+        return spacings * spacing + self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+
+    def _proof_tail_hold_s(self, sender_token: str, header: "_FrameHeader", bucket_before,
+                           report_requested: bool, fragment_on_air_bytes: int) -> float:
+        """How long the PROOF that replaces this window's complete report
+        waits for the sender's burst tail (alpha 0.1.9, item 2). 0.0 when
+        the burst is demonstrably over.
+
+        The evidence. At the 2026-09-23 two-hop stop the report was skipped
+        13 times and the proof was keyed within a second of completion, yet
+        its first attempt succeeded 9 of 17 across the session against the
+        path's own 67-69 % -- and bare single-fragment packets' proofs,
+        which have no burst behind them, succeeded 6 of 7 and turned round
+        in 3.8 s against the raw window's 10.0 s. The collision partner is
+        the sender's own burst tail: `_run_raw_window_rounds` appends a
+        part's parity fragment AFTER its data fragments, one
+        `_raw_fragment_gap_s` later (4.63 s at two hops), so when the data
+        fragments complete the packet the parity is still to come. In the
+        four stop-2 cases where the rx-log shows a RAW frame 3.8 to 4.9 s
+        after completion, three of the proofs missed.
+
+        The wait is ONE of the sender's start-to-start spacings plus the
+        half-airtime margin -- `_report_hold_s(..., arriving=False)`, the
+        existing pure rule and its existing constant, not a new one. It is
+        deliberately not the still-arriving hold (`arriving=True`, TWO
+        spacings): that is 9.55 s at two hops against the sender's own
+        report wait of 9.0 s (`direct_raw_report_wait_base` 4.0 plus
+        `direct_raw_report_wait_per_hop` 2.5 per hop), so it would expire
+        the sender's window and provoke the QUERY that alpha 0.1.8's item 1
+        exists to remove. One spacing is 5.00 s at two hops and 3.18 s at
+        one, comfortably inside the wait at every hop count, and it is what
+        the tail actually costs -- we are waiting for one known frame, not
+        for silence.
+
+        This is a hold on a frame NOT YET SENT, so the 0.1.7 second cut is
+        untouched: no hold on a frame already on the air is cut or
+        shortened, and the radio lock is never held across the wait."""
+        if self.proof_report_grace_s <= 0:
+            return 0.0
+        hops = self._receiver_hops_to(sender_token)
+        # Alpha 0.1.9 second pass (item 3): no hold at zero hop. The hold
+        # exists because through repeaters the parity trails the data by a
+        # relay-scaled spacing and the proof is in the relay chain when it
+        # is keyed; at zero hop the parity follows within
+        # `direct_raw_zero_hop_gap` (0.15 s) and there is no chain, so the
+        # hold buys nothing and costs the proof's latency. Zero hop is this
+        # node's OWN path to the sender -- the proof goes over it -- whatever
+        # the peer last reported: session 2 of 2026-09-23 held zero-hop
+        # proofs 1.0 to 2.3 s, the unflagged-completion branch below plus a
+        # stale one-hop peer report in `_receiver_hops_to`.
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        own = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        if hops == 0 or (own is not None and own.out_path_len == 0):
+            return 0.0
+        # Did the sender put a parity fragment behind this part, and has it
+        # arrived? The raw header declares no parity count -- `frag_total`
+        # counts data fragments only -- so this reads the sender's own pure
+        # rules (`_raw_parity_fragments` / `_raw_parity_fits`, and the
+        # `len(idxs) >= 2` condition in `_run_raw_window_rounds`) at this
+        # hop count. `bucket.parity` is non-empty only once a parity frame
+        # has actually landed, which includes the case where the parity
+        # reconstructed the fragment that completed the part.
+        parity_arrived = bool(bucket_before is not None and bucket_before.parity)
+        parity_expected = bool(
+            header.frag_total >= 2
+            and self._raw_parity_fragments(hops) > 0
+            and self._raw_parity_fits(self._direct_raw_payload_budget(hops), hops)
+        )
+        if parity_expected and not parity_arrived:
+            return self._report_hold_s(fragment_on_air_bytes, hops, arriving=False)
+        if not report_requested:
+            # An unflagged fragment completed the part, so the burst has at
+            # least its two flagged frames still to come -- the same
+            # condition that makes the report path schedule rather than
+            # send. One spacing clears the next of them.
+            return self._report_hold_s(fragment_on_air_bytes, hops, arriving=False)
+        # The flagged last frame completed the part and any parity is
+        # already in: nothing of this burst is still due, so the proof goes
+        # now, exactly as in alpha 0.1.8.
+        return 0.0
+
+    def _note_proof_tail_hold(self, proof_key: bytes, sender_token: str, header: "_FrameHeader",
+                              bucket_before, report_requested: bool, fragment_on_air_bytes: int) -> None:
+        """Arm the burst-tail hold for the proof of this packet, keyed by
+        the value that proof carries in its destination field (alpha 0.1.9,
+        item 2). `_send_outgoing_packet` reads it once and clears it."""
+        wait_s = self._proof_tail_hold_s(sender_token, header, bucket_before, report_requested,
+                                         fragment_on_air_bytes)
+        if wait_s <= 0:
+            return
+        key = bytes(proof_key)
+        self._proof_tail_hold_until[key] = time.monotonic() + wait_s
+        while len(self._proof_tail_hold_until) > self.PROOF_TAIL_HOLD_MAX_KEYS:
+            self._proof_tail_hold_until.popitem(last=False)
+
+    def _note_complete_report_sent(self, sender_token: str, pkt_id: Optional[int]) -> None:
+        """The one place that stamps "the sender now knows this packet is
+        complete" -- `_report_recently_sent` reads it, and nothing else
+        does (alpha 0.1.9, item 1: the stamp used to be written inline by
+        `_send_completion_report` alone).
+
+        Alpha 0.1.8's item 1 replaces the complete report with RNS's PROOF
+        when it can, and captured that as `completion_report_skipped` --
+        but it never stamped it, so the parity fragment that follows the
+        completing data fragment one spacing later was treated as a fresh
+        trigger and `_send_completion_report` went out anyway: four times
+        at the 2026-09-23 two-hop stop, `held_s 0.0`, 3.8 to 4.9 s after
+        the skip, queued behind the proof's 11 s ACK timeout. Those skips
+        saved nothing. The proof is the sender's signal in exactly the
+        sense a complete report is, so it stamps the same way."""
+        if pkt_id is None:
+            return
+        self._last_complete_report_at[(sender_token, pkt_id)] = time.monotonic()
+        if len(self._last_complete_report_at) > 256:
+            for k in list(self._last_complete_report_at)[:64]:
+                self._last_complete_report_at.pop(k, None)
+
+    def _report_recently_sent(self, sender_token: str, pkt_id: Optional[int], fragment_on_air_bytes: int) -> bool:
+        """Alpha 0.1.6 (item 3): whether a complete report for this packet
+        went out within the sender's burst tail -- a flagged frame arriving
+        inside that window (the parity fragment behind the completing data
+        fragment, a duplicate relayed twice) is the same burst, not a
+        re-drive, and reporting again is the second report per window the
+        field counted (six of fifteen at zero hop; pairs 0.85-5.4 s apart
+        at two hops). A re-drive comes after the sender's report wait, well
+        past the window, and is reported as before."""
+        if pkt_id is None:
+            return False
+        sent_at = self._last_complete_report_at.get((sender_token, pkt_id))
+        if sent_at is None:
+            return False
+        window = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token), arriving=True)
+        return time.monotonic() - sent_at < window
+
+    def _receiver_hops_to(self, sender_token: str) -> int:
+        """The hop count a receiver scales its report holds by: the larger
+        of its own resolved hop count to the sender and the path length the
+        sender reported in its last "Q" v5 frame (alpha 0.1.6, item 3). The
+        sender's fragment spacing follows the SENDER's path, and the field's
+        two-hop doubles came from a laptop holding at its own one-hop count
+        (1.93 s) while the desktop spaced its fragments for two hops
+        (4.6 s), so the completing fragment landed up to 1.55 s after the
+        hold. 0 when neither is known."""
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        own = max(0, resolved.out_path_len) if resolved is not None else 0
+        board = self._path_boards.get(peer_prefix) if peer_prefix else None
+        reported = board.peer_path_len if board is not None and board.peer_path_len is not None else 0
+        return max(own, reported)
+
+    def _peer_view_fields(self, sender_token: str) -> dict:
+        """Capture fields for the peer's reported view of the path between
+        us (alpha 0.1.7, item 4): this node's own resolved hop count to the
+        sender, and the path length and delivery rate the peer last put in
+        a "Q" v5 header (`_note_peer_reported_path`) -- the numbers the
+        receiver's holds scale by (`_receiver_hops_to`), which the field
+        could not read from the 0.1.6 captures."""
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        board = self._path_boards.get(peer_prefix) if peer_prefix else None
+        return {
+            "hop_count": resolved.out_path_len if resolved is not None else None,
+            "peer_path_len": board.peer_path_len if board is not None else None,
+            "peer_rate": round(board.peer_rate, 3) if board is not None and board.peer_rate is not None else None,
+        }
+
+    def _schedule_sender_report(self, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
+        """Alpha 0.1.5 (2b): a part completed on an unflagged fragment --
+        the sender's window is still in the air. Hold ONE complete report
+        for this sender until its fragments stop arriving for
+        `_report_hold_s(..., arriving=True)`; `_rearm_sender_report` pushes
+        the deadline on every further fragment, and any report that goes
+        out meanwhile (the flagged last fragment's, a gaps report, a
+        duplicate's) supersedes it, since every report lists the sender's
+        recent packets. `header` names the part whose completion is the
+        report's trigger."""
+        if not self.direct_raw_report_enabled:
+            return
+        hold_s = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token), arriving=True)
+        self._cancel_sender_report(sender_token)
+        entry = {"header": header, "frag_bytes": fragment_on_air_bytes, "hold_s": hold_s, "task": None}
+
+        async def fire():
+            try:
+                await asyncio.sleep(hold_s)
+                if self._pending_sender_reports.get(sender_token) is not entry:
+                    return
+                self._pending_sender_reports.pop(sender_token, None)
+                self._send_completion_report(
+                    sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=hold_s,
+                )
+            except asyncio.CancelledError:
+                pass
+
+        entry["task"] = self._spawn_background_task(fire())
+        self._pending_sender_reports[sender_token] = entry
+
+    def _rearm_sender_report(self, sender_token: str) -> None:
+        """Another fragment from this sender: the held report waits again."""
+        entry = self._pending_sender_reports.get(sender_token)
+        if entry is None:
+            return
+        self._schedule_sender_report(sender_token, entry["header"], entry["frag_bytes"])
+
+    def _cancel_sender_report(self, sender_token: str) -> None:
+        entry = self._pending_sender_reports.pop(sender_token, None)
+        if entry is not None and entry.get("task") is not None and not entry["task"].done():
+            entry["task"].cancel()
 
     def _schedule_gaps_report(self, key, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
         """Hold the gaps report for `_report_hold_s` (M1 debounce); if the
@@ -8176,10 +10826,7 @@ class _ReconcileMixin:
         if not self.direct_report_debounce or not self.direct_raw_report_enabled:
             self._send_completion_report(sender_token, header, complete=False, held=held_now())
             return
-        peer_prefix = self._canonical_peer_prefix(sender_token)
-        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
-        hops = max(0, resolved.out_path_len) if resolved is not None else 0
-        hold_s = self._report_hold_s(fragment_on_air_bytes, hops)
+        hold_s = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token))
         self._cancel_gaps_report(key)
 
         async def fire():
@@ -8201,6 +10848,29 @@ class _ReconcileMixin:
         if task is not None and not task.done():
             task.cancel()
 
+    def _report_should_ack(self, sender_token: str) -> bool:
+        """Whether this node's completion REPORT to `sender_token` goes
+        through the ACKNOWLEDGED send path instead of the no-ACK frame
+        (alpha 0.1.8, item 2).
+
+        The threshold reads `_receiver_hops_to`, which is the larger of
+        this node's own resolved path length to the sender and the path
+        length the SENDER reported in its last "Q" v5 header -- the
+        question is how lossy the link is, and the `max()` errs toward
+        acknowledging, which is the safe direction here. It returns 0 when
+        neither is known, so an unknown hop count keeps today's behaviour.
+
+        Why the threshold and not always: at two hops the 2026-09-22 field
+        session had the no-ACK report reach the sender 3 times out of 22,
+        and each miss cost the sender its whole report wait and then a
+        QUERY round (2.1-2.4 s of channel time at two hops) to learn what
+        the report already said; the ACK is about 0.42 s there. At ONE hop
+        reports arrived 33 times of 48 in alpha 0.1.6 and the ACK would
+        cost more than it saves."""
+        if self.direct_report_ack_min_hops <= 0:
+            return False
+        return self._receiver_hops_to(sender_token) >= self.direct_report_ack_min_hops
+
     def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set,
                                 held_s: Optional[float] = None) -> None:
         """Receiver-initiated completion report (2026-09-20): one unsolicited
@@ -8212,6 +10882,16 @@ class _ReconcileMixin:
         path if it is lost. Off when `direct_raw_report_enabled` is no."""
         if not self.direct_raw_report_enabled or header.pkt_id is None:
             return
+        # 2b: every report lists the sender's recent packets, so a report
+        # held for "still arriving" is covered by whichever goes out now.
+        self._cancel_sender_report(sender_token)
+        # Alpha 0.1.8 (item 1): and so is a report held for a proof -- one
+        # report per window, whichever trigger wins (the 0.1.6 item 3 rule).
+        self._cancel_proof_grace(sender_token)
+        if complete:
+            # Item 3 (alpha 0.1.6): a flagged frame of this packet within the
+            # burst tail of this report is not reported again.
+            self._note_complete_report_sent(sender_token, header.pkt_id)
         nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
         self._debug(
             f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
@@ -8222,8 +10902,14 @@ class _ReconcileMixin:
                 "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
                 "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
                 "round": (header.attempt or 0) & 0x03,
-                "held_s": round(held_s, 3) if held_s is not None else None,   # M1 debounce hold, gaps reports only
+                "held_s": round(held_s, 3) if held_s is not None else None,   # the hold this report waited (0.0: at once; item 3)
                 "noack": self.direct_report_noack,
+                # Alpha 0.1.8 (item 2): which carrier this report took.
+                # `report_acked` true means the acknowledged path with one
+                # retry, because this node is at least
+                # `direct_report_ack_min_hops` from the sender.
+                "report_acked": self._report_should_ack(sender_token),
+                **self._peer_view_fields(sender_token),   # alpha 0.1.7 (item 4): what the hold scaled by
             })
         # M2 (2026-09-20): the report lists this sender's recent raw packets
         # (newest first, the triggering one guaranteed), so one report
@@ -8273,14 +10959,20 @@ class _ReconcileMixin:
                 f"no resolvable contact/public_key."
             )
             return
-        if entries and (version is None or version >= 4):
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        # v5 (alpha 0.1.6, item 1): every ANSWER and REPORT carries this
+        # node's path length to the peer and its delivery rate on it.
+        wire_path_len, wire_rate = self._path_rate_for_wire(peer_prefix)
+        if entries and (version is None or version >= 5):
+            frame = self._encode_completion_frame_v5(self.COMPLETION_TYPE_ANSWER, entries, nonce=nonce,
+                                                     path_len=wire_path_len, rate=wire_rate)
+        elif entries and version >= 4:
             frame = self._encode_completion_frame_v4(self.COMPLETION_TYPE_ANSWER, entries, nonce=nonce)
         else:
             frame = self._encode_completion_frame(
                 self.COMPLETION_TYPE_ANSWER, pkt_id, frag_total, complete=complete, nonce=nonce,
-                held=held, version=version,
+                held=held, version=version, path_len=wire_path_len, rate=wire_rate,
             )
-        peer_prefix = self._canonical_peer_prefix(sender_token)
         # Simulation finding (2026-09-19, one-hop raw scenario): this
         # ANSWER used to leave the radio right behind the firmware's own
         # ACK for the QUERY, and through a repeater it reached the chain
@@ -8300,7 +10992,13 @@ class _ReconcileMixin:
         gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
         if gap_s > 0:
             await asyncio.sleep(gap_s)
-        if self.direct_report_noack:
+        # Alpha 0.1.8 (item 2): a REPORT at or above `direct_report_ack_
+        # min_hops` takes the acknowledged carrier instead, with one retry.
+        # Only a report -- a QUERY's ANSWER already has the querier's own
+        # timeout as its recovery path and is not what the field evidence
+        # is about.
+        acked_report = report and self._report_should_ack(sender_token)
+        if self.direct_report_noack and not acked_report:
             # Phase 3 M1 (2026-09-20): TXT_TYPE_CLI_DATA -- delivered, never
             # ACKed; the querier's / sender's next action confirms it.
             try:
@@ -8312,24 +11010,56 @@ class _ReconcileMixin:
             except Exception as exc:
                 self._debug(f"no-ACK completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) failed locally: {exc}.")
             return
+        # Alpha 0.1.8 (item 2): an acknowledged REPORT gets one retry, and
+        # its ACK wait is bounded by how long its answer is still useful to
+        # the sender rather than by the miss ceiling -- at two hops that
+        # ceiling is ~9.4-11 s while the sender's whole report wait is 9 s,
+        # so an unbounded first attempt would put the retry on the air only
+        # after the sender had already given up and started a QUERY round.
+        attempts = 2 if acked_report else 1
+        ack_max_s = self._ack_preempt_floor_s(peer_prefix, hops) if acked_report else None
         try:
-            ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
-                target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
-                priority=self.PRIORITY_ANSWER, time_critical=True,
-                kind="completion_report" if report else "completion_answer",
-                # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
-                # used to run with hop_count=None, i.e. the flat firmware
-                # suggestion, so neither the hop cap nor the abort applied).
-                hop_count=hops,
-                # Phase 1 (2026-09-20): best effort, never retried -- a
-                # queued Link handshake may cut this ACK wait once the
-                # peer's expected ACK time has passed.
-                preemptible=True,
-            )
+            ok = False
+            for attempt in range(attempts):
+                if attempt:
+                    # Re-encode rather than resend the bytes: the report
+                    # body is an absolute snapshot of what this node holds
+                    # (`_recent_raw_entries` reads the buckets live), held
+                    # sets only ever grow, and re-driving fragments the
+                    # receiver has since reconstructed from parity would be
+                    # worse than saying nothing. The round NONCE is kept --
+                    # the sender registered its waiter under that exact
+                    # value -- while the firmware `attempt` byte varies, so
+                    # neither a repeater nor the destination dedups the
+                    # retry against the first transmission.
+                    fresh = self._recent_raw_entries(sender_token)
+                    if not fresh or not any(e[2] for e in fresh):
+                        break      # nothing complete left to tell it about
+                    frame = self._encode_completion_frame_v5(
+                        self.COMPLETION_TYPE_ANSWER, [(p, t, c, h) for p, t, c, h in fresh], nonce=nonce,
+                        path_len=wire_path_len, rate=wire_rate,
+                    )
+                ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
+                    target, frame, ((nonce or 0) + attempt) & 0x03, peer_prefix=peer_prefix,
+                    priority=self.PRIORITY_ANSWER, time_critical=True,
+                    kind="completion_report" if report else "completion_answer",
+                    # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
+                    # used to run with hop_count=None, i.e. the flat firmware
+                    # suggestion, so neither the hop cap nor the abort applied).
+                    hop_count=hops,
+                    # Phase 1 (2026-09-20): best effort, never retried -- a
+                    # queued Link handshake may cut this ACK wait once the
+                    # peer's expected ACK time has passed.
+                    preemptible=True,
+                    report=report,
+                    ack_timeout_max_s=ack_max_s,
+                )
+                if ok:
+                    break
             if not ok:
                 self._debug(
-                    f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) got no ACK -- "
-                    f"not retried; the querier's own timeout is the recovery path."
+                    f"completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) got no ACK "
+                    f"in {attempts} attempt(s) -- the sender's own timeout is the recovery path."
                 )
         except Exception as exc:
             self._debug(
@@ -8415,6 +11145,9 @@ class _ReconcileMixin:
         key = self._reassembly_key(header, sender_token, mode="direct")
         if raw and header.pkt_id is not None:
             self._note_recent_raw_pkt(sender_token, header.pkt_id, header.frag_total)
+            # 2b: this sender is still bursting -- a held complete report
+            # waits for the silence again.
+            self._rearm_sender_report(sender_token)
 
         if raw and parity:
             # M4: a parity fragment. Keep it on the bucket (opening one if
@@ -8424,12 +11157,14 @@ class _ReconcileMixin:
             # take the one path.
             if self._dedup_contains(key):
                 self._incoming_dropped_total += 1
-                if report_requested:
-                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                if report_requested and not self._report_recently_sent(sender_token, header.pkt_id, len(payload) + self.RAW_HEADER_SIZE):
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
                 return
             bucket = self._reassembly.get(key)
             if bucket is None:
                 bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+            if report_requested:
+                bucket.flagged_seen = True
             if len(payload) >= 2:
                 bucket.parity[header.frag_idx] = (payload[0], bytes(payload[1:]))
                 bucket.last_progress = time.monotonic()
@@ -8440,7 +11175,7 @@ class _ReconcileMixin:
                 idx, data = reconstructed
                 self._handle_direct_multifragment_frame(
                     _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
-                    data, sender_token, raw=True, report_requested=report_requested,
+                    data, sender_token, raw=True, report_requested=report_requested or bucket.flagged_seen,
                 )
                 return
             if report_requested and key in self._reassembly:
@@ -8450,25 +11185,34 @@ class _ReconcileMixin:
         if self._dedup_contains(key):
             self._incoming_dropped_total += 1
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
-            if raw and report_requested:
+            if raw and report_requested and not self._report_recently_sent(
+                    sender_token, header.pkt_id, len(payload) + self.RAW_HEADER_SIZE):
                 # Completion report (2026-09-20): a flagged fragment for a
                 # packet already delivered means the sender never got the
                 # report (or a QUERY's answer) and re-burst -- tell it again,
-                # so it stops without a QUERY round trip.
-                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                # so it stops without a QUERY round trip. Not within the
+                # burst tail of a report just sent (item 3, alpha 0.1.6).
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
             return
 
+        # 2b: the burst's tail is here if THIS fragment is flagged or an
+        # earlier flagged frame (data or parity) of this packet was; read
+        # before the bucket is consumed by a completion.
+        bucket_before = self._reassembly.get(key)
+        tail_seen = bool(report_requested or (bucket_before is not None and bucket_before.flagged_seen))
         complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
         if complete_data is None and raw:
-            # M4: a parity that arrived earlier may now cover exactly one gap.
             bucket = self._reassembly.get(key)
+            if bucket is not None and report_requested:
+                bucket.flagged_seen = True   # the bucket may have been opened by this fragment
+            # M4: a parity that arrived earlier may now cover exactly one gap.
             if bucket is not None and bucket.parity:
                 reconstructed = self._reconstruct_from_parity(key, bucket)
                 if reconstructed is not None:
                     idx, data = reconstructed
                     self._handle_direct_multifragment_frame(
                         _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
-                        data, sender_token, raw=True, report_requested=report_requested,
+                        data, sender_token, raw=True, report_requested=report_requested or bucket.flagged_seen,
                     )
                     return
         if complete_data is None:
@@ -8483,14 +11227,42 @@ class _ReconcileMixin:
                 self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
         else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
+            proof_key = None
             if raw:
                 # Report BEFORE RNS sees the packet, so the report enters the
                 # radio lock ahead of whatever RNS sends back (a PROOF, the
                 # next Resource request) and the sender learns first. A gaps
                 # report still held for this bucket is dropped: complete
                 # supersedes it (M1 debounce).
+                #
+                # Alpha 0.1.8 (item 1): with one exception. When RNS is
+                # about to prove this very packet, its PROOF tells the
+                # sender everything the report would, so the report is held
+                # a moment and dropped if the proof appears -- and then RNS
+                # must see the packet FIRST, or there is no proof to wait
+                # for. `_proof_may_replace_report` states the four gates.
                 self._cancel_gaps_report(key)
-                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                rns_header = self._parse_rns_header(complete_data)
+                proof_key = self._proof_may_replace_report(complete_data, rns_header, sender_token, peer_prefix)
+                if proof_key is not None:
+                    # Item 2 (alpha 0.1.9): register the burst-tail hold
+                    # BEFORE handing the packet to RNS, because RNS queues
+                    # the proof synchronously inside `process_incoming` and
+                    # the outgoing worker may dispatch it at this callback's
+                    # next await. Nothing here transmits or holds the radio.
+                    self._note_proof_tail_hold(
+                        proof_key, sender_token, header, bucket_before, report_requested,
+                        len(payload) + self.RAW_HEADER_SIZE,
+                    )
+                    pass          # decided below, after process_incoming
+                elif tail_seen or not self.direct_report_hold_during_burst:
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
+                else:
+                    # 2b: an unflagged fragment completed this part, so the
+                    # sender's window is still on the air -- one report for
+                    # the whole window once its fragments stop arriving,
+                    # unless the flagged last fragment reports first.
+                    self._schedule_sender_report(sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
             else:
@@ -8505,6 +11277,18 @@ class _ReconcileMixin:
                 complete_data, transport="direct_raw_multifragment" if raw else "direct_multifragment",
                 sender_peer_prefix=peer_prefix, frag_total=header.frag_total, pkt_id=header.pkt_id,
             )
+            if proof_key is not None:
+                # RNS has the packet now. On the installed RNS the proof is
+                # queued within milliseconds (`Transport.inbound` is
+                # synchronous and LXMF's `delivery_packet` proves on its
+                # first line); the grace covers RNS 1.5's inbound queue and
+                # a loaded host, and expires into the report as before.
+                if self._proof_enqueued_at_for_key(proof_key) is not None:
+                    # Item 1 (alpha 0.1.9): see `_note_complete_report_sent`.
+                    self._note_complete_report_sent(sender_token, header.pkt_id)
+                    self._capture_report_skipped_for_proof(sender_token, header, proof_key)
+                else:
+                    self._hold_report_for_proof(sender_token, header, proof_key)
 
     # -- Reassembly (docs/reliability_engine_design.md §5) ----------------
 
@@ -8667,6 +11451,10 @@ class _ReconcileMixin:
                 self._pending_link_request_sweep(now)
                 self._send_answered_sweep(now)
                 self._announce_cache_sweep(now)
+                # Alpha 0.1.8 (item 4): persist it here rather than at
+                # detach, so an unclean exit (the field's restarts) still
+                # leaves a usable file. A no-op unless something changed.
+                self._save_announce_cache()
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
                 self._closed_links_sweep(now)
@@ -8693,6 +11481,11 @@ class _ReconcileMixin:
         expired = [h for h, (_peer, expiry) in self._proof_correlation.items() if now >= expiry]
         for h in expired:
             del self._proof_correlation[h]
+        # Alpha 0.1.7 (item 1): a proof older than proof_max_age (or 120 s
+        # with that disabled) is no longer in the queue either way.
+        max_age = self.proof_max_age_s if self.proof_max_age_s > 0 else 120.0
+        for h in [h for h, t in self._proof_enqueued_at.items() if now - t > max_age]:
+            del self._proof_enqueued_at[h]
 
     # -- Whole-packet dedup (docs/reliability_engine_design.md §7) --------
 
@@ -8838,8 +11631,11 @@ class _RoutingMixin:
                 RNS.LOG_WARNING,
             )
         seq = next(self._outqueue_seq)
+        enqueued_at = time.monotonic()
         try:
-            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic(), inflight_key))
+            self._outqueue.put_nowait((priority, seq, raw, header, enqueued_at, inflight_key))
+            if header is not None and header.destination_hash and self._plain_proof(header):
+                self._note_proof_enqueued(header.destination_hash, enqueued_at)
         except queue.Full:
             self._release_inflight(inflight_key)
             self._outgoing_dropped_total += 1
@@ -9159,6 +11955,109 @@ class _RoutingMixin:
             self._unknown_dest_backoff_until.pop(h, None)
             self._unknown_dest_last_attempt.pop(h, None)
 
+    # -- The announce cache across restarts (alpha 0.1.8, item 4) --------
+
+    def _announce_cache_file_path(self) -> Optional[str]:
+        """Beside the peer cache, under `RNS.Reticulum.storagepath` and by
+        the same rules (`_peer_cache_file_path`)."""
+        if self.announce_cache_path:
+            return self.announce_cache_path
+        base = getattr(RNS, "Reticulum", None)
+        base = getattr(base, "storagepath", None) if base is not None else None
+        if not base:
+            return None
+        return os.path.join(base, "smci_announces.json")
+
+    def _load_announce_cache(self) -> None:
+        """Restore the announce cache at start, so a restart does not put
+        a path request on the air for every destination this node already
+        holds an announce for. The laptop restarted three times in the
+        2026-09-22 evening session and each restart at two hops cost about
+        three minutes of path requests (8 transmitted and 9 rate-limited
+        between 22:29:07 and 22:32:33), answered by the desktop with
+        three-fragment announce windows through two repeaters -- for
+        destinations the desktop had announced before 22:20 and the laptop
+        had already cached in its previous process.
+
+        Ages are persisted as wall-clock (`time.time()`), since
+        `time.monotonic()` has no meaning across a restart, and converted
+        back on load. An entry older than `announce_cache_ttl` is dropped
+        here exactly as `_announce_cache_sweep` would drop it -- that TTL
+        (an hour by default) is the age cap, and it is far inside RNS's
+        own: `Transport.PATHFINDER_E` keeps a restored path a week,
+        `AP_PATH_TIME` a day and `ROAMING_PATH_TIME` six hours
+        (`RNS/Transport.py`), and RNS restores each entry with its own
+        original timestamp and expiry rather than refreshing it.
+
+        Each restored entry is stamped as verified AT THE RESTORE INSTANT
+        rather than at its original cache time: coming up is not evidence
+        that the destination died, so the first request after a restart is
+        answered from the cache and the next over-the-air verification
+        falls due one interval later."""
+        if self.announce_cache_ttl_s <= 0:
+            return
+        path = self._announce_cache_file_path()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            now_wall, now_mono = time.time(), time.monotonic()
+            restored = dropped = 0
+            for entry in data.get("announces", [])[-self.ANNOUNCE_CACHE_MAX_KEYS:]:
+                try:
+                    dst = bytes.fromhex(str(entry["destination_hash"]))
+                    raw = bytes.fromhex(str(entry["raw"]))
+                    source_peer = str(entry["source_peer"])
+                    age_s = now_wall - float(entry["cached_at_wall"])
+                except (KeyError, ValueError, TypeError):
+                    dropped += 1
+                    continue
+                if not dst or not raw or age_s < 0 or age_s > self.announce_cache_ttl_s:
+                    dropped += 1
+                    continue
+                self._announce_cache[dst] = (raw, now_mono - age_s, source_peer, now_mono)
+                restored += 1
+            RNS.log(
+                f"{self}: restored {restored} cached announce(s) from {path}"
+                + (f" ({dropped} dropped as stale or unreadable)." if dropped else "."),
+                RNS.LOG_DEBUG,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to load the announce cache ({path}): {exc} -- "
+                f"starting with an empty one.",
+                RNS.LOG_WARNING,
+            )
+
+    def _save_announce_cache(self) -> None:
+        """Written the way the peer cache is (tmp file + os.replace), and
+        only when something changed since the last write."""
+        if self.announce_cache_ttl_s <= 0 or not self._announce_cache_dirty:
+            return
+        path = self._announce_cache_file_path()
+        if not path:
+            return
+        try:
+            now_wall, now_mono = time.time(), time.monotonic()
+            data = {"announces": [
+                {
+                    "destination_hash": dst.hex(),
+                    "raw": raw.hex(),
+                    "source_peer": source_peer,
+                    "cached_at_wall": now_wall - (now_mono - cached_at),
+                }
+                for dst, (raw, cached_at, source_peer, _verified_at) in self._announce_cache.items()
+                if now_mono - cached_at <= self.announce_cache_ttl_s
+            ]}
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+            self._announce_cache_dirty = False
+        except Exception as exc:
+            RNS.log(f"{self}: failed to save the announce cache ({path}): {exc}", RNS.LOG_WARNING)
+
     def _cache_announce(self, data: bytes, header: Optional[_RnsHeader], sender_peer_prefix: Optional[str]) -> None:
         """Remember an ANNOUNCE a bound peer delivered DIRECT (phase 1,
         2026-09-20), bytes exactly as received. CHANNEL announces are never
@@ -9168,13 +12067,21 @@ class _RoutingMixin:
                 or sender_peer_prefix is None or sender_peer_prefix not in self._peers
                 or self.announce_cache_ttl_s <= 0):
             return
+        now = time.monotonic()
         self._announce_cache.pop(header.destination_hash, None)
-        self._announce_cache[header.destination_hash] = (bytes(data), time.monotonic(), sender_peer_prefix)
+        # Alpha 0.1.8 (item 4): the fourth field is when this destination
+        # was last VERIFIED -- a live announce is itself a verification, so
+        # it starts equal to the cache time; a restored entry is stamped
+        # with the restore instant (`_load_announce_cache`) and a path
+        # request that goes on the air re-stamps it. It is deliberately
+        # separate from the cache time, which stays truthful for the TTL.
+        self._announce_cache[header.destination_hash] = (bytes(data), now, sender_peer_prefix, now)
         while len(self._announce_cache) > self.ANNOUNCE_CACHE_MAX_KEYS:
             self._announce_cache.popitem(last=False)
+        self._announce_cache_dirty = True
 
     def _announce_cache_sweep(self, now: float) -> None:
-        stale = [k for k, (_raw, t, _src) in self._announce_cache.items() if now - t > self.announce_cache_ttl_s]
+        stale = [k for k, entry in self._announce_cache.items() if now - entry[1] > self.announce_cache_ttl_s]
         for k in stale:
             del self._announce_cache[k]
         stale = [k for k, t in self._path_request_local_answer_at.items() if now - t > self.path_request_local_answer_min_interval_s]
@@ -9194,17 +12101,27 @@ class _RoutingMixin:
         entry = self._announce_cache.get(requested_hash)
         if entry is None:
             return None
-        raw, cached_at, source_peer = entry
+        raw, cached_at, source_peer, verified_at = entry
         now = time.monotonic()
         if now - cached_at > self.announce_cache_ttl_s:
             self._announce_cache.pop(requested_hash, None)
             return None
         if source_peer not in self._peers or self._path_discovery_in_backoff(source_peer):
             return None
-        last = self._path_request_local_answer_at.get(requested_hash)
-        if last is not None and now - last < self.path_request_local_answer_min_interval_s:
-            # The second re-request inside the interval is the one that
-            # verifies the destination over the air.
+        if now - verified_at >= self.path_request_local_answer_min_interval_s:
+            # Alpha 0.1.8 (item 4): ONE verification per interval goes over
+            # the air; every other request in between is answered from the
+            # cache. This is the inverse of the 0.1.6 rule, which capped the
+            # LOCAL answers at one per interval and let everything else
+            # transmit -- with RNS re-requesting every 30-70 s, that put the
+            # majority on the air. The laptop's 2026-09-22 capture, for the
+            # one destination `6b9f66014d98` over an hour: 20 requests
+            # transmitted against 12 answered locally, and the pair at
+            # 22:37:02 / 22:37:38 went out 70 s and 106 s after a local
+            # answer for exactly that reason. The verification itself is
+            # kept -- a genuinely dead destination must still be re-checked
+            # (the 0.1.6 rule's purpose) -- it is now rate-limited instead
+            # of inverted. `_note_path_request_on_air` re-stamps it.
             return None
         header = self._parse_rns_header(raw)
         if header is None:
@@ -9224,6 +12141,17 @@ class _RoutingMixin:
         self._path_request_local_answer_at[requested_hash] = now
         self.process_incoming(bytes(answer), transport="local_announce_cache", sender_peer_prefix=source_peer)
         return source_peer
+
+    def _note_path_request_on_air(self, requested_hash: Optional[bytes]) -> None:
+        """A path request for `requested_hash` is being transmitted: that
+        IS the periodic verification, so the cached announce may answer
+        every request for the next `path_request_local_answer_min_interval`
+        (alpha 0.1.8, item 4)."""
+        if requested_hash is None:
+            return
+        entry = self._announce_cache.get(requested_hash)
+        if entry is not None:
+            self._announce_cache[requested_hash] = entry[:3] + (time.monotonic(),)
 
     def _path_request_rate_limited(self, requested_hash: Optional[bytes]) -> bool:
         """PATH_REQUEST_RATE_LIMIT_WINDOW_S -- same shape and fail-open
@@ -9362,6 +12290,21 @@ class _RoutingMixin:
             f"destination_hash={header.destination_hash.hex() if header and header.destination_hash else None}."
         )
 
+        # Alpha 0.1.9 (item 2): a PROOF that replaced a window's complete
+        # report waits out the sender's burst tail before it is dispatched.
+        # See `_proof_tail_hold_s` for why one fragment spacing and why
+        # this does not touch the 0.1.7 second cut (nothing is on the air
+        # yet, so no hold is being cut).
+        tail_hold_s = self._proof_tail_hold_remaining(header)
+        if tail_hold_s > 0:
+            self._capture_outgoing(header, data, "proof_tail_hold")
+            task = self._spawn_background_task(
+                self._send_proof_after_burst_tail(data, header, tail_hold_s, expires_at)
+            )
+            if spawned is not None:
+                spawned.append(task)
+            return
+
         # User-requested fix (2026-09-15, real NomadNet field testing):
         # RNS.Link's own keepalive/staleness timing (Link.py) is computed
         # exactly once, from the initial LINK_REQUEST<->LRPROOF handshake
@@ -9463,6 +12406,8 @@ class _RoutingMixin:
                 )
                 return
             answered_from = self._answer_path_request_locally(requested)
+            if answered_from is None:
+                self._note_path_request_on_air(requested)
             if answered_from is not None:
                 # Phase 1 (2026-09-20): answered from the cached announce,
                 # nothing transmitted -- see announce_cache_ttl.
@@ -9491,20 +12436,81 @@ class _RoutingMixin:
 
         await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=spawned)
 
+    def _proof_tail_hold_remaining(self, header: Optional[_RnsHeader]) -> float:
+        """Seconds this plain PROOF still owes the sender's burst tail, and
+        0.0 for everything else (alpha 0.1.9, item 2). Reads the deadline
+        the receiver armed in `_note_proof_tail_hold` and CLEARS it, so one
+        proof waits once: a small-mesh DIRECT-to-all proof goes to several
+        peers off one queue entry, and the tail belongs to the one sender
+        whose window this proof completes."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return 0.0
+        deadline = self._proof_tail_hold_until.pop(bytes(header.destination_hash), None)
+        if deadline is None:
+            return 0.0
+        return max(0.0, deadline - time.monotonic())
+
+    async def _send_proof_after_burst_tail(
+        self, data: bytes, header: _RnsHeader, wait_s: float, expires_at: Optional[float] = None,
+    ) -> None:
+        """Sleep out the sender's burst tail, then dispatch the proof
+        normally (alpha 0.1.9, item 2). Shaped exactly like
+        `_send_delayed_link_proof`: the sleep happens in a spawned task so
+        the outgoing worker keeps draining, the radio lock is never held
+        across it, and whatever the dispatch spawns is awaited here so the
+        packet's in-flight entry covers the whole send.
+
+        The wait is recorded for the attempt record rather than passed
+        down, mirroring how `proof_enqueued_at` is looked up per attempt."""
+        key = bytes(header.destination_hash) if header.destination_hash else None
+        try:
+            await asyncio.sleep(wait_s)
+            if self.detached or not self.online:
+                return
+            if key is not None:
+                self._proof_tail_hold_waited[key] = round(wait_s, 3)
+                while len(self._proof_tail_hold_waited) > self.PROOF_TAIL_HOLD_MAX_KEYS:
+                    self._proof_tail_hold_waited.popitem(last=False)
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if key is not None:
+                self._proof_tail_hold_waited.pop(key, None)
+
     async def _send_delayed_link_proof(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
     ) -> None:
-        await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
-        if self.detached or not self.online:
-            return
-        inner: list = []
-        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
-        # Finish everything the dispatch spawned before this task ends, so
-        # the packet's in-flight entry (released when THIS task finishes)
-        # really covers the whole send.
-        live = [t for t in inner if t is not None]
-        if live:
-            await asyncio.gather(*live, return_exceptions=True)
+        # Alpha 0.1.6 (item 2): registered for supersession for the whole
+        # delay and send, so a newer LINKREQUEST from the peer expires it.
+        link_id = bytes(header.destination_hash) if header.destination_hash else None
+        peer = self._rns_token_peer.get(header.destination_hash) if link_id is not None else None
+        if peer is not None:
+            self._pending_link_proofs.setdefault(peer, set()).add(link_id)
+        try:
+            await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
+            if self.detached or not self.online:
+                return
+            if peer is not None and self._send_superseded(self.LRPROOF_KEY_PREFIX + link_id):
+                self._capture_outgoing(header, data, "lrproof_superseded")
+                return
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            # Finish everything the dispatch spawned before this task ends, so
+            # the packet's in-flight entry (released when THIS task finishes)
+            # really covers the whole send.
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if peer is not None:
+                pending = self._pending_link_proofs.get(peer)
+                if pending is not None:
+                    pending.discard(link_id)
+                    if not pending:
+                        self._pending_link_proofs.pop(peer, None)
 
     async def _dispatch_outgoing_packet(
         self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
@@ -9896,7 +12902,10 @@ class _RoutingMixin:
         `_send_direct_to_all_peers`, which is the one caller that has no
         broadcast running alongside to cover for a False and therefore needs
         to know)."""
-        resolved = self._resolved_paths.get(peer_prefix)
+        # Alpha 0.1.6 (item 1): the same scoreboard decision `_send_direct_
+        # packet` makes -- this is the other place a send decides resolved-
+        # versus-discover (a DIRECT-to-all copy never reaches it).
+        resolved = await self._select_path(peer_prefix)
         if resolved is None:
             if not trigger_discovery:
                 return False
@@ -10730,6 +13739,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # Wire shape: "Q" + Z85([ver:1][type:1][complete:1][pkt_id_hi:1]
     # [pkt_id_lo:1][frag_total:1]), 6 raw bytes -> 10 characters on the
     # wire, comfortably one DIRECT bare message under any realistic budget.
+    LRPROOF_KEY_PREFIX = b"LRP:"   # the answered-send key of an LRPROOF is this + its link_id (alpha 0.1.6 item 2)
     COMPLETION_MARKER = "Q"
     # Step 3 (2026-09-18): v2 ANSWER frames append a have-bitmap
     # (ceil(frag_total/8) bytes, bit i set = receiver holds frag_idx i)
@@ -10763,11 +13773,18 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # build for window reports (a v3 peer drops the v4 frame as an
     # unsupported version and the sender falls back to its v4 QUERY, which
     # that peer drops too -- the same all-or-nothing as v3 was).
-    COMPLETION_PROTOCOL_VERSION = 4
+    COMPLETION_PROTOCOL_VERSION = 5
+    COMPLETION_PROTOCOL_VERSION_V4 = 4
     COMPLETION_PROTOCOL_VERSION_V3 = 3
     COMPLETION_PROTOCOL_VERSION_V2 = 2
     COMPLETION_PROTOCOL_VERSION_V1 = 1
     COMPLETION_V4_HEADER_SIZE = 4   # ver+type+n+nonce
+    # v5 (alpha 0.1.6, item 1): the v4 header plus the sender's path length
+    # to the receiver (0xFF: none) and its delivery rate on it in 1/250
+    # steps (0xFF: untried) -- the peer's view for the path scoreboard.
+    COMPLETION_V5_HEADER_SIZE = 6   # ver+type+n+nonce+path_len+rate
+    COMPLETION_PATH_UNKNOWN = 0xFF
+    COMPLETION_RATE_SCALE = 250
     COMPLETION_V4_MAX_ENTRIES = 8
     # A v4 REPORT lists the sender's raw packets seen within this span
     # (M2): longer than a window burst plus its report wait at three hops.
@@ -10858,6 +13875,14 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # tens of destinations per hour, so this only ever trims pathological
     # growth over days of uptime, never a working set.
     RNS_TOKEN_PEER_MAX_KEYS = 4096
+    # Alpha 0.1.7 (item 1): queue times of recent plain PROOFs
+    # (`_proof_enqueued_at`); the field's worst backlog was 13 proofs.
+    PROOF_ENQUEUED_MAX_KEYS = 64
+    # Alpha 0.1.9 (item 2): deadlines of proofs waiting out the sender's
+    # burst tail (`_proof_tail_hold_until`). Same order of magnitude as the
+    # proof backlog above; one entry per window whose report a proof
+    # replaced, cleared as each proof is dispatched.
+    PROOF_TAIL_HOLD_MAX_KEYS = 64
 
     # Audit fix (2026-09-19): how many post-bind path-discovery rounds
     # `_discover_path_after_bind` runs before leaving it to real traffic.
@@ -10954,6 +13979,14 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
 
         self.owner = owner
         cfg = configuration
+        # 0.1.0: what a capture file's header records -- the keys the
+        # config block gave, and every setting the _configure_* calls
+        # below produce (defaults included).
+        try:
+            self._config_given = dict(cfg)
+        except Exception:
+            self._config_given = {}
+        settings_before = set(vars(self))
 
         self._configure_identity(cfg)
         self._configure_transport(cfg)
@@ -10964,6 +13997,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         self._configure_path_discovery(cfg)
         self._configure_peer_discovery(cfg)
         self._configure_observability(cfg)
+        self._settings_at_start = self._settings_snapshot(settings_before)
         # Field-diagnosed fix (2026-09-18, see module docstring): these
         # timing knobs are spread across five different _configure_*
         # methods above, each independently tunable, but they aren't
@@ -10982,6 +14016,23 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # base class's None default, even if this constructor's connection
         # attempt below fails and the interface stays offline.
         self.HW_MTU = RNS.Reticulum.MTU
+        # RNS 1.5 reads `ifac_size` on EVERY inbound frame
+        # (`Transport.preprocess_inbound`: `len(raw) > interface.HW_MTU +
+        # (interface.ifac_size or 0)`), and it is set by `RNS.Reticulum`
+        # when IT configures an interface from the config file -- None when
+        # no IFAC is configured (`RNS/Reticulum.py`). So under `rnsd` this
+        # attribute already exists and the assignment below is shadowed by
+        # the instance value Reticulum sets. It matters for every path that
+        # constructs this interface WITHOUT Reticulum: the hardware scripts
+        # in `testscripts/` that build a SmartMeshCoreInterface directly
+        # (`zero_hop_peer_discovery_test.py` and friends) and the hermetic
+        # unit tests, which on RNS 1.5.4 raised AttributeError on the first
+        # inbound packet. Set here rather than left to the base class
+        # because the base class does not define it (verified against both
+        # the installed 1.5.4 and the 1.5.2 copy in `referenceprojects/`).
+        # Added 2026-09-23 with alpha 0.1.9.
+        if not hasattr(self, "ifac_size"):
+            self.ifac_size = None
 
         # --- Internal async/threading state -----------------------------
         # `self._mc` itself stays a plain, genuinely-Optional attribute --
@@ -11058,6 +14109,22 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # telling a repeater's echo of our frame apart from unrelated
         # traffic once real captures exist to check that against.
         self._last_own_tx_at = None
+        # Alpha 0.1.5 (2a, 2026-09-21): when this node's radio is estimated
+        # to finish transmitting everything it has been handed. Every keyed
+        # frame extends it by its own airtime from the later of now and the
+        # previous value (`_note_radio_keyed`, in `_pre_transmit_gate`):
+        # `send_raw_data` / `send_msg` return when the frame is QUEUED, so a
+        # zero-hop burst of 15 fragments was "sent" in 2.6 s while the
+        # radio needed ~14 s -- the window's burst end, the report wait,
+        # the report estimator and `since_own_tx_s` all read this instead.
+        self._radio_busy_until = 0.0
+        # Alpha 0.1.5 (item 8): the interface's own summed airtime estimate
+        # and frame count since start, written beside the firmware's measured
+        # transmit time in every `radio_stats` record.
+        self._estimated_tx_air_total_s = 0.0
+        self._frames_keyed_total = 0
+        self._radio_stats_task = None
+        self._radio_stats_unsupported = False
         # Step 2 (2026-09-18): per-peer measured ACK RTT -- peer_prefix ->
         # {"srtt", "rttvar", "samples", "last_rtt"}; see _record_ack_rtt/
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on
@@ -11112,6 +14179,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # extends. Always maintained; only acted on when rx_log_holds_
         # enabled (see that config's own comment).
         self._radio_params = None
+        # 0.1.0: the last SELF_INFO payload, and the radio fields the
+        # capture last recorded (a `radio_settings` record follows a change).
+        self._self_info = None
+        self._captured_radio = None
         self._medium_busy_until = 0.0
         self._medium_busy_reason = None
         self._stats_task = None
@@ -11258,6 +14329,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # See _answered_send_key / _signal_send_answered.
         self._send_answered_events = {}
         self._send_answered_at = {}
+        self._send_answered_how = {}      # key -> how it was answered ("superseded" is a drop, alpha 0.1.6 item 2)
+        # Alpha 0.1.6 (item 2): peer prefix -> {link_id} of LRPROOFs queued
+        # or in flight to that peer (`_supersede_link_proofs`).
+        self._pending_link_proofs = {}
         # Phase 1 (2026-09-20): destination_hash -> (announce bytes as
         # received, time.monotonic(), source peer prefix) for every ANNOUNCE
         # a bound peer delivered to RNS through this interface (LRU,
@@ -11266,14 +14341,38 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # _answer_path_request_locally.
         self._announce_cache = collections.OrderedDict()
         self._path_request_local_answer_at = {}
+        # Alpha 0.1.8 (item 4): the cache is persisted under
+        # RNS.Reticulum.storagepath and restored at start, so a restart
+        # does not re-request destinations this node already holds an
+        # announce for. Set whenever an entry is added.
+        self._announce_cache_dirty = False
+        self._announce_cache_loaded = False
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
+        # Alpha 0.1.8 (item 1): sender token -> the task holding a complete
+        # report for `proof_report_grace_s` while RNS decides whether to
+        # prove the packet. Cancelled whenever a report for that sender
+        # goes out for any other reason.
+        self._pending_proof_graces = {}
+        # Alpha 0.1.5 (2b): sender token -> {"task", "header", "frag_bytes"}
+        # for a complete report held while that sender's fragments are still
+        # arriving; re-armed by every fragment, superseded by any report.
+        self._pending_sender_reports = {}
+        # Alpha 0.1.6 (item 3): (sender token, pkt_id) -> when a complete
+        # report for it last went out (`_report_recently_sent`).
+        self._last_complete_report_at = {}
         # Phase 3 M2 (2026-09-20): peer prefix -> the open _RawWindow parts
         # join; sender token -> {(pkt_id, frag_total): last seen} for the
         # v4 report's entries.
         self._raw_windows = {}
         self._recent_raw_pkts = {}
+        # Alpha 0.1.5 (item 5): peer prefix -> recent raw part arrival times
+        # (monotonic), the window collect's inter-part spacing estimate.
+        self._raw_part_arrivals = {}
+        # Alpha 0.1.6 (item 1): peer prefix -> `_PathBoard`, the scoreboard
+        # of candidate paths to that peer (`_paths.py`).
+        self._path_boards = {}
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 
@@ -11358,23 +14457,53 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # it did before the token was ever learned.
         self._rns_token_peer = collections.OrderedDict()
         self._proof_correlation = {}
+        # Alpha 0.1.7 (item 1): when each queued plain PROOF was handed to
+        # this interface, keyed by its destination field (the proved
+        # packet's truncated hash, or the link_id), so its age is known at
+        # every attempt (`_send_direct_with_attempts`, proof_fresh_s).
+        # Bounded; entries older than proof_max_age are swept with the
+        # proof correlations.
+        self._proof_enqueued_at = collections.OrderedDict()
+        # Alpha 0.1.9 (item 2): proof key (the value the PROOF carries in
+        # its destination field) -> the monotonic deadline until which that
+        # proof waits for the sender's burst tail, and, once it has waited,
+        # how long it actually waited so the attempt record can carry it
+        # (`proof_tail_hold_s`). Both bounded by PROOF_TAIL_HOLD_MAX_KEYS.
+        self._proof_tail_hold_until = collections.OrderedDict()
+        self._proof_tail_hold_waited = collections.OrderedDict()
 
+        # Alpha 0.1.6 (item 4): the connection supervisor's state.
+        self._supervisor_task = None
+        self._startup_gate = None
+        self._detach_event = None
+        self._disconnect_event = None
+        self._disconnect_reason = None
+        self._connection_state = "init"
+        self._peer_cache_loaded = False
+        self._pending_capture_events = []
+        self._serial_noise_times = collections.deque()
+        self._serial_noise_total = 0
+        self._serial_noise_warned_at = 0.0
         self._setup_done = threading.Event()
 
         self._load_meshcore_or_panic()
         self._start_async_bridge()
 
+        # Alpha 0.1.6 (item 4): this returns once the port is open (or the
+        # first attempt failed); the handshake and setup run on the loop
+        # and the supervisor retries forever, so rnsd's startup is never
+        # held for a rebooting radio.
         if not self._setup_done.wait(timeout=self.SETUP_TIMEOUT_S):
             RNS.log(
-                f"{self}: setup timed out after {self.SETUP_TIMEOUT_S:.0f}s "
-                f"-- interface will remain offline.",
-                RNS.LOG_ERROR,
+                f"{self}: the first connection attempt did not finish in {self.SETUP_TIMEOUT_S:.0f}s "
+                f"-- the connection supervisor keeps trying in the background.",
+                RNS.LOG_WARNING,
             )
         elif not self.online:
             RNS.log(
-                f"{self}: setup completed but the interface did not come "
-                f"online -- see the specific failure logged above.",
-                RNS.LOG_ERROR,
+                f"{self}: not online yet ({self._connection_state}) -- the connection supervisor brings the "
+                f"interface up once the radio answers, and retries with backoff if it does not.",
+                RNS.LOG_INFO,
             )
 
     # -------------------------------------------------------------------
@@ -11532,7 +14661,20 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
             expected_types = (expected_types,)
 
         async with self._command_lock:
+            started = time.monotonic()
             result = await command_coro
+            # Alpha 0.1.6 (item 4): the library returns the first ERROR it
+            # sees, and its reader emits ERRORs of its own for garbled
+            # inbound frames (boot text, a serial hiccup, a second process
+            # reading the port). Those are noise, not this command's
+            # reply: keep waiting for the expected type until the command
+            # timeout, counting them.
+            noise = self._error_is_noise(result)
+            while noise is not None:
+                self._note_serial_noise(noise, context)
+                remaining = self.command_timeout_s - (time.monotonic() - started)
+                result = await self._wait_expected_reply(tuple(expected_types) + (self._EventType.ERROR,), remaining)
+                noise = self._error_is_noise(result)
 
         self._debug(f"{context} -> {getattr(result, 'type', result)!r}")
 
@@ -11568,156 +14710,515 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
             return f"tcp host={self.host} port={self.tcp_port}"
         return f"unknown transport '{self.transport}'"
 
-    async def _connect(self, MeshCore):
-        # Confirmed directly against the installed meshcore library
-        # (2.3.9.1) while building this milestone: MeshCore.connect()
-        # only cleans up its own dispatcher task on a *graceful* refusal
-        # (the underlying connection_manager.connect() returning None) --
-        # a raw OSError from the socket/serial layer itself (e.g. a
-        # refused TCP connection, no device at the port) propagates
-        # straight out of create_serial/create_ble/create_tcp without
-        # that cleanup running, and without ever handing this method a
-        # MeshCore instance to call disconnect() on. The visible symptom
-        # is a harmless "Task was destroyed but it is pending" asyncio
-        # warning logged once per failed connection attempt -- confirmed
-        # to not affect this interface's own behavior (the exception is
-        # still caught and self.online correctly stays False), but worth
-        # recording here rather than re-diagnosing it as this interface's
-        # own bug the next time it's seen in a log.
+    # -------------------------------------------------------------------
+    # The connection supervisor (alpha 0.1.6, item 4, 2026-09-22)
+    #
+    # The owner's "event failed" errors and rnsd stuck connecting on
+    # restart, read against `meshcore` 2.3.9.1 (`meshcore.py`,
+    # `connection_manager.py`, `serial_cx.py`, `reader.py`,
+    # `commands/base.py`): the library sends the handshake
+    # (`send_appstart`) once, right after the port opens, and gives up
+    # after one 15 s timeout -- but opening the port asserts DTR / RTS
+    # (pyserial's defaults), which resets the Heltec V3's ESP32, so the
+    # handshake often goes to a rebooting radio spewing boot text onto the
+    # UART; on a drop it retried three times a second apart and then went
+    # dead for good (`_reconnect_attempts` never reset, writes silently
+    # ignored, every command a 15 s timeout); and it matches a command's
+    # reply by event type only while its reader emits ERROR events of its
+    # own for garbled frames, so a corrupted inbound frame was reported as
+    # the in-flight command's failure. The interface now owns the
+    # lifecycle: it builds the connection and the MeshCore object itself
+    # (`auto_reconnect` off in the library), opens the port, settles,
+    # flushes, runs the handshake up to `handshake_attempts` times, does
+    # the full device setup, and on a disconnect tears down and retries
+    # forever with backoff `connect_retry_min` .. `connect_retry_max`.
+    # The constructor returns once the port is open (serial) or the first
+    # attempt is over; the handshake happens on the loop. Every state
+    # change is a `connection_state` capture record (buffered until the
+    # capture file opens, which needs the node name from the handshake).
+    # -------------------------------------------------------------------
+
+    SERIAL_NOISE_REASON_PREFIXES = ("invalid_frame_length", "binary_parse_error", "unknown_stats_type")
+
+    def _build_connection(self):
+        """The library's connection object and a MeshCore around it, not
+        yet opened. The library's own `auto_reconnect` is off: the
+        supervisor reconnects. `SerialConnection` / `TCPConnection` /
+        `BLEConnection` and `MeshCore(cx, ...)` are the library's public
+        exports (`meshcore/__init__.py`)."""
+        mod = self._mc_module
         if self.transport == "serial":
-            return await MeshCore.create_serial(
-                self.port,
-                self.baudrate,
-                auto_reconnect=self.auto_reconnect,
-                max_reconnect_attempts=self.max_reconnect_attempts,
+            cx = mod.SerialConnection(self.port, self.baudrate)
+        elif self.transport == "ble":
+            cx = mod.BLEConnection(address=self.ble_name or None)
+        elif self.transport == "tcp":
+            cx = mod.TCPConnection(self.host, self.tcp_port)
+        else:
+            raise ValueError(f"unknown transport '{self.transport}' (expected serial, ble, or tcp)")
+        return mod.MeshCore(cx, auto_reconnect=False)
+
+    async def _open_connection(self, mc) -> bool:
+        """Open the port / socket / BLE link: the library's dispatcher and
+        `connection_manager.connect()` (an OSError propagates to the
+        supervisor; None is a refused connection)."""
+        await mc.dispatcher.start()
+        result = await mc.connection_manager.connect()
+        if result is None:
+            try:
+                await mc.dispatcher.stop()
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _flush_serial_input(self, mc) -> bool:
+        """Drop whatever the radio put on the UART so far (boot text after
+        the port-open reset, a half frame from a previous holder): the
+        pyserial instance behind the library's serial transport, reached
+        through public attributes and probed at every step."""
+        try:
+            cx = getattr(mc.connection_manager, "connection", None)
+            transport = getattr(cx, "transport", None)
+            ser = getattr(transport, "serial", None)
+            if ser is not None and hasattr(ser, "reset_input_buffer"):
+                ser.reset_input_buffer()
+                return True
+        except Exception as exc:
+            self._debug(f"serial input flush failed: {exc}")
+        return False
+
+    @staticmethod
+    def _port_holders(device: str, proc_root: str = "/proc", own_pid: Optional[int] = None) -> list:
+        """Every other process holding `device` open: [(pid, cmdline)],
+        from /proc/<pid>/fd (Linux lets two processes open one serial port;
+        the laptop runs MeshChat's own RNS and, at times, a separate rnsd,
+        both loading this interface from the same config). Pure over the
+        proc tree so the tests can point it at a fake one."""
+        holders = []
+        own_pid = os.getpid() if own_pid is None else own_pid
+        try:
+            real = os.path.realpath(device)
+        except Exception:
+            real = device
+        try:
+            pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+        except Exception:
+            return holders
+        for pid in pids:
+            if int(pid) == own_pid:
+                continue
+            fd_dir = os.path.join(proc_root, pid, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except Exception:
+                continue
+            for fd in fds:
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd))
+                except Exception:
+                    continue
+                if target == device or target == real:
+                    try:
+                        with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+                            cmdline = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+                    except Exception:
+                        cmdline = "?"
+                    holders.append((int(pid), cmdline))
+                    break
+        return holders
+
+    def _check_port_holders(self) -> list:
+        if self.transport != "serial":
+            return []
+        holders = self._port_holders(self.port)
+        if holders:
+            who = "; ".join(f"pid {pid}: {cmd[:120]}" for pid, cmd in holders)
+            RNS.log(
+                f"{self}: *** ANOTHER PROCESS ALREADY HOLDS {self.port}: {who}. Two readers on one serial port "
+                f"each get half the radio's frames (garbled commands, 'event failed', lost messages). "
+                f"Proceeding anyway; stop the other process unless you mean to run both. ***",
+                RNS.LOG_WARNING,
             )
-        if self.transport == "ble":
-            return await MeshCore.create_ble(
-                self.ble_name or None,
-                auto_reconnect=self.auto_reconnect,
-                max_reconnect_attempts=self.max_reconnect_attempts,
+            self._capture_connection_state("port_shared", holders=[[pid, cmd[:120]] for pid, cmd in holders])
+        return holders
+
+    def _capture_connection_state(self, state: str, **fields) -> None:
+        """A `connection_state` capture record, buffered until the capture
+        file exists (it opens after the first handshake, which names the
+        node)."""
+        self._connection_state = state
+        record = {"event": "connection_state", "state": state, "transport": self.transport}
+        record.update(fields)
+        if self._packet_capture_file is not None:
+            self._capture_event("out", record)
+        elif self.packet_capture_enabled:
+            record["ts_buffered"] = time.time()
+            self._pending_capture_events.append(record)
+            del self._pending_capture_events[:-64]
+
+    async def _handshake(self, mc) -> bool:
+        """`send_appstart` until the radio answers with SELF_INFO: up to
+        `handshake_attempts` tries of `handshake_timeout` each, the input
+        flushed before each (serial), one second between them. On success
+        the identity and radio block are applied."""
+        saved_timeout = getattr(mc.commands, "default_timeout", None)
+        try:
+            for attempt in range(1, max(1, self.handshake_attempts) + 1):
+                if self.detached:
+                    return False
+                if self.transport == "serial":
+                    self._flush_serial_input(mc)
+                try:
+                    if saved_timeout is not None:
+                        mc.commands.default_timeout = self.handshake_timeout_s
+                    result = await asyncio.wait_for(mc.commands.send_appstart(), timeout=self.handshake_timeout_s + 2.0)
+                except Exception as exc:
+                    result = None
+                    self._debug(f"handshake attempt {attempt}: {exc}")
+                if result is not None and result.type == self._EventType.SELF_INFO:
+                    self._apply_self_info(result.payload if isinstance(result.payload, dict) else {})
+                    if attempt > 1:
+                        RNS.log(f"{self}: handshake answered on attempt {attempt}.", RNS.LOG_DEBUG)
+                    return True
+                reason = None
+                if result is not None and isinstance(result.payload, dict):
+                    reason = result.payload.get("reason", result.payload.get("code_string"))
+                RNS.log(
+                    f"{self}: handshake attempt {attempt}/{self.handshake_attempts} unanswered"
+                    f"{f' ({reason})' if reason else ''} -- retrying in 1s.",
+                    RNS.LOG_WARNING if attempt >= 2 else RNS.LOG_DEBUG,
+                )
+                self._capture_connection_state("handshake_retry", attempt=attempt, reason=reason)
+                await asyncio.sleep(1.0)
+            return False
+        finally:
+            if saved_timeout is not None:
+                mc.commands.default_timeout = saved_timeout
+
+    def _apply_self_info(self, info: dict) -> None:
+        self._own_node_name = info.get("name", "") or self._own_node_name
+        node_key = str(info.get("public_key", "") or "")
+        if node_key:
+            self._own_pubkey_hex = node_key.lower()
+        params = self._parse_radio_params(info)
+        if params is not None:
+            self._radio_params = params
+        elif any(k in info for k in ("radio_sf", "radio_bw", "radio_cr")):
+            RNS.log(
+                f"{self}: SELF_INFO radio block is implausible (sf={info.get('radio_sf')!r} "
+                f"bw={info.get('radio_bw')!r}kHz cr={info.get('radio_cr')!r}) -- ignoring it; airtime "
+                f"estimates fall back to duty_cycle_estimate_bitrate until a sane block arrives.",
+                RNS.LOG_WARNING,
             )
-        if self.transport == "tcp":
-            return await MeshCore.create_tcp(
-                self.host,
-                self.tcp_port,
-                auto_reconnect=self.auto_reconnect,
-                max_reconnect_attempts=self.max_reconnect_attempts,
+        RNS.log(f"{self}: node identity '{self._own_node_name}' key={node_key[:16]}...", RNS.LOG_INFO)
+        self._self_info = dict(info)
+        if getattr(self, "_packet_capture_file", None) is not None:
+            radio = self._capture_self_info()
+            if radio != self._captured_radio:
+                self._captured_radio = radio
+                self._capture_event("out", {"event": "radio_settings", "radio": radio,
+                                            "radio_params": list(self._radio_params) if self._radio_params else None})
+
+    async def _fetch_own_identity(self) -> None:
+        """Re-asks the radio for SELF_INFO while the identity is still
+        unknown (`_contact_refresh_loop` retries it): the handshake in the
+        supervisor is where it normally comes from."""
+        try:
+            result = await self._run_command(
+                self._mc_ready.commands.send_appstart(), "send_appstart", self._EventType.SELF_INFO,
             )
-        raise ValueError(f"unknown transport '{self.transport}' (expected serial, ble, or tcp)")
+        except Exception as exc:
+            RNS.log(f"{self}: could not fetch node identity: {exc} -- retried on the next contact refresh.",
+                    RNS.LOG_WARNING)
+        else:
+            self._apply_self_info(result.payload if isinstance(result.payload, dict) else {})
+
+    async def _apply_device_settings(self) -> None:
+        """Radio override, channel, telemetry mode -- everything the
+        firmware must be told on every (re)connect."""
+        if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
+            try:
+                await self._run_command(
+                    self._mc_ready.commands.set_radio(self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr),
+                    "set_radio", self._EventType.OK,
+                )
+                RNS.log(
+                    f"{self}: radio override applied (freq={self.radio_freq}MHz "
+                    f"bw={self.radio_bw}kHz sf={self.radio_sf} cr={self.radio_cr}).",
+                    RNS.LOG_INFO,
+                )
+                # MeshBench finding 1 (2026-09-20): the airtime model must
+                # follow the override, not the pre-override SELF_INFO block.
+                params = self._parse_radio_params(
+                    {"radio_sf": self.radio_sf, "radio_bw": self.radio_bw, "radio_cr": self.radio_cr}
+                )
+                if params is not None:
+                    self._radio_params = params
+            except Exception as exc:
+                RNS.log(f"{self}: radio override failed: {exc} -- continuing with the node's currently stored "
+                        f"radio settings.", RNS.LOG_WARNING)
+        else:
+            RNS.log(f"{self}: no radio override configured -- using the node's currently stored radio settings.",
+                    RNS.LOG_DEBUG)
+
+        try:
+            secret_bytes = bytes.fromhex(self.channel_secret_hex)
+            await self._run_command(
+                self._mc_ready.commands.set_channel(self.channel_idx, self.channel_name, secret_bytes),
+                "set_channel", self._EventType.OK,
+            )
+            RNS.log(f"{self}: channel configured (idx={self.channel_idx} name='{self.channel_name}').", RNS.LOG_INFO)
+            if self._using_default_channel_secret:
+                RNS.log(
+                    f"{self}: no channel_secret configured -- joining the shared default channel so nodes can "
+                    f"find each other with zero setup. This is fine for RNS traffic (it's already encrypted "
+                    f"end-to-end); set channel_idx/channel_name/channel_secret explicitly for a private channel.",
+                    RNS.LOG_INFO,
+                )
+        except Exception as exc:
+            RNS.log(f"{self}: channel setup failed: {exc}", RNS.LOG_WARNING)
+
+        try:
+            await self._run_command(
+                self._mc_ready.commands.set_telemetry_mode_base(self.TELEM_MODE_ALLOW_FLAGS),
+                "set_telemetry_mode_base", self._EventType.OK,
+            )
+            RNS.log(
+                f"{self}: telemetry_mode_base set to per-contact-flags -- path discovery "
+                f"(docs/path_discovery_spec.md) is a telemetry request under the hood, and only answers a "
+                f"peer whose own contact entry has been granted the base permission bit.",
+                RNS.LOG_DEBUG,
+            )
+        except Exception as exc:
+            RNS.log(f"{self}: setting telemetry_mode_base failed: {exc} -- this node may not answer other nodes' "
+                    f"path discovery requests until this is retried.", RNS.LOG_WARNING)
+
+    async def _setup_connection(self, mc) -> bool:
+        """Everything after the port is open, on every (re)connect:
+        settle, handshake, device setup, contacts, subscriptions, message
+        fetching; the process-lifetime loops are started on the first
+        success only."""
+        self._mc = mc
+        self._disconnect_event = asyncio.Event()
+        self._subscribe_connection_events()
+        if self.transport == "serial" and self.serial_open_settle_s > 0:
+            # Opening the port toggled DTR / RTS and reset the radio.
+            await asyncio.sleep(self.serial_open_settle_s)
+        if not await self._handshake(mc):
+            RNS.log(
+                f"{self}: the radio did not answer the handshake in {self.handshake_attempts} attempt(s) "
+                f"({self._connection_description()}) -- closing the port and retrying.",
+                RNS.LOG_ERROR,
+            )
+            return False
+        await self._apply_device_settings()
+
+        # Code-review fix: self.online is set True here, BEFORE
+        # _load_peer_cache() below, deliberately -- _load_peer_cache()
+        # calls _register_peer() per cached entry, which (for a peer new
+        # to this process's own _peers dict, true for every cache-
+        # restored peer) schedules a proactive discover_path() background
+        # task; discover_path()'s own first line no-ops while offline.
+        self.online = True
+        self._connected_since = time.time()
+        RNS.log(
+            f"{self}: online (bitrate={self.bitrate}bps HW_MTU={self.HW_MTU} "
+            f"channel_budget={self._channel_payload_budget()}B "
+            f"direct_budget={self._direct_payload_budget()}B).",
+            RNS.LOG_INFO,
+        )
+        if self.packet_capture_enabled and self._packet_capture_file is None:
+            self._open_packet_capture()
+        if self.peer_discovery_enabled and not self._peer_cache_loaded:
+            self._peer_cache_loaded = True
+            self._load_peer_cache()
+        # Alpha 0.1.8 (item 4): once per process, like the peer cache, and
+        # after it -- a restored entry's source peer must already be bound
+        # for `_answer_path_request_locally` to use it.
+        if not self._announce_cache_loaded:
+            self._announce_cache_loaded = True
+            self._load_announce_cache()
+        try:
+            await self._refresh_contacts_and_grant_telemetry()
+        except Exception as exc:
+            RNS.log(f"{self}: initial contact refresh failed: {exc}", RNS.LOG_WARNING)
+        self._subscribe_data_events()
+        await self._start_auto_message_fetching()
+        if self._outgoing_worker_task is None:
+            self._stats_task = asyncio.ensure_future(self._stats_loop())
+            # Item 8 (alpha 0.1.5): the radio's own transmit statistics at
+            # start, then on the cadence.
+            await self._poll_radio_stats("start")
+            self._radio_stats_task = asyncio.ensure_future(self._radio_stats_loop())
+            self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
+            self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
+            self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
+            if self.peer_discovery_enabled:
+                self._peer_discovery_task = asyncio.ensure_future(self._peer_discovery_bootstrap())
+                self._peer_ttl_sweep_task = asyncio.ensure_future(self._peer_ttl_sweep_loop())
+        else:
+            await self._poll_radio_stats("reconnect")
+        return True
+
+    async def _close_connection(self, mc, reason: str) -> None:
+        self.online = False
+        if self._mc is mc:
+            self._mc = None
+        for step, coro in (("stop_auto_message_fetching", mc.stop_auto_message_fetching), ("disconnect", mc.disconnect)):
+            try:
+                await asyncio.wait_for(coro(), timeout=5.0)
+            except Exception as exc:
+                self._debug(f"{step} during close ({reason}): {exc}")
+
+    def _release_startup_gate(self) -> None:
+        if not self._startup_gate.done():
+            self._startup_gate.set_result(None)
+
+    async def _connection_supervisor(self) -> None:
+        """Retry forever with backoff; run the full setup on every
+        (re)connect; wait for a disconnect; repeat. `max_reconnect_attempts`
+        0 (the default) is forever; `auto_reconnect = no` stops after the
+        first drop, as the library used to."""
+        attempt = 0
+        delay = self.connect_retry_min_s
+        try:
+            while not self.detached:
+                attempt += 1
+                self._capture_connection_state("connecting", attempt=attempt)
+                mc = None
+                opened = False
+                try:
+                    self._check_port_holders()
+                    mc = self._build_connection()
+                    opened = await self._open_connection(mc)
+                except Exception as exc:
+                    RNS.log(f"{self}: connection failed ({self._connection_description()}): {exc}", RNS.LOG_ERROR)
+                    self._capture_connection_state("open_failed", attempt=attempt, reason=str(exc)[:200])
+                if not opened and mc is not None:
+                    self._capture_connection_state("open_failed", attempt=attempt, reason="refused")
+                if opened:
+                    RNS.log(f"{self}: connected ({self._connection_description()}).", RNS.LOG_INFO)
+                    self._capture_connection_state("open", attempt=attempt)
+                if self.transport == "serial" or not opened:
+                    # The constructor waits only this long: the port is
+                    # open (or could not be); the handshake is the loop's.
+                    self._release_startup_gate()
+                if opened:
+                    ok = False
+                    try:
+                        ok = await self._setup_connection(mc)
+                    except Exception as exc:
+                        RNS.log(f"{self}: setup failed ({self._connection_description()}): {exc}", RNS.LOG_ERROR)
+                        RNS.log("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), RNS.LOG_DEBUG)
+                    self._release_startup_gate()
+                    if ok:
+                        delay = self.connect_retry_min_s
+                        self._capture_connection_state("online", attempt=attempt)
+                        await self._disconnect_event.wait()
+                        reason = self._disconnect_reason or "unknown"
+                        RNS.log(f"{self}: MeshCore connection lost ({reason}) -- interface offline; reconnecting.",
+                                RNS.LOG_WARNING)
+                        self._capture_connection_state("disconnected", reason=reason,
+                                                       online_s=round(time.time() - (self._connected_since or time.time()), 1))
+                        await self._close_connection(mc, reason)
+                        if self.detached:
+                            break
+                        if not self.auto_reconnect:
+                            RNS.log(f"{self}: auto_reconnect is off -- staying offline.", RNS.LOG_WARNING)
+                            break
+                        attempt = 0
+                    else:
+                        self._capture_connection_state("setup_failed", attempt=attempt)
+                        await self._close_connection(mc, "setup failed")
+                if self.detached:
+                    break
+                if self.max_reconnect_attempts and attempt >= self.max_reconnect_attempts:
+                    RNS.log(f"{self}: giving up after {attempt} connection attempt(s) (max_reconnect_attempts).",
+                            RNS.LOG_ERROR)
+                    break
+                self._capture_connection_state("retry_wait", attempt=attempt, delay_s=delay)
+                RNS.log(f"{self}: next connection attempt in {delay:.0f}s.", RNS.LOG_INFO)
+                try:
+                    await asyncio.wait_for(self._detach_event.wait(), timeout=delay)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(delay * 2, self.connect_retry_max_s)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._release_startup_gate()
 
     def _subscribe_connection_events(self):
-        # Only ever called from _async_setup right after its own
-        # `self._mc is None` guard passes -- `_mc_ready` documents that
-        # instead of repeating the guard here.
         self._mc_ready.subscribe(self._EventType.CONNECTED, self._on_mc_connected)
         self._mc_ready.subscribe(self._EventType.DISCONNECTED, self._on_mc_disconnected)
 
     def _on_mc_connected(self, event):
-        if self.detached:
-            return
-        was_offline = not self.online
-        reconnected = bool((event.payload or {}).get("reconnected")) if isinstance(getattr(event, "payload", None), dict) else False
-        self.online = True
-        if was_offline or reconnected:
-            RNS.log(
-                f"{self}: MeshCore connection (re)established"
-                + (" (library auto-reconnect)." if reconnected and not was_offline else "."),
-                RNS.LOG_INFO,
-            )
-            # Code-review fix: _start_auto_message_fetching() was only
-            # ever called once, from _async_setup. If a reconnect's own
-            # internal get_msg() poll ever raises (plausible right as the
-            # connection drops), the installed library's own _fetch_
-            # messages_loop silently exits for good on any exception and
-            # is never restarted on its own -- confirmed directly against
-            # its source, which breaks the loop with no re-arm path.
-            # Without re-arming here, a reconnect would quietly return
-            # this interface to the exact "online but deaf" failure mode
-            # the original M5 field-test fix (this same method's sibling)
-            # exists to prevent, with no error logged anywhere.
-            #
-            # Audit fix (2026-09-19): gating this on `was_offline` alone made
-            # it dead code for the default configuration. Confirmed against
-            # the installed library (meshcore/connection_manager.py:99-121):
-            # with `auto_reconnect` on -- the default here -- an unexpected
-            # drop does NOT emit DISCONNECTED at all. It silently starts
-            # `_attempt_reconnect` and emits CONNECTED{reconnected:True} on
-            # success, so `_on_mc_disconnected` never runs, `self.online`
-            # never goes False, and `was_offline` is False exactly when the
-            # re-arm matters most. DISCONNECTED is only emitted when
-            # auto-reconnect is off or every attempt has failed. The
-            # `reconnected` flag from the event now also triggers the
-            # re-arm; `_rearm_auto_message_fetching` stops first, so doing
-            # it once too often is harmless.
-            self._spawn_background_task(self._rearm_auto_message_fetching())
-            if not self._own_pubkey_hex:
-                self._spawn_background_task(self._fetch_own_identity())
+        # The supervisor opens the connection itself; this only ever sees
+        # the library's own CONNECTED for the open it just made.
+        self._debug("library CONNECTED event.")
 
     def _on_mc_disconnected(self, event):
+        """The library's DISCONNECTED (with `auto_reconnect` off it is
+        emitted at once on an unexpected drop): the supervisor takes it
+        from here."""
         if self.detached:
             return
-        if self.online:
-            RNS.log(
-                f"{self}: MeshCore connection lost -- interface going "
-                f"offline until it reconnects.",
-                RNS.LOG_WARNING,
-            )
+        payload = getattr(event, "payload", None)
+        self._disconnect_reason = str((payload or {}).get("reason", "unknown")) if isinstance(payload, dict) else "unknown"
         self.online = False
+        if self._disconnect_event is not None and not self._disconnect_event.is_set():
+            self._disconnect_event.set()
 
-    async def _fetch_own_identity(self) -> None:
-        """Code-review fix: this was previously inlined in `_async_setup`
-        and only ever attempted once, at initial connect. If `send_appstart`
-        failed there (a plausible timing issue right after the radio link
-        comes up), `_own_pubkey_hex` stayed empty for the interface's
-        entire lifetime -- and `_own_pubkey_prefix()` returning None makes
-        the self-echo guard in `_handle_incoming_bind_frame` (`own_prefix
-        is not None and frame.pubkey_prefix == own_prefix`) silently skip
-        the check forever, meaning this node's own bind frames bouncing
-        back to it (e.g. via a repeater or CHANNEL rebroadcast) would be
-        misprocessed as if from a genuine peer. Extracted into its own
-        method so `_on_mc_connected` can retry it on every reconnect, not
-        just at the very first one, closing that permanent-failure window.
-        """
-        try:
-            # Only ever called once a connection is live (from _async_setup
-            # or _on_mc_connected's reconnect path) -- see `_mc_ready`.
-            result = await self._run_command(
-                self._mc_ready.commands.send_appstart(),
-                "send_appstart",
-                self._EventType.SELF_INFO,
-            )
-        except Exception as exc:
+    def _error_is_noise(self, result) -> Optional[str]:
+        """The reason string when `result` is one of the reader's own
+        ERROR events for a garbled inbound frame (not the firmware's
+        ERROR reply, not a timeout), else None."""
+        if result is None or result.type != self._EventType.ERROR:
+            return None
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason.startswith(self.SERIAL_NOISE_REASON_PREFIXES):
+            return reason
+        return None
+
+    def _note_serial_noise(self, reason: str, context: str) -> None:
+        now = time.monotonic()
+        self._serial_noise_times.append(now)
+        while self._serial_noise_times and now - self._serial_noise_times[0] > 60.0:
+            self._serial_noise_times.popleft()
+        self._serial_noise_total += 1
+        per_min = len(self._serial_noise_times)
+        self._debug(f"{context}: reader ERROR ({reason}) ignored as stream noise ({per_min} in the last minute).")
+        if per_min >= self.serial_noise_warn_per_min and now - self._serial_noise_warned_at > 60.0:
+            self._serial_noise_warned_at = now
             RNS.log(
-                f"{self}: could not fetch node identity: {exc} -- "
-                f"continuing anyway, but the CHANNEL payload budget below "
-                f"will assume an empty node name until this succeeds; if "
-                f"this node actually has a name configured, outgoing "
-                f"CHANNEL fragments could be silently truncated by the "
-                f"firmware as a result. This will be retried on the next "
-                f"reconnect if the pubkey is still unknown by then.",
+                f"{self}: serial stream corrupted -- {per_min} garbled frame(s) from the radio in the last minute "
+                f"({reason}); is another process reading {self.port}? (see the port-holder check at connect).",
                 RNS.LOG_WARNING,
             )
-        else:
-            info = result.payload if isinstance(result.payload, dict) else {}
-            self._own_node_name = info.get("name", "")
-            node_key = info.get("public_key", "")
-            self._own_pubkey_hex = node_key.lower()
-            params = self._parse_radio_params(info)
-            if params is not None:
-                self._radio_params = params
-            elif any(k in info for k in ("radio_sf", "radio_bw", "radio_cr")):
-                RNS.log(
-                    f"{self}: SELF_INFO radio block is implausible (sf={info.get('radio_sf')!r} "
-                    f"bw={info.get('radio_bw')!r}kHz cr={info.get('radio_cr')!r}) -- ignoring it; airtime "
-                    f"estimates fall back to duty_cycle_estimate_bitrate until a sane block arrives.",
-                    RNS.LOG_WARNING,
-                )
-            RNS.log(
-                f"{self}: node identity '{self._own_node_name}' "
-                f"key={node_key[:16]}...",
-                RNS.LOG_INFO,
-            )
+            self._capture_connection_state("serial_noise", per_min=per_min, total=self._serial_noise_total, reason=reason)
+
+    async def _wait_expected_reply(self, expected_types, timeout_s: float):
+        """The reply a command is still owed after a noise ERROR: the
+        first event of any expected type within `timeout_s`, or None."""
+        if timeout_s <= 0:
+            return None
+        loop = asyncio.get_running_loop()
+        tasks = [loop.create_task(self._mc_ready.wait_for_event(t, timeout=timeout_s)) for t in expected_types]
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+        for t in done:
+            try:
+                if t.result() is not None:
+                    return t.result()
+            except Exception:
+                pass
+        return None
 
     @staticmethod
     def _parse_radio_params(info: dict) -> "Optional[tuple]":
@@ -11739,159 +15240,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     async def _async_setup(self):
         self._command_lock_impl = asyncio.Lock()
         self._direct_exchange_lock_impl = _PriorityAsyncLock()
-        self._duty_cycle_impl = _DutyCycleLimiter(self.duty_cycle_window_s, self.duty_cycle_max_fraction)
-        MeshCore = self._mc_module.MeshCore
-
-        try:
-            self._mc = await self._connect(MeshCore)
-        except Exception as exc:
-            RNS.log(
-                f"{self}: connection failed ({self._connection_description()}): {exc}",
-                RNS.LOG_ERROR,
-            )
-            return
-
-        if self._mc is None:
-            RNS.log(
-                f"{self}: driver init returned no MeshCore instance "
-                f"({self._connection_description()}).",
-                RNS.LOG_ERROR,
-            )
-            return
-
-        RNS.log(f"{self}: connected ({self._connection_description()}).", RNS.LOG_INFO)
-        self._subscribe_connection_events()
-
-        await self._fetch_own_identity()
-
-        if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
-            try:
-                await self._run_command(
-                    self._mc_ready.commands.set_radio(
-                        self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr
-                    ),
-                    "set_radio",
-                    self._EventType.OK,
-                )
-                RNS.log(
-                    f"{self}: radio override applied (freq={self.radio_freq}MHz "
-                    f"bw={self.radio_bw}kHz sf={self.radio_sf} cr={self.radio_cr}).",
-                    RNS.LOG_INFO,
-                )
-                # MeshBench finding 1 (2026-09-20): the airtime model must
-                # follow the override, not the pre-override SELF_INFO block.
-                params = self._parse_radio_params(
-                    {"radio_sf": self.radio_sf, "radio_bw": self.radio_bw, "radio_cr": self.radio_cr}
-                )
-                if params is not None:
-                    self._radio_params = params
-            except Exception as exc:
-                RNS.log(
-                    f"{self}: radio override failed: {exc} -- continuing "
-                    f"with the node's currently stored radio settings.",
-                    RNS.LOG_WARNING,
-                )
-        else:
-            RNS.log(
-                f"{self}: no radio override configured -- using the "
-                f"node's currently stored radio settings.",
-                RNS.LOG_INFO,
-            )
-
-        try:
-            secret_bytes = bytes.fromhex(self.channel_secret_hex)
-            await self._run_command(
-                self._mc_ready.commands.set_channel(
-                    self.channel_idx, self.channel_name, secret_bytes
-                ),
-                "set_channel",
-                self._EventType.OK,
-            )
-            RNS.log(
-                f"{self}: channel configured (idx={self.channel_idx} "
-                f"name='{self.channel_name}').",
-                RNS.LOG_INFO,
-            )
-            if self._using_default_channel_secret:
-                RNS.log(
-                    f"{self}: no channel_secret configured -- joining the "
-                    f"shared default channel so nodes can find each other "
-                    f"with zero setup. This is fine for RNS traffic (it's "
-                    f"already encrypted end-to-end); set channel_idx/"
-                    f"channel_name/channel_secret explicitly for a private "
-                    f"channel.",
-                    RNS.LOG_INFO,
-                )
-        except Exception as exc:
-            RNS.log(f"{self}: channel setup failed: {exc}", RNS.LOG_WARNING)
-
-        try:
-            await self._run_command(
-                self._mc_ready.commands.set_telemetry_mode_base(self.TELEM_MODE_ALLOW_FLAGS),
-                "set_telemetry_mode_base",
-                self._EventType.OK,
-            )
-            RNS.log(
-                f"{self}: telemetry_mode_base set to per-contact-flags -- "
-                f"path discovery (docs/path_discovery_spec.md) is a "
-                f"telemetry request under the hood, and only answers a "
-                f"peer whose own contact entry has been granted the base "
-                f"permission bit.",
-                RNS.LOG_INFO,
-            )
-        except Exception as exc:
-            RNS.log(
-                f"{self}: setting telemetry_mode_base failed: {exc} -- "
-                f"this node may not answer other nodes' path discovery "
-                f"requests until this is retried.",
-                RNS.LOG_WARNING,
-            )
-
-        # Code-review fix: self.online is set True here, BEFORE
-        # _load_peer_cache() below, deliberately -- _load_peer_cache()
-        # calls _register_peer() per cached entry, which (for a peer new
-        # to this process's own _peers dict, true for every cache-
-        # restored peer) schedules a proactive discover_path() background
-        # task. That task's first real chance to run is at the next
-        # await point in this same coroutine -- which used to be *before*
-        # self.online was set, so discover_path()'s own first line
-        # ("if ... not self.online: return None") silently no-opped for
-        # every single cache-restored peer, with no log line at all
-        # (unlike the backoff-skip case, which does self._debug()).
-        # Confirmed by code review: this made the Milestone 6 "proactive
-        # discovery on bind" fix quietly inert for exactly the startup
-        # case it was added for. Nothing else in this method depends on
-        # self.online being false up to this point.
-        self.online = True
-        self._connected_since = time.time()
-        RNS.log(
-            f"{self}: online (bitrate={self.bitrate}bps HW_MTU={self.HW_MTU} "
-            f"channel_budget={self._channel_payload_budget()}B "
-            f"direct_budget={self._direct_payload_budget()}B).",
-            RNS.LOG_INFO,
+        self._duty_cycle_impl = _DutyCycleLimiter(
+            self.duty_cycle_window_s, self.duty_cycle_max_fraction, self.duty_cycle_max_fraction_zero_hop,
         )
-
-        if self.packet_capture_enabled:
-            self._open_packet_capture()
-
-        if self.peer_discovery_enabled:
-            self._load_peer_cache()
-
-        try:
-            await self._refresh_contacts_and_grant_telemetry()
-        except Exception as exc:
-            RNS.log(f"{self}: initial contact refresh failed: {exc}", RNS.LOG_WARNING)
-
-        self._subscribe_data_events()
-        await self._start_auto_message_fetching()
-
-        self._stats_task = asyncio.ensure_future(self._stats_loop())
-        self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
-        self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
-        self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
-        if self.peer_discovery_enabled:
-            self._peer_discovery_task = asyncio.ensure_future(self._peer_discovery_bootstrap())
-            self._peer_ttl_sweep_task = asyncio.ensure_future(self._peer_ttl_sweep_loop())
+        self._startup_gate = asyncio.get_running_loop().create_future()
+        self._detach_event = asyncio.Event()
+        self._supervisor_task = asyncio.ensure_future(self._connection_supervisor())
+        await self._startup_gate
 
     _RX_LOG_WINDOW_FOREIGN_CAP = 20
     _RX_LOG_PAYLOAD_TYPE_TEXT_MSG = 2
@@ -11907,6 +15262,19 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     _TXT_MSG_FIXED_OVERHEAD_BYTES = 2 + 1 + 1 + 2
     _TXT_MSG_PLAINTEXT_OVERHEAD_BYTES = 4 + 1 + 1
 
+    # Alpha 0.1.6 (item 1): the per-peer path scoreboard (`_paths.py`).
+    PATH_CANDIDATES_KEPT = 4        # candidate paths kept per peer
+    PATH_SAMPLES_KEPT = 8           # send outcomes a candidate's delivery rate is over
+    # Alpha 0.1.8 (item 1): how often the proof grace looks for the proof.
+    # Short against the grace itself, so a proof that arrives early is not
+    # made to wait out the whole of it.
+    PROOF_GRACE_POLL_S = 0.02
+    PATH_SAMPLE_WINDOW_S = 600.0    # outcomes older than this count for nothing
+    PATH_SAMPLE_HALF_LIFE_S = 180.0 # an outcome's weight halves every this many seconds
+    PATH_PRIOR_OPTIMISTIC = 0.8     # an untried path's assumed delivery rate
+    PATH_PRIOR_WEAK = 0.25          # ... a zero-hop one heard below path_weak_snr_db (see _configure_path_discovery)
+    PATH_RATE_FLOOR = 0.05          # a measured rate is never scored below this
+    _RX_LOG_PAYLOAD_TYPE_ADVERT = 4
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT
     _RX_LOG_ACK_BEARING_TYPES = {0, 2}  # REQ, TEXT_MSG -- the receiver answers with an ACK (or PATH when flooded)
@@ -12026,6 +15394,21 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         RNS.log(f"{self}: detached.", RNS.LOG_INFO)
 
     async def _async_teardown(self):
+        if self._detach_event is not None:
+            self._detach_event.set()
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._radio_stats_task is not None:
+            self._radio_stats_task.cancel()
+        # Item 8: the radio's transmit statistics at stop, best effort.
+        try:
+            await asyncio.wait_for(self._poll_radio_stats("stop"), timeout=5.0)
+        except Exception:
+            pass
         if self._stats_task is not None:
             self._stats_task.cancel()
         if self._reassembly_cleanup_task is not None:

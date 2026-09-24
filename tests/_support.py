@@ -130,9 +130,11 @@ def _bring_up(mesh, names, timeout=40.0, config=None):
 
 
 def _prime(sender, receiver, timeout=60.0):
-    """One packet from receiver -> sender teaches the sender an RNS token
-    for receiver.dest_hash, the way real traffic bootstraps DIRECT-primary."""
-    receiver.send(build_rns_packet("data", dest_hash=receiver.dest_hash, payload=b"prime"))
+    """One ANNOUNCE from receiver -> sender teaches the sender an RNS token
+    for receiver.dest_hash, the way real traffic bootstraps DIRECT-primary
+    (alpha 0.1.7, item 3: a DATA packet addressed to the receiver's own
+    destination no longer teaches anything; an announce is what RNS sends)."""
+    receiver.send(build_rns_packet("announce", dest_hash=receiver.dest_hash, payload=b"prime"))
     assert wait_until(lambda: receiver.dest_hash in sender.iface._rns_token_peer, timeout), "token never learned"
 
 

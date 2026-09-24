@@ -1,5 +1,6 @@
 """Raw fragmentation and the reconcile: the raw burst-then-report/QUERY sender with its resume and text-fallback verdicts, the report window and QUERY answer budgets, the completion QUERY / ANSWER / REPORT handling on both sides, and the per-sender reassembly buckets, dedup cache and their sweeps. Phase 3 of the 2026-09-20 pass redesigns this module around one burst-and-report state machine."""
 import asyncio
+import collections
 import time
 from typing import Optional
 
@@ -7,6 +8,12 @@ import RNS
 
 from ._common import _FrameHeader, _ReassemblyBucket, _CompletionFrame, PRIORITY_NORMAL
 from ._locks import _PreemptedForHandshake
+
+
+# Alpha 0.1.8 (item 1): what `_await_completion_report` returns when the
+# far side's RNS proved every packet of the window -- the proof is the
+# completion, so there is no report to wait for and nothing to QUERY.
+_WINDOW_PROVED = object()
 
 
 class _ReconcileMixin:
@@ -140,9 +147,11 @@ class _ReconcileMixin:
         receiver's reassembly clock), then CMD_SEND_RAW_DATA. Returns
         whether the firmware accepted it; never waits for anything after."""
         on_air = 2 + len(path) + len(frame)
+        # A source-routed raw fragment is relayed once per path byte; an
+        # empty path is the zero-hop class (alpha 0.1.5 duty-cycle ledgers).
         gate = await self._pre_transmit_gate(
             "", skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority), on_air_bytes=on_air,
-            interrupt=interrupt,
+            interrupt=interrupt, relayed=len(path) > 0, telemetry=telemetry,
         )
         if telemetry is not None:
             telemetry["quiet_defer_wait_s"], telemetry["duty_cycle_wait_s"], telemetry["medium_hold_wait_s"] = gate
@@ -181,7 +190,28 @@ class _ReconcileMixin:
         # in large_payload, 7/9 QUERYs in relay. The frame's own airtime is
         # now added on top of the hop-scaled term.
         airtime = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-        return max(0.0, (1.0 + self.direct_raw_hop_gap_factor * hops) * airtime)
+        # Alpha 0.1.5 (item 4): the field A/B's `no` arm drops the frame's own
+        # airtime from the gap through repeaters; the default keeps it.
+        own = 1.0 if self.direct_raw_gap_own_airtime else 0.0
+        return max(0.0, (own + self.direct_raw_hop_gap_factor * hops) * airtime)
+
+    def _raw_burst_next_send_wait_s(self, hops: int, gap_s: float, airtime_s: float, now: float,
+                                    busy_until: float, queue_ahead: Optional[int] = None) -> float:
+        """How long the burst loop sleeps before handing the firmware the
+        NEXT fragment (pure function, alpha 0.1.5 2a). Through repeaters the
+        hop-scaled gap (which contains the frame's airtime) is the answer, as
+        before. At zero hop the flat gap alone let the loop queue a whole
+        window into the firmware in seconds; the loop now also waits until
+        the radio is estimated to have at most `direct_raw_burst_queue_ahead`
+        frames of air left ahead of it -- `busy_until - queue_ahead x
+        airtime` -- so the air stays back to back with a bounded queue and
+        the loop's own clock tracks the radio's. 0 frames ahead disables
+        the pacing (the pre-0.1.5 loop)."""
+        wait_s = max(0.0, gap_s)
+        queue_ahead = self.direct_raw_burst_queue_ahead if queue_ahead is None else queue_ahead
+        if hops <= 0 and queue_ahead > 0:
+            wait_s = max(wait_s, (busy_until - queue_ahead * max(0.0, airtime_s)) - now)
+        return max(0.0, wait_s)
 
     def _completion_report_wait_s(self, hops: int, peer_prefix: str) -> float:
         """How long a raw sender keeps its radio quiet after a burst for the
@@ -222,8 +252,40 @@ class _ReconcileMixin:
         if burst_end is None:
             return None
         latency_s = time.monotonic() - burst_end
+        if latency_s < 0:
+            # 2a: a report that lands before the burst's estimated end on air
+            # measures the airtime estimate's pessimism, not the report path;
+            # it does not train the window.
+            return None
         self._rtt_sample(self._report_rtt, peer_prefix, latency_s)
         return latency_s
+
+    async def _wait_future_or_proof(self, fut: "asyncio.Future", timeout_s: float, events):
+        """The report future against the events this window's PROOFs set,
+        with the radio already released (alpha 0.1.8, item 1). Returns the
+        report if it arrived, else None -- the caller re-checks whether a
+        proof completed the window and, if not, keeps waiting."""
+        if fut.done():
+            return fut.result()
+        if timeout_s <= 0:
+            return None
+        if any(e.is_set() for e in events):
+            return None
+        loop = asyncio.get_running_loop()
+        fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
+        try:
+            await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in waits:
+                if not t.done():
+                    t.cancel()
+            for t in waits:
+                try:
+                    await t
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+        return fut.result() if fut.done() else None
 
     def _expect_report(self, peer_prefix: str, pkt_id: int, burst_end: Optional[float]) -> None:
         """Register (or, with None, withdraw) the burst end time a report
@@ -237,7 +299,8 @@ class _ReconcileMixin:
     async def _await_completion_report(
         self, fut: "asyncio.Future", peer_prefix: str, pkt_id: int, frag_total: int, hops: int, stage: str,
         last_sent_idx: Optional[int] = None, rearm=None, release_lock=None, window_pkts=None,
-    ) -> Optional[_CompletionFrame]:
+        burst_end: Optional[float] = None, on_early=None, proved_check=None, proved_events=None,
+    ):
         """Wait (lock held, radio quiet) for the receiver's completion
         report after a raw burst; None if none arrived inside
         `_completion_report_wait_s`, in which case the caller falls back to
@@ -263,11 +326,40 @@ class _ReconcileMixin:
         was lost this costs at most that extra half window; today's
         behaviour (re-drive it at once) is the fallback either way."""
         wait_s = self._completion_report_wait_s(hops, peer_prefix)
-        started = time.monotonic()
+        # 2a (alpha 0.1.5): the window is measured from the burst's
+        # estimated end on air (`burst_end`, the radio's busy-until when the
+        # last fragment was queued), which may still be in the future.
+        started = time.monotonic() if burst_end is None else max(burst_end, 0.0)
         provisional: Optional[_CompletionFrame] = None
         deadline_s = wait_s
+        # 2c (alpha 0.1.5): a report that arrives BEFORE the burst has ended
+        # on air -- the future already resolved when this wait starts, or a
+        # report landing while `time.monotonic() < burst_end` -- is progress,
+        # not the end of the wait: `on_early(frame)` applies it to the parts
+        # it mentions and says whether anything is still missing; the wait
+        # then continues to burst_end + window for the receiver's word on
+        # the rest. Only when that expires is the last early report acted
+        # on (captured as `reported_stale`), so parts absent from any report
+        # are re-burst only after the wait has actually expired -- the
+        # field's part-8 report ended the wait with parts 9-12 unmentioned
+        # and still in the sender's own radio queue. With nothing missing
+        # after an early report the wait ends at once.
+        early: Optional[_CompletionFrame] = None
+        early_reports = 0
+        done_at_entry = fut.done()
         released = release_lock is None
         while True:
+            # Alpha 0.1.8 (item 1): RNS proves every single-destination DATA
+            # packet, and the proof says the same thing the report would --
+            # "I have it" -- with none of the report's own frame, hold or
+            # QUERY behind it. Checked before the wait and again after every
+            # wakeup, since a proof may have landed during the burst.
+            if proved_check is not None and proved_check():
+                self._debug(
+                    f"RAW window to {peer_prefix!r} ({stage}): every packet proved by the far side's RNS "
+                    f"{max(0.0, time.monotonic() - started):.1f}s after the burst -- no report wait, no QUERY."
+                )
+                return _WINDOW_PROVED
             remaining = deadline_s - (time.monotonic() - started)
             if remaining <= 0:
                 got = None
@@ -276,17 +368,33 @@ class _ReconcileMixin:
                     if not released:
                         # Phase 1 (2026-09-20): a queued Link handshake takes
                         # the radio; the rest of this wait is radio-free (the
-                        # report future outlives the wait either way).
-                        done, cut = await self._wait_future_or_preempt(fut, remaining)
+                        # report future outlives the wait either way). Item 6
+                        # (alpha 0.1.5): so does a completion REPORT this
+                        # node owes the far sender -- under both-ways load
+                        # it waited 11-13 s behind this very wait.
+                        done, cut = await self._wait_future_or_preempt(
+                            fut, remaining, also_reports=True, extra_events=proved_events)
+                        if cut and proved_check is not None and proved_check():
+                            continue
                         if cut:
                             release_lock()
                             released = True
                             self._debug(
                                 f"report wait ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) released the radio to a "
-                                f"Link handshake after {time.monotonic() - started:.2f}s; still listening for the report."
+                                f"queued Link handshake or completion report after {time.monotonic() - started:.2f}s; "
+                                f"still listening for the report."
                             )
                             continue
                         got = fut.result() if done else None
+                    elif proved_events:
+                        # Radio-free, so no lock event is consulted here
+                        # (one that stayed set would spin): the report
+                        # future against the proof events, whichever first.
+                        got = await self._wait_future_or_proof(fut, remaining, proved_events)
+                        if got is None and (time.monotonic() - started) < deadline_s - 0.001:
+                            # A proof woke this, not the deadline: re-check
+                            # at the top of the loop.
+                            continue
                     else:
                         got = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
                 except (asyncio.TimeoutError, Exception):
@@ -295,11 +403,31 @@ class _ReconcileMixin:
                 if provisional is not None:
                     got = provisional
                     break
+                if early is not None:
+                    got = early
+                    break
                 self._debug(
                     f"no completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) within "
                     f"{wait_s:.1f}s of the burst -- falling back to a QUERY."
                 )
                 return None
+            arrived_early = on_early is not None and rearm is not None and (
+                done_at_entry or (burst_end is not None and time.monotonic() < burst_end))
+            done_at_entry = False
+            if arrived_early:
+                early_reports += 1
+                early = got
+                still_missing = on_early(got)
+                if not still_missing:
+                    # Everything this window sent is held: nothing to wait for.
+                    break
+                fut = rearm()
+                self._debug(
+                    f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}) arrived before the burst "
+                    f"ended on air ({self._radio_busy_remaining_s():.1f}s of own air left) -- applied as progress, "
+                    f"waiting for the receiver's word on the rest."
+                )
+                continue
             if got.entries and window_pkts is not None:
                 # v4 window report (M2): the gaps of every entry that belongs
                 # to this window, as (pkt_id, frag_idx) pairs.
@@ -324,8 +452,9 @@ class _ReconcileMixin:
                 )
                 continue
             break
-        waited_s = time.monotonic() - started
+        waited_s = max(0.0, time.monotonic() - started)
         is_provisional = got is provisional
+        acted_on_early = early is not None and got is early and (time.monotonic() - started) >= deadline_s - 0.001
         self._debug(
             f"completion REPORT ({stage}, pkt_id={pkt_id}, peer={peer_prefix!r}): v{got.version} "
             f"complete={got.complete} held={sorted(got.held) if got.held is not None else None} "
@@ -335,10 +464,13 @@ class _ReconcileMixin:
             self._capture_event("out", {
                 "event": "completion_check_result",
                 "peer_prefix": peer_prefix, "pkt_id": pkt_id, "frag_total": frag_total,
-                "outcome": "reported", "complete": got.complete, "stage": stage,
+                "hop_count": hops,
+                "outcome": "reported_stale" if acted_on_early else "reported", "complete": got.complete, "stage": stage,
                 "timeout_s": round(wait_s, 3), "answer_version": got.version,
                 "held": sorted(got.held) if got.held is not None else None,
+                "entries": [(e[0], e[1], e[2], sorted(e[3]) if e[3] is not None else None) for e in got.entries] or None,
                 "report_wait_s": round(waited_s, 3), "provisional": is_provisional,
+                "early_reports": early_reports,
             })
         return got
 
@@ -359,9 +491,9 @@ class _ReconcileMixin:
             return
         if answered or any(i.get("acked") for i in infos):
             # An ANSWER proves the path even if the QUERY's own ACK was lost.
-            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True, path_sample=False)
         elif all(i.get("waited_full_timeout") for i in infos):
-            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True)
+            self.record_direct_send_result(peer_prefix, succeeded=False, waited_full_timeout=True, path_sample=False)
 
     async def _raw_path_reset_mid_send(
         self, peer_prefix: str, path: bytes, pkt_id: int, rnd: int, acked: list, frag_total: int, remember,
@@ -402,7 +534,7 @@ class _ReconcileMixin:
 
     class _RawPart:
         __slots__ = ("data", "pkt_id", "chunks", "frag_total", "acked", "resume_key", "expires_at",
-                     "future", "last_progress_at", "resumed", "hop_count", "priority")
+                     "future", "last_progress_at", "resumed", "hop_count", "priority", "proof_key")
 
         def __init__(self, data, pkt_id, expires_at, resume_key, hop_count, priority):
             self.data = data
@@ -417,9 +549,13 @@ class _ReconcileMixin:
             self.resumed = False
             self.hop_count = hop_count
             self.priority = priority
+            # Alpha 0.1.8 (item 1): the truncated hash the PROOF for this
+            # packet will carry in its destination field, or None when RNS
+            # does not prove this packet per packet (`_answered_send_key`).
+            self.proof_key = None
 
     class _RawWindow:
-        __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed")
+        __slots__ = ("peer_prefix", "target", "parts", "opened_at", "leader", "closed", "last_join_at")
 
         def __init__(self, peer_prefix, target):
             self.peer_prefix = peer_prefix
@@ -428,16 +564,61 @@ class _ReconcileMixin:
             self.opened_at = time.monotonic()
             self.leader = None
             self.closed = False
+            self.last_join_at = self.opened_at   # item 5: the collect's silence clock
+
+    # Alpha 0.1.5 (item 5): the shortest silence after which a window stops
+    # waiting for more parts -- RNS's Resource sender emits a window's parts
+    # in one loop and the outgoing worker hands them over within a few
+    # loop turns, so a lone packet starts within this.
+    RAW_WINDOW_COLLECT_FLOOR_S = 0.04
+    # How many recent part arrivals per peer feed the spacing estimate.
+    RAW_PART_ARRIVALS_KEPT = 8
 
     def _window_collect_s(self) -> float:
-        """How long a window stays open for further parts after its first
-        (pure function): RNS's Resource sender emits a window's parts within
-        milliseconds and the outgoing worker dequeues one per loop turn, so
-        `direct_raw_window_collect` (0.75 s) gathers a whole RNS window;
-        0 when window batching is off (a single part never waits)."""
+        """The LONGEST a window stays open for further parts after its first
+        (pure function): `direct_raw_window_collect` (0.75 s), the maximum
+        since alpha 0.1.5 (item 5) -- the collect ends earlier once nothing
+        is queued from RNS and no part has joined within the observed
+        inter-part spacing (`_window_collect_continue`); 0 when window
+        batching is off (a single part never waits)."""
         if not self.direct_raw_window_enabled:
             return 0.0
         return max(0.0, self.direct_raw_window_collect_s)
+
+    def _note_raw_part_arrival(self, peer_prefix: str, now: float) -> None:
+        """A raw-eligible part for this peer reached the window machine."""
+        arrivals = self._raw_part_arrivals.setdefault(peer_prefix, collections.deque(maxlen=self.RAW_PART_ARRIVALS_KEPT))
+        arrivals.append(now)
+
+    def _observed_part_spacing_s(self, peer_prefix: str, max_s: float) -> float:
+        """The inter-part spacing of this peer's current transfer (pure over
+        the recorded arrivals, alpha 0.1.5 item 5): twice the median gap
+        between consecutive recent arrivals that fell inside `max_s` (gaps
+        longer than the collect maximum are between windows, not between a
+        window's parts), never below RAW_WINDOW_COLLECT_FLOOR_S nor above
+        `max_s`; the floor alone when nothing has been observed yet."""
+        floor = self.RAW_WINDOW_COLLECT_FLOOR_S
+        arrivals = list(self._raw_part_arrivals.get(peer_prefix, ()))
+        gaps = sorted(b - a for a, b in zip(arrivals, arrivals[1:]) if 0.0 <= b - a < max_s)
+        if not gaps:
+            return min(max_s, floor) if max_s > 0 else 0.0
+        median = gaps[len(gaps) // 2]
+        return max(floor, min(max_s, 2.0 * median))
+
+    def _window_collect_continue(self, now: float, opened_at: float, last_join_at: float, n_parts: int,
+                                 max_parts: int, queue_depth: int, spacing_s: float, max_s: float) -> bool:
+        """Whether the window keeps collecting (pure function, alpha 0.1.5
+        item 5): never past `max_s` from opening or `max_parts` parts; while
+        the outgoing queue still holds packets (RNS's next part may be one
+        of them) or a part joined within the observed inter-part spacing.
+        A lone part -- nothing queued, no join within the spacing -- stops
+        within the floor instead of the 0.75 s maximum, which the
+        zero-hop probe RTT paid on every single packet."""
+        if now - opened_at >= max_s or n_parts >= max_parts:
+            return False
+        if queue_depth > 0:
+            return True
+        return (now - last_join_at) < spacing_s
 
     async def _send_direct_raw_fragmented(
         self, target: str, peer_prefix: str, payload: bytes, pkt_id: int,
@@ -469,11 +650,19 @@ class _ReconcileMixin:
             RNS.log(f"{self}: dropping raw DIRECT send to {peer_prefix!r} -- packet expired before its first transmission.", RNS.LOG_WARNING)
             return False
         part = self._RawPart(payload, pkt_id, expires_at, resume_key, hop_count, priority)
+        # Alpha 0.1.8 (item 1): the same key the bare DIRECT path already
+        # uses to stop retrying once the proof lands (`_answered_send_key`,
+        # `_direct.py`) -- a plain DATA to a SINGLE destination only, so a
+        # Link packet's proof (which carries the link_id and so names no
+        # particular packet), a Resource part and an announce all leave it
+        # None and those windows keep reporting as they do today.
+        part.proof_key = self._answered_send_key(payload, self._parse_rns_header(payload))
         part.chunks = chunks
         part.frag_total = len(chunks)
         part.acked, part.resumed = self._resume_state(resume, part.frag_total, pkt_id, peer_prefix, raw=True)
         part.last_progress_at = time.monotonic() if part.resumed else None
         part.future = asyncio.get_running_loop().create_future()
+        self._note_raw_part_arrival(peer_prefix, time.monotonic())
         window = self._raw_windows.get(peer_prefix)
         max_parts = max(1, self.direct_raw_window_max_parts)
         if window is None or window.closed or len(window.parts) >= max_parts or window.target != target:
@@ -493,8 +682,72 @@ class _ReconcileMixin:
                         p.future.set_result(None)
             return part.future.result()
         window.parts.append(part)
+        window.last_join_at = time.monotonic()
         self._debug(f"RAW part pkt_id={pkt_id} joined the open window to {peer_prefix!r} ({len(window.parts)} parts).")
         return await part.future
+
+    def _frame_entries(self, frame: "_CompletionFrame") -> tuple:
+        """A completion frame's per-part entries: the v4 list, or the single
+        v1-v3 part as one entry (held None when it carried no bitmap)."""
+        if frame.entries:
+            return tuple(frame.entries)
+        return ((frame.pkt_id, frame.frag_total, frame.complete, self._held_from_answer(frame, frame.frag_total)),)
+
+    def _capture_window_proved(self, peer_prefix: str, parts, stage: str) -> None:
+        """The `proved` outcome, recorded in the same record type the
+        report and the QUERY answer use, so the reconcile accounting stays
+        in one place (alpha 0.1.8, item 1)."""
+        if self._packet_capture_file is None:
+            return
+        for part in parts:
+            self._capture_event("out", {
+                "event": "completion_check_result", "peer_prefix": peer_prefix,
+                "pkt_id": part.pkt_id, "frag_total": part.frag_total,
+                "hop_count": self._receiver_hops_to(peer_prefix),
+                "outcome": "proved", "complete": True, "stage": stage,
+                "timeout_s": None, "answer_version": None, "held": None, "entries": None,
+                "report_wait_s": None, "provisional": False, "early_reports": 0,
+                "proved_by": self._send_answered_by(part.proof_key) if part.proof_key is not None else None,
+            })
+
+    def _mark_part_proved(self, window, part, peer_prefix: str) -> None:
+        """One part of a window completed by the PROOF its packet drew from
+        the far side's RNS, rather than by a completion report (alpha
+        0.1.8, item 1). The same three steps `_apply_window_entries` takes
+        for a part a report completed."""
+        part.acked = [True] * part.frag_total
+        part.last_progress_at = time.monotonic()
+        self._resumable_sends.pop(part.resume_key, None)
+        if not part.future.done():
+            part.future.set_result(True)
+        self._debug(f"RAW part pkt_id={part.pkt_id} to {peer_prefix!r} complete (proof).")
+
+    def _window_proved_parts(self, parts, peer_prefix: str) -> list:
+        """The parts of this window whose packet the far side's RNS has
+        proved, from the signal `_signal_send_answered` already raises for
+        every inbound DIRECT PROOF (`_peers.py`). `proof_key` is None for
+        anything RNS does not prove per packet -- a Resource part, anything
+        inside a Link, an announce -- so those parts never appear here and
+        the window keeps waiting for its report."""
+        proved = []
+        for part in parts:
+            key = getattr(part, "proof_key", None)
+            if key is None or part.future.done():
+                continue
+            if self._answered_send_event(key).is_set():
+                proved.append(part)
+        return proved
+
+    def _window_all_proved(self, parts, peer_prefix: str) -> bool:
+        """True when every part still outstanding has been proved -- the
+        window is complete and neither the report wait nor a QUERY has
+        anything left to ask about."""
+        outstanding = [p for p in parts if not p.future.done()]
+        if not outstanding:
+            return False
+        if any(getattr(p, "proof_key", None) is None for p in outstanding):
+            return False
+        return all(self._answered_send_event(p.proof_key).is_set() for p in outstanding)
 
     def _window_missing(self, parts) -> list:
         """[(part, frag_idx)] still to send, in part order."""
@@ -535,9 +788,21 @@ class _ReconcileMixin:
         peer_prefix, target = window.peer_prefix, window.target
         collect_s = self._window_collect_s()
         if collect_s > 0:
-            deadline = time.monotonic() + collect_s
-            while time.monotonic() < deadline and len(window.parts) < max(1, self.direct_raw_window_max_parts):
-                await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            # Item 5 (alpha 0.1.5): adaptive collect -- stop as soon as
+            # nothing is queued from RNS and no part has joined within the
+            # transfer's observed inter-part spacing; `collect_s` is the cap.
+            spacing_s = self._observed_part_spacing_s(peer_prefix, collect_s)
+            while self._window_collect_continue(
+                time.monotonic(), window.opened_at, window.last_join_at, len(window.parts),
+                max(1, self.direct_raw_window_max_parts), self._outqueue.qsize(), spacing_s, collect_s,
+            ):
+                await asyncio.sleep(0.01)
+            if self._packet_capture_file is not None:
+                self._capture_event("out", {
+                    "event": "raw_window_collect", "peer_prefix": peer_prefix, "parts": len(window.parts),
+                    "collect_s": round(time.monotonic() - window.opened_at, 3), "spacing_s": round(spacing_s, 3),
+                    "max_s": collect_s,
+                })
         window.closed = True
         parts = window.parts
         hop_count = parts[0].hop_count
@@ -563,6 +828,21 @@ class _ReconcileMixin:
             if slot_held:
                 slot.release()
 
+    @staticmethod
+    def _raw_window_rounds_rule(reconcile_rounds: int, max_rounds_relayed: int, hops: int) -> int:
+        """Burst-and-reconcile rounds a window gets (pure, alpha 0.1.6 item
+        2): `reconcile_rounds` at zero hop; through repeaters the smaller
+        of that and `max_rounds_relayed` (0: no separate cap). The field's
+        two-hop windows ran three rounds of a burst, a report wait and up
+        to two ~18 s QUERY exchanges each while link proofs waited."""
+        rounds = max(1, int(reconcile_rounds))
+        if hops >= 1 and max_rounds_relayed > 0:
+            rounds = max(1, min(rounds, int(max_rounds_relayed)))
+        return rounds
+
+    def _raw_window_rounds(self, gap_hops: int) -> int:
+        return self._raw_window_rounds_rule(self.direct_raw_reconcile_rounds, self.direct_raw_window_max_rounds, gap_hops)
+
     async def _run_raw_window_rounds(self, window, parts, path: bytes, own_prefix: str, hop_count, priority: int, gap_hops: int) -> None:
         peer_prefix, target = window.peer_prefix, window.target
         self._debug(
@@ -586,7 +866,7 @@ class _ReconcileMixin:
                 if not p.future.done():
                     p.future.set_result(value)
 
-        rounds = max(1, self.direct_raw_reconcile_rounds)
+        rounds = self._raw_window_rounds(gap_hops)
         query_unanswered_rounds = 0
         empty_answered_bursts = 0
         burst_allowed = True
@@ -632,6 +912,7 @@ class _ReconcileMixin:
                 await lock.acquire(priority)
                 lock_held = True
                 yields = 0
+                report_yields = 0
 
                 def release_for_handshake() -> None:
                     nonlocal lock_held
@@ -690,46 +971,119 @@ class _ReconcileMixin:
                                 "frag_idx": frag_idx, "frag_total": part.frag_total, "round": rnd, "ok": sent_ok,
                                 "size_bytes": len(frame), "path_len": len(path), "hop_count": hop_count,
                                 "on_air_bytes": (2 + len(path) + len(frame)) if sent_ok else None,
+                                "gap_s": round(self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame)), 3),
                                 "duty_cycle_wait_s": telemetry.get("duty_cycle_wait_s"),
+                                "duty_cycle_ledger": telemetry.get("duty_cycle_ledger"),
                                 "medium_hold_wait_s": telemetry.get("medium_hold_wait_s"),
-                                "handshake_yields": yields, "window_parts": len(parts),
+                                "handshake_yields": yields, "report_yields": report_yields, "window_parts": len(parts),
                                 "parity_mask": (sum(1 << i for i, _p in parity_over) if parity_over is not None else None),
                             })
-                        gap_s = self._raw_fragment_gap_s(gap_hops, 2 + len(path) + len(frame))
-                        if gap_s > 0:
-                            await asyncio.sleep(gap_s)
+                        on_air_bytes = 2 + len(path) + len(frame)
+                        gap_s = self._raw_fragment_gap_s(gap_hops, on_air_bytes)
+                        # 2a: at zero hop, also wait for the radio to catch
+                        # up (bounded firmware queue, loop clock = air clock).
+                        wait_s = self._raw_burst_next_send_wait_s(
+                            gap_hops, gap_s, self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes),
+                            time.monotonic(), self._radio_busy_until,
+                        )
+                        # Always await, even for a zero wait (alpha 0.1.9,
+                        # 2026-09-23). `asyncio.sleep(0)` yields to the loop
+                        # once, which is what lets a report or handshake that
+                        # was queued while this fragment was in flight
+                        # actually register as a waiter before the two checks
+                        # below ask whether one is queued. Skipping the await
+                        # on a zero gap starved them: the loop ran the whole
+                        # burst without ever giving the event loop a turn, so
+                        # `report_requested()` was False at every part
+                        # boundary and the report waited out the entire
+                        # window -- exactly what alpha 0.1.5's item 6 exists
+                        # to prevent. Surfaced while
+                        # `direct_raw_gap_own_airtime` briefly defaulted to
+                        # `no`, which leaves a gap of zero wherever
+                        # `direct_raw_hop_gap_factor` is also 0; the shipped
+                        # factor is 2.0 and the zero-hop gap is 0.15, so no
+                        # shipped configuration hits it, but nothing should
+                        # depend on the gap being nonzero.
+                        await asyncio.sleep(wait_s)
                         if n < len(burst) - 1 and lock.preempt_requested():
                             yields += 1
                             await lock.yield_to_preempt()
                             if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
                                 fail_rest(False)
                                 return
-                    if yields:
-                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake {yields} time(s).")
+                        elif n < len(burst) - 1 and burst[n + 1][0] is not part and lock.report_requested():
+                            # Item 6 (alpha 0.1.5): between two PARTS of the
+                            # window (never inside a part's burst) a
+                            # completion REPORT this node owes the far
+                            # sender goes out first -- under both-ways load
+                            # its report otherwise waits behind the whole
+                            # window (12-15 s observed in the phase-4 slow
+                            # scenario) while the far sender's report wait
+                            # expires and it re-queries. Resumes behind the
+                            # report's tier, ahead of ordinary waiters.
+                            report_yields += 1
+                            await lock.yield_to_preempt(lock.REPORT_YIELDED_PRIORITY)
+                            if await self._raw_path_reset_mid_send(peer_prefix, path, part.pkt_id, rnd, part.acked, part.frag_total, remember_all):
+                                fail_rest(False)
+                                return
+                    if yields or report_yields:
+                        self._debug(f"RAW window to {peer_prefix!r}: round {rnd} yielded the radio to a Link handshake "
+                                    f"{yields} time(s) and to a completion report {report_yields} time(s).")
                     if report_fut is not None:
-                        stale_report = None
-                        if report_fut.done() and not report_fut.result().complete:
-                            stale_report = report_fut.result()
-                            report_fut = rearm()
+                        # 2a: the burst ends when the radio is estimated to
+                        # have finished the last queued fragment, not when
+                        # the last send command returned -- the report wait
+                        # and the report-latency estimator both anchor here.
+                        burst_end = max(time.monotonic(), self._radio_busy_until)
                         for p, _ in missing:
-                            self._expect_report(peer_prefix, p.pkt_id, time.monotonic())
+                            self._expect_report(peer_prefix, p.pkt_id, burst_end)
                         last_part, last_idx = missing[-1]
+
+                        def apply_early(frame) -> bool:
+                            # 2c: a report from before the burst's end on
+                            # air (the field's part-8 report) is applied to
+                            # the parts it names; True while parts of this
+                            # window are still missing.
+                            self._apply_window_entries(window, self._frame_entries(frame), "early report")
+                            return bool(self._window_missing(parts))
+
+                        # Alpha 0.1.8 (item 1): the PROOFs this window's own
+                        # packets will draw. `_signal_send_answered` already
+                        # sets these for every inbound DIRECT PROOF; nothing
+                        # was listening on the raw path until now.
+                        proof_keys = [p.proof_key for p, _ in missing if p.proof_key is not None]
+                        proved_events = [self._answered_send_event(k) for k in dict.fromkeys(proof_keys)]
                         report = await self._await_completion_report(
                             report_fut, peer_prefix, last_part.pkt_id, last_part.frag_total, gap_hops, stage=f"raw{rnd}",
                             last_sent_idx=last_idx, rearm=rearm, release_lock=release_for_handshake,
-                            window_pkts=live_pkts,
+                            window_pkts=live_pkts, burst_end=burst_end, on_early=apply_early,
+                            proved_check=(lambda: self._window_all_proved(parts, peer_prefix)) if proved_events else None,
+                            proved_events=proved_events or None,
                         )
-                        if report is None and stale_report is not None:
-                            report = stale_report
-                            self._capture_completion_check_result(
-                                peer_prefix, last_part.pkt_id, last_part.frag_total, "reported_stale", stale_report.complete,
-                                stage=f"raw{rnd}", answer_version=stale_report.version,
-                                held=sorted(stale_report.held) if stale_report.held is not None else None,
-                            )
                 finally:
                     release_for_handshake()
                 for p, _ in missing:
                     self._completion_query_waiters.pop((peer_prefix, p.pkt_id), None)
+                if report is _WINDOW_PROVED:
+                    # Alpha 0.1.8 (item 1): the window ends here. No report
+                    # wait was spent past the proof, no QUERY is sent, and
+                    # the parts are marked exactly as a report would mark
+                    # them. Path evidence only from a proof the PEER this
+                    # window was addressed to delivered -- the same rule the
+                    # bare path's `answered` outcome applies, since a proof
+                    # relayed by another peer or over CHANNEL says nothing
+                    # about this peer's path.
+                    proved_parts = list(dict.fromkeys(p for p, _ in missing))
+                    for part in proved_parts:
+                        self._mark_part_proved(window, part, peer_prefix)
+                    for p, _ in missing:
+                        self._expect_report(peer_prefix, p.pkt_id, None)
+                    if any(self._send_answered_by(p.proof_key) == peer_prefix
+                           for p in proved_parts if p.proof_key is not None):
+                        self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                    self._raw_incomplete_strikes.pop(peer_prefix, None)
+                    self._capture_window_proved(peer_prefix, proved_parts, stage=f"raw{rnd}")
+                    return
             held_before = sum(sum(p.acked) for p in parts)
             answer = report
             query_infos: list = []
@@ -761,8 +1115,7 @@ class _ReconcileMixin:
                     fail_rest(False)
                     return
                 continue
-            entries = answer.entries if answer.entries else ((answer.pkt_id, answer.frag_total, answer.complete,
-                                                              self._held_from_answer(answer, answer.frag_total)),)
+            entries = self._frame_entries(answer)
             if all(e[3] is None for e in entries):
                 query_unanswered_rounds += 1
                 consecutive_unanswered += 1
@@ -1033,8 +1386,10 @@ class _ReconcileMixin:
         answer: Optional[_CompletionFrame] = None
         timeout_s = self._completion_query_timeout_s(peer_prefix, hop_count)
         try:
-            frame = self._encode_completion_frame_v4(
+            wire_path_len, wire_rate = self._path_rate_for_wire(peer_prefix)
+            frame = self._encode_completion_frame_v5(
                 self.COMPLETION_TYPE_QUERY, [(p, t, False, None) for p, t in query_entries], nonce=query_nonce,
+                path_len=wire_path_len, rate=wire_rate,
             )
             # First raw field test (2026-09-18 night): the QUERY is one
             # ordinary ACKed exchange -- lock held through its transmit and
@@ -1168,7 +1523,7 @@ class _ReconcileMixin:
             self._capture_completion_check_result(
                 peer_prefix, pkt_id, frag_total, outcome,
                 answer.complete if answer is not None else False,
-                stage=stage, timeout_s=timeout_s,
+                stage=stage, timeout_s=timeout_s, hop_count=hop_count,
                 answer_version=answer.version if answer is not None else None,
                 held=sorted(answer.held) if answer is not None and answer.held is not None else None,
             )
@@ -1194,6 +1549,12 @@ class _ReconcileMixin:
         except ValueError as exc:
             self._debug(f"discarding malformed completion-check frame from {sender_token!r}: {exc}")
             return
+        if frame.peer_path_len is not None:
+            # v5 (alpha 0.1.6, item 1): the sender's path view feeds this
+            # node's scoreboard for the symmetric path.
+            _peer = self._canonical_peer_prefix(sender_token)
+            if _peer is not None:
+                self._note_peer_reported_path(_peer, frame.peer_path_len, frame.peer_rate)
 
         if frame.type == self.COMPLETION_TYPE_QUERY:
             # Step 3 (2026-09-18): answer with what we actually hold, not
@@ -1208,7 +1569,7 @@ class _ReconcileMixin:
                 # one v4 ANSWER lists every part's state.
                 entries = [(p, t) + self._bucket_state(sender_token, p, t) for p, t, _c, _h in frame.entries]
                 self._debug(
-                    f"completion QUERY (v4) from {sender_token!r} for {[(p, t) for p, t, _c, _h in frame.entries]}: "
+                    f"completion QUERY (v{frame.version}) from {sender_token!r} for {[(p, t) for p, t, _c, _h in frame.entries]}: "
                     f"answering {[(p, c, sorted(h)) for p, _t, c, h in entries]}."
                 )
                 if self._packet_capture_file is not None:
@@ -1217,6 +1578,10 @@ class _ReconcileMixin:
                         "pkt_id": frame.pkt_id, "frag_total": frame.frag_total, "query_version": frame.version,
                         "answering_complete": entries[0][2], "answering_held": sorted(entries[0][3]),
                         "entries": [(p, t, c, sorted(h)) for p, t, c, h in entries],
+                        # alpha 0.1.7 (item 4): the v5 header as received
+                        "peer_path_len": frame.peer_path_len,
+                        "peer_rate": round(frame.peer_rate, 3) if frame.peer_rate is not None else None,
+                        "hop_count": self._peer_view_fields(sender_token)["hop_count"],
                     })
                 self._spawn_background_task(
                     self._send_completion_answer(
@@ -1239,6 +1604,9 @@ class _ReconcileMixin:
                     "query_version": frame.version,
                     "answering_complete": complete,
                     "answering_held": sorted(held),
+                    "peer_path_len": frame.peer_path_len,
+                    "peer_rate": round(frame.peer_rate, 3) if frame.peer_rate is not None else None,
+                    "hop_count": self._peer_view_fields(sender_token)["hop_count"],
                 })
             self._spawn_background_task(
                 self._send_completion_answer(
@@ -1377,6 +1745,124 @@ class _ReconcileMixin:
             for k in sorted(table, key=table.get)[: len(table) - 2 * self.COMPLETION_V4_MAX_ENTRIES]:
                 table.pop(k, None)
 
+    # -- Item 1 (alpha 0.1.8): the proof is the completion ---------------
+
+    def _proof_expected_key(self, data: bytes, header) -> Optional[bytes]:
+        """The value the PROOF for this just-delivered packet will carry in
+        its destination field, when RNS proves it per packet at all: a
+        plain DATA to a SINGLE destination, which is what `_answered_send_
+        key` keys the sender's side on. None for everything RNS does not
+        prove one packet at a time -- a Resource part (context RESOURCE;
+        a Resource is proved once, whole, as RESOURCE_PRF), anything else
+        carried inside a Link, and every announce."""
+        if header is None or not data:
+            return None
+        if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
+                and header.destination_type == RNS.Destination.SINGLE):
+            return self._compute_truncated_hash(data, header.header_type)
+        return None
+
+    def _proof_may_replace_report(self, complete_data: bytes, header, sender_token: str,
+                                  peer_prefix: Optional[str]) -> Optional[bytes]:
+        """The proof key to wait for before sending this window's complete
+        report, or None to report exactly as before (alpha 0.1.8, item 1).
+
+        Four gates, each of which would otherwise cost the sender its only
+        signal:
+
+        1. RNS proves this packet per packet (`_proof_expected_key`).
+        2. Its destination is served by this node's own RNS
+           (`_is_local_destination`). On a transport node relaying the
+           packet onward nothing proves it, so no proof is ever coming.
+        3. Nothing else of this sender's recent raw packets is incomplete.
+           The complete report is NOT about one packet: it carries a
+           per-fragment bitmap for every recent pkt_id of this sender
+           (`_recent_raw_entries`), and those bitmaps are how the sender
+           re-drives exactly the missing fragments of its OTHER parts
+           without a QUERY first. A proof says only "this one packet
+           arrived", so while anything else is incomplete the report is
+           worth far more than the proof's latency.
+        4. The sender is a bound peer with a resolved path, so the proof
+           routes back to it DIRECT (`_proof_correlation`'s own gate in
+           `_observe_raw_received_packet`). Without that the proof may go
+           out over CHANNEL, to every peer, or not at all."""
+        if self.proof_report_grace_s <= 0:
+            return None
+        key = self._proof_expected_key(complete_data, header)
+        if key is None:
+            return None
+        if header.destination_hash is None or not self._is_local_destination(header.destination_hash):
+            return None
+        if any(not complete for _pkt, _total, complete, _held in self._recent_raw_entries(sender_token)):
+            return None
+        if peer_prefix is None or peer_prefix not in self._peers or peer_prefix not in self._resolved_paths:
+            return None
+        return key
+
+    def _cancel_proof_grace(self, sender_token: str) -> None:
+        task = self._pending_proof_graces.pop(sender_token, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _hold_report_for_proof(self, sender_token: str, header: "_FrameHeader", proof_key: bytes) -> None:
+        """Hold this window's complete report for `proof_report_grace_s`.
+        If RNS hands the proof over inside it, the proof IS the completion
+        and the report is dropped -- one frame instead of two, and the
+        proof no longer queues behind the report's own relay hold, which at
+        two hops in the 2026-09-22 field session put it on the air about
+        8 s after the packet landed (proof turnaround 17.9 s median, 30.6 s
+        p90). If the grace expires, the report goes exactly as before.
+
+        Nothing here bypasses a hold or shortens one. The 0.1.7 second cut
+        stands untouched: this works by not sending a frame, never by
+        cutting the relay window of one already sent."""
+        self._cancel_proof_grace(sender_token)
+
+        async def grace():
+            try:
+                deadline = time.monotonic() + self.proof_report_grace_s
+                while True:
+                    if self._proof_enqueued_at_for_key(proof_key) is not None:
+                        # Item 1 (alpha 0.1.9): the proof stands in for the
+                        # report, so the packet counts as reported and the
+                        # burst tail's flagged frames do not re-trigger one.
+                        self._note_complete_report_sent(sender_token, header.pkt_id)
+                        self._capture_report_skipped_for_proof(sender_token, header, proof_key)
+                        self._debug(
+                            f"completion REPORT to {sender_token!r} (pkt_id={header.pkt_id}) skipped: RNS proved the "
+                            f"packet inside the {self.proof_report_grace_s:.2f}s grace, and the proof says the same "
+                            f"thing with one frame instead of two."
+                        )
+                        return
+                    if time.monotonic() >= deadline or self.detached or not self.online:
+                        break
+                    await asyncio.sleep(min(self.PROOF_GRACE_POLL_S, max(0.0, deadline - time.monotonic())))
+                self._send_completion_report(
+                    sender_token, header, complete=True, held=set(range(header.frag_total)),
+                    held_s=round(self.proof_report_grace_s, 3),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                RNS.log(f"{self}: proof grace for {sender_token!r} failed: {exc}", RNS.LOG_WARNING)
+            finally:
+                if self._pending_proof_graces.get(sender_token) is task_holder.get("task"):
+                    self._pending_proof_graces.pop(sender_token, None)
+
+        task_holder = {}
+        task_holder["task"] = asyncio.get_running_loop().create_task(grace())
+        self._pending_proof_graces[sender_token] = task_holder["task"]
+
+    def _capture_report_skipped_for_proof(self, sender_token: str, header: "_FrameHeader", proof_key: bytes) -> None:
+        if self._packet_capture_file is None:
+            return
+        self._capture_event("out", dict({
+            "event": "completion_report_skipped", "peer_prefix": self._canonical_peer_prefix(sender_token),
+            "pkt_id": header.pkt_id, "frag_total": header.frag_total,
+            "report_skipped_for_proof": True, "proof_key": proof_key.hex(),
+            "grace_s": round(self.proof_report_grace_s, 3),
+        }, **self._peer_view_fields(self._canonical_peer_prefix(sender_token))))
+
     def _recent_raw_entries(self, sender_token: str) -> list:
         """The v4 report entries for this sender: (pkt_id, frag_total,
         complete, held) for its recent raw packets, newest first."""
@@ -1389,17 +1875,267 @@ class _ReconcileMixin:
             entries.append((pkt_id, frag_total, complete, held))
         return entries
 
-    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int) -> float:
-        """How long a receiver holds a gaps report after a flagged fragment
-        that left gaps (pure function, phase 3 M1): the time the burst's
-        LAST fragment needs to arrive -- one fragment's airtime plus, through
-        repeaters, the hop-scaled relay gap the sender itself observes
-        between fragments (`_raw_fragment_gap_s`). Field: the complete
-        report followed the gaps report by 0.22-0.43 s at the receiver at
-        zero hop, one fragment airtime (~0.9 s at SF7/BW62.5) covers it."""
+    # Alpha 0.1.5 (2b): the margin, in fragment airtimes, a "still arriving"
+    # hold adds to the sender's spacing for relay and host jitter before the
+    # receiver concludes the burst has ended.
+    RAW_ARRIVING_HOLD_MARGIN_AIRTIMES = 0.5
+    # How many of the sender's start-to-start spacings the hold spans: TWO,
+    # so one lost fragment does not end the silence. MeshBench
+    # `page_transfer` on the first cut (one spacing + the margin, 3.19 s at
+    # one hop against a 2.74 s spacing): the hold fired 8 times, 7 of them
+    # while the sender still had 1-7 frames of its re-drive to send -- the
+    # fragment after the completing one had been lost at the repeater, so
+    # the receiver's silence ran past one spacing mid-burst -- and 0 of the
+    # 8 reports reached the sender (MeshBench: half-duplex / collision at
+    # the repeater). Exactly the collision 2b exists to remove.
+    RAW_ARRIVING_HOLD_SPACINGS = 2.0
+    # Alpha 0.1.6 (item 3): the gaps hold spans ONE sender spacing plus the
+    # margin (it was one airtime at zero hop, the relay gap through
+    # repeaters, with no margin). The 2026-09-21 session: the completing
+    # fragment landed 0.01 s after the 0.91 s hold at zero hop and 0.1-1.55 s
+    # after the 1.93 s hold at two hops, so 6 of 15 receiver reports were a
+    # gaps report and a complete report back to back.
+    RAW_GAPS_HOLD_SPACINGS = 1.0
+
+    def _report_hold_s(self, fragment_on_air_bytes: int, hops: int, arriving: bool = False) -> float:
+        """How long a receiver holds a report (pure function, phase 3 M1;
+        generalised in alpha 0.1.5 2b; the gaps hold widened in alpha 0.1.6
+        item 3).
+
+        Gaps case (`arriving=False`): after a flagged fragment that left
+        gaps, the time the burst's LAST fragment needs to arrive -- one of
+        the sender's start-to-start spacings at this hop count (a fragment's
+        airtime plus `direct_raw_zero_hop_gap` at zero hop; the hop-scaled
+        relay gap, which contains the airtime, through repeaters) plus half
+        an airtime of margin. Field: the complete report followed the gaps
+        report by 0.22-0.43 s at zero hop in the 2026-09-20 session, but in
+        the 2026-09-21 session the completing fragment landed just outside
+        the one-airtime hold (0.01 s at zero hop, up to 1.55 s past the
+        relay-gap hold at two hops).
+
+        Still-arriving case (`arriving=True`): after an UNFLAGGED fragment
+        completed a part, the silence that says the sender's window burst
+        is over -- RAW_ARRIVING_HOLD_SPACINGS (two) of the sender's start-
+        to-start spacings at this hop count (airtime + `direct_raw_zero_
+        hop_gap` at zero hop; the hop-scaled gap, which contains the
+        airtime, through repeaters), so one lost fragment does not end the
+        silence, plus half an airtime for relay and host jitter. Re-armed
+        by every fragment."""
+        airtime = self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
         if hops > 0:
-            return self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
-        return self._estimate_tx_airtime_s("", on_air_bytes=fragment_on_air_bytes)
+            hold = self._raw_fragment_gap_s(hops, fragment_on_air_bytes)
+        else:
+            hold = airtime
+        spacing = hold + (max(0.0, self.direct_raw_zero_hop_gap_s) if hops <= 0 else 0.0)
+        spacings = self.RAW_ARRIVING_HOLD_SPACINGS if arriving else self.RAW_GAPS_HOLD_SPACINGS
+        return spacings * spacing + self.RAW_ARRIVING_HOLD_MARGIN_AIRTIMES * airtime
+
+    def _proof_tail_hold_s(self, sender_token: str, header: "_FrameHeader", bucket_before,
+                           report_requested: bool, fragment_on_air_bytes: int) -> float:
+        """How long the PROOF that replaces this window's complete report
+        waits for the sender's burst tail (alpha 0.1.9, item 2). 0.0 when
+        the burst is demonstrably over.
+
+        The evidence. At the 2026-09-23 two-hop stop the report was skipped
+        13 times and the proof was keyed within a second of completion, yet
+        its first attempt succeeded 9 of 17 across the session against the
+        path's own 67-69 % -- and bare single-fragment packets' proofs,
+        which have no burst behind them, succeeded 6 of 7 and turned round
+        in 3.8 s against the raw window's 10.0 s. The collision partner is
+        the sender's own burst tail: `_run_raw_window_rounds` appends a
+        part's parity fragment AFTER its data fragments, one
+        `_raw_fragment_gap_s` later (4.63 s at two hops), so when the data
+        fragments complete the packet the parity is still to come. In the
+        four stop-2 cases where the rx-log shows a RAW frame 3.8 to 4.9 s
+        after completion, three of the proofs missed.
+
+        The wait is ONE of the sender's start-to-start spacings plus the
+        half-airtime margin -- `_report_hold_s(..., arriving=False)`, the
+        existing pure rule and its existing constant, not a new one. It is
+        deliberately not the still-arriving hold (`arriving=True`, TWO
+        spacings): that is 9.55 s at two hops against the sender's own
+        report wait of 9.0 s (`direct_raw_report_wait_base` 4.0 plus
+        `direct_raw_report_wait_per_hop` 2.5 per hop), so it would expire
+        the sender's window and provoke the QUERY that alpha 0.1.8's item 1
+        exists to remove. One spacing is 5.00 s at two hops and 3.18 s at
+        one, comfortably inside the wait at every hop count, and it is what
+        the tail actually costs -- we are waiting for one known frame, not
+        for silence.
+
+        This is a hold on a frame NOT YET SENT, so the 0.1.7 second cut is
+        untouched: no hold on a frame already on the air is cut or
+        shortened, and the radio lock is never held across the wait."""
+        if self.proof_report_grace_s <= 0:
+            return 0.0
+        hops = self._receiver_hops_to(sender_token)
+        # Alpha 0.1.9 second pass (item 3): no hold at zero hop. The hold
+        # exists because through repeaters the parity trails the data by a
+        # relay-scaled spacing and the proof is in the relay chain when it
+        # is keyed; at zero hop the parity follows within
+        # `direct_raw_zero_hop_gap` (0.15 s) and there is no chain, so the
+        # hold buys nothing and costs the proof's latency. Zero hop is this
+        # node's OWN path to the sender -- the proof goes over it -- whatever
+        # the peer last reported: session 2 of 2026-09-23 held zero-hop
+        # proofs 1.0 to 2.3 s, the unflagged-completion branch below plus a
+        # stale one-hop peer report in `_receiver_hops_to`.
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        own = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        if hops == 0 or (own is not None and own.out_path_len == 0):
+            return 0.0
+        # Did the sender put a parity fragment behind this part, and has it
+        # arrived? The raw header declares no parity count -- `frag_total`
+        # counts data fragments only -- so this reads the sender's own pure
+        # rules (`_raw_parity_fragments` / `_raw_parity_fits`, and the
+        # `len(idxs) >= 2` condition in `_run_raw_window_rounds`) at this
+        # hop count. `bucket.parity` is non-empty only once a parity frame
+        # has actually landed, which includes the case where the parity
+        # reconstructed the fragment that completed the part.
+        parity_arrived = bool(bucket_before is not None and bucket_before.parity)
+        parity_expected = bool(
+            header.frag_total >= 2
+            and self._raw_parity_fragments(hops) > 0
+            and self._raw_parity_fits(self._direct_raw_payload_budget(hops), hops)
+        )
+        if parity_expected and not parity_arrived:
+            return self._report_hold_s(fragment_on_air_bytes, hops, arriving=False)
+        if not report_requested:
+            # An unflagged fragment completed the part, so the burst has at
+            # least its two flagged frames still to come -- the same
+            # condition that makes the report path schedule rather than
+            # send. One spacing clears the next of them.
+            return self._report_hold_s(fragment_on_air_bytes, hops, arriving=False)
+        # The flagged last frame completed the part and any parity is
+        # already in: nothing of this burst is still due, so the proof goes
+        # now, exactly as in alpha 0.1.8.
+        return 0.0
+
+    def _note_proof_tail_hold(self, proof_key: bytes, sender_token: str, header: "_FrameHeader",
+                              bucket_before, report_requested: bool, fragment_on_air_bytes: int) -> None:
+        """Arm the burst-tail hold for the proof of this packet, keyed by
+        the value that proof carries in its destination field (alpha 0.1.9,
+        item 2). `_send_outgoing_packet` reads it once and clears it."""
+        wait_s = self._proof_tail_hold_s(sender_token, header, bucket_before, report_requested,
+                                         fragment_on_air_bytes)
+        if wait_s <= 0:
+            return
+        key = bytes(proof_key)
+        self._proof_tail_hold_until[key] = time.monotonic() + wait_s
+        while len(self._proof_tail_hold_until) > self.PROOF_TAIL_HOLD_MAX_KEYS:
+            self._proof_tail_hold_until.popitem(last=False)
+
+    def _note_complete_report_sent(self, sender_token: str, pkt_id: Optional[int]) -> None:
+        """The one place that stamps "the sender now knows this packet is
+        complete" -- `_report_recently_sent` reads it, and nothing else
+        does (alpha 0.1.9, item 1: the stamp used to be written inline by
+        `_send_completion_report` alone).
+
+        Alpha 0.1.8's item 1 replaces the complete report with RNS's PROOF
+        when it can, and captured that as `completion_report_skipped` --
+        but it never stamped it, so the parity fragment that follows the
+        completing data fragment one spacing later was treated as a fresh
+        trigger and `_send_completion_report` went out anyway: four times
+        at the 2026-09-23 two-hop stop, `held_s 0.0`, 3.8 to 4.9 s after
+        the skip, queued behind the proof's 11 s ACK timeout. Those skips
+        saved nothing. The proof is the sender's signal in exactly the
+        sense a complete report is, so it stamps the same way."""
+        if pkt_id is None:
+            return
+        self._last_complete_report_at[(sender_token, pkt_id)] = time.monotonic()
+        if len(self._last_complete_report_at) > 256:
+            for k in list(self._last_complete_report_at)[:64]:
+                self._last_complete_report_at.pop(k, None)
+
+    def _report_recently_sent(self, sender_token: str, pkt_id: Optional[int], fragment_on_air_bytes: int) -> bool:
+        """Alpha 0.1.6 (item 3): whether a complete report for this packet
+        went out within the sender's burst tail -- a flagged frame arriving
+        inside that window (the parity fragment behind the completing data
+        fragment, a duplicate relayed twice) is the same burst, not a
+        re-drive, and reporting again is the second report per window the
+        field counted (six of fifteen at zero hop; pairs 0.85-5.4 s apart
+        at two hops). A re-drive comes after the sender's report wait, well
+        past the window, and is reported as before."""
+        if pkt_id is None:
+            return False
+        sent_at = self._last_complete_report_at.get((sender_token, pkt_id))
+        if sent_at is None:
+            return False
+        window = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token), arriving=True)
+        return time.monotonic() - sent_at < window
+
+    def _receiver_hops_to(self, sender_token: str) -> int:
+        """The hop count a receiver scales its report holds by: the larger
+        of its own resolved hop count to the sender and the path length the
+        sender reported in its last "Q" v5 frame (alpha 0.1.6, item 3). The
+        sender's fragment spacing follows the SENDER's path, and the field's
+        two-hop doubles came from a laptop holding at its own one-hop count
+        (1.93 s) while the desktop spaced its fragments for two hops
+        (4.6 s), so the completing fragment landed up to 1.55 s after the
+        hold. 0 when neither is known."""
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        own = max(0, resolved.out_path_len) if resolved is not None else 0
+        board = self._path_boards.get(peer_prefix) if peer_prefix else None
+        reported = board.peer_path_len if board is not None and board.peer_path_len is not None else 0
+        return max(own, reported)
+
+    def _peer_view_fields(self, sender_token: str) -> dict:
+        """Capture fields for the peer's reported view of the path between
+        us (alpha 0.1.7, item 4): this node's own resolved hop count to the
+        sender, and the path length and delivery rate the peer last put in
+        a "Q" v5 header (`_note_peer_reported_path`) -- the numbers the
+        receiver's holds scale by (`_receiver_hops_to`), which the field
+        could not read from the 0.1.6 captures."""
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
+        board = self._path_boards.get(peer_prefix) if peer_prefix else None
+        return {
+            "hop_count": resolved.out_path_len if resolved is not None else None,
+            "peer_path_len": board.peer_path_len if board is not None else None,
+            "peer_rate": round(board.peer_rate, 3) if board is not None and board.peer_rate is not None else None,
+        }
+
+    def _schedule_sender_report(self, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
+        """Alpha 0.1.5 (2b): a part completed on an unflagged fragment --
+        the sender's window is still in the air. Hold ONE complete report
+        for this sender until its fragments stop arriving for
+        `_report_hold_s(..., arriving=True)`; `_rearm_sender_report` pushes
+        the deadline on every further fragment, and any report that goes
+        out meanwhile (the flagged last fragment's, a gaps report, a
+        duplicate's) supersedes it, since every report lists the sender's
+        recent packets. `header` names the part whose completion is the
+        report's trigger."""
+        if not self.direct_raw_report_enabled:
+            return
+        hold_s = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token), arriving=True)
+        self._cancel_sender_report(sender_token)
+        entry = {"header": header, "frag_bytes": fragment_on_air_bytes, "hold_s": hold_s, "task": None}
+
+        async def fire():
+            try:
+                await asyncio.sleep(hold_s)
+                if self._pending_sender_reports.get(sender_token) is not entry:
+                    return
+                self._pending_sender_reports.pop(sender_token, None)
+                self._send_completion_report(
+                    sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=hold_s,
+                )
+            except asyncio.CancelledError:
+                pass
+
+        entry["task"] = self._spawn_background_task(fire())
+        self._pending_sender_reports[sender_token] = entry
+
+    def _rearm_sender_report(self, sender_token: str) -> None:
+        """Another fragment from this sender: the held report waits again."""
+        entry = self._pending_sender_reports.get(sender_token)
+        if entry is None:
+            return
+        self._schedule_sender_report(sender_token, entry["header"], entry["frag_bytes"])
+
+    def _cancel_sender_report(self, sender_token: str) -> None:
+        entry = self._pending_sender_reports.pop(sender_token, None)
+        if entry is not None and entry.get("task") is not None and not entry["task"].done():
+            entry["task"].cancel()
 
     def _schedule_gaps_report(self, key, sender_token: str, header: _FrameHeader, fragment_on_air_bytes: int) -> None:
         """Hold the gaps report for `_report_hold_s` (M1 debounce); if the
@@ -1414,10 +2150,7 @@ class _ReconcileMixin:
         if not self.direct_report_debounce or not self.direct_raw_report_enabled:
             self._send_completion_report(sender_token, header, complete=False, held=held_now())
             return
-        peer_prefix = self._canonical_peer_prefix(sender_token)
-        resolved = self._resolved_paths.get(peer_prefix) if peer_prefix else None
-        hops = max(0, resolved.out_path_len) if resolved is not None else 0
-        hold_s = self._report_hold_s(fragment_on_air_bytes, hops)
+        hold_s = self._report_hold_s(fragment_on_air_bytes, self._receiver_hops_to(sender_token))
         self._cancel_gaps_report(key)
 
         async def fire():
@@ -1439,6 +2172,29 @@ class _ReconcileMixin:
         if task is not None and not task.done():
             task.cancel()
 
+    def _report_should_ack(self, sender_token: str) -> bool:
+        """Whether this node's completion REPORT to `sender_token` goes
+        through the ACKNOWLEDGED send path instead of the no-ACK frame
+        (alpha 0.1.8, item 2).
+
+        The threshold reads `_receiver_hops_to`, which is the larger of
+        this node's own resolved path length to the sender and the path
+        length the SENDER reported in its last "Q" v5 header -- the
+        question is how lossy the link is, and the `max()` errs toward
+        acknowledging, which is the safe direction here. It returns 0 when
+        neither is known, so an unknown hop count keeps today's behaviour.
+
+        Why the threshold and not always: at two hops the 2026-09-22 field
+        session had the no-ACK report reach the sender 3 times out of 22,
+        and each miss cost the sender its whole report wait and then a
+        QUERY round (2.1-2.4 s of channel time at two hops) to learn what
+        the report already said; the ACK is about 0.42 s there. At ONE hop
+        reports arrived 33 times of 48 in alpha 0.1.6 and the ACK would
+        cost more than it saves."""
+        if self.direct_report_ack_min_hops <= 0:
+            return False
+        return self._receiver_hops_to(sender_token) >= self.direct_report_ack_min_hops
+
     def _send_completion_report(self, sender_token: str, header: _FrameHeader, complete: bool, held: set,
                                 held_s: Optional[float] = None) -> None:
         """Receiver-initiated completion report (2026-09-20): one unsolicited
@@ -1450,6 +2206,16 @@ class _ReconcileMixin:
         path if it is lost. Off when `direct_raw_report_enabled` is no."""
         if not self.direct_raw_report_enabled or header.pkt_id is None:
             return
+        # 2b: every report lists the sender's recent packets, so a report
+        # held for "still arriving" is covered by whichever goes out now.
+        self._cancel_sender_report(sender_token)
+        # Alpha 0.1.8 (item 1): and so is a report held for a proof -- one
+        # report per window, whichever trigger wins (the 0.1.6 item 3 rule).
+        self._cancel_proof_grace(sender_token)
+        if complete:
+            # Item 3 (alpha 0.1.6): a flagged frame of this packet within the
+            # burst tail of this report is not reported again.
+            self._note_complete_report_sent(sender_token, header.pkt_id)
         nonce = self.COMPLETION_REPORT_NONCE_BASE | ((header.attempt or 0) & 0x03)
         self._debug(
             f"completion REPORT to {sender_token!r} for pkt_id={header.pkt_id} frag_total={header.frag_total}: "
@@ -1460,8 +2226,14 @@ class _ReconcileMixin:
                 "event": "completion_report_sent", "sender_token": sender_token, "pkt_id": header.pkt_id,
                 "frag_total": header.frag_total, "complete": complete, "held": sorted(held),
                 "round": (header.attempt or 0) & 0x03,
-                "held_s": round(held_s, 3) if held_s is not None else None,   # M1 debounce hold, gaps reports only
+                "held_s": round(held_s, 3) if held_s is not None else None,   # the hold this report waited (0.0: at once; item 3)
                 "noack": self.direct_report_noack,
+                # Alpha 0.1.8 (item 2): which carrier this report took.
+                # `report_acked` true means the acknowledged path with one
+                # retry, because this node is at least
+                # `direct_report_ack_min_hops` from the sender.
+                "report_acked": self._report_should_ack(sender_token),
+                **self._peer_view_fields(sender_token),   # alpha 0.1.7 (item 4): what the hold scaled by
             })
         # M2 (2026-09-20): the report lists this sender's recent raw packets
         # (newest first, the triggering one guaranteed), so one report
@@ -1511,14 +2283,20 @@ class _ReconcileMixin:
                 f"no resolvable contact/public_key."
             )
             return
-        if entries and (version is None or version >= 4):
+        peer_prefix = self._canonical_peer_prefix(sender_token)
+        # v5 (alpha 0.1.6, item 1): every ANSWER and REPORT carries this
+        # node's path length to the peer and its delivery rate on it.
+        wire_path_len, wire_rate = self._path_rate_for_wire(peer_prefix)
+        if entries and (version is None or version >= 5):
+            frame = self._encode_completion_frame_v5(self.COMPLETION_TYPE_ANSWER, entries, nonce=nonce,
+                                                     path_len=wire_path_len, rate=wire_rate)
+        elif entries and version >= 4:
             frame = self._encode_completion_frame_v4(self.COMPLETION_TYPE_ANSWER, entries, nonce=nonce)
         else:
             frame = self._encode_completion_frame(
                 self.COMPLETION_TYPE_ANSWER, pkt_id, frag_total, complete=complete, nonce=nonce,
-                held=held, version=version,
+                held=held, version=version, path_len=wire_path_len, rate=wire_rate,
             )
-        peer_prefix = self._canonical_peer_prefix(sender_token)
         # Simulation finding (2026-09-19, one-hop raw scenario): this
         # ANSWER used to leave the radio right behind the firmware's own
         # ACK for the QUERY, and through a repeater it reached the chain
@@ -1538,7 +2316,13 @@ class _ReconcileMixin:
         gap_s = 0.0 if report else self._completion_answer_hold_s(hops)
         if gap_s > 0:
             await asyncio.sleep(gap_s)
-        if self.direct_report_noack:
+        # Alpha 0.1.8 (item 2): a REPORT at or above `direct_report_ack_
+        # min_hops` takes the acknowledged carrier instead, with one retry.
+        # Only a report -- a QUERY's ANSWER already has the querier's own
+        # timeout as its recovery path and is not what the field evidence
+        # is about.
+        acked_report = report and self._report_should_ack(sender_token)
+        if self.direct_report_noack and not acked_report:
             # Phase 3 M1 (2026-09-20): TXT_TYPE_CLI_DATA -- delivered, never
             # ACKed; the querier's / sender's next action confirms it.
             try:
@@ -1550,24 +2334,56 @@ class _ReconcileMixin:
             except Exception as exc:
                 self._debug(f"no-ACK completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) failed locally: {exc}.")
             return
+        # Alpha 0.1.8 (item 2): an acknowledged REPORT gets one retry, and
+        # its ACK wait is bounded by how long its answer is still useful to
+        # the sender rather than by the miss ceiling -- at two hops that
+        # ceiling is ~9.4-11 s while the sender's whole report wait is 9 s,
+        # so an unbounded first attempt would put the retry on the air only
+        # after the sender had already given up and started a QUERY round.
+        attempts = 2 if acked_report else 1
+        ack_max_s = self._ack_preempt_floor_s(peer_prefix, hops) if acked_report else None
         try:
-            ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
-                target, frame, (nonce or 0) & 0x03, peer_prefix=peer_prefix,
-                priority=self.PRIORITY_ANSWER, time_critical=True,
-                kind="completion_report" if report else "completion_answer",
-                # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
-                # used to run with hop_count=None, i.e. the flat firmware
-                # suggestion, so neither the hop cap nor the abort applied).
-                hop_count=hops,
-                # Phase 1 (2026-09-20): best effort, never retried -- a
-                # queued Link handshake may cut this ACK wait once the
-                # peer's expected ACK time has passed.
-                preemptible=True,
-            )
+            ok = False
+            for attempt in range(attempts):
+                if attempt:
+                    # Re-encode rather than resend the bytes: the report
+                    # body is an absolute snapshot of what this node holds
+                    # (`_recent_raw_entries` reads the buckets live), held
+                    # sets only ever grow, and re-driving fragments the
+                    # receiver has since reconstructed from parity would be
+                    # worse than saying nothing. The round NONCE is kept --
+                    # the sender registered its waiter under that exact
+                    # value -- while the firmware `attempt` byte varies, so
+                    # neither a repeater nor the destination dedups the
+                    # retry against the first transmission.
+                    fresh = self._recent_raw_entries(sender_token)
+                    if not fresh or not any(e[2] for e in fresh):
+                        break      # nothing complete left to tell it about
+                    frame = self._encode_completion_frame_v5(
+                        self.COMPLETION_TYPE_ANSWER, [(p, t, c, h) for p, t, c, h in fresh], nonce=nonce,
+                        path_len=wire_path_len, rate=wire_rate,
+                    )
+                ok, _waited_full_timeout = await self._send_direct_frame_and_wait_for_ack(
+                    target, frame, ((nonce or 0) + attempt) & 0x03, peer_prefix=peer_prefix,
+                    priority=self.PRIORITY_ANSWER, time_critical=True,
+                    kind="completion_report" if report else "completion_answer",
+                    # 2026-09-20: the ANSWER's own ACK wait is hop-aware too (it
+                    # used to run with hop_count=None, i.e. the flat firmware
+                    # suggestion, so neither the hop cap nor the abort applied).
+                    hop_count=hops,
+                    # Phase 1 (2026-09-20): best effort, never retried -- a
+                    # queued Link handshake may cut this ACK wait once the
+                    # peer's expected ACK time has passed.
+                    preemptible=True,
+                    report=report,
+                    ack_timeout_max_s=ack_max_s,
+                )
+                if ok:
+                    break
             if not ok:
                 self._debug(
-                    f"completion ANSWER to {sender_token!r} (pkt_id={pkt_id}) got no ACK -- "
-                    f"not retried; the querier's own timeout is the recovery path."
+                    f"completion {'REPORT' if report else 'ANSWER'} to {sender_token!r} (pkt_id={pkt_id}) got no ACK "
+                    f"in {attempts} attempt(s) -- the sender's own timeout is the recovery path."
                 )
         except Exception as exc:
             self._debug(
@@ -1653,6 +2469,9 @@ class _ReconcileMixin:
         key = self._reassembly_key(header, sender_token, mode="direct")
         if raw and header.pkt_id is not None:
             self._note_recent_raw_pkt(sender_token, header.pkt_id, header.frag_total)
+            # 2b: this sender is still bursting -- a held complete report
+            # waits for the silence again.
+            self._rearm_sender_report(sender_token)
 
         if raw and parity:
             # M4: a parity fragment. Keep it on the bucket (opening one if
@@ -1662,12 +2481,14 @@ class _ReconcileMixin:
             # take the one path.
             if self._dedup_contains(key):
                 self._incoming_dropped_total += 1
-                if report_requested:
-                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                if report_requested and not self._report_recently_sent(sender_token, header.pkt_id, len(payload) + self.RAW_HEADER_SIZE):
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
                 return
             bucket = self._reassembly.get(key)
             if bucket is None:
                 bucket = self._new_reassembly_bucket(key, header.frag_total, header.coop)
+            if report_requested:
+                bucket.flagged_seen = True
             if len(payload) >= 2:
                 bucket.parity[header.frag_idx] = (payload[0], bytes(payload[1:]))
                 bucket.last_progress = time.monotonic()
@@ -1678,7 +2499,7 @@ class _ReconcileMixin:
                 idx, data = reconstructed
                 self._handle_direct_multifragment_frame(
                     _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
-                    data, sender_token, raw=True, report_requested=report_requested,
+                    data, sender_token, raw=True, report_requested=report_requested or bucket.flagged_seen,
                 )
                 return
             if report_requested and key in self._reassembly:
@@ -1688,25 +2509,34 @@ class _ReconcileMixin:
         if self._dedup_contains(key):
             self._incoming_dropped_total += 1
             self._debug(f"dropping late/duplicate DIRECT fragment for {key} (already delivered).")
-            if raw and report_requested:
+            if raw and report_requested and not self._report_recently_sent(
+                    sender_token, header.pkt_id, len(payload) + self.RAW_HEADER_SIZE):
                 # Completion report (2026-09-20): a flagged fragment for a
                 # packet already delivered means the sender never got the
                 # report (or a QUERY's answer) and re-burst -- tell it again,
-                # so it stops without a QUERY round trip.
-                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                # so it stops without a QUERY round trip. Not within the
+                # burst tail of a report just sent (item 3, alpha 0.1.6).
+                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
             return
 
+        # 2b: the burst's tail is here if THIS fragment is flagged or an
+        # earlier flagged frame (data or parity) of this packet was; read
+        # before the bucket is consumed by a completion.
+        bucket_before = self._reassembly.get(key)
+        tail_seen = bool(report_requested or (bucket_before is not None and bucket_before.flagged_seen))
         complete_data = self._add_channel_fragment(key, header, payload, raw=raw)
         if complete_data is None and raw:
-            # M4: a parity that arrived earlier may now cover exactly one gap.
             bucket = self._reassembly.get(key)
+            if bucket is not None and report_requested:
+                bucket.flagged_seen = True   # the bucket may have been opened by this fragment
+            # M4: a parity that arrived earlier may now cover exactly one gap.
             if bucket is not None and bucket.parity:
                 reconstructed = self._reconstruct_from_parity(key, bucket)
                 if reconstructed is not None:
                     idx, data = reconstructed
                     self._handle_direct_multifragment_frame(
                         _FrameHeader(header.version, True, header.coop, header.pkt_id, idx, header.frag_total, header.attempt),
-                        data, sender_token, raw=True, report_requested=report_requested,
+                        data, sender_token, raw=True, report_requested=report_requested or bucket.flagged_seen,
                     )
                     return
         if complete_data is None:
@@ -1721,14 +2551,42 @@ class _ReconcileMixin:
                 self._schedule_gaps_report(key, sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
         else:
             peer_prefix = self._canonical_peer_prefix(sender_token)
+            proof_key = None
             if raw:
                 # Report BEFORE RNS sees the packet, so the report enters the
                 # radio lock ahead of whatever RNS sends back (a PROOF, the
                 # next Resource request) and the sender learns first. A gaps
                 # report still held for this bucket is dropped: complete
                 # supersedes it (M1 debounce).
+                #
+                # Alpha 0.1.8 (item 1): with one exception. When RNS is
+                # about to prove this very packet, its PROOF tells the
+                # sender everything the report would, so the report is held
+                # a moment and dropped if the proof appears -- and then RNS
+                # must see the packet FIRST, or there is no proof to wait
+                # for. `_proof_may_replace_report` states the four gates.
                 self._cancel_gaps_report(key)
-                self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)))
+                rns_header = self._parse_rns_header(complete_data)
+                proof_key = self._proof_may_replace_report(complete_data, rns_header, sender_token, peer_prefix)
+                if proof_key is not None:
+                    # Item 2 (alpha 0.1.9): register the burst-tail hold
+                    # BEFORE handing the packet to RNS, because RNS queues
+                    # the proof synchronously inside `process_incoming` and
+                    # the outgoing worker may dispatch it at this callback's
+                    # next await. Nothing here transmits or holds the radio.
+                    self._note_proof_tail_hold(
+                        proof_key, sender_token, header, bucket_before, report_requested,
+                        len(payload) + self.RAW_HEADER_SIZE,
+                    )
+                    pass          # decided below, after process_incoming
+                elif tail_seen or not self.direct_report_hold_during_burst:
+                    self._send_completion_report(sender_token, header, complete=True, held=set(range(header.frag_total)), held_s=0.0)
+                else:
+                    # 2b: an unflagged fragment completed this part, so the
+                    # sender's window is still on the air -- one report for
+                    # the whole window once its fragments stop arriving,
+                    # unless the flagged last fragment reports first.
+                    self._schedule_sender_report(sender_token, header, len(payload) + self.RAW_HEADER_SIZE)
             if not raw:
                 self._observe_incoming_rns_packet(complete_data, peer_prefix)
             else:
@@ -1743,6 +2601,18 @@ class _ReconcileMixin:
                 complete_data, transport="direct_raw_multifragment" if raw else "direct_multifragment",
                 sender_peer_prefix=peer_prefix, frag_total=header.frag_total, pkt_id=header.pkt_id,
             )
+            if proof_key is not None:
+                # RNS has the packet now. On the installed RNS the proof is
+                # queued within milliseconds (`Transport.inbound` is
+                # synchronous and LXMF's `delivery_packet` proves on its
+                # first line); the grace covers RNS 1.5's inbound queue and
+                # a loaded host, and expires into the report as before.
+                if self._proof_enqueued_at_for_key(proof_key) is not None:
+                    # Item 1 (alpha 0.1.9): see `_note_complete_report_sent`.
+                    self._note_complete_report_sent(sender_token, header.pkt_id)
+                    self._capture_report_skipped_for_proof(sender_token, header, proof_key)
+                else:
+                    self._hold_report_for_proof(sender_token, header, proof_key)
 
     # -- Reassembly (docs/reliability_engine_design.md §5) ----------------
 
@@ -1905,6 +2775,10 @@ class _ReconcileMixin:
                 self._pending_link_request_sweep(now)
                 self._send_answered_sweep(now)
                 self._announce_cache_sweep(now)
+                # Alpha 0.1.8 (item 4): persist it here rather than at
+                # detach, so an unclean exit (the field's restarts) still
+                # leaves a usable file. A no-op unless something changed.
+                self._save_announce_cache()
                 self._outgoing_inflight_sweep(now)
                 self._resumable_sends_sweep(now)
                 self._closed_links_sweep(now)
@@ -1931,6 +2805,11 @@ class _ReconcileMixin:
         expired = [h for h, (_peer, expiry) in self._proof_correlation.items() if now >= expiry]
         for h in expired:
             del self._proof_correlation[h]
+        # Alpha 0.1.7 (item 1): a proof older than proof_max_age (or 120 s
+        # with that disabled) is no longer in the queue either way.
+        max_age = self.proof_max_age_s if self.proof_max_age_s > 0 else 120.0
+        for h in [h for h, t in self._proof_enqueued_at.items() if now - t > max_age]:
+            del self._proof_enqueued_at[h]
 
     # -- Whole-packet dedup (docs/reliability_engine_design.md §7) --------
 

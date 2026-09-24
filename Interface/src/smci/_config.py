@@ -31,7 +31,29 @@ class _ConfigMixin:
         # should try to recover from a USB re-enumeration or a brief BLE
         # range loss rather than sitting dead until rnsd is restarted.
         self.auto_reconnect = _cfg_bool(cfg.get("auto_reconnect", "yes"))
-        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 3))
+        # Alpha 0.1.6 (item 4, 2026-09-22): the interface's own connection
+        # supervisor replaces the library's reconnect (which retried three
+        # times a second apart and then stayed dead). `max_reconnect_
+        # attempts` is now the supervisor's cap, 0 = forever (was the
+        # library's 3); `auto_reconnect = no` stays offline after a drop.
+        # The retry delay starts at `connect_retry_min` and doubles to
+        # `connect_retry_max`. Opening a serial port asserts DTR / RTS,
+        # which resets a Heltec V3 (boot text on the UART for a second or
+        # two), so the handshake waits `serial_open_settle` after the open,
+        # flushes the input and tries `handshake_attempts` times at
+        # `handshake_timeout` each. `command_timeout` is how long a command
+        # is owed its reply while the reader's own ERROR events for garbled
+        # frames are ignored (the library's 15 s default); more than
+        # `serial_noise_warn_per_min` of those in a minute is logged as a
+        # corrupted stream (two processes on one port, typically).
+        self.max_reconnect_attempts = int(cfg.get("max_reconnect_attempts", 0))
+        self.connect_retry_min_s = max(1.0, float(cfg.get("connect_retry_min", 5.0)))
+        self.connect_retry_max_s = max(self.connect_retry_min_s, float(cfg.get("connect_retry_max", 60.0)))
+        self.serial_open_settle_s = max(0.0, float(cfg.get("serial_open_settle", 2.0)))
+        self.handshake_attempts = max(1, int(cfg.get("handshake_attempts", 5)))
+        self.handshake_timeout_s = max(1.0, float(cfg.get("handshake_timeout", 5.0)))
+        self.command_timeout_s = max(1.0, float(cfg.get("command_timeout", 15.0)))
+        self.serial_noise_warn_per_min = max(1, int(cfg.get("serial_noise_warn_per_min", 5)))
 
         # RNS-facing nominal bitrate. Deliberately NOT the base class's
         # 62500 default (`reliability_engine_design.md`'s base-class
@@ -70,6 +92,18 @@ class _ConfigMixin:
         self.duty_cycle_enabled = _cfg_bool(cfg.get("duty_cycle_enabled", "yes"))
         self.duty_cycle_window_s = float(cfg.get("duty_cycle_window", 60.0))
         self.duty_cycle_max_fraction = float(cfg.get("duty_cycle_max_fraction", 0.30))
+        # Alpha 0.1.5 (2026-09-21, the owner's decision after the alpha
+        # 0.1.4 field session): two ledgers over the same window. Every
+        # frame a repeater will relay -- any DIRECT frame with a routed
+        # path, every CHANNEL flood (announces, path requests, bind frames)
+        # -- is charged to both and waits on both budgets, so what touches
+        # a repeater stays at `duty_cycle_max_fraction` (30%). A zero-hop
+        # DIRECT frame (the target's out_path_len is 0) is charged to the
+        # total ledger only and waits on this cap: 85%, because the
+        # zero-hop 12-part page of that session took 147 s of which 109 s
+        # were waits at 30%, and a frame between two adjacent radios costs
+        # nobody else's repeater any air. Never loosen the 30%.
+        self.duty_cycle_max_fraction_zero_hop = float(cfg.get("duty_cycle_max_fraction_zero_hop", 0.85))
         # User-requested (2026-09-18 evening, see module docstring): link-
         # maintenance traffic (PRIORITY_HANDSHAKE -- LINKREQUEST, PROOF,
         # KEEPALIVE..LRPROOF, RESOURCE_PRF/ICL/RCL) never waits for budget;
@@ -462,6 +496,22 @@ class _ConfigMixin:
         # Per-fragment raw payload cap on the wire, before the 13-byte
         # header; also bounded by the firmware limits above.
         self.direct_raw_payload_cap = int(cfg.get("direct_raw_payload_cap", 170))
+        # Alpha 0.1.5 (2a, 2026-09-21): how many frames a zero-hop raw burst
+        # may hold queued in the firmware ahead of the one on air. The
+        # firmware queues a frame and returns OK at once, so the pre-0.1.5
+        # loop handed a whole window (15 fragments, ~14 s of air) to the
+        # radio in 2.6 s: the burst was "over" before the radio had started
+        # on most of it, a report arriving meanwhile was read as the end of
+        # the wait, handshake yields between fragments yielded nothing (the
+        # handshake queued behind the burst), and the companion's packet
+        # pool is 16 entries shared with reception (StaticPoolPacketManager
+        # in MyMesh.cpp). Now the next fragment is handed over when the
+        # radio is estimated to have at most this many frames ahead of it
+        # (`_raw_burst_next_send_wait_s`); 1 keeps the air back to back
+        # with one frame queued. Through repeaters the hop-scaled gap
+        # already exceeds the airtime, so this never binds there. 0 = off
+        # (the pre-0.1.5 behaviour).
+        self.direct_raw_burst_queue_ahead = int(cfg.get("direct_raw_burst_queue_ahead", 1))
         # Quiet time after each fragment of a burst (the last one included):
         # a flat gap at zero hop (the receiver sends no ACK, so only its own
         # processing needs covering), or this factor x hop count x the
@@ -471,6 +521,29 @@ class _ConfigMixin:
         # _raw_fragment_gap_s for the 2026-09-19 field evidence.
         self.direct_raw_zero_hop_gap_s = float(cfg.get("direct_raw_zero_hop_gap", 0.15))
         self.direct_raw_hop_gap_factor = float(cfg.get("direct_raw_hop_gap_factor", 2.0))
+        # Alpha 0.1.5 (item 4, 2026-09-21): the field A/B knob for the one-hop
+        # gap. MeshBench finding 2 (2026-09-20) added the frame's own airtime
+        # to the hop-scaled gap -- `(1 + factor x hops) x airtime` -- because
+        # `send_raw_data` returns when the frame is queued, not sent. At one
+        # hop that gap is two thirds of a three-fragment part's time, and
+        # MeshBench cannot judge it (its frames are ~30% slower than the
+        # field's, so its one-hop loss alternates at any gap; and it has no
+        # listen-before-talk, which is what would let a real radio drop the
+        # `+1` -- the repeater's relay is audible to the sender). `no` drops
+        # the `+1 x airtime` term through repeaters (zero hop is untouched);
+        # every `raw_fragment_sent` record carries the `gap_s` actually used.
+        # DEFAULT UNCHANGED: `fieldtests/AB_PROTOCOL.md` decides.
+        #
+        # Alpha 0.1.9's first pass flipped this to `no` without the A/B
+        # (2026-09-23, commit 5bbe1a8); the second pass (2026-09-24) put it
+        # back to `yes`, because the A/B has still never run and the only
+        # field time the `no` arm got was five raw parts, all during a
+        # dead-path period (docs/history.md, "Alpha 0.1.9, second pass").
+        # MeshBench cannot judge it: the `+1` guards against keying inside a
+        # repeater's relay of the previous fragment (MeshBench finding 2,
+        # 2026-09-20), and a real SX1262 defers on hearing that relay while
+        # MeshBench's virtual radio has no listen-before-talk.
+        self.direct_raw_gap_own_airtime = _cfg_bool(cfg.get("direct_raw_gap_own_airtime", "yes"))
         # Burst-then-ask rounds per packet, and QUERY tries per round.
         # Audit fix (2026-09-19): clamped to 4. The raw header carries the
         # round in 2 bits (`attempt & 0x03`), and the firmware dedups
@@ -481,6 +554,17 @@ class _ConfigMixin:
         # burst of airtime for nothing.
         self.direct_raw_reconcile_rounds = max(1, min(4, int(cfg.get("direct_raw_reconcile_rounds", 3))))
         self.direct_raw_query_attempts = int(cfg.get("direct_raw_query_attempts", 2))
+        # Alpha 0.1.6 (item 2, 2026-09-22): through repeaters a window's
+        # rounds are capped lower than `direct_raw_reconcile_rounds` (which
+        # zero hop keeps). Every round at two hops is a burst (three
+        # fragments at ~0.9 s plus 4.5 s gaps), a report wait and up to two
+        # QUERY exchanges of ~18 s each, and the 2026-09-21 session's
+        # two-hop windows ran all three while link proofs and answers
+        # queued behind them (23 sends waited more than 30 s for the
+        # radio). After this many rounds the window falls back to the
+        # existing text path (per-fragment ACKs) or fails, exactly as it
+        # does when the rounds are exhausted today. 0: no separate cap.
+        self.direct_raw_window_max_rounds = max(0, int(cfg.get("direct_raw_window_max_rounds", 2)))
         # Receiver-initiated completion report (2026-09-20, module docstring
         # entry of that date). After a raw burst the sender used to key its
         # reconcile QUERY the instant the last fragment's gap ended -- which
@@ -515,6 +599,22 @@ class _ConfigMixin:
         # zero-hop session were the previous report's ACK wait). `no`
         # restores ACKed reports and answers.
         self.direct_report_noack = _cfg_bool(cfg.get("direct_report_noack", "yes"))
+        # Alpha 0.1.8 (item 2): from this hop count up, a completion REPORT
+        # goes through the ACKNOWLEDGED send path instead, with one retry.
+        # The no-ACK frame is one transmission and is never retried, and at
+        # two hops the 2026-09-22 field session had it reach the sender 3
+        # times out of 22 -- the sender then waited out its 10-18 s report
+        # wait and spent a whole QUERY round (a QUERY, its ACK and an
+        # ANSWER, 2.1-2.4 s of channel time at two hops) to learn what the
+        # report already said. The ACK costs about 0.42 s of channel time
+        # at two hops, so it pays for itself if it saves roughly one QUERY
+        # round in five. At ONE hop it does not: reports arrived 33 times
+        # of 48 there in alpha 0.1.6 and the ACK would cost more than it
+        # saves, so below the threshold the no-ACK frame and its hold are
+        # untouched. The frame's CONTENT is identical either way -- only
+        # its carrier changes -- so the golden wire snapshot is unaffected.
+        # 0 disables the item entirely.
+        self.direct_report_ack_min_hops = max(0, int(cfg.get("direct_report_ack_min_hops", 2)))
         # Phase 3 M1: a flagged fragment that leaves gaps no longer reports
         # at once -- the second-last fragment is flagged too, so at zero hop
         # the receiver sent a gaps report and, 0.2-0.4 s later, the complete
@@ -524,6 +624,25 @@ class _ConfigMixin:
         # (`_report_hold_s`) and dropped if the bucket completes first. `no`
         # reports immediately as before.
         self.direct_report_debounce = _cfg_bool(cfg.get("direct_report_debounce", "yes"))
+        # Alpha 0.1.5 (2b, 2026-09-21): the receiver sends no per-part
+        # complete report while fragments of the same sender's window are
+        # still arriving. The field (zero-hop 12-part page, 08:38): the
+        # laptop reported each part the moment it completed, while the
+        # desktop's radio was still transmitting the rest of the window --
+        # the report for part 8 reached the desktop mid-burst and ended its
+        # wait early, the reports for parts 9 and 10 were transmitted into
+        # the desktop's own queue and never heard, and every one of the
+        # four on-air losses of that page sat within 2 s of one of those
+        # reports. Now a completed part that arrived UNFLAGGED (not one of
+        # the burst's last two fragments) is reported after a silence of one
+        # fragment's start-to-start spacing at this hop count plus half an
+        # airtime (`_report_hold_s(..., arriving=True)`), re-armed by every
+        # further fragment from that sender; a flagged fragment reports at
+        # once (complete) or after the M1 debounce (gaps), as before, and
+        # every report lists the sender's recent packets, so one report
+        # covers the window. A lone single-part burst is unchanged: its last
+        # two fragments are flagged. `no` reports every completion at once.
+        self.direct_report_hold_during_burst = _cfg_bool(cfg.get("direct_report_hold_during_burst", "yes"))
         # Phase 3 M2 (2026-09-20): one report per WINDOW. RNS hands the
         # sender a window of 4-6 Resource parts within milliseconds; each
         # used to be its own burst-and-report exchange (two in flight per
@@ -535,6 +654,12 @@ class _ConfigMixin:
         # bitmap per part; re-drives are batched the same way and the v4
         # QUERY asks about the whole window. `direct_raw_window_enabled =
         # no` sends each part as a window of one, with no collect wait.
+        # Alpha 0.1.5 (item 5): `direct_raw_window_collect` is the MAXIMUM
+        # -- the collect ends as soon as nothing is queued from RNS and no
+        # part has joined within the transfer's observed inter-part spacing
+        # (floor 40 ms), so a lone packet starts within that floor instead
+        # of paying the whole 0.75 s (every zero-hop probe did), while a
+        # window of parts arriving together still batches.
         self.direct_raw_window_enabled = _cfg_bool(cfg.get("direct_raw_window_enabled", "yes"))
         self.direct_raw_window_collect_s = float(cfg.get("direct_raw_window_collect", 0.75))
         self.direct_raw_window_max_parts = int(cfg.get("direct_raw_window_max_parts", 6))
@@ -691,6 +816,40 @@ class _ConfigMixin:
         # the first: a proof is one bare frame, so a stale retry wastes
         # nothing already spent. 0 disables.
         self.proof_max_age_s = float(cfg.get("proof_max_age", 45.0))
+        # Alpha 0.1.7 (item 1): a plain PROOF younger than this (measured
+        # from the moment RNS handed it to this interface, which is within
+        # milliseconds of the DATA it answers arriving) is treated like a
+        # Link handshake for the RADIO LOCK only: it pre-empts idle holds
+        # and is taken at the raw window's existing yield points, exactly
+        # as an LRPROOF and the receiver's own completion report are. Its
+        # tier (ANSWER), attempt budget and duty-cycle accounting do not
+        # change, and it still expires at proof_max_age. The 2026-09-22
+        # one-hop session: one 211 B LXMF message arrived six times in 70 s
+        # because each proof left the radio 5-20 s after its DATA, queued
+        # behind the page windows this node was serving, and LXMF re-sends
+        # an unproved opportunistic message after DELIVERY_RETRY_WAIT 10 s
+        # (checked every 4 s, up to 5 attempts). 8 s: the far side's retry
+        # is due at 10-14 s after its send, minus ~2 s of transit at one
+        # hop. Past it the proof is bulk-tier as before. 0 disables.
+        self.proof_fresh_s = float(cfg.get("proof_fresh_s", 8.0))
+        # Alpha 0.1.8 (item 1): how long a raw window's COMPLETE report is
+        # held while RNS decides whether to prove the packet that window
+        # delivered. RNS proves every single-destination DATA packet, and
+        # its PROOF tells the sender exactly what the report would --
+        # "I have it" -- so when the proof appears inside the grace the
+        # report is dropped and the sender's window ends on the proof
+        # instead. Measured on the installed RNS 1.4.2 the proof reaches
+        # `process_outgoing` within a millisecond of the packet being
+        # handed over (`Transport.inbound` is synchronous and LXMF's
+        # `delivery_packet` calls `prove()` on its first line); the grace
+        # is set two orders of magnitude above that to cover RNS 1.5's
+        # inbound queue (`USE_INBOUND_QUEUE`, one thread hop) and a loaded
+        # host. It is only ever spent when a proof is genuinely plausible
+        # -- see `_proof_may_replace_report`'s four gates -- so it costs
+        # nothing on Resource parts, Link traffic, announces or a transport
+        # node's relayed packets. 0 disables the whole item and every such
+        # window reports as it did in alpha 0.1.7.
+        self.proof_report_grace_s = max(0.0, float(cfg.get("proof_report_grace", 0.25)))
         # How many times the same bytes may be suppressed as "already in
         # flight" before the packet is forced through with a fresh in-flight
         # entry (field fix 2026-09-19: a stuck entry deadlocked a transfer for
@@ -717,6 +876,52 @@ class _ConfigMixin:
         self.path_discovery_base_cooldown_s = float(cfg.get("path_discovery_base_cooldown", 20.0))
         self.path_discovery_max_cooldown_s = float(cfg.get("path_discovery_max_cooldown", 900.0))
         self.path_discovery_backoff_factor = float(cfg.get("path_discovery_backoff_factor", 1.8))
+        # Alpha 0.1.6 (item 1, 2026-09-22): path selection by measured
+        # reliability, replacing alpha 0.1.5's shorter-path adoption. Every
+        # route this node learns to a peer -- the discovered path, the
+        # reverse of each distinct flood copy the peer's own floods took,
+        # the zero-hop option when the peer has been heard directly, and the
+        # path the peer itself reports in every "Q" v5 frame -- is a
+        # candidate on a per-peer scoreboard (`_PathBoard`, `_paths.py`).
+        # Each candidate is scored as expected transmissions per delivered
+        # frame times (hops + 1): airtime per delivered byte, lower is
+        # better, from its delivery rate over its last PATH_SAMPLES_KEPT
+        # sends (older ones weighted down, nothing older than
+        # PATH_SAMPLE_WINDOW_S counted). An untried path scores with the
+        # optimistic prior PATH_PRIOR_OPTIMISTIC, except a zero-hop candidate
+        # whose last direct frame from the peer was below `path_weak_snr_db`
+        # (the owner's repeater assumption: a two-hop path via a well-placed
+        # repeater beats a weak direct one), which scores with
+        # PATH_PRIOR_WEAK. The current path is kept while it delivers; after
+        # `path_switch_after_misses` consecutive missed sends the next real
+        # packet goes on the best-scoring alternative (a trial, no dedicated
+        # probe); the switch is made for good only when the alternative's
+        # score beats the current one by `path_switch_margin`, and a path
+        # switched away from is not switched back to for
+        # `path_switch_cooldown` seconds. Discovery runs only when every
+        # candidate has missed its last `path_switch_after_misses` sends
+        # (and a candidate whose last miss is older than the cooldown is
+        # tried again). The field (2026-09-21 evening, 22:00-22:35): the
+        # shortest-in-window rule adopted a 504 s old zero-hop route over a
+        # one-hop path confirmed 2 s earlier, missed twice, reset, and the
+        # desktop then sat on a two-hop path for 32 minutes while the
+        # laptop reached it in one, because the one-hop route was never
+        # re-tried without a fresh flood. The old key `path_adopt_enabled`
+        # is accepted as an alias of `path_selection_enabled`.
+        legacy = cfg.get("path_adopt_enabled")
+        self.path_selection_enabled = _cfg_bool(cfg.get("path_selection_enabled", "yes" if legacy is None else legacy))
+        self.path_weak_snr_db = float(cfg.get("path_weak_snr_db", 3.0))
+        # Alpha 0.1.9 (item 4): 2 -> 4 because the unit changed. This
+        # counts consecutive missed ATTEMPTS now, not missed sends, and a
+        # missed send is exactly `direct_send_attempts` (2) consecutive
+        # missed attempts -- so 4 is the same patience 2 used to buy, while
+        # a send with a larger budget (a four-attempt handshake, a pass-1
+        # finish) finally costs what it spends. See
+        # `_note_path_attempt_result` for the field evidence and for why
+        # the delivery-rate samples stay per send.
+        self.path_switch_after_misses = max(1, int(cfg.get("path_switch_after_misses", 4)))
+        self.path_switch_margin = max(0.0, float(cfg.get("path_switch_margin", 0.25)))
+        self.path_switch_cooldown_s = max(0.0, float(cfg.get("path_switch_cooldown", 120.0)))
 
         # Stale cached-DIRECT-path detection (§8). Built and unit-tested in
         # Milestone 4; since Milestone 5 every live DIRECT send path feeds it
@@ -794,8 +999,40 @@ class _ConfigMixin:
         # nothing: the next request for the same destination inside the
         # interval goes over the air, which is how a genuinely dead
         # destination is re-verified. 0 disables either.
-        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 3600.0))
-        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 120.0))
+        #
+        # Alpha 0.1.9 (item 3): the TTL was 3600 s, which is shorter than
+        # a field day. The 2026-09-23 session had two stops two hours
+        # apart; every entry cached at the first stop had expired by the
+        # second, so eight announces went over the air again at two hops
+        # (the laptop's 11:28 capture, `direct_raw_multifragment`) for
+        # destinations it had already held. A week matches what RNS
+        # itself keeps: a path learned over a MODE_FULL interface expires
+        # at `Transport.PATHFINDER_E` (60*60*24*7) and the path table is
+        # culled at `Transport.DESTINATION_TIMEOUT` (also a week) --
+        # `RNS/Transport.py`, verified 2026-09-23 -- so the cache now
+        # expires exactly when the answering node's OWN record of the
+        # same announce would, and never later. Serving a week-old entry
+        # is bounded by liveness rather than by age: the entry answers
+        # only while the peer that delivered it is still bound and out of
+        # path-discovery backoff (`_answer_path_request_locally`), and
+        # one on-air verification per destination per
+        # `path_request_local_answer_min_interval` still runs. The cache
+        # is LRU-bounded at ANNOUNCE_CACHE_MAX_KEYS (256), so the longer
+        # TTL costs bounded memory and a bounded file.
+        self.announce_cache_ttl_s = float(cfg.get("announce_cache_ttl", 604800.0))
+        # Alpha 0.1.8 (item 4): where the cache is persisted. Empty means
+        # `smci_announces.json` beside the peer cache under
+        # RNS.Reticulum.storagepath; `announce_cache_ttl = 0` disables
+        # both the cache and its file.
+        self.announce_cache_path = str(cfg.get("announce_cache_path", "") or "")
+        # Alpha 0.1.9 (item 3): 120 s put six verification requests on the
+        # air for three destinations in the 3 1/2 minutes between
+        # 11:40:51 and 11:44:16 of the 2026-09-23 two-hop stop, each one a
+        # relayed DIRECT request answered with a multi-fragment announce
+        # window. Ten minutes keeps the re-verification of a genuinely
+        # dead destination (0.1.6's purpose for the rule) while costing
+        # one request per destination per interval instead of five.
+        self.path_request_local_answer_min_interval_s = float(cfg.get("path_request_local_answer_min_interval", 600.0))
 
     def _configure_peer_discovery(self, cfg):
         # Master on/off switch for the entire bind-frame subsystem (both
@@ -1107,6 +1344,29 @@ class _ConfigMixin:
         # storage path is known).
         self.packet_capture_enabled = _cfg_bool(cfg.get("packet_capture_enabled", "no"))
         self.packet_capture_dir = cfg.get("packet_capture_dir", None)
+        # Alpha 0.1.5 (item 7, 2026-09-21): the capture file carries a node
+        # label so two machines' captures of one session tell apart at a
+        # glance -- the MeshCore node name from SELF_INFO by default (the
+        # field's `afipc` and `a`; the desktop's 2026-09-21 file had to be
+        # renamed by hand), or this value. Empty and no node name gives the
+        # pre-0.1.5 filename. `_capture_filename` is the pure rule.
+        self.packet_capture_label = str(cfg.get("packet_capture_label", "") or "").strip()
+        # Alpha 0.1.5 (item 8, 2026-09-21): airtime estimator calibration,
+        # instrumentation only. Firmware v1.17.1's CMD_GET_STATS (56,
+        # companion protocol v8+; `MyMesh.cpp`) returns the radio's measured
+        # transmit time -- `Dispatcher::checkSend` adds the wall-clock
+        # duration of every completed send to `total_air_time`; reported as
+        # whole seconds -- and per-type packet counts; the library exposes
+        # them as `get_stats_radio()` (tx_air_secs, rx_air_secs, noise floor,
+        # last RSSI/SNR) and `get_stats_packets()` (recv, sent, flood/direct
+        # tx/rx). The interface reads both at start, at stop and every
+        # `radio_stats_interval` seconds (0 = start and stop only) into a
+        # `radio_stats` capture record next to its own summed airtime
+        # estimate and frame count since start, so a field summary can
+        # compare the estimator against the radio. The estimator itself is
+        # unchanged. A firmware without the command (an ERROR reply) is
+        # logged once and the poll stops.
+        self.radio_stats_interval_s = float(cfg.get("radio_stats_interval", 300.0))
 
         # User-requested (2026-09-18, "lessen our reliance on arbitrary
         # wait times" -- step 1 of that plan, see module docstring): tap

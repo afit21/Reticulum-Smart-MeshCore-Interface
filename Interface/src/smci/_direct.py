@@ -16,10 +16,25 @@ class _DirectSendMixin:
         (see duty_cycle_exempt_handshake). Its airtime is still recorded."""
         return self.duty_cycle_exempt_handshake and priority == self.PRIORITY_HANDSHAKE
 
+    def _relayed_frame(self, hop_count: Optional[int], peer_prefix: Optional[str] = None) -> bool:
+        """Whether a DIRECT frame will be relayed by a repeater -- the hop
+        class the duty-cycle limiter's two ledgers key on (alpha 0.1.5,
+        2026-09-21). `hop_count` is the target's `out_path_len` when the
+        caller has it; otherwise the peer's resolved path is consulted; a
+        frame whose route is unknown is charged as relayed (the stricter
+        budget), never the other way round."""
+        if hop_count is not None:
+            return hop_count > 0
+        if peer_prefix is not None:
+            resolved = self._resolved_paths.get(peer_prefix)
+            if resolved is not None:
+                return resolved.out_path_len > 0
+        return True
+
     async def _throttle_for_duty_cycle(
         self, frame: str, exempt: bool = False, on_air_bytes: Optional[int] = None,
-        interrupt: "Optional[asyncio.Event]" = None,
-    ) -> float:
+        interrupt: "Optional[asyncio.Event]" = None, relayed: bool = True,
+    ) -> "tuple[float, Optional[str]]":
         """User-requested fix (2026-09-16): called at every actual radio-
         keying call site (`_send_channel_fastpath_frame`, one iteration
         of `_send_channel_multifragment_pass`'s per-fragment loop,
@@ -31,15 +46,26 @@ class _DirectSendMixin:
         shipped -- reusing `bitrate` massively overestimated real per-
         frame airtime and forced an artificial ~10s wait on every single
         exchange), waits out whatever `_DutyCycleLimiter` says is needed,
-        then records the estimate as consumed. Returns the delay actually
-        applied -- logged at debug level and available to the caller for
-        capture, never gates *whether* the send proceeds, only *when*
-        it's allowed to start. A no-op returning 0.0 immediately when
-        `duty_cycle_enabled` is off."""
+        then records the estimate as consumed. Returns `(delay, ledger)`:
+        the delay actually applied and the ledger that held the frame
+        ("relayed" / "total" / None) -- logged at debug level and available
+        to the caller for capture, never gates *whether* the send
+        proceeds, only *when* it's allowed to start. `(0.0, None)`
+        immediately when `duty_cycle_enabled` is off.
+
+        Alpha 0.1.5 (2026-09-21): `relayed` is the frame's hop class. A
+        frame a repeater will relay -- any DIRECT frame with a routed path,
+        every CHANNEL flood -- is charged to both ledgers and waits on both
+        budgets (`duty_cycle_max_fraction`, 30%, and the total cap); a
+        zero-hop DIRECT frame is charged to the total ledger only and waits
+        on `duty_cycle_max_fraction_zero_hop` (85%). The owner's rule: what
+        touches a repeater stays at 30%, two adjacent radios may use the
+        channel between them."""
         if not self.duty_cycle_enabled or self.duty_cycle_estimate_bitrate <= 0:
-            return 0.0
+            return 0.0, None
         estimated_s = self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes)
-        budget_s = self.duty_cycle_window_s * self.duty_cycle_max_fraction
+        budget_s = self.duty_cycle_window_s * (
+            self.duty_cycle_max_fraction if relayed else self.duty_cycle_max_fraction_zero_hop)
         if estimated_s > budget_s and not getattr(self, "_duty_cycle_overrun_warned", False):
             # MeshBench finding 1 (2026-09-20): one absurd radio parameter
             # turned into one frame per window with nothing in the log.
@@ -53,22 +79,22 @@ class _DirectSendMixin:
             )
         if exempt:
             # Link-maintenance traffic: charged, never delayed.
-            self._duty_cycle.record(estimated_s)
+            self._duty_cycle.record(estimated_s, relayed=relayed)
             self._debug(
                 f"duty-cycle: handshake-class {len(frame)}-char frame sent without waiting "
-                f"for budget ({estimated_s:.2f}s airtime still charged to the window)."
+                f"for budget ({estimated_s:.2f}s airtime still charged to the {'relayed and total' if relayed else 'total'} ledger)."
             )
-            return 0.0
-        delay = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt)
-        self._duty_cycle.record(estimated_s)
+            return 0.0, None
+        delay, ledger = await self._duty_cycle.wait_for_budget(estimated_s, interrupt=interrupt, relayed=relayed)
+        self._duty_cycle.record(estimated_s, relayed=relayed)
         if delay > 0:
             self._debug(
-                f"duty-cycle throttle: waited {delay:.2f}s before this "
-                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} frame "
-                f"(estimated {estimated_s:.2f}s airtime, "
+                f"duty-cycle throttle: waited {delay:.2f}s on the {ledger} ledger before this "
+                f"{f'{on_air_bytes}-byte raw' if on_air_bytes is not None else f'{len(frame)}-char'} "
+                f"{'relayed' if relayed else 'zero-hop'} frame (estimated {estimated_s:.2f}s airtime, "
                 f"{'LoRa model' if self._radio_params is not None else f'duty_cycle_estimate_bitrate={self.duty_cycle_estimate_bitrate}bps'})."
             )
-        return delay
+        return delay, ledger
 
     async def _wait_for_incoming_quiet(self) -> float:
         """User-requested fix (2026-09-16): "if we hear a message come in
@@ -141,6 +167,7 @@ class _DirectSendMixin:
     async def _pre_transmit_gate(
         self, frame: str, skip_quiet_defer: bool = False, duty_cycle_exempt: bool = False,
         on_air_bytes: Optional[int] = None, interrupt: "Optional[asyncio.Event]" = None,
+        relayed: bool = True, telemetry: Optional[dict] = None,
     ) -> "tuple[float, float, float]":
         """Code-review fix: `await self._wait_for_incoming_quiet()` then
         `await self._throttle_for_duty_cycle(frame)`, in that order, used
@@ -190,58 +217,89 @@ class _DirectSendMixin:
         quiet_defer_wait_s = 0.0
         if not skip_quiet_defer:
             quiet_defer_wait_s = await self._wait_for_incoming_quiet()
-        duty_cycle_wait_s = await self._throttle_for_duty_cycle(
-            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt,
+        duty_cycle_wait_s, duty_cycle_ledger = await self._throttle_for_duty_cycle(
+            frame, exempt=duty_cycle_exempt, on_air_bytes=on_air_bytes, interrupt=interrupt, relayed=relayed,
         )
+        if telemetry is not None:
+            # Alpha 0.1.5: which ledger a wait was charged to ("relayed" /
+            # "total" / None), and the frame's hop class, for the capture.
+            telemetry["duty_cycle_ledger"] = duty_cycle_ledger
+            telemetry["duty_cycle_relayed"] = relayed
         # Step 4 (2026-09-18): last, so it reflects whatever was overheard
         # during the two waits above. A no-op unless rx_log_holds_enabled.
         medium_hold_wait_s = await self._wait_for_medium_clear()
         # Stamped here, not at the send_msg/send_chan_msg call itself: this
         # is the last common point every radio-keying path passes through,
         # and the command is issued immediately after this returns.
-        self._last_own_tx_at = time.monotonic()
+        now = time.monotonic()
+        self._last_own_tx_at = now
+        # Alpha 0.1.5 (2a): the frame is about to be QUEUED in the firmware;
+        # the radio is busy for its airtime after whatever it already holds.
+        busy_until = self._note_radio_keyed(self._estimate_tx_airtime_s(frame, on_air_bytes=on_air_bytes), now)
+        if telemetry is not None:
+            telemetry["radio_busy_until"] = busy_until
         return quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s
 
-    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float) -> "tuple[bool, bool]":
+    async def _wait_future_or_preempt(self, fut: "asyncio.Future", timeout_s: float,
+                                      also_reports: bool = False, handshake_only: bool = False,
+                                      extra_events=None) -> "tuple[bool, bool]":
         """Await `fut` (shielded: it outlives this wait) for up to
         `timeout_s`, ending early when a Link handshake queues for the
-        radio lock (phase 1, 2026-09-20). Returns `(future_done, cut_by_a
-        _handshake)`; the future's own exception is the caller's."""
+        radio lock (phase 1, 2026-09-20) -- or, with `also_reports` (item
+        6, alpha 0.1.5), when a completion REPORT this node owes the far
+        sender does: the report wait is radio-free, so the holder loses
+        nothing by letting the report out. Returns `(future_done, cut)`;
+        the future's own exception is the caller's. `handshake_only`
+        (alpha 0.1.7, item 1): only a Link handshake cuts this wait, not a
+        fresh plain PROOF -- for the QUERY quiet hold, which keeps this
+        node silent while the ANSWER transits the repeater.
+        `extra_events` (alpha 0.1.8, item 1): further events that end
+        the wait, reported as `cut`; the caller checks its own
+        condition first to tell them apart from a pre-emptor. The raw
+        window passes the event its packets' PROOFs set."""
         if fut.done():
             return True, False
-        event = self._direct_exchange_lock.preempt_event()
-        if event.is_set():
+        lock = self._direct_exchange_lock
+        events = ([lock.preempt_event(handshake_only=handshake_only)]
+                  + ([lock.report_event()] if also_reports else [])
+                  + list(extra_events or ()))
+        if any(e.is_set() for e in events):
             return False, True
         if timeout_s <= 0:
             return False, False
         loop = asyncio.get_running_loop()
         fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
-        preempt_wait = loop.create_task(event.wait())
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
         try:
-            done, _pending = await asyncio.wait({fut_wait, preempt_wait}, return_when=asyncio.FIRST_COMPLETED)
+            done, _pending = await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 if not t.done():
                     t.cancel()
             # Retrieve the timed-out / cancelled task's exception so asyncio
             # does not log "Task exception was never retrieved".
-            for t in (fut_wait, preempt_wait):
+            for t in waits:
                 try:
                     await t
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
         if fut.done():
             return True, False
-        return False, preempt_wait in done
+        return False, any(w in done for w in waits[1:])
 
-    async def _idle_hold(self, seconds: float, floor_s: float = 0.0) -> bool:
+    async def _idle_hold(self, seconds: float, floor_s: float = 0.0, handshake_only: bool = False) -> bool:
         """Sleep `seconds` with the radio lock held, but return early
         (True) once a link handshake is queued for the lock and at least
         `floor_s` has passed (phase 1, 2026-09-20). The lock's pre-empt
-        event is the signal; False when the whole time elapsed."""
+        event is the signal; False when the whole time elapsed. With
+        `handshake_only` (alpha 0.1.7, item 1) a fresh plain PROOF does not
+        cut the hold -- the no-ACK report hold is the repeater's relay
+        window for this node's own frame, and a proof keyed into it was
+        missed at the repeater in MeshBench `large_payload` (proof success
+        4/23 against 9/24, every report behind an 8 s timeout)."""
         if seconds <= 0:
             return False
-        event = self._direct_exchange_lock.preempt_event()
+        event = self._direct_exchange_lock.preempt_event(handshake_only=handshake_only)
         started = time.monotonic()
         if floor_s > 0:
             await asyncio.sleep(min(seconds, floor_s))
@@ -279,6 +337,13 @@ class _DirectSendMixin:
             return None
         if header.packet_type == RNS.Packet.LINKREQUEST:
             return self._compute_link_id(data)
+        if header.packet_type == RNS.Packet.PROOF and header.context == RNS.Packet.LRPROOF \
+                and header.destination_hash:
+            # Alpha 0.1.6 (item 2): an LRPROOF is keyed by its link_id so a
+            # newer LINKREQUEST from the same peer can supersede it
+            # (`_supersede_link_proofs`); its retries stop like an answered
+            # send's, but as a drop, not a success.
+            return self.LRPROOF_KEY_PREFIX + bytes(header.destination_hash)
         if (header.packet_type == RNS.Packet.DATA and header.context == RNS.Packet.NONE
                 and header.destination_type == RNS.Destination.SINGLE):
             # Review (2026-09-20): every plain DATA to a SINGLE destination,
@@ -300,6 +365,7 @@ class _DirectSendMixin:
             event = asyncio.Event()
             if key in self._send_answered_at:
                 event.set()
+            event.superseded = self._send_answered_how.get(key) == "superseded"
             self._send_answered_events[key] = (event, time.monotonic())
             return event
         return entry[0]
@@ -324,10 +390,48 @@ class _DirectSendMixin:
         if key is None:
             return
         self._send_answered_at[key] = (time.monotonic(), sender_peer_prefix)
+        self._send_answered_how[key] = how
         entry = self._send_answered_events.get(key)
         if entry is not None and not entry[0].is_set():
+            entry[0].superseded = how == "superseded"
             entry[0].set()
             self._debug(f"send {key.hex()} answered ({how}) while its retry loop was live -- no further attempts.")
+
+    def _send_superseded(self, key: Optional[bytes]) -> bool:
+        """Whether the send with this key was superseded (alpha 0.1.6 item 2:
+        an LRPROOF whose peer has since sent a newer LINKREQUEST) rather
+        than answered."""
+        return key is not None and self._send_answered_how.get(key) == "superseded"
+
+    def _supersede_link_proofs(self, peer_prefix: str, new_link_id: Optional[bytes]) -> int:
+        """A new LINKREQUEST from `peer_prefix` supersedes every LRPROOF
+        still pending for an earlier link of that peer (alpha 0.1.6, item
+        2): RNS on the far side has abandoned that link after its client's
+        window (MeshChat gives a link 15 s), so the frame is pure airtime.
+        The 2026-09-21 session at two hops: six LINKREQUESTs in 2.5 minutes,
+        each answered by an LRPROOF of four attempts at 11 s ACK timeouts,
+        queued at the handshake tier ahead of everything -- completion
+        answers and reports waited up to 125 s behind them. Returns how
+        many were superseded."""
+        pending = self._pending_link_proofs.get(peer_prefix)
+        if not pending:
+            return 0
+        superseded = 0
+        for link_id in list(pending):
+            if new_link_id is not None and link_id == new_link_id:
+                continue
+            key = self.LRPROOF_KEY_PREFIX + link_id
+            if not self._send_superseded(key):
+                self._signal_send_answered(key, "superseded")
+                superseded += 1
+        if superseded:
+            self._outgoing_dropped_total += superseded
+            RNS.log(
+                f"{self}: {superseded} queued LRPROOF(s) for {peer_prefix!r} expired -- superseded by its newer "
+                f"LINKREQUEST (the far side abandoned that link); not (re)sent.",
+                RNS.LOG_DEBUG,
+            )
+        return superseded
 
     def _send_answered_sweep(self, now: float) -> None:
         ttl = self.proof_correlation_ttl_s
@@ -335,6 +439,8 @@ class _DirectSendMixin:
             del self._send_answered_at[k]
         for k in [k for k, (_ev, t) in self._send_answered_events.items() if now - t > ttl]:
             del self._send_answered_events[k]
+        for k in [k for k in self._send_answered_how if k not in self._send_answered_at]:
+            del self._send_answered_how[k]
 
     async def _send_direct_packet(
         self, data: bytes, header: Optional[_RnsHeader], peer_prefix: str,
@@ -348,7 +454,12 @@ class _DirectSendMixin:
         interface's own record being out of sync with the device contact
         table can cause -- see path_discovery_spec.md's persistence
         note)."""
-        resolved = self._resolved_paths.get(peer_prefix)
+        # Alpha 0.1.6 (item 1): the scoreboard's one decision -- the current
+        # path while it delivers, a trial of the best-scoring alternative
+        # after it misses, None once every candidate has failed -- inside
+        # the one place that decides resolved-versus-discover, never beside
+        # it (alpha 0.1.5's shorter-path adoption stood here before).
+        resolved = await self._select_path(peer_prefix)
         if resolved is None:
             # Milestone 6: docs/reliability_engine_design.md §8's "next
             # send attempt for this peer goes through discover_path()
@@ -456,6 +567,12 @@ class _DirectSendMixin:
                 expire_retries=self._plain_proof(header) and self.proof_max_age_s > 0,
                 # A Link handshake pre-empts idle holds of the radio lock.
                 preempt=self._is_link_handshake(header),
+                # Alpha 0.1.7 (item 1): so does a plain PROOF while it is
+                # younger than proof_fresh_s (re-read at every attempt).
+                proof_enqueued_at=self._proof_enqueued_at_for(header),
+                # Alpha 0.1.9 (item 2): how long this proof waited for the
+                # sender's burst tail before it was dispatched, capture-only.
+                proof_tail_hold_s=self._proof_tail_hold_waited_for(header),
             )
 
         # Milestone 6: DIRECT-needs-fragmenting shape
@@ -836,6 +953,8 @@ class _DirectSendMixin:
         attempts_override: Optional[int] = None, record_result: bool = True,
         expires_at: Optional[float] = None, cancel_key: Optional[bytes] = None,
         expire_retries: bool = False, preempt: bool = False,
+        proof_enqueued_at: Optional[float] = None,
+        proof_tail_hold_s: Optional[float] = None,
     ) -> bool:
         """docs/reliability_engine_design.md §4's "outer multi-attempt
         loop for a single DIRECT message" (`direct_send_attempts`,
@@ -906,6 +1025,24 @@ class _DirectSendMixin:
         for attempt in range(attempts_budget):
             if self.detached or not self.online:
                 return False
+            # Alpha 0.1.7 (item 1): a plain PROOF's age at THIS attempt --
+            # fresh, it pre-empts idle holds like a handshake; a retry after
+            # a miss at the hop cap has usually aged past proof_fresh_s and
+            # queues as bulk again. Capture-only otherwise.
+            proof_age_s = (time.monotonic() - proof_enqueued_at) if proof_enqueued_at is not None else None
+            proof_fresh = self._proof_is_fresh(proof_age_s) if proof_age_s is not None else None
+            attempt_preempt = preempt or bool(proof_fresh)
+            if cancel_event is not None and cancel_event.is_set() and self._send_superseded(cancel_key):
+                # Alpha 0.1.6 (item 2): an LRPROOF superseded by the peer's
+                # newer LINKREQUEST -- expired, like a stale plain proof.
+                self._outgoing_dropped_total += 1
+                self._capture_direct_attempt_result(
+                    peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
+                    pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
+                    time_critical=time_critical, pass_number=pass_number,
+                    ack_timeout_source="superseded", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                )
+                return False
             if cancel_event is not None and cancel_event.is_set():
                 self._debug(
                     f"DIRECT send to {peer_prefix!r} answered before attempt {attempt} -- "
@@ -917,7 +1054,7 @@ class _DirectSendMixin:
                     peer_prefix, attempt, True, self._direct_exchange_queue_depth, 0.0, None,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                     time_critical=time_critical, pass_number=pass_number,
-                    ack_timeout_source="answered",
+                    ack_timeout_source="answered", proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                 )
                 # Path evidence only when THIS peer delivered the reply
                 # (review, 2026-09-20): a DIRECT-to-all copy cancelled by a
@@ -949,6 +1086,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, self._direct_exchange_queue_depth, 0.0, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number, ack_timeout_source="expired",
+                        proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                 return False
             frame = frame_builder(attempt)
@@ -959,7 +1097,9 @@ class _DirectSendMixin:
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, priority=priority,
                     hop_count=hop_count, time_critical=(time_critical or attempt > 0),
                     pass_number=pass_number, expires_at=expires_at, cancel_event=cancel_event,
-                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=preempt,
+                    expire_retries=expire_retries, attempt_info=attempt_info, preempt=attempt_preempt,
+                    proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                    proof_tail_hold_s=proof_tail_hold_s,
                 )
             except Exception as exc:
                 RNS.log(
@@ -968,11 +1108,17 @@ class _DirectSendMixin:
                     RNS.LOG_WARNING,
                 )
                 ok, waited_full_timeout = False, False
+            if ok and self._send_superseded(cancel_key):
+                # Cut mid-wait by the supersession: the frame went out, no
+                # ACK came before the newer LINKREQUEST; not path evidence.
+                self._outgoing_dropped_total += 1
+                return False
             if ok:
                 if record_result and not (
                         cancel_event is not None and cancel_event.is_set()
                         and self._send_answered_by(cancel_key) != peer_prefix):
-                    self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True)
+                    self.record_direct_send_result(peer_prefix, succeeded=True, waited_full_timeout=True,
+                                                   ack_latency_s=attempt_info.get("ack_latency_s"))
                 return True
             # No per-attempt delay here anymore -- the post-send listen
             # window (outcome-dependent range, 2026-09-16) fires inside
@@ -1040,6 +1186,7 @@ class _DirectSendMixin:
     async def _await_direct_ack(
         self, sent, peer_prefix: Optional[str], hop_count: Optional[int], rx_window: dict, ack_wait_start: float,
         cancel_event: "Optional[asyncio.Event]" = None, preemptible: bool = False,
+        ack_timeout_max_s: Optional[float] = None,
     ) -> "tuple[bool, bool, Optional[float], str, Optional[float], Optional[float]]":
         """The ACK wait for one transmitted DIRECT frame (refactor,
         2026-09-19: lifted verbatim out of `_send_direct_frame_and_wait_
@@ -1078,6 +1225,16 @@ class _DirectSendMixin:
             if peer_prefix is not None:
                 self._last_firmware_ack_timeout_s[peer_prefix] = timeout_s
             timeout_s, ack_timeout_source = self._adaptive_ack_timeout(peer_prefix, timeout_s)
+            if ack_timeout_max_s is not None and ack_timeout_max_s > 0 and ack_timeout_max_s < timeout_s:
+                # Alpha 0.1.8 (item 2): a completion REPORT's ACK wait is
+                # bounded by how long its answer is still USEFUL to the
+                # sender, not by the miss ceiling. At two hops the cap is
+                # 11 s (adaptively ~9.4 s) while the sender's whole report
+                # wait is 9 s, so an unbounded first attempt would hold
+                # this radio past the moment the sender gave up and would
+                # put the retry on the air after the QUERY round had
+                # already started.
+                timeout_s, ack_timeout_source = ack_timeout_max_s, "report_window"
 
             # Field fix (2026-09-18 evening): early abort on a
             # dead first hop -- see _hop1_abort_deadline_s. Wait
@@ -1098,7 +1255,7 @@ class _DirectSendMixin:
                 floor_s = min(timeout_s, self._ack_preempt_floor_s(peer_prefix, hop_count))
                 ack_event, answered = await self._wait_for_ack_event(ack_filters, floor_s, cancel_event)
                 if ack_event is None and not answered and timeout_s > floor_s:
-                    preempt_event = self._direct_exchange_lock.preempt_event()
+                    preempt_event = self._direct_exchange_lock.preempt_event(handshake_only=True)
                     if preempt_event.is_set():
                         return False, False, timeout_s, "preempted", None, None
                     ack_event, answered = await self._wait_for_ack_event(
@@ -1227,6 +1384,11 @@ class _DirectSendMixin:
         attempt_info: Optional[dict] = None,  # out-param: "expired" True when the attempt aged out in the lock wait and never transmitted
         preempt: bool = False,  # a Link handshake: may pre-empt an idle hold of the lock (phase 1, 2026-09-20)
         preemptible: bool = False,  # a best-effort ANSWER/REPORT: its own ACK wait may be cut for a queued handshake
+        proof_age_s: Optional[float] = None,  # capture-only (alpha 0.1.7, item 1): a plain PROOF's age at this attempt
+        proof_fresh: Optional[bool] = None,  # capture-only: whether that age made it pre-empt (proof_fresh_s)
+        proof_tail_hold_s: Optional[float] = None,  # capture-only (alpha 0.1.9, item 2): the burst tail this proof waited out
+        report: bool = False,  # alpha 0.1.8 item 2: take the lock in the REPORT class, as the no-ACK carrier does
+        ack_timeout_max_s: Optional[float] = None,  # alpha 0.1.8 item 2: ceiling on this frame's ACK wait
     ) -> "tuple[bool, bool]":
         """Sends one already-encoded DIRECT `frame` string (bare or
         multi-fragment shape) to `target` (a MeshCore pubkey) and waits
@@ -1304,7 +1466,13 @@ class _DirectSendMixin:
         wait_start = time.monotonic()
         preempted = False
         try:
-            async with self._direct_exchange_lock(priority, preempt=preempt):
+            # Alpha 0.1.8 (item 2): `report=True` takes the lock in the
+            # REPORT class, exactly as `_send_direct_noack_frame` does for
+            # the same frame -- without it, moving a report onto this
+            # carrier would silently lose alpha 0.1.5 item 6 (a raw window
+            # yields the radio between its parts to a report this node
+            # owes) and alpha 0.1.7 item 3c.
+            async with self._direct_exchange_lock(priority, preempt=preempt, report=report):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 if quiet_wait is not None and quiet_wait.done():
@@ -1316,7 +1484,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, True, self._direct_exchange_queue_depth, time.monotonic() - wait_start, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="answered_before_send", kind=kind,
+                        ack_timeout_source="answered_before_send", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     if quiet_info is not None:
                         quiet_info["answered_at"] = time.monotonic()
@@ -1333,7 +1501,7 @@ class _DirectSendMixin:
                         peer_prefix, attempt, False, queue_depth_at_acquire, lock_wait_s, None,
                         pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, hop_count=hop_count,
                         time_critical=time_critical, pass_number=pass_number,
-                        ack_timeout_source="expired", kind=kind,
+                        ack_timeout_source="expired", kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
                     )
                     return False, False
                 # Code-review fix: a local exception raised anywhere in this
@@ -1366,6 +1534,7 @@ class _DirectSendMixin:
                     sent = await self._send_direct_frame(
                         target, frame, attempt, time_critical=time_critical, gate_telemetry=gate_telemetry,
                         duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                        hop_count=hop_count, peer_prefix=peer_prefix,
                     )
                     ack_wait_start = time.monotonic()
                     rx_window["tx_at"] = ack_wait_start
@@ -1375,9 +1544,12 @@ class _DirectSendMixin:
                     (ok, waited_full_timeout, ack_timeout_s, ack_timeout_source,
                      ack_latency_s, hop1_abort_deadline_s) = await self._await_direct_ack(
                         sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=cancel_event,
-                        preemptible=preemptible,
+                        preemptible=preemptible, ack_timeout_max_s=ack_timeout_max_s,
                     )
                     preempted = ack_timeout_source == "preempted"
+                    if ack_timeout_source == "answered" and getattr(cancel_event, "superseded", False):
+                        # Alpha 0.1.6 (item 2): cut by a supersession, not a reply.
+                        ok, ack_timeout_source = False, "superseded"
                     ack_done_at = time.monotonic()
                 except Exception as exc:
                     send_exc = exc
@@ -1491,13 +1663,17 @@ class _DirectSendMixin:
                         # the hold early; the caller keeps waiting for the
                         # answer with the radio free, as it does after the
                         # window.
-                        answered, cut = await self._wait_future_or_preempt(quiet_wait, quiet_remaining_s)
+                        # Alpha 0.1.6 (item 2): and so does a completion
+                        # REPORT this node owes the far sender (the item-6
+                        # class), as the window's report wait already did.
+                        answered, cut = await self._wait_future_or_preempt(
+                            quiet_wait, quiet_remaining_s, also_reports=True, handshake_only=True)
                         if answered and quiet_info is not None:
                             quiet_info["answered_at"] = time.monotonic()
                         if cut:
                             self._debug(
                                 f"quiet window for {peer_prefix!r} cut at {time.monotonic() - quiet_started:.2f}s "
-                                f"of {quiet_remaining_s:.2f}s -- a Link handshake is waiting for the radio."
+                                f"of {quiet_remaining_s:.2f}s -- a Link handshake or a completion report is waiting for the radio."
                             )
                         quiet_hold_s = time.monotonic() - quiet_started
                     if quiet_info is not None:
@@ -1517,17 +1693,27 @@ class _DirectSendMixin:
                     f"quiet_hold={quiet_hold_s if quiet_hold_s is None else round(quiet_hold_s, 2)}"
                     + (f" (local send exception: {send_exc})" if send_exc is not None else "") + "."
                 )
+                # Alpha 0.1.9 (item 4): one attempt's evidence about the
+                # path, recorded here because this is the single place that
+                # knows both the outcome and WHY -- every caller of this
+                # method reaches it, including the raw fragments and the
+                # QUERY/ANSWER sends that bypass `_send_direct_with_attempts`
+                # and were therefore never counted at all.
+                self._note_path_attempt_result(peer_prefix, ok, waited_full_timeout,
+                                               ack_timeout_source, ack_latency_s=ack_latency_s)
                 self._capture_direct_attempt_result(
                     peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,
                     hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
                     quiet_defer_wait_s=gate_telemetry.get("quiet_defer_wait_s"),
                     duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
+                    duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
                     ack_timeout_source=ack_timeout_source, ack_latency_s=ack_latency_s,
                     send_cmd_latency_s=send_cmd_latency_s, rx_window=rx_window,
                     medium_hold_wait_s=gate_telemetry.get("medium_hold_wait_s"),
                     miss_diagnosis=miss_diagnosis, medium_busy_remaining_s=medium_busy_remaining_s,
-                    kind=kind, hop1_abort_deadline_s=hop1_abort_deadline_s,
+                    kind=kind, proof_age_s=proof_age_s, proof_fresh=proof_fresh,
+                    proof_tail_hold_s=proof_tail_hold_s, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
                     on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)
@@ -1539,6 +1725,15 @@ class _DirectSendMixin:
                     # (_send_direct_with_attempts) see and log this exactly
                     # as it did before this fix.
                     raise send_exc
+                if attempt_info is not None:
+                    attempt_info["ack_latency_s"] = ack_latency_s
+                if ok and peer_prefix is not None and rx_window.get("ack_snr") is not None:
+                    # Alpha 0.1.6 (item 1): the ACK the radio log matched to
+                    # this frame is the last frame received over the path
+                    # it went on -- its signal is the candidate's.
+                    _r = self._resolved_paths.get(peer_prefix)
+                    self._note_path_signal(peer_prefix, _r.out_path_hex if _r is not None else None,
+                                           rx_window.get("ack_snr"), rx_window.get("ack_rssi"))
                 return ok, waited_full_timeout
         finally:
             self._direct_exchange_queue_depth -= 1
@@ -1576,7 +1771,10 @@ class _DirectSendMixin:
         self._direct_exchange_queue_depth += 1
         wait_start = time.monotonic()
         try:
-            async with self._direct_exchange_lock(priority):
+            # Item 6 (alpha 0.1.5): a completion REPORT queues as the report
+            # class, which a raw window this node is sending yields to
+            # between two of its parts (`_run_raw_window_rounds`).
+            async with self._direct_exchange_lock(priority, report=(kind == "completion_report")):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 gate_telemetry: dict = {}
@@ -1585,10 +1783,12 @@ class _DirectSendMixin:
                 send_exc = None
                 hold_s = 0.0
                 try:
-                    await self._pre_transmit_gate(
+                    _q, duty_cycle_wait_s, _m = await self._pre_transmit_gate(
                         frame, skip_quiet_defer=True, duty_cycle_exempt=self._duty_cycle_exempt(priority),
+                        on_air_bytes=on_air_bytes, relayed=hop_count > 0, telemetry=gate_telemetry,
                     )
                     gate_telemetry["duty_cycle_exempt"] = self._duty_cycle_exempt(priority)
+                    gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
                     dst = bytes.fromhex(str(target)[:12])
                     data = (
                         bytes([0x02, self.TXT_TYPE_CLI_DATA, attempt & 0xFF])
@@ -1603,9 +1803,10 @@ class _DirectSendMixin:
                     hold_s = self._noack_frame_hold_s(on_air_bytes, hop_count)
                     # The frame is on air / in the chain: keep the radio
                     # quiet for its hold, yielding to a Link handshake only
-                    # once the frame itself is off the air.
+                    # once the frame itself is off the air (and to nothing
+                    # else: alpha 0.1.7, item 1, second cut).
                     airtime_s = self._estimate_tx_airtime_s("", on_air_bytes=on_air_bytes)
-                    await self._idle_hold(hold_s, floor_s=airtime_s)
+                    await self._idle_hold(hold_s, floor_s=airtime_s, handshake_only=True)
                 except Exception as exc:
                     send_exc = exc
                 self._debug(
@@ -1617,6 +1818,8 @@ class _DirectSendMixin:
                     hop_count=hop_count, time_critical=True, listen_delay_s=hold_s,
                     ack_timeout_source="noack", kind=kind,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
+                    duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
+                    duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
                     on_air_bytes=on_air_bytes if ok else None,
                 )
                 return ok
@@ -1645,6 +1848,7 @@ class _DirectSendMixin:
     async def _send_direct_frame(
         self, target, frame: str, attempt: int = 0, time_critical: bool = False,
         gate_telemetry: Optional[dict] = None, duty_cycle_exempt: bool = False,
+        hop_count: Optional[int] = None, peer_prefix: Optional[str] = None,
     ):
         """Sends one already-encoded DIRECT frame string (bare or
         multi-fragment shape -- this method doesn't care which) via
@@ -1679,11 +1883,17 @@ class _DirectSendMixin:
         below then raises -- the gate already ran and cost real time
         either way, and that's exactly the case a field-tuning analysis
         most wants visible."""
+        # Alpha 0.1.5: the frame's hop class for the duty-cycle ledgers --
+        # `hop_count` from the caller (the target's out_path_len) or the
+        # peer's resolved path; unknown counts as relayed.
+        gate_info: dict = {}
         quiet_defer_wait_s, duty_cycle_wait_s, medium_hold_wait_s = await self._pre_transmit_gate(
             frame, skip_quiet_defer=time_critical, duty_cycle_exempt=duty_cycle_exempt,
+            relayed=self._relayed_frame(hop_count, peer_prefix), telemetry=gate_info,
         )
         if gate_telemetry is not None:
             gate_telemetry["duty_cycle_exempt"] = duty_cycle_exempt
+            gate_telemetry["duty_cycle_ledger"] = gate_info.get("duty_cycle_ledger")
             gate_telemetry["quiet_defer_wait_s"] = quiet_defer_wait_s
             gate_telemetry["duty_cycle_wait_s"] = duty_cycle_wait_s
             gate_telemetry["medium_hold_wait_s"] = medium_hold_wait_s

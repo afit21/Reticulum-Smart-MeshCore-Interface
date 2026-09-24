@@ -2,10 +2,12 @@
 import asyncio
 import collections
 import itertools
+import os
 import queue
 import threading
 import time
 import traceback
+from typing import Optional
 
 import RNS
 from RNS.Interfaces.Interface import Interface
@@ -290,6 +292,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # Wire shape: "Q" + Z85([ver:1][type:1][complete:1][pkt_id_hi:1]
     # [pkt_id_lo:1][frag_total:1]), 6 raw bytes -> 10 characters on the
     # wire, comfortably one DIRECT bare message under any realistic budget.
+    LRPROOF_KEY_PREFIX = b"LRP:"   # the answered-send key of an LRPROOF is this + its link_id (alpha 0.1.6 item 2)
     COMPLETION_MARKER = "Q"
     # Step 3 (2026-09-18): v2 ANSWER frames append a have-bitmap
     # (ceil(frag_total/8) bytes, bit i set = receiver holds frag_idx i)
@@ -323,11 +326,18 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # build for window reports (a v3 peer drops the v4 frame as an
     # unsupported version and the sender falls back to its v4 QUERY, which
     # that peer drops too -- the same all-or-nothing as v3 was).
-    COMPLETION_PROTOCOL_VERSION = 4
+    COMPLETION_PROTOCOL_VERSION = 5
+    COMPLETION_PROTOCOL_VERSION_V4 = 4
     COMPLETION_PROTOCOL_VERSION_V3 = 3
     COMPLETION_PROTOCOL_VERSION_V2 = 2
     COMPLETION_PROTOCOL_VERSION_V1 = 1
     COMPLETION_V4_HEADER_SIZE = 4   # ver+type+n+nonce
+    # v5 (alpha 0.1.6, item 1): the v4 header plus the sender's path length
+    # to the receiver (0xFF: none) and its delivery rate on it in 1/250
+    # steps (0xFF: untried) -- the peer's view for the path scoreboard.
+    COMPLETION_V5_HEADER_SIZE = 6   # ver+type+n+nonce+path_len+rate
+    COMPLETION_PATH_UNKNOWN = 0xFF
+    COMPLETION_RATE_SCALE = 250
     COMPLETION_V4_MAX_ENTRIES = 8
     # A v4 REPORT lists the sender's raw packets seen within this span
     # (M2): longer than a window burst plus its report wait at three hops.
@@ -418,6 +428,14 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     # tens of destinations per hour, so this only ever trims pathological
     # growth over days of uptime, never a working set.
     RNS_TOKEN_PEER_MAX_KEYS = 4096
+    # Alpha 0.1.7 (item 1): queue times of recent plain PROOFs
+    # (`_proof_enqueued_at`); the field's worst backlog was 13 proofs.
+    PROOF_ENQUEUED_MAX_KEYS = 64
+    # Alpha 0.1.9 (item 2): deadlines of proofs waiting out the sender's
+    # burst tail (`_proof_tail_hold_until`). Same order of magnitude as the
+    # proof backlog above; one entry per window whose report a proof
+    # replaced, cleared as each proof is dispatched.
+    PROOF_TAIL_HOLD_MAX_KEYS = 64
 
     # Audit fix (2026-09-19): how many post-bind path-discovery rounds
     # `_discover_path_after_bind` runs before leaving it to real traffic.
@@ -514,6 +532,14 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
 
         self.owner = owner
         cfg = configuration
+        # 0.1.0: what a capture file's header records -- the keys the
+        # config block gave, and every setting the _configure_* calls
+        # below produce (defaults included).
+        try:
+            self._config_given = dict(cfg)
+        except Exception:
+            self._config_given = {}
+        settings_before = set(vars(self))
 
         self._configure_identity(cfg)
         self._configure_transport(cfg)
@@ -524,6 +550,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         self._configure_path_discovery(cfg)
         self._configure_peer_discovery(cfg)
         self._configure_observability(cfg)
+        self._settings_at_start = self._settings_snapshot(settings_before)
         # Field-diagnosed fix (2026-09-18, see module docstring): these
         # timing knobs are spread across five different _configure_*
         # methods above, each independently tunable, but they aren't
@@ -542,6 +569,23 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # base class's None default, even if this constructor's connection
         # attempt below fails and the interface stays offline.
         self.HW_MTU = RNS.Reticulum.MTU
+        # RNS 1.5 reads `ifac_size` on EVERY inbound frame
+        # (`Transport.preprocess_inbound`: `len(raw) > interface.HW_MTU +
+        # (interface.ifac_size or 0)`), and it is set by `RNS.Reticulum`
+        # when IT configures an interface from the config file -- None when
+        # no IFAC is configured (`RNS/Reticulum.py`). So under `rnsd` this
+        # attribute already exists and the assignment below is shadowed by
+        # the instance value Reticulum sets. It matters for every path that
+        # constructs this interface WITHOUT Reticulum: the hardware scripts
+        # in `testscripts/` that build a SmartMeshCoreInterface directly
+        # (`zero_hop_peer_discovery_test.py` and friends) and the hermetic
+        # unit tests, which on RNS 1.5.4 raised AttributeError on the first
+        # inbound packet. Set here rather than left to the base class
+        # because the base class does not define it (verified against both
+        # the installed 1.5.4 and the 1.5.2 copy in `referenceprojects/`).
+        # Added 2026-09-23 with alpha 0.1.9.
+        if not hasattr(self, "ifac_size"):
+            self.ifac_size = None
 
         # --- Internal async/threading state -----------------------------
         # `self._mc` itself stays a plain, genuinely-Optional attribute --
@@ -618,6 +662,22 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # telling a repeater's echo of our frame apart from unrelated
         # traffic once real captures exist to check that against.
         self._last_own_tx_at = None
+        # Alpha 0.1.5 (2a, 2026-09-21): when this node's radio is estimated
+        # to finish transmitting everything it has been handed. Every keyed
+        # frame extends it by its own airtime from the later of now and the
+        # previous value (`_note_radio_keyed`, in `_pre_transmit_gate`):
+        # `send_raw_data` / `send_msg` return when the frame is QUEUED, so a
+        # zero-hop burst of 15 fragments was "sent" in 2.6 s while the
+        # radio needed ~14 s -- the window's burst end, the report wait,
+        # the report estimator and `since_own_tx_s` all read this instead.
+        self._radio_busy_until = 0.0
+        # Alpha 0.1.5 (item 8): the interface's own summed airtime estimate
+        # and frame count since start, written beside the firmware's measured
+        # transmit time in every `radio_stats` record.
+        self._estimated_tx_air_total_s = 0.0
+        self._frames_keyed_total = 0
+        self._radio_stats_task = None
+        self._radio_stats_unsupported = False
         # Step 2 (2026-09-18): per-peer measured ACK RTT -- peer_prefix ->
         # {"srtt", "rttvar", "samples", "last_rtt"}; see _record_ack_rtt/
         # _adaptive_ack_timeout/_invalidate_ack_rtt. Only ever touched on
@@ -672,6 +732,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # extends. Always maintained; only acted on when rx_log_holds_
         # enabled (see that config's own comment).
         self._radio_params = None
+        # 0.1.0: the last SELF_INFO payload, and the radio fields the
+        # capture last recorded (a `radio_settings` record follows a change).
+        self._self_info = None
+        self._captured_radio = None
         self._medium_busy_until = 0.0
         self._medium_busy_reason = None
         self._stats_task = None
@@ -818,6 +882,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # See _answered_send_key / _signal_send_answered.
         self._send_answered_events = {}
         self._send_answered_at = {}
+        self._send_answered_how = {}      # key -> how it was answered ("superseded" is a drop, alpha 0.1.6 item 2)
+        # Alpha 0.1.6 (item 2): peer prefix -> {link_id} of LRPROOFs queued
+        # or in flight to that peer (`_supersede_link_proofs`).
+        self._pending_link_proofs = {}
         # Phase 1 (2026-09-20): destination_hash -> (announce bytes as
         # received, time.monotonic(), source peer prefix) for every ANNOUNCE
         # a bound peer delivered to RNS through this interface (LRU,
@@ -826,14 +894,38 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # _answer_path_request_locally.
         self._announce_cache = collections.OrderedDict()
         self._path_request_local_answer_at = {}
+        # Alpha 0.1.8 (item 4): the cache is persisted under
+        # RNS.Reticulum.storagepath and restored at start, so a restart
+        # does not re-request destinations this node already holds an
+        # announce for. Set whenever an entry is added.
+        self._announce_cache_dirty = False
+        self._announce_cache_loaded = False
         # Phase 3 M1 (2026-09-20): reassembly key -> the task holding a gaps
         # report (M1 debounce); cancelled when the bucket completes.
         self._pending_gap_reports = {}
+        # Alpha 0.1.8 (item 1): sender token -> the task holding a complete
+        # report for `proof_report_grace_s` while RNS decides whether to
+        # prove the packet. Cancelled whenever a report for that sender
+        # goes out for any other reason.
+        self._pending_proof_graces = {}
+        # Alpha 0.1.5 (2b): sender token -> {"task", "header", "frag_bytes"}
+        # for a complete report held while that sender's fragments are still
+        # arriving; re-armed by every fragment, superseded by any report.
+        self._pending_sender_reports = {}
+        # Alpha 0.1.6 (item 3): (sender token, pkt_id) -> when a complete
+        # report for it last went out (`_report_recently_sent`).
+        self._last_complete_report_at = {}
         # Phase 3 M2 (2026-09-20): peer prefix -> the open _RawWindow parts
         # join; sender token -> {(pkt_id, frag_total): last seen} for the
         # v4 report's entries.
         self._raw_windows = {}
         self._recent_raw_pkts = {}
+        # Alpha 0.1.5 (item 5): peer prefix -> recent raw part arrival times
+        # (monotonic), the window collect's inter-part spacing estimate.
+        self._raw_part_arrivals = {}
+        # Alpha 0.1.6 (item 1): peer prefix -> `_PathBoard`, the scoreboard
+        # of candidate paths to that peer (`_paths.py`).
+        self._path_boards = {}
         # M3: short raw source prefixes already logged as ambiguous.
         self._raw_src_ambiguous_logged = set()
 
@@ -918,23 +1010,53 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # it did before the token was ever learned.
         self._rns_token_peer = collections.OrderedDict()
         self._proof_correlation = {}
+        # Alpha 0.1.7 (item 1): when each queued plain PROOF was handed to
+        # this interface, keyed by its destination field (the proved
+        # packet's truncated hash, or the link_id), so its age is known at
+        # every attempt (`_send_direct_with_attempts`, proof_fresh_s).
+        # Bounded; entries older than proof_max_age are swept with the
+        # proof correlations.
+        self._proof_enqueued_at = collections.OrderedDict()
+        # Alpha 0.1.9 (item 2): proof key (the value the PROOF carries in
+        # its destination field) -> the monotonic deadline until which that
+        # proof waits for the sender's burst tail, and, once it has waited,
+        # how long it actually waited so the attempt record can carry it
+        # (`proof_tail_hold_s`). Both bounded by PROOF_TAIL_HOLD_MAX_KEYS.
+        self._proof_tail_hold_until = collections.OrderedDict()
+        self._proof_tail_hold_waited = collections.OrderedDict()
 
+        # Alpha 0.1.6 (item 4): the connection supervisor's state.
+        self._supervisor_task = None
+        self._startup_gate = None
+        self._detach_event = None
+        self._disconnect_event = None
+        self._disconnect_reason = None
+        self._connection_state = "init"
+        self._peer_cache_loaded = False
+        self._pending_capture_events = []
+        self._serial_noise_times = collections.deque()
+        self._serial_noise_total = 0
+        self._serial_noise_warned_at = 0.0
         self._setup_done = threading.Event()
 
         self._load_meshcore_or_panic()
         self._start_async_bridge()
 
+        # Alpha 0.1.6 (item 4): this returns once the port is open (or the
+        # first attempt failed); the handshake and setup run on the loop
+        # and the supervisor retries forever, so rnsd's startup is never
+        # held for a rebooting radio.
         if not self._setup_done.wait(timeout=self.SETUP_TIMEOUT_S):
             RNS.log(
-                f"{self}: setup timed out after {self.SETUP_TIMEOUT_S:.0f}s "
-                f"-- interface will remain offline.",
-                RNS.LOG_ERROR,
+                f"{self}: the first connection attempt did not finish in {self.SETUP_TIMEOUT_S:.0f}s "
+                f"-- the connection supervisor keeps trying in the background.",
+                RNS.LOG_WARNING,
             )
         elif not self.online:
             RNS.log(
-                f"{self}: setup completed but the interface did not come "
-                f"online -- see the specific failure logged above.",
-                RNS.LOG_ERROR,
+                f"{self}: not online yet ({self._connection_state}) -- the connection supervisor brings the "
+                f"interface up once the radio answers, and retries with backoff if it does not.",
+                RNS.LOG_INFO,
             )
 
     # -------------------------------------------------------------------
@@ -1092,7 +1214,20 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
             expected_types = (expected_types,)
 
         async with self._command_lock:
+            started = time.monotonic()
             result = await command_coro
+            # Alpha 0.1.6 (item 4): the library returns the first ERROR it
+            # sees, and its reader emits ERRORs of its own for garbled
+            # inbound frames (boot text, a serial hiccup, a second process
+            # reading the port). Those are noise, not this command's
+            # reply: keep waiting for the expected type until the command
+            # timeout, counting them.
+            noise = self._error_is_noise(result)
+            while noise is not None:
+                self._note_serial_noise(noise, context)
+                remaining = self.command_timeout_s - (time.monotonic() - started)
+                result = await self._wait_expected_reply(tuple(expected_types) + (self._EventType.ERROR,), remaining)
+                noise = self._error_is_noise(result)
 
         self._debug(f"{context} -> {getattr(result, 'type', result)!r}")
 
@@ -1128,156 +1263,515 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
             return f"tcp host={self.host} port={self.tcp_port}"
         return f"unknown transport '{self.transport}'"
 
-    async def _connect(self, MeshCore):
-        # Confirmed directly against the installed meshcore library
-        # (2.3.9.1) while building this milestone: MeshCore.connect()
-        # only cleans up its own dispatcher task on a *graceful* refusal
-        # (the underlying connection_manager.connect() returning None) --
-        # a raw OSError from the socket/serial layer itself (e.g. a
-        # refused TCP connection, no device at the port) propagates
-        # straight out of create_serial/create_ble/create_tcp without
-        # that cleanup running, and without ever handing this method a
-        # MeshCore instance to call disconnect() on. The visible symptom
-        # is a harmless "Task was destroyed but it is pending" asyncio
-        # warning logged once per failed connection attempt -- confirmed
-        # to not affect this interface's own behavior (the exception is
-        # still caught and self.online correctly stays False), but worth
-        # recording here rather than re-diagnosing it as this interface's
-        # own bug the next time it's seen in a log.
+    # -------------------------------------------------------------------
+    # The connection supervisor (alpha 0.1.6, item 4, 2026-09-22)
+    #
+    # The owner's "event failed" errors and rnsd stuck connecting on
+    # restart, read against `meshcore` 2.3.9.1 (`meshcore.py`,
+    # `connection_manager.py`, `serial_cx.py`, `reader.py`,
+    # `commands/base.py`): the library sends the handshake
+    # (`send_appstart`) once, right after the port opens, and gives up
+    # after one 15 s timeout -- but opening the port asserts DTR / RTS
+    # (pyserial's defaults), which resets the Heltec V3's ESP32, so the
+    # handshake often goes to a rebooting radio spewing boot text onto the
+    # UART; on a drop it retried three times a second apart and then went
+    # dead for good (`_reconnect_attempts` never reset, writes silently
+    # ignored, every command a 15 s timeout); and it matches a command's
+    # reply by event type only while its reader emits ERROR events of its
+    # own for garbled frames, so a corrupted inbound frame was reported as
+    # the in-flight command's failure. The interface now owns the
+    # lifecycle: it builds the connection and the MeshCore object itself
+    # (`auto_reconnect` off in the library), opens the port, settles,
+    # flushes, runs the handshake up to `handshake_attempts` times, does
+    # the full device setup, and on a disconnect tears down and retries
+    # forever with backoff `connect_retry_min` .. `connect_retry_max`.
+    # The constructor returns once the port is open (serial) or the first
+    # attempt is over; the handshake happens on the loop. Every state
+    # change is a `connection_state` capture record (buffered until the
+    # capture file opens, which needs the node name from the handshake).
+    # -------------------------------------------------------------------
+
+    SERIAL_NOISE_REASON_PREFIXES = ("invalid_frame_length", "binary_parse_error", "unknown_stats_type")
+
+    def _build_connection(self):
+        """The library's connection object and a MeshCore around it, not
+        yet opened. The library's own `auto_reconnect` is off: the
+        supervisor reconnects. `SerialConnection` / `TCPConnection` /
+        `BLEConnection` and `MeshCore(cx, ...)` are the library's public
+        exports (`meshcore/__init__.py`)."""
+        mod = self._mc_module
         if self.transport == "serial":
-            return await MeshCore.create_serial(
-                self.port,
-                self.baudrate,
-                auto_reconnect=self.auto_reconnect,
-                max_reconnect_attempts=self.max_reconnect_attempts,
+            cx = mod.SerialConnection(self.port, self.baudrate)
+        elif self.transport == "ble":
+            cx = mod.BLEConnection(address=self.ble_name or None)
+        elif self.transport == "tcp":
+            cx = mod.TCPConnection(self.host, self.tcp_port)
+        else:
+            raise ValueError(f"unknown transport '{self.transport}' (expected serial, ble, or tcp)")
+        return mod.MeshCore(cx, auto_reconnect=False)
+
+    async def _open_connection(self, mc) -> bool:
+        """Open the port / socket / BLE link: the library's dispatcher and
+        `connection_manager.connect()` (an OSError propagates to the
+        supervisor; None is a refused connection)."""
+        await mc.dispatcher.start()
+        result = await mc.connection_manager.connect()
+        if result is None:
+            try:
+                await mc.dispatcher.stop()
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _flush_serial_input(self, mc) -> bool:
+        """Drop whatever the radio put on the UART so far (boot text after
+        the port-open reset, a half frame from a previous holder): the
+        pyserial instance behind the library's serial transport, reached
+        through public attributes and probed at every step."""
+        try:
+            cx = getattr(mc.connection_manager, "connection", None)
+            transport = getattr(cx, "transport", None)
+            ser = getattr(transport, "serial", None)
+            if ser is not None and hasattr(ser, "reset_input_buffer"):
+                ser.reset_input_buffer()
+                return True
+        except Exception as exc:
+            self._debug(f"serial input flush failed: {exc}")
+        return False
+
+    @staticmethod
+    def _port_holders(device: str, proc_root: str = "/proc", own_pid: Optional[int] = None) -> list:
+        """Every other process holding `device` open: [(pid, cmdline)],
+        from /proc/<pid>/fd (Linux lets two processes open one serial port;
+        the laptop runs MeshChat's own RNS and, at times, a separate rnsd,
+        both loading this interface from the same config). Pure over the
+        proc tree so the tests can point it at a fake one."""
+        holders = []
+        own_pid = os.getpid() if own_pid is None else own_pid
+        try:
+            real = os.path.realpath(device)
+        except Exception:
+            real = device
+        try:
+            pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+        except Exception:
+            return holders
+        for pid in pids:
+            if int(pid) == own_pid:
+                continue
+            fd_dir = os.path.join(proc_root, pid, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except Exception:
+                continue
+            for fd in fds:
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd))
+                except Exception:
+                    continue
+                if target == device or target == real:
+                    try:
+                        with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+                            cmdline = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+                    except Exception:
+                        cmdline = "?"
+                    holders.append((int(pid), cmdline))
+                    break
+        return holders
+
+    def _check_port_holders(self) -> list:
+        if self.transport != "serial":
+            return []
+        holders = self._port_holders(self.port)
+        if holders:
+            who = "; ".join(f"pid {pid}: {cmd[:120]}" for pid, cmd in holders)
+            RNS.log(
+                f"{self}: *** ANOTHER PROCESS ALREADY HOLDS {self.port}: {who}. Two readers on one serial port "
+                f"each get half the radio's frames (garbled commands, 'event failed', lost messages). "
+                f"Proceeding anyway; stop the other process unless you mean to run both. ***",
+                RNS.LOG_WARNING,
             )
-        if self.transport == "ble":
-            return await MeshCore.create_ble(
-                self.ble_name or None,
-                auto_reconnect=self.auto_reconnect,
-                max_reconnect_attempts=self.max_reconnect_attempts,
+            self._capture_connection_state("port_shared", holders=[[pid, cmd[:120]] for pid, cmd in holders])
+        return holders
+
+    def _capture_connection_state(self, state: str, **fields) -> None:
+        """A `connection_state` capture record, buffered until the capture
+        file exists (it opens after the first handshake, which names the
+        node)."""
+        self._connection_state = state
+        record = {"event": "connection_state", "state": state, "transport": self.transport}
+        record.update(fields)
+        if self._packet_capture_file is not None:
+            self._capture_event("out", record)
+        elif self.packet_capture_enabled:
+            record["ts_buffered"] = time.time()
+            self._pending_capture_events.append(record)
+            del self._pending_capture_events[:-64]
+
+    async def _handshake(self, mc) -> bool:
+        """`send_appstart` until the radio answers with SELF_INFO: up to
+        `handshake_attempts` tries of `handshake_timeout` each, the input
+        flushed before each (serial), one second between them. On success
+        the identity and radio block are applied."""
+        saved_timeout = getattr(mc.commands, "default_timeout", None)
+        try:
+            for attempt in range(1, max(1, self.handshake_attempts) + 1):
+                if self.detached:
+                    return False
+                if self.transport == "serial":
+                    self._flush_serial_input(mc)
+                try:
+                    if saved_timeout is not None:
+                        mc.commands.default_timeout = self.handshake_timeout_s
+                    result = await asyncio.wait_for(mc.commands.send_appstart(), timeout=self.handshake_timeout_s + 2.0)
+                except Exception as exc:
+                    result = None
+                    self._debug(f"handshake attempt {attempt}: {exc}")
+                if result is not None and result.type == self._EventType.SELF_INFO:
+                    self._apply_self_info(result.payload if isinstance(result.payload, dict) else {})
+                    if attempt > 1:
+                        RNS.log(f"{self}: handshake answered on attempt {attempt}.", RNS.LOG_DEBUG)
+                    return True
+                reason = None
+                if result is not None and isinstance(result.payload, dict):
+                    reason = result.payload.get("reason", result.payload.get("code_string"))
+                RNS.log(
+                    f"{self}: handshake attempt {attempt}/{self.handshake_attempts} unanswered"
+                    f"{f' ({reason})' if reason else ''} -- retrying in 1s.",
+                    RNS.LOG_WARNING if attempt >= 2 else RNS.LOG_DEBUG,
+                )
+                self._capture_connection_state("handshake_retry", attempt=attempt, reason=reason)
+                await asyncio.sleep(1.0)
+            return False
+        finally:
+            if saved_timeout is not None:
+                mc.commands.default_timeout = saved_timeout
+
+    def _apply_self_info(self, info: dict) -> None:
+        self._own_node_name = info.get("name", "") or self._own_node_name
+        node_key = str(info.get("public_key", "") or "")
+        if node_key:
+            self._own_pubkey_hex = node_key.lower()
+        params = self._parse_radio_params(info)
+        if params is not None:
+            self._radio_params = params
+        elif any(k in info for k in ("radio_sf", "radio_bw", "radio_cr")):
+            RNS.log(
+                f"{self}: SELF_INFO radio block is implausible (sf={info.get('radio_sf')!r} "
+                f"bw={info.get('radio_bw')!r}kHz cr={info.get('radio_cr')!r}) -- ignoring it; airtime "
+                f"estimates fall back to duty_cycle_estimate_bitrate until a sane block arrives.",
+                RNS.LOG_WARNING,
             )
-        if self.transport == "tcp":
-            return await MeshCore.create_tcp(
-                self.host,
-                self.tcp_port,
-                auto_reconnect=self.auto_reconnect,
-                max_reconnect_attempts=self.max_reconnect_attempts,
+        RNS.log(f"{self}: node identity '{self._own_node_name}' key={node_key[:16]}...", RNS.LOG_INFO)
+        self._self_info = dict(info)
+        if getattr(self, "_packet_capture_file", None) is not None:
+            radio = self._capture_self_info()
+            if radio != self._captured_radio:
+                self._captured_radio = radio
+                self._capture_event("out", {"event": "radio_settings", "radio": radio,
+                                            "radio_params": list(self._radio_params) if self._radio_params else None})
+
+    async def _fetch_own_identity(self) -> None:
+        """Re-asks the radio for SELF_INFO while the identity is still
+        unknown (`_contact_refresh_loop` retries it): the handshake in the
+        supervisor is where it normally comes from."""
+        try:
+            result = await self._run_command(
+                self._mc_ready.commands.send_appstart(), "send_appstart", self._EventType.SELF_INFO,
             )
-        raise ValueError(f"unknown transport '{self.transport}' (expected serial, ble, or tcp)")
+        except Exception as exc:
+            RNS.log(f"{self}: could not fetch node identity: {exc} -- retried on the next contact refresh.",
+                    RNS.LOG_WARNING)
+        else:
+            self._apply_self_info(result.payload if isinstance(result.payload, dict) else {})
+
+    async def _apply_device_settings(self) -> None:
+        """Radio override, channel, telemetry mode -- everything the
+        firmware must be told on every (re)connect."""
+        if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
+            try:
+                await self._run_command(
+                    self._mc_ready.commands.set_radio(self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr),
+                    "set_radio", self._EventType.OK,
+                )
+                RNS.log(
+                    f"{self}: radio override applied (freq={self.radio_freq}MHz "
+                    f"bw={self.radio_bw}kHz sf={self.radio_sf} cr={self.radio_cr}).",
+                    RNS.LOG_INFO,
+                )
+                # MeshBench finding 1 (2026-09-20): the airtime model must
+                # follow the override, not the pre-override SELF_INFO block.
+                params = self._parse_radio_params(
+                    {"radio_sf": self.radio_sf, "radio_bw": self.radio_bw, "radio_cr": self.radio_cr}
+                )
+                if params is not None:
+                    self._radio_params = params
+            except Exception as exc:
+                RNS.log(f"{self}: radio override failed: {exc} -- continuing with the node's currently stored "
+                        f"radio settings.", RNS.LOG_WARNING)
+        else:
+            RNS.log(f"{self}: no radio override configured -- using the node's currently stored radio settings.",
+                    RNS.LOG_DEBUG)
+
+        try:
+            secret_bytes = bytes.fromhex(self.channel_secret_hex)
+            await self._run_command(
+                self._mc_ready.commands.set_channel(self.channel_idx, self.channel_name, secret_bytes),
+                "set_channel", self._EventType.OK,
+            )
+            RNS.log(f"{self}: channel configured (idx={self.channel_idx} name='{self.channel_name}').", RNS.LOG_INFO)
+            if self._using_default_channel_secret:
+                RNS.log(
+                    f"{self}: no channel_secret configured -- joining the shared default channel so nodes can "
+                    f"find each other with zero setup. This is fine for RNS traffic (it's already encrypted "
+                    f"end-to-end); set channel_idx/channel_name/channel_secret explicitly for a private channel.",
+                    RNS.LOG_INFO,
+                )
+        except Exception as exc:
+            RNS.log(f"{self}: channel setup failed: {exc}", RNS.LOG_WARNING)
+
+        try:
+            await self._run_command(
+                self._mc_ready.commands.set_telemetry_mode_base(self.TELEM_MODE_ALLOW_FLAGS),
+                "set_telemetry_mode_base", self._EventType.OK,
+            )
+            RNS.log(
+                f"{self}: telemetry_mode_base set to per-contact-flags -- path discovery "
+                f"(docs/path_discovery_spec.md) is a telemetry request under the hood, and only answers a "
+                f"peer whose own contact entry has been granted the base permission bit.",
+                RNS.LOG_DEBUG,
+            )
+        except Exception as exc:
+            RNS.log(f"{self}: setting telemetry_mode_base failed: {exc} -- this node may not answer other nodes' "
+                    f"path discovery requests until this is retried.", RNS.LOG_WARNING)
+
+    async def _setup_connection(self, mc) -> bool:
+        """Everything after the port is open, on every (re)connect:
+        settle, handshake, device setup, contacts, subscriptions, message
+        fetching; the process-lifetime loops are started on the first
+        success only."""
+        self._mc = mc
+        self._disconnect_event = asyncio.Event()
+        self._subscribe_connection_events()
+        if self.transport == "serial" and self.serial_open_settle_s > 0:
+            # Opening the port toggled DTR / RTS and reset the radio.
+            await asyncio.sleep(self.serial_open_settle_s)
+        if not await self._handshake(mc):
+            RNS.log(
+                f"{self}: the radio did not answer the handshake in {self.handshake_attempts} attempt(s) "
+                f"({self._connection_description()}) -- closing the port and retrying.",
+                RNS.LOG_ERROR,
+            )
+            return False
+        await self._apply_device_settings()
+
+        # Code-review fix: self.online is set True here, BEFORE
+        # _load_peer_cache() below, deliberately -- _load_peer_cache()
+        # calls _register_peer() per cached entry, which (for a peer new
+        # to this process's own _peers dict, true for every cache-
+        # restored peer) schedules a proactive discover_path() background
+        # task; discover_path()'s own first line no-ops while offline.
+        self.online = True
+        self._connected_since = time.time()
+        RNS.log(
+            f"{self}: online (bitrate={self.bitrate}bps HW_MTU={self.HW_MTU} "
+            f"channel_budget={self._channel_payload_budget()}B "
+            f"direct_budget={self._direct_payload_budget()}B).",
+            RNS.LOG_INFO,
+        )
+        if self.packet_capture_enabled and self._packet_capture_file is None:
+            self._open_packet_capture()
+        if self.peer_discovery_enabled and not self._peer_cache_loaded:
+            self._peer_cache_loaded = True
+            self._load_peer_cache()
+        # Alpha 0.1.8 (item 4): once per process, like the peer cache, and
+        # after it -- a restored entry's source peer must already be bound
+        # for `_answer_path_request_locally` to use it.
+        if not self._announce_cache_loaded:
+            self._announce_cache_loaded = True
+            self._load_announce_cache()
+        try:
+            await self._refresh_contacts_and_grant_telemetry()
+        except Exception as exc:
+            RNS.log(f"{self}: initial contact refresh failed: {exc}", RNS.LOG_WARNING)
+        self._subscribe_data_events()
+        await self._start_auto_message_fetching()
+        if self._outgoing_worker_task is None:
+            self._stats_task = asyncio.ensure_future(self._stats_loop())
+            # Item 8 (alpha 0.1.5): the radio's own transmit statistics at
+            # start, then on the cadence.
+            await self._poll_radio_stats("start")
+            self._radio_stats_task = asyncio.ensure_future(self._radio_stats_loop())
+            self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
+            self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
+            self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
+            if self.peer_discovery_enabled:
+                self._peer_discovery_task = asyncio.ensure_future(self._peer_discovery_bootstrap())
+                self._peer_ttl_sweep_task = asyncio.ensure_future(self._peer_ttl_sweep_loop())
+        else:
+            await self._poll_radio_stats("reconnect")
+        return True
+
+    async def _close_connection(self, mc, reason: str) -> None:
+        self.online = False
+        if self._mc is mc:
+            self._mc = None
+        for step, coro in (("stop_auto_message_fetching", mc.stop_auto_message_fetching), ("disconnect", mc.disconnect)):
+            try:
+                await asyncio.wait_for(coro(), timeout=5.0)
+            except Exception as exc:
+                self._debug(f"{step} during close ({reason}): {exc}")
+
+    def _release_startup_gate(self) -> None:
+        if not self._startup_gate.done():
+            self._startup_gate.set_result(None)
+
+    async def _connection_supervisor(self) -> None:
+        """Retry forever with backoff; run the full setup on every
+        (re)connect; wait for a disconnect; repeat. `max_reconnect_attempts`
+        0 (the default) is forever; `auto_reconnect = no` stops after the
+        first drop, as the library used to."""
+        attempt = 0
+        delay = self.connect_retry_min_s
+        try:
+            while not self.detached:
+                attempt += 1
+                self._capture_connection_state("connecting", attempt=attempt)
+                mc = None
+                opened = False
+                try:
+                    self._check_port_holders()
+                    mc = self._build_connection()
+                    opened = await self._open_connection(mc)
+                except Exception as exc:
+                    RNS.log(f"{self}: connection failed ({self._connection_description()}): {exc}", RNS.LOG_ERROR)
+                    self._capture_connection_state("open_failed", attempt=attempt, reason=str(exc)[:200])
+                if not opened and mc is not None:
+                    self._capture_connection_state("open_failed", attempt=attempt, reason="refused")
+                if opened:
+                    RNS.log(f"{self}: connected ({self._connection_description()}).", RNS.LOG_INFO)
+                    self._capture_connection_state("open", attempt=attempt)
+                if self.transport == "serial" or not opened:
+                    # The constructor waits only this long: the port is
+                    # open (or could not be); the handshake is the loop's.
+                    self._release_startup_gate()
+                if opened:
+                    ok = False
+                    try:
+                        ok = await self._setup_connection(mc)
+                    except Exception as exc:
+                        RNS.log(f"{self}: setup failed ({self._connection_description()}): {exc}", RNS.LOG_ERROR)
+                        RNS.log("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), RNS.LOG_DEBUG)
+                    self._release_startup_gate()
+                    if ok:
+                        delay = self.connect_retry_min_s
+                        self._capture_connection_state("online", attempt=attempt)
+                        await self._disconnect_event.wait()
+                        reason = self._disconnect_reason or "unknown"
+                        RNS.log(f"{self}: MeshCore connection lost ({reason}) -- interface offline; reconnecting.",
+                                RNS.LOG_WARNING)
+                        self._capture_connection_state("disconnected", reason=reason,
+                                                       online_s=round(time.time() - (self._connected_since or time.time()), 1))
+                        await self._close_connection(mc, reason)
+                        if self.detached:
+                            break
+                        if not self.auto_reconnect:
+                            RNS.log(f"{self}: auto_reconnect is off -- staying offline.", RNS.LOG_WARNING)
+                            break
+                        attempt = 0
+                    else:
+                        self._capture_connection_state("setup_failed", attempt=attempt)
+                        await self._close_connection(mc, "setup failed")
+                if self.detached:
+                    break
+                if self.max_reconnect_attempts and attempt >= self.max_reconnect_attempts:
+                    RNS.log(f"{self}: giving up after {attempt} connection attempt(s) (max_reconnect_attempts).",
+                            RNS.LOG_ERROR)
+                    break
+                self._capture_connection_state("retry_wait", attempt=attempt, delay_s=delay)
+                RNS.log(f"{self}: next connection attempt in {delay:.0f}s.", RNS.LOG_INFO)
+                try:
+                    await asyncio.wait_for(self._detach_event.wait(), timeout=delay)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(delay * 2, self.connect_retry_max_s)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._release_startup_gate()
 
     def _subscribe_connection_events(self):
-        # Only ever called from _async_setup right after its own
-        # `self._mc is None` guard passes -- `_mc_ready` documents that
-        # instead of repeating the guard here.
         self._mc_ready.subscribe(self._EventType.CONNECTED, self._on_mc_connected)
         self._mc_ready.subscribe(self._EventType.DISCONNECTED, self._on_mc_disconnected)
 
     def _on_mc_connected(self, event):
-        if self.detached:
-            return
-        was_offline = not self.online
-        reconnected = bool((event.payload or {}).get("reconnected")) if isinstance(getattr(event, "payload", None), dict) else False
-        self.online = True
-        if was_offline or reconnected:
-            RNS.log(
-                f"{self}: MeshCore connection (re)established"
-                + (" (library auto-reconnect)." if reconnected and not was_offline else "."),
-                RNS.LOG_INFO,
-            )
-            # Code-review fix: _start_auto_message_fetching() was only
-            # ever called once, from _async_setup. If a reconnect's own
-            # internal get_msg() poll ever raises (plausible right as the
-            # connection drops), the installed library's own _fetch_
-            # messages_loop silently exits for good on any exception and
-            # is never restarted on its own -- confirmed directly against
-            # its source, which breaks the loop with no re-arm path.
-            # Without re-arming here, a reconnect would quietly return
-            # this interface to the exact "online but deaf" failure mode
-            # the original M5 field-test fix (this same method's sibling)
-            # exists to prevent, with no error logged anywhere.
-            #
-            # Audit fix (2026-09-19): gating this on `was_offline` alone made
-            # it dead code for the default configuration. Confirmed against
-            # the installed library (meshcore/connection_manager.py:99-121):
-            # with `auto_reconnect` on -- the default here -- an unexpected
-            # drop does NOT emit DISCONNECTED at all. It silently starts
-            # `_attempt_reconnect` and emits CONNECTED{reconnected:True} on
-            # success, so `_on_mc_disconnected` never runs, `self.online`
-            # never goes False, and `was_offline` is False exactly when the
-            # re-arm matters most. DISCONNECTED is only emitted when
-            # auto-reconnect is off or every attempt has failed. The
-            # `reconnected` flag from the event now also triggers the
-            # re-arm; `_rearm_auto_message_fetching` stops first, so doing
-            # it once too often is harmless.
-            self._spawn_background_task(self._rearm_auto_message_fetching())
-            if not self._own_pubkey_hex:
-                self._spawn_background_task(self._fetch_own_identity())
+        # The supervisor opens the connection itself; this only ever sees
+        # the library's own CONNECTED for the open it just made.
+        self._debug("library CONNECTED event.")
 
     def _on_mc_disconnected(self, event):
+        """The library's DISCONNECTED (with `auto_reconnect` off it is
+        emitted at once on an unexpected drop): the supervisor takes it
+        from here."""
         if self.detached:
             return
-        if self.online:
-            RNS.log(
-                f"{self}: MeshCore connection lost -- interface going "
-                f"offline until it reconnects.",
-                RNS.LOG_WARNING,
-            )
+        payload = getattr(event, "payload", None)
+        self._disconnect_reason = str((payload or {}).get("reason", "unknown")) if isinstance(payload, dict) else "unknown"
         self.online = False
+        if self._disconnect_event is not None and not self._disconnect_event.is_set():
+            self._disconnect_event.set()
 
-    async def _fetch_own_identity(self) -> None:
-        """Code-review fix: this was previously inlined in `_async_setup`
-        and only ever attempted once, at initial connect. If `send_appstart`
-        failed there (a plausible timing issue right after the radio link
-        comes up), `_own_pubkey_hex` stayed empty for the interface's
-        entire lifetime -- and `_own_pubkey_prefix()` returning None makes
-        the self-echo guard in `_handle_incoming_bind_frame` (`own_prefix
-        is not None and frame.pubkey_prefix == own_prefix`) silently skip
-        the check forever, meaning this node's own bind frames bouncing
-        back to it (e.g. via a repeater or CHANNEL rebroadcast) would be
-        misprocessed as if from a genuine peer. Extracted into its own
-        method so `_on_mc_connected` can retry it on every reconnect, not
-        just at the very first one, closing that permanent-failure window.
-        """
-        try:
-            # Only ever called once a connection is live (from _async_setup
-            # or _on_mc_connected's reconnect path) -- see `_mc_ready`.
-            result = await self._run_command(
-                self._mc_ready.commands.send_appstart(),
-                "send_appstart",
-                self._EventType.SELF_INFO,
-            )
-        except Exception as exc:
+    def _error_is_noise(self, result) -> Optional[str]:
+        """The reason string when `result` is one of the reader's own
+        ERROR events for a garbled inbound frame (not the firmware's
+        ERROR reply, not a timeout), else None."""
+        if result is None or result.type != self._EventType.ERROR:
+            return None
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason.startswith(self.SERIAL_NOISE_REASON_PREFIXES):
+            return reason
+        return None
+
+    def _note_serial_noise(self, reason: str, context: str) -> None:
+        now = time.monotonic()
+        self._serial_noise_times.append(now)
+        while self._serial_noise_times and now - self._serial_noise_times[0] > 60.0:
+            self._serial_noise_times.popleft()
+        self._serial_noise_total += 1
+        per_min = len(self._serial_noise_times)
+        self._debug(f"{context}: reader ERROR ({reason}) ignored as stream noise ({per_min} in the last minute).")
+        if per_min >= self.serial_noise_warn_per_min and now - self._serial_noise_warned_at > 60.0:
+            self._serial_noise_warned_at = now
             RNS.log(
-                f"{self}: could not fetch node identity: {exc} -- "
-                f"continuing anyway, but the CHANNEL payload budget below "
-                f"will assume an empty node name until this succeeds; if "
-                f"this node actually has a name configured, outgoing "
-                f"CHANNEL fragments could be silently truncated by the "
-                f"firmware as a result. This will be retried on the next "
-                f"reconnect if the pubkey is still unknown by then.",
+                f"{self}: serial stream corrupted -- {per_min} garbled frame(s) from the radio in the last minute "
+                f"({reason}); is another process reading {self.port}? (see the port-holder check at connect).",
                 RNS.LOG_WARNING,
             )
-        else:
-            info = result.payload if isinstance(result.payload, dict) else {}
-            self._own_node_name = info.get("name", "")
-            node_key = info.get("public_key", "")
-            self._own_pubkey_hex = node_key.lower()
-            params = self._parse_radio_params(info)
-            if params is not None:
-                self._radio_params = params
-            elif any(k in info for k in ("radio_sf", "radio_bw", "radio_cr")):
-                RNS.log(
-                    f"{self}: SELF_INFO radio block is implausible (sf={info.get('radio_sf')!r} "
-                    f"bw={info.get('radio_bw')!r}kHz cr={info.get('radio_cr')!r}) -- ignoring it; airtime "
-                    f"estimates fall back to duty_cycle_estimate_bitrate until a sane block arrives.",
-                    RNS.LOG_WARNING,
-                )
-            RNS.log(
-                f"{self}: node identity '{self._own_node_name}' "
-                f"key={node_key[:16]}...",
-                RNS.LOG_INFO,
-            )
+            self._capture_connection_state("serial_noise", per_min=per_min, total=self._serial_noise_total, reason=reason)
+
+    async def _wait_expected_reply(self, expected_types, timeout_s: float):
+        """The reply a command is still owed after a noise ERROR: the
+        first event of any expected type within `timeout_s`, or None."""
+        if timeout_s <= 0:
+            return None
+        loop = asyncio.get_running_loop()
+        tasks = [loop.create_task(self._mc_ready.wait_for_event(t, timeout=timeout_s)) for t in expected_types]
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+        for t in done:
+            try:
+                if t.result() is not None:
+                    return t.result()
+            except Exception:
+                pass
+        return None
 
     @staticmethod
     def _parse_radio_params(info: dict) -> "Optional[tuple]":
@@ -1299,159 +1793,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     async def _async_setup(self):
         self._command_lock_impl = asyncio.Lock()
         self._direct_exchange_lock_impl = _PriorityAsyncLock()
-        self._duty_cycle_impl = _DutyCycleLimiter(self.duty_cycle_window_s, self.duty_cycle_max_fraction)
-        MeshCore = self._mc_module.MeshCore
-
-        try:
-            self._mc = await self._connect(MeshCore)
-        except Exception as exc:
-            RNS.log(
-                f"{self}: connection failed ({self._connection_description()}): {exc}",
-                RNS.LOG_ERROR,
-            )
-            return
-
-        if self._mc is None:
-            RNS.log(
-                f"{self}: driver init returned no MeshCore instance "
-                f"({self._connection_description()}).",
-                RNS.LOG_ERROR,
-            )
-            return
-
-        RNS.log(f"{self}: connected ({self._connection_description()}).", RNS.LOG_INFO)
-        self._subscribe_connection_events()
-
-        await self._fetch_own_identity()
-
-        if self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr:
-            try:
-                await self._run_command(
-                    self._mc_ready.commands.set_radio(
-                        self.radio_freq, self.radio_bw, self.radio_sf, self.radio_cr
-                    ),
-                    "set_radio",
-                    self._EventType.OK,
-                )
-                RNS.log(
-                    f"{self}: radio override applied (freq={self.radio_freq}MHz "
-                    f"bw={self.radio_bw}kHz sf={self.radio_sf} cr={self.radio_cr}).",
-                    RNS.LOG_INFO,
-                )
-                # MeshBench finding 1 (2026-09-20): the airtime model must
-                # follow the override, not the pre-override SELF_INFO block.
-                params = self._parse_radio_params(
-                    {"radio_sf": self.radio_sf, "radio_bw": self.radio_bw, "radio_cr": self.radio_cr}
-                )
-                if params is not None:
-                    self._radio_params = params
-            except Exception as exc:
-                RNS.log(
-                    f"{self}: radio override failed: {exc} -- continuing "
-                    f"with the node's currently stored radio settings.",
-                    RNS.LOG_WARNING,
-                )
-        else:
-            RNS.log(
-                f"{self}: no radio override configured -- using the "
-                f"node's currently stored radio settings.",
-                RNS.LOG_INFO,
-            )
-
-        try:
-            secret_bytes = bytes.fromhex(self.channel_secret_hex)
-            await self._run_command(
-                self._mc_ready.commands.set_channel(
-                    self.channel_idx, self.channel_name, secret_bytes
-                ),
-                "set_channel",
-                self._EventType.OK,
-            )
-            RNS.log(
-                f"{self}: channel configured (idx={self.channel_idx} "
-                f"name='{self.channel_name}').",
-                RNS.LOG_INFO,
-            )
-            if self._using_default_channel_secret:
-                RNS.log(
-                    f"{self}: no channel_secret configured -- joining the "
-                    f"shared default channel so nodes can find each other "
-                    f"with zero setup. This is fine for RNS traffic (it's "
-                    f"already encrypted end-to-end); set channel_idx/"
-                    f"channel_name/channel_secret explicitly for a private "
-                    f"channel.",
-                    RNS.LOG_INFO,
-                )
-        except Exception as exc:
-            RNS.log(f"{self}: channel setup failed: {exc}", RNS.LOG_WARNING)
-
-        try:
-            await self._run_command(
-                self._mc_ready.commands.set_telemetry_mode_base(self.TELEM_MODE_ALLOW_FLAGS),
-                "set_telemetry_mode_base",
-                self._EventType.OK,
-            )
-            RNS.log(
-                f"{self}: telemetry_mode_base set to per-contact-flags -- "
-                f"path discovery (docs/path_discovery_spec.md) is a "
-                f"telemetry request under the hood, and only answers a "
-                f"peer whose own contact entry has been granted the base "
-                f"permission bit.",
-                RNS.LOG_INFO,
-            )
-        except Exception as exc:
-            RNS.log(
-                f"{self}: setting telemetry_mode_base failed: {exc} -- "
-                f"this node may not answer other nodes' path discovery "
-                f"requests until this is retried.",
-                RNS.LOG_WARNING,
-            )
-
-        # Code-review fix: self.online is set True here, BEFORE
-        # _load_peer_cache() below, deliberately -- _load_peer_cache()
-        # calls _register_peer() per cached entry, which (for a peer new
-        # to this process's own _peers dict, true for every cache-
-        # restored peer) schedules a proactive discover_path() background
-        # task. That task's first real chance to run is at the next
-        # await point in this same coroutine -- which used to be *before*
-        # self.online was set, so discover_path()'s own first line
-        # ("if ... not self.online: return None") silently no-opped for
-        # every single cache-restored peer, with no log line at all
-        # (unlike the backoff-skip case, which does self._debug()).
-        # Confirmed by code review: this made the Milestone 6 "proactive
-        # discovery on bind" fix quietly inert for exactly the startup
-        # case it was added for. Nothing else in this method depends on
-        # self.online being false up to this point.
-        self.online = True
-        self._connected_since = time.time()
-        RNS.log(
-            f"{self}: online (bitrate={self.bitrate}bps HW_MTU={self.HW_MTU} "
-            f"channel_budget={self._channel_payload_budget()}B "
-            f"direct_budget={self._direct_payload_budget()}B).",
-            RNS.LOG_INFO,
+        self._duty_cycle_impl = _DutyCycleLimiter(
+            self.duty_cycle_window_s, self.duty_cycle_max_fraction, self.duty_cycle_max_fraction_zero_hop,
         )
-
-        if self.packet_capture_enabled:
-            self._open_packet_capture()
-
-        if self.peer_discovery_enabled:
-            self._load_peer_cache()
-
-        try:
-            await self._refresh_contacts_and_grant_telemetry()
-        except Exception as exc:
-            RNS.log(f"{self}: initial contact refresh failed: {exc}", RNS.LOG_WARNING)
-
-        self._subscribe_data_events()
-        await self._start_auto_message_fetching()
-
-        self._stats_task = asyncio.ensure_future(self._stats_loop())
-        self._outgoing_worker_task = asyncio.ensure_future(self._outgoing_worker())
-        self._reassembly_cleanup_task = asyncio.ensure_future(self._reassembly_cleanup_loop())
-        self._contact_refresh_task = asyncio.ensure_future(self._contact_refresh_loop())
-        if self.peer_discovery_enabled:
-            self._peer_discovery_task = asyncio.ensure_future(self._peer_discovery_bootstrap())
-            self._peer_ttl_sweep_task = asyncio.ensure_future(self._peer_ttl_sweep_loop())
+        self._startup_gate = asyncio.get_running_loop().create_future()
+        self._detach_event = asyncio.Event()
+        self._supervisor_task = asyncio.ensure_future(self._connection_supervisor())
+        await self._startup_gate
 
     _RX_LOG_WINDOW_FOREIGN_CAP = 20
     _RX_LOG_PAYLOAD_TYPE_TEXT_MSG = 2
@@ -1467,6 +1815,19 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
     _TXT_MSG_FIXED_OVERHEAD_BYTES = 2 + 1 + 1 + 2
     _TXT_MSG_PLAINTEXT_OVERHEAD_BYTES = 4 + 1 + 1
 
+    # Alpha 0.1.6 (item 1): the per-peer path scoreboard (`_paths.py`).
+    PATH_CANDIDATES_KEPT = 4        # candidate paths kept per peer
+    PATH_SAMPLES_KEPT = 8           # send outcomes a candidate's delivery rate is over
+    # Alpha 0.1.8 (item 1): how often the proof grace looks for the proof.
+    # Short against the grace itself, so a proof that arrives early is not
+    # made to wait out the whole of it.
+    PROOF_GRACE_POLL_S = 0.02
+    PATH_SAMPLE_WINDOW_S = 600.0    # outcomes older than this count for nothing
+    PATH_SAMPLE_HALF_LIFE_S = 180.0 # an outcome's weight halves every this many seconds
+    PATH_PRIOR_OPTIMISTIC = 0.8     # an untried path's assumed delivery rate
+    PATH_PRIOR_WEAK = 0.25          # ... a zero-hop one heard below path_weak_snr_db (see _configure_path_discovery)
+    PATH_RATE_FLOOR = 0.05          # a measured rate is never scored below this
+    _RX_LOG_PAYLOAD_TYPE_ADVERT = 4
     _RX_LOG_ROUTE_FLOOD = {0, 1}   # TC_FLOOD, FLOOD (meshcore ROUTE_TYPENAMES order)
     _RX_LOG_ROUTE_DIRECT = {2, 3}  # DIRECT, TC_DIRECT
     _RX_LOG_ACK_BEARING_TYPES = {0, 2}  # REQ, TEXT_MSG -- the receiver answers with an ACK (or PATH when flooded)
@@ -1586,6 +1947,21 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         RNS.log(f"{self}: detached.", RNS.LOG_INFO)
 
     async def _async_teardown(self):
+        if self._detach_event is not None:
+            self._detach_event.set()
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._radio_stats_task is not None:
+            self._radio_stats_task.cancel()
+        # Item 8: the radio's transmit statistics at stop, best effort.
+        try:
+            await asyncio.wait_for(self._poll_radio_stats("stop"), timeout=5.0)
+        except Exception:
+            pass
         if self._stats_task is not None:
             self._stats_task.cancel()
         if self._reassembly_cleanup_task is not None:

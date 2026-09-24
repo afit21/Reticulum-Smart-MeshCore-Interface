@@ -125,14 +125,40 @@ def _miss_cause(detail: str) -> str:
 
 def capture_files(run_dir: str) -> dict:
     """{node_name: [capture paths]} -- the interface names its file
-    capture_<iface name>_<stamp>.jsonl."""
+    capture_<iface name>_<stamp>.jsonl, or, since alpha 0.1.5 (item 7),
+    <label>_capture_<iface name>_<stamp>.jsonl with the MeshCore node name
+    (or packet_capture_label) in front. The node key here stays the
+    INTERFACE name (what the scenario runner keys on)."""
     out = collections.defaultdict(list)
-    for cap in sorted(glob.glob(os.path.join(run_dir, "capture_*.jsonl"))):
-        stem = os.path.basename(cap)[len("capture_"):-len(".jsonl")]
+    for cap in sorted(glob.glob(os.path.join(run_dir, "*capture_*.jsonl"))):
+        stem = os.path.basename(cap)[:-len(".jsonl")]
+        stem = stem[stem.index("capture_") + len("capture_"):]
         node = stem.rsplit("_", 1)[0] if "_" in stem else stem
         out[node].append(cap)
     return dict(out)
 
+
+
+REPORT_REPEAT_WINDOW_S = 120.0   # longer than any receiver hold or sender report wait
+
+
+def reports_per_packet(recs: list):
+    """Reports sent per (sender, pkt_id, round) key, counting a later
+    report for the same key as a repeat only within REPORT_REPEAT_WINDOW_S
+    of the previous one (see the alpha 0.1.7 note where this is used).
+    None when no report was sent."""
+    last = {}
+    reports = 0
+    firsts = 0
+    for r in sorted((r for r in recs if r.get("event") == "completion_report_sent"), key=lambda r: r.get("ts") or 0):
+        key = (r.get("sender_token"), r.get("pkt_id"), r.get("round"))
+        ts = r.get("ts") or 0
+        reports += 1
+        prev = last.get(key)
+        if prev is None or ts - prev > REPORT_REPEAT_WINDOW_S:
+            firsts += 1
+        last[key] = ts
+    return round(reports / firsts, 2) if firsts else None
 
 def analyse_capture(recs: list) -> dict:
     n = {"records": len(recs)}
@@ -190,6 +216,14 @@ def analyse_capture(recs: list) -> dict:
         if r.get("duty_cycle_wait_s"):
             waits["duty_cycle_wait_s"] += r["duty_cycle_wait_s"]
     n["duty_cycle_waits"] = dist([r.get("duty_cycle_wait_s") for r in rf if r.get("duty_cycle_wait_s")])
+    # Alpha 0.1.5: which ledger held each wait ("relayed" = the 30% cap for
+    # anything a repeater relays, "total" = the 85% zero-hop cap), summed
+    # over raw fragments and DIRECT attempts alike.
+    ledger_sums: dict = collections.defaultdict(float)
+    for r in rf + att_all:
+        if r.get("duty_cycle_wait_s") and r.get("duty_cycle_ledger"):
+            ledger_sums[r["duty_cycle_ledger"]] += r["duty_cycle_wait_s"]
+    n["duty_cycle_wait_by_ledger"] = dict(ledger_sums)
     fr = [r for r in recs if r.get("event") == "fragment_received"]
     n["frag_recv"] = len(fr)
     n["frag_recv_raw"] = sum(1 for r in fr if r.get("raw"))
@@ -212,6 +246,16 @@ def analyse_capture(recs: list) -> dict:
     n["in_types"] = dict(collections.Counter(r.get("packet_type_name") for r in pk_in))
     n["reports_sent"] = sum(1 for r in recs if r.get("event") == "completion_report_sent")
     n["reports_sent_complete"] = sum(1 for r in recs if r.get("event") == "completion_report_sent" and r.get("complete"))
+    # Alpha 0.1.6 (item 3): reports per reported packet -- the field's
+    # doubled reports were two records for one (sender, pkt_id, round);
+    # 1.0 is one report per window. Alpha 0.1.7 (item 4): a repeat only
+    # counts within REPORT_REPEAT_WINDOW_S of the previous report for the
+    # same key -- the sender's pkt_id counter restarts with its process
+    # (the laptop's did at 12:35 on 2026-09-22, and its ids 0, 1 and 4 were
+    # reported again 50 minutes after the first time, reading as 1.33
+    # reports per window on a receiver that sent exactly one per window).
+    n["reports_per_packet"] = reports_per_packet(recs)
+    n["reports_held"] = sum(1 for r in recs if r.get("event") == "completion_report_sent" and (r.get("held_s") or 0) > 0)
     n["queries_received"] = sum(1 for r in recs if r.get("event") == "completion_query_received")
     n["small_mesh_mode"] = dict(collections.Counter(r.get("small_mesh_mode") for r in pk_out))
     n["bound_peers_max"] = max((r.get("bound_peers") or 0 for r in pk_out), default=0)
@@ -234,7 +278,82 @@ def analyse_capture(recs: list) -> dict:
     n["linkrequest_out"] = len(lr_out)
     n["lrproof_in"] = len(lrp_in)
     n["handshake_s"] = dist(handshakes)
+    n["proof"] = proof_attempts(recs, pk_in, pk_out, att_all)
     return n
+
+
+def proof_attempts(recs: list, pk_in: list, pk_out: list, att_all: list) -> dict:
+    """Per hop and per population, the plain PROOF's turnaround and the
+    success of its FIRST attempt (alpha 0.1.9, item 2).
+
+    The same reading `field_ab_compare.py` prints for a field capture, so a
+    MeshBench run and a field session can be read against each other. An
+    inbound DATA is answered by the plain PROOF that follows it within
+    PROOF_JOIN_S; that proof's `direct_send_result` is when it left the
+    radio. The populations differ by about a factor of two -- the 2026-09-23
+    two-hop field stop read 10.0 s median for a proof answering a raw
+    multi-fragment window against 3.8 s for one answering a bare
+    single-fragment packet -- so a combined number hides what item 2 moves.
+    "raw win, report skipped" is the subset whose completion report the proof
+    replaced (alpha 0.1.8 item 1), matched on the `proof_key` that
+    `completion_report_skipped` records and the proof carries as its
+    destination hash. A proof is a bare DIRECT send, so its attempts carry
+    `pkt_id: null`, and since one exchange holds the radio lock at a time the
+    last `attempt == 0` between the proof being queued and its send result is
+    its first attempt.
+    """
+    join_s = 2.0
+    dsr = collections.defaultdict(list)
+    for r in recs:
+        if r.get("event") == "direct_send_result" and r.get("destination_hash"):
+            dsr[r["destination_hash"]].append(r["ts"])
+    skipped = collections.defaultdict(list)
+    for r in recs:
+        if r.get("event") == "completion_report_skipped" and r.get("proof_key"):
+            skipped[r["proof_key"]].append(r["ts"])
+    bare_att = sorted((r for r in att_all if r.get("pkt_id") is None), key=lambda r: r["ts"])
+    turnaround = collections.defaultdict(lambda: collections.defaultdict(list))
+    first = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0]))
+    holds = []
+    last_data = None
+    pending = 0
+    for r in sorted(pk_in + pk_out, key=lambda x: x["ts"]):
+        if r.get("direction") == "in" and r.get("packet_type_name") == "DATA":
+            last_data = (r["ts"], r.get("hop_count"), r.get("transport"))
+            continue
+        if not (r.get("direction") == "out" and r.get("packet_type_name") == "PROOF"
+                and (r.get("context_name") or "NONE") == "NONE"):
+            continue
+        if last_data is None or r["ts"] - last_data[0] > join_s:
+            continue
+        hop, transport = last_data[1], last_data[2]
+        sent = [t for t in dsr.get(r.get("destination_hash"), []) if t >= r["ts"]]
+        if not sent:
+            pending += 1
+            continue
+        kinds = ["all"]
+        kinds.append("bare packet" if transport == "direct_bare"
+                     else "raw window" if transport and "multifragment" in transport else "other")
+        if any(abs(t - r["ts"]) <= join_s for t in skipped.get(r.get("destination_hash"), [])):
+            kinds.append("raw win, report skipped")
+        block = [a for a in bare_att if r["ts"] <= a["ts"] <= sent[0]]
+        first_att = next((a for a in reversed(block) if a.get("attempt") == 0), None)
+        for k in kinds:
+            turnaround[k][hop].append(round(sent[0] - last_data[0], 2))
+            if first_att is not None:
+                first[k][hop][1] += 1
+                if first_att.get("ok"):
+                    first[k][hop][0] += 1
+        if first_att is not None and first_att.get("proof_tail_hold_s") is not None:
+            holds.append(first_att["proof_tail_hold_s"])
+    def by_hop(d, fn):
+        return {str(h): fn(v) for h, v in sorted(d.items(), key=lambda kv: (kv[0] is None, kv[0] if kv[0] is not None else -1))}
+    return {
+        "turnaround_s": {k: by_hop(v, dist) for k, v in sorted(turnaround.items())},
+        "first_attempt": {k: by_hop(v, lambda x: {"ok": x[0], "n": x[1]}) for k, v in sorted(first.items())},
+        "tail_hold_s": dist(holds),
+        "no_send_result": pending,
+    }
 
 
 def burst_table(run_dir: str, sender: str = "A", receiver: str = "B") -> list:
@@ -471,13 +590,26 @@ def print_block(r: dict) -> None:
                   f"lock med {fmt(b['lock_med'], 2)} quiet_hold sum {fmt(b['quiet_hold_sum'], 1)} missed-ACK timeout max {fmt(b['missed_timeout_max'], 1)}")
         print(f"    attempt kinds {n['attempt_kinds']} failed {n['attempt_kinds_failed']} diagnosis {n['miss_diagnosis']}")
         print(f"    completion checks {n['completion_n']} {n['completion']}; reports sent {n['reports_sent']} "
-              f"(complete {n['reports_sent_complete']}); queries received {n['queries_received']}")
+              f"(complete {n['reports_sent_complete']}, held {n['reports_held']}, per reported packet {n['reports_per_packet']}); "
+              f"queries received {n['queries_received']}")
         print(f"    raw fragments sent {n['raw_sent']} ({n['raw_bytes']} B) rounds {n['raw_rounds']}; fragments received {n['frag_recv']} (raw {n['frag_recv_raw']}); "
-              f"duty-cycle waits {dist_str(n['duty_cycle_waits'])}")
+              f"duty-cycle waits {dist_str(n['duty_cycle_waits'])}"
+              + (f" by ledger {n['duty_cycle_wait_by_ledger']}" if n.get("duty_cycle_wait_by_ledger") else ""))
         print(f"    direct sends {n['send_results']} methods {n['send_methods']} text fallbacks {n['text_fallbacks']}; slot waits {dist_str(n['slot_waits'])}")
         print(f"    waits (s, summed): {n['waits_s']}")
         if n["linkrequest_out"] or n["lrproof_in"]:
             print(f"    LINKREQUEST out {n['linkrequest_out']}, LRPROOF in {n['lrproof_in']}, handshake {dist_str(n['handshake_s'], 2)}")
+        proof = n.get("proof") or {}
+        for kind, hops in sorted((proof.get("turnaround_s") or {}).items()):
+            for hop, d in sorted(hops.items()):
+                fa = ((proof.get("first_attempt") or {}).get(kind) or {}).get(hop) or {}
+                fa_s = (f", 1st attempt {fa['ok']}/{fa['n']} ({fa['ok'] / fa['n']:.0%})"
+                        if fa.get("n") else "")
+                print(f"    PROOF {kind}, hop {hop}: turnaround {dist_str(d, 2)}{fa_s}")
+        if (proof.get("tail_hold_s") or {}).get("n"):
+            print(f"    PROOF burst-tail holds (alpha 0.1.9 item 2): {dist_str(proof['tail_hold_s'], 2)}")
+        if proof.get("no_send_result"):
+            print(f"    PROOFs with no send result: {proof['no_send_result']}")
         if n["other_events"]:
             print(f"    other events {n['other_events']}")
     print("  air (meshbench): " + "; ".join(f"{k}: {v['tx']} tx, {v['bytes']} B, {v['ms']/1000:.1f} s" for k, v in sorted(r["air"].items()))

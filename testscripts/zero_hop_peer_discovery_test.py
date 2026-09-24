@@ -159,8 +159,14 @@ def main() -> None:
 
     log(f"[{args.role}] connecting to {args.port}...")
     iface = module.SmartMeshCoreInterface(owner=owner, configuration=cfg)
+    # Alpha 0.1.6 (item 4): the constructor returns once the port is open;
+    # the handshake (with its settle and retries) finishes on the loop.
+    online_deadline = time.monotonic() + 60.0
+    while not iface.online and time.monotonic() < online_deadline:
+        time.sleep(0.2)
     if not iface.online:
-        log(f"[{args.role}] FAILED to come online -- see errors above.")
+        log(f"[{args.role}] FAILED to come online within 60s (state {iface._connection_state}) -- see errors above.")
+        iface.detach()
         sys.exit(1)
     log(f"[{args.role}] online. Waiting up to {args.bind_timeout:.0f}s for bind-frame peer discovery...")
 

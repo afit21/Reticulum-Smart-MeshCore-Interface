@@ -102,6 +102,7 @@ ENCODERS = (
     "_encode_bind_frame",
     "_encode_completion_frame",
     "_encode_completion_frame_v4",
+    "_encode_completion_frame_v5",
     "_encode_raw_fragment",
     "_encode_raw_parity",
 )
@@ -194,8 +195,10 @@ def build_cases(module):
     # -- "Q": completion frames ---------------------------------------------
     # v3 is listed explicitly since 2026-09-20 (M2 made v4 the default): its
     # layout stays pinned even though no frame is encoded as v3 by default.
+    # v4 likewise since 2026-09-22 (alpha 0.1.6 item 1 made v5 the default).
     versions = (("v1", cls.COMPLETION_PROTOCOL_VERSION_V1), ("v2", cls.COMPLETION_PROTOCOL_VERSION_V2),
-                ("v3", getattr(cls, "COMPLETION_PROTOCOL_VERSION_V3", 3)), ("default", None))
+                ("v3", getattr(cls, "COMPLETION_PROTOCOL_VERSION_V3", 3)),
+                ("v4", getattr(cls, "COMPLETION_PROTOCOL_VERSION_V4", 4)), ("default", None))
     types = (("query", cls.COMPLETION_TYPE_QUERY), ("answer", cls.COMPLETION_TYPE_ANSWER))
     for ver_name, version in versions:
         for type_name, frame_type in types:
@@ -224,6 +227,19 @@ def build_cases(module):
             for nonce in (0, 0x5A, 0xF1):
                 cases.append(_case(f"completion_v4_{type_name}_{set_name}_nonce{nonce:02x}",
                                    "_encode_completion_frame_v4", frame_type=frame_type, entries=entries, nonce=nonce))
+    # -- "Q" v5: the v4 entries behind the sender's path view (alpha 0.1.6
+    # item 1, 2026-09-22): `path_len` / `rate` None encode as 0xFF.
+    for set_name, entries in v4_sets.items():
+        for type_name, frame_type in types:
+            for path_len, rate in ((None, None), (0, None), (1, 0.5), (2, 0.876), (63, 1.0), (300, 1.7)):
+                cases.append(_case(
+                    f"completion_v5_{type_name}_{set_name}_path{'x' if path_len is None else path_len}"
+                    f"_rate{'x' if rate is None else int(rate * 1000)}",
+                    "_encode_completion_frame_v5", frame_type=frame_type, entries=entries, nonce=0x5A,
+                    path_len=path_len, rate=rate))
+    cases.append(_case("completion_default_answer_one_path1_rate0_5", "_encode_completion_frame",
+                       frame_type=cls.COMPLETION_TYPE_ANSWER, pkt_id=PKT_ID, frag_total=3, complete=False,
+                       held=[0, 2], version=None, nonce=0xF1, path_len=1, rate=0.5))
     # nonce is ignored below v3; `complete` is independent of the bitmap.
     cases.append(_case("completion_v1_answer_total8_nonce5a_ignored", "_encode_completion_frame",
                        frame_type=cls.COMPLETION_TYPE_ANSWER, pkt_id=PKT_ID, frag_total=8, complete=False,
@@ -294,10 +310,15 @@ def _invoke(iface, call, a):
     if call == "_encode_completion_frame":
         return iface._encode_completion_frame(
             a["frame_type"], a["pkt_id"], a["frag_total"], complete=a["complete"],
-            held=set(a["held"]), version=a["version"], nonce=a["nonce"])
+            held=set(a["held"]), version=a["version"], nonce=a["nonce"],
+            path_len=a.get("path_len"), rate=a.get("rate"))
     if call == "_encode_completion_frame_v4":
         return iface._encode_completion_frame_v4(
             a["frame_type"], [(p, t, c, set(h)) for p, t, c, h in a["entries"]], nonce=a["nonce"])
+    if call == "_encode_completion_frame_v5":
+        return iface._encode_completion_frame_v5(
+            a["frame_type"], [(p, t, c, set(h)) for p, t, c, h in a["entries"]], nonce=a["nonce"],
+            path_len=a.get("path_len"), rate=a.get("rate"))
     if call == "_encode_raw_parity":
         return iface._encode_raw_parity(
             [(i, bytes.fromhex(h)) for i, h in a["fragments"]], a["dst_pubkey_hex"], a["src_prefix_hex"],
@@ -387,11 +408,20 @@ def check_decodes(module, case, kind, encoded):
         else:
             eq("held", cf.held, None)
         eq("nonce", cf.nonce, (a["nonce"] & 0xFF) if version >= 3 else None)
-    elif call == "_encode_completion_frame_v4":
+    elif call in ("_encode_completion_frame_v4", "_encode_completion_frame_v5"):
         cf = iface._decode_completion_frame(encoded)
-        eq("version", cf.version, cls.COMPLETION_PROTOCOL_VERSION)
+        eq("version", cf.version, cls.COMPLETION_PROTOCOL_VERSION_V4 if call.endswith("v4") else cls.COMPLETION_PROTOCOL_VERSION)
         eq("type", cf.type, a["frame_type"])
         eq("nonce", cf.nonce, a["nonce"] & 0xFF)
+        if call.endswith("v5"):
+            want_path = None if a.get("path_len") is None or a["path_len"] < 0 else min(0xFE, a["path_len"])
+            eq("peer_path_len", cf.peer_path_len, want_path)
+            want_rate = (None if a.get("rate") is None
+                         else max(0, min(cls.COMPLETION_RATE_SCALE, int(round(a["rate"] * cls.COMPLETION_RATE_SCALE)))) / cls.COMPLETION_RATE_SCALE)
+            eq("peer_rate", cf.peer_rate, want_rate)
+        else:
+            eq("peer_path_len", cf.peer_path_len, None)
+            eq("peer_rate", cf.peer_rate, None)
         eq("n", len(cf.entries), len(a["entries"]))
         is_answer = a["frame_type"] == cls.COMPLETION_TYPE_ANSWER
         for got, want in zip(cf.entries, a["entries"]):

@@ -13,8 +13,70 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.4 (alpha 0.1.3 plus the 2026-09-20 airtime / throughput
-pass; both nodes must run it, the "Q" and raw wire formats changed); the
+STATUS -- 0.1.0 (2026-09-24): the first release. It is the alpha 0.1.9
+second-pass build (`35a6c22`, RNS 1.5.4) after its field session of
+2026-09-24 morning (`fieldtests/raw/Alpha0.1.9/`: zero hop at home, a
+one-hop trial, then a two-and-a-half-hour two-hop stop) showed both
+defects that pass targeted fixed in the field -- 7 path decisions in four
+hours against 45 on the 0.1.9 drive, one of them wasted, the longest
+zero-hop miss run 12 against 144, no proof held at zero hop -- and the
+best two-hop numbers this project has recorded (attempt success 73 %,
+part time 18 s median, 0.20 QUERY attempts per raw send, 2.24 on-air bytes
+per delivered byte). The release itself changes no behaviour: the
+routine INFO logs (the periodic [STATS] line, path discovery and path
+decisions, cache restores, feature availability notes) moved to DEBUG so
+rnsd's log shows only connection state, identity, radio and channel
+setup, peers binding and expiring, and packet capture; the update script
+installs from `main` and `update-interface-dev.sh` from `development`.
+No wire change -- alpha 0.1.9 and 0.1.0 nodes interoperate. Alpha 0.1.9
+was alpha 0.1.8 plus the corrections its own first
+field session, 2026-09-23, asked for: a completion report that was skipped
+because RNS's PROOF replaces it now counts as reported, so the parity
+fragment in the sender's burst tail no longer sends it after all; that
+proof waits one fragment spacing for the tail before it is dispatched,
+instead of being keyed into it; the announce cache's TTL and the
+path-request verification interval are sized for a field day rather than
+an hour; and a path's miss count is kept per ATTEMPT rather than per send,
+so the raw-fragment and QUERY attempts that dominate the airtime finally
+reach the death clock -- `path_switch_after_misses` 2 -> 4 and
+`PATH_EXHAUST_MISSES` 4 -> 8 are the same thresholds in the new unit. No
+wire change -- the golden wire snapshot is untouched and alpha 0.1.8 and
+0.1.9 nodes interoperate, although items 1 and 2 pay off only when the
+RECEIVER runs 0.1.9. The interface also defines `ifac_size`, which RNS 1.5 reads on every
+inbound frame and which only `RNS.Reticulum` used to set -- so building
+this interface without Reticulum, as the white-box hardware scripts do,
+works again on RNS 1.5.4. A second pass on 2026-09-24, from the release's
+own two field sessions of 2026-09-23 evening, corrected it: a zero-hop
+attempt counts toward the path's miss count (the empty hex is the
+zero-hop path, not the absence of one); a candidate dead over
+PATH_EXHAUST_MISSES attempts stays out until something is heard over it
+again, a candidate re-admitted after its cooldown must measure no worse
+than the current path, and the current path is kept while its measured
+rate beats every eligible alternative; the proof waits for no burst tail
+at zero hop; and `direct_raw_gap_own_airtime` defaults to `yes` again
+until the field A/B has run); alpha 0.1.8 was alpha 0.1.7 plus the 2026-09-23 pass from that
+build's 2026-09-22 evening field session, which had a two-hop stop: for a
+raw window whose packets RNS proves, the PROOF is the completion and the
+report is not sent; at two hops and beyond a report that IS sent goes on
+the acknowledged carrier with one retry; the path scoreboard ages its
+peer-reported rate and signal readings and scores a candidate whose
+evidence has all expired as weak; the announce cache is persisted across a
+restart and one path-request verification per interval goes on the air
+instead of most of them. No wire change -- the golden wire snapshot is
+untouched and alpha 0.1.7 and 0.1.8 nodes interoperate, although the two
+sides get the benefit only when both run 0.1.8); alpha 0.1.7 was alpha
+0.1.6 plus the 2026-09-22 afternoon pass
+from that build's field session: young plain proofs pre-empt bulk like a
+handshake, token learning never maps a local destination, the peer's
+reported path view on the capture records; no wire change, alpha 0.1.6
+and 0.1.7 nodes interoperate); alpha 0.1.6 was alpha 0.1.5 plus the
+2026-09-22 pass (path selection by measured reliability, the bounded
+multi-hop window hold, the connection supervisor, one report per window,
+the corrected calibration line -- the "Q" wire format changed to v5, the
+sender's path view, so both nodes must run alpha 0.1.6 or later);
+alpha 0.1.5 was alpha 0.1.4 plus the 2026-09-21 pass (the hop-aware
+airtime cap, the burst / report collision fixes, shorter-path adoption,
+the adaptive window collect, the report yield); the
 dated account of every design decision and field-driven fix from alpha
 0.1.0 (2026-09-15) onward is `docs/history.md` (moved out of this
 docstring on 2026-09-20, phase 2 of that pass, unchanged), with the
@@ -60,13 +122,19 @@ change regenerates it in the same commit):
     v2+ ANSWER adds the have-bitmap, ceil(frag_total / 8) bytes, bit i = fragment i held
   Version 4 (2026-09-20, one report per window), multi-part:
     [4][type][n: 1..8][nonce] then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
-  COMPLETION_PROTOCOL_VERSION is 4; v1-v3 frames still decode and a
-  v1 / v3 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
+  Version 5 (2026-09-22, alpha 0.1.6: the sender's path view for the
+  receiver's path scoreboard), the v4 entries behind two more header bytes:
+    [5][type][n: 1..8][nonce][path_len: hops to the receiver, 0xFF none]
+    [rate: delivery rate on that path in 1/250 steps, 0xFF untried]
+    then n x [pkt_id:2 BE][frag_total][complete][bitmap ceil(frag_total / 8)]
+  COMPLETION_PROTOCOL_VERSION is 5; v1-v4 frames still decode and a
+  v1 / v3 / v4 QUERY is answered in its own version. A QUERY's nonce cycles 1..0xEF
   (COMPLETION_QUERY_NONCE_MAX) and its ANSWER echoes it; a receiver-
   initiated REPORT is an ANSWER with nonce 0xF0 | round
   (COMPLETION_REPORT_NONCE_BASE), round being the raw header's attempt
-  bits. A pre-v3 peer drops a v3 QUERY and a pre-v4 peer a v4 frame, so
-  both nodes must run the same build for reconciliation to work. Reports
+  bits. A pre-v3 peer drops a v3 QUERY, a pre-v4 peer a v4 frame and a
+  pre-v5 peer a v5 frame, so both nodes must run the same build for
+  reconciliation to work (alpha 0.1.6: both nodes must run alpha 0.1.6). Reports
   and answers are sent as MeshCore TXT_TYPE_CLI_DATA (encrypted, never
   ACKed by the firmware) since 2026-09-20; the QUERY is a plain ACKed
   text message.

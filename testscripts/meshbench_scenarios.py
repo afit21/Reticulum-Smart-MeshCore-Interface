@@ -177,6 +177,7 @@ Exit code 0 iff every hard check held.
 """
 import argparse
 import collections
+import statistics
 import glob
 import json
 import math
@@ -274,6 +275,7 @@ class Scenario:
     min_bound_peers: Optional[int] = None    # hard check: the sender's capture shows at least this many bound peers
     duration_s: float = 0.0                  # unit loop runs for this long instead of a fixed count (soak)
     health_interval_s: float = 0.0           # nodes emit health events this often (soak)
+    link_margin: Optional[float] = None      # a must-link pair's minimum dB for THIS scenario (weak_direct: a deliberately weak link)
 
 
 def rep(name, east, north=0.0, mast=50.0, console=(), standby=False):
@@ -327,6 +329,40 @@ SCENARIOS = {
               "north after R2 because the terrain east of R2 is flat for 50 km (a straight R3 stayed clear of R1 at 44 km and "
               "a ridge at ~51 km east blocked R3-B): found with `topology three_hop --place ...` on 2026-09-20 -- R2-R3 +16 dB, "
               "R3-B +12 dB, R1-R3 -6.7 dB, R2-B -6.6 dB, R1-B -16 dB.",
+    ),
+    "shortcut_appears": Scenario(
+        "shortcut_appears", "three_hop chain; after --fail-after probes B moves to within one clear hop of R1 while A still holds the three-hop path: shorter-path adoption from B's own floods (alpha 0.1.5 item 3).",
+        nodes=[comp("A", -8), rep("R1", 0), rep("R2", 22, mast=30), rep("R3", 26, 16, mast=15), comp("B", 20.3, 21.7)],
+        must_link=[("A", "R1"), ("R1", "R2"), ("R2", "R3"), ("R3", "B")],
+        must_block=[("A", "R2"), ("R1", "R3"), ("R2", "B"), ("R1", "B"), ("A", "B")],
+        expected_hops=None, min_delivered=0.0, probes=10, start_after_paths=True,
+        actions=lambda args: [After(args.fail_after, "move", "B", {"east_km": 8.0, "north_km": 0.0})],
+        notes="The 2026-09-21 field asymmetry (the desktop held a four-hop path to the laptop for 35 minutes while the "
+              "laptop's floods arrived over two hops). Probes start at three hops; after --fail-after probes B is moved to "
+              "(+8 km E, 0 N): R1-B +11.2 dB grazing, A-B -6.2 dB blocked, R2-B +0.7 dB marginal, R3-B -10.1 dB blocked "
+              "(`topology three_hop --place B=8,0` on 2026-09-21), so a one-hop route via R1 exists while A holds R1,R2,R3. "
+              "Hard check: A's capture shows a `path_adopted` record (new path shorter than the old) and no "
+              "`path_adoption_failed`; informational: how many of A's path_resolved events after the move rediscovered "
+              "three hops (a stale-path reset + rediscovery, the old way), the hop count of A's sends after adoption. "
+              "Delivery is not asserted (B's own three-hop path to A dies with the move and it must reset and rediscover).",
+    ),
+    "weak_direct": Scenario(
+        "weak_direct", "A and B hear each other directly but weakly; R reaches both strongly: path selection by measured reliability (alpha 0.1.6 item 1) should settle on the one-hop path.",
+        nodes=[comp("A", -5), rep("R", 0), comp("B", 6)],
+        must_link=[("A", "R"), ("R", "B"), ("A", "B")], must_block=[], expected_hops=None, min_delivered=0.0,
+        probes=16, start_after_paths=True, link_margin=2.0,
+        notes="Placements from `topology relay --place A=-5,0 --place B=6,0 --pair A-B --link-margin 2` (2026-09-22): "
+              "A-R +20.7 dB, R-B +12.5 dB, A-B +3.0 dB both ways (11.0 km, terrain at 10.3 km sits 3 m above the line "
+              "of sight; the scenario's own gate margin is 2 dB). A first cut at B=5.4 (A-B +7.2 dB) delivered 16/16 "
+              "sends over the direct path in MeshBench, which has no fading at that margin, so the scoreboard rightly "
+              "kept it. Hard check: the sender's last six DIRECT sends are at one hop and a `path_selected` record "
+              "exists. MeshBench's firmware reports every frame at SNR 0.0, so the weak-SNR prior (below "
+              "path_weak_snr_db) applies to an untried zero-hop candidate here; a discovered direct path that "
+              "delivers is kept by design, so the scenario measures whether the +3 dB link loses enough frames for "
+              "two missed sends and a trial of the one-hop candidate. Both 2026-09-22 runs at +3 dB delivered 16/16 "
+              "over the direct path, so the one-hop expectation is INFORMATIONAL while the direct path delivers 90 % "
+              "or more (the `path_selected` check stays hard); the weak-direct decision is the field's, where the "
+              "SNR is real (the 2026-09-21 zero-hop ACKs read 2.0 and -1.75 dB as the laptop drove off).",
     ),
     "failover": Scenario(
         "failover", "A - R1 - B with R2 a cold standby; after --fail-after probes R1's firmware dies and R2's starts. "
@@ -716,6 +752,8 @@ def run_scenario(scenario: Scenario, args) -> int:
     duration = args.duration if args.duration is not None else scenario.duration_s
     if scenario.health_interval_s and not args.health_interval:
         args.health_interval = scenario.health_interval_s
+    if scenario.link_margin is not None:
+        args.link_margin = min(args.link_margin, scenario.link_margin)
     capture_dir = args.capture_dir
     if capture_dir:
         os.makedirs(capture_dir, exist_ok=True)
@@ -1035,6 +1073,110 @@ def run_scenario(scenario: Scenario, args) -> int:
                       f"sender bound >= {scenario.min_bound_peers} peers (max seen {bound_max})")
                 check(non_small > 0, f"sender routed with small-mesh mode OFF ({non_small} sends outside small-mesh mode)")
                 measurements.update(bound_peers_max=bound_max, sends_outside_small_mesh=non_small)
+            if scenario.name == "shortcut_appears" and capture_dir:
+                # Alpha 0.1.6 (item 1): the shorter-path adoption events are
+                # `path_selected` records now (reason selected / trial /
+                # switch); the hard check is that the sender left the
+                # three-hop path for a shorter one on its scoreboard and the
+                # next delivery on that path confirmed it.
+                # Alpha 0.1.8 (item 0): read BOTH boards, not just the
+                # sender's. The alpha 0.1.7 close-out left this check open
+                # after it passed 1 of 9 on that build against 5 of 6 on
+                # 0.1.6, and the 2026-09-23 isolation settled it: reverting
+                # 0.1.7's item 3 (token learning) made the check FAIL MORE
+                # (1 of 3 against the shipped build's 2 of 3), so no code
+                # change of 0.1.7 was ever responsible. The mechanism the
+                # 0.1.7 close-out described is real and is a property of the
+                # SCENARIO: A's trial window on the one-hop route does reach
+                # B -- MeshBench logs B's radio receiving the fragment and
+                # B's capture shows the fragment, its report and its proof --
+                # but B's report, answer and proof travel back over B's OWN
+                # path, which stays three hops until B's board also trials,
+                # and B trials only after two consecutive misses of its own.
+                # Whether B misses twice depends on which of A's probes
+                # reach it, so reading only A's `direct_send_result` made
+                # the check a coin flip on B's unrelated luck. The adoption
+                # being tested is "a node left the three-hop path for a
+                # shorter one and that path then delivered", which either
+                # node demonstrates.
+                per_node = {}
+                for node in (scenario.sender, scenario.responder):
+                    recs = read_capture(capture_dir, node)
+                    selected = [r for r in recs if r.get("event") == "path_selected"
+                                and r.get("reason") in ("selected", "trial", "switch")]
+                    shorter = [r for r in selected if r.get("previous_path_len") is None
+                               or (r.get("path_len") is not None and r["path_len"] < r["previous_path_len"])]
+                    node_shorter = [r for r in shorter if r.get("path_len") is not None and r["path_len"] < 3]
+                    node_confirmed = []
+                    for r in node_shorter:
+                        nxt = next((d for d in recs if d.get("event") == "direct_send_result"
+                                    and d.get("seq", 0) > r.get("seq", 0) and d.get("out_path_hex") == r.get("path_hex")), None)
+                        if nxt is not None and nxt.get("ok"):
+                            node_confirmed.append(r)
+                    per_node[node] = (node_shorter, node_confirmed)
+                after_move_shorter = [r for n in per_node for r in per_node[n][0]]
+                confirmed = [r for n in per_node for r in per_node[n][1]]
+                move = next((a for a in actions if a.action == "move"), None)
+                move_seq = None
+                if move is not None and move.fired_at_probe is not None:
+                    move_seq = min((p.get("seq") or 0 for p in plist if (p.get("seq") or 0) > move.fired_at_probe), default=None)
+                check(bool(after_move_shorter),
+                      "a node selected a shorter path than three hops from its scoreboard: "
+                      + "; ".join(f"{n} {[(r.get('previous_path_len'), r.get('path_len'), r.get('reason')) for r in per_node[n][0]]}"
+                                  for n in per_node))
+                check(bool(confirmed),
+                      "a shorter selected path delivered its next send (either node): "
+                      + "; ".join(f"{n} {len(per_node[n][1])} of {len(per_node[n][0])}" for n in per_node))
+                after_move = [(p.get("seq"), sorted((p.get("resolved") or {}).values())) for p in plist
+                              if move is not None and move.fired_at_probe is not None and (p.get("seq") or 0) > move.fired_at_probe]
+                first = after_move_shorter[0] if after_move_shorter else None
+                after_sends = [r.get("out_path_len") for r in recs if r.get("event") == "direct_send_result"
+                               and first is not None and r.get("seq", 0) > first.get("seq", 0)]
+                measurements.update(path_selected=[(r.get("previous_path_len"), r.get("path_len"), r.get("reason")) for r in selected],
+                                    path_selected_shorter_confirmed=len(confirmed),
+                                    sender_resolved_after_move=after_move,
+                                    sender_out_path_len_after_selection=dict(collections.Counter(after_sends)))
+                log(f"info  selection: {measurements['path_selected']} shorter confirmed {len(confirmed)}; sender's out_path_len per "
+                    f"probe after the move {after_move}; sends after the first shorter selection by out_path_len "
+                    f"{measurements['sender_out_path_len_after_selection']}")
+            if scenario.name == "weak_direct" and capture_dir:
+                # Alpha 0.1.6 (item 1): A and B hear each other directly but
+                # weakly while R reaches both strongly. The hard check: the
+                # sender's DIRECT sends end up on the one-hop path and stay
+                # there -- of its last six `direct_send_result`s at least
+                # five are at one hop -- and a `path_selected` record shows
+                # the scoreboard made the choice (a trial or a switch after
+                # misses on the direct path, or the one-hop path selected
+                # first because the direct one was heard below
+                # path_weak_snr_db).
+                recs = read_capture(capture_dir, scenario.sender)
+                sends = [r for r in recs if r.get("event") == "direct_send_result"]
+                last = [r.get("out_path_len") for r in sends[-6:]]
+                selected = [r for r in recs if r.get("event") == "path_selected"]
+                one_hop_last = sum(1 for h in last if h == 1)
+                direct_ok = [r for r in sends if r.get("out_path_len") == 0]
+                direct_rate = (sum(1 for r in direct_ok if r.get("ok")) / len(direct_ok)) if direct_ok else None
+                if direct_rate is not None and direct_rate >= 0.9:
+                    # MeshBench's channel loses nothing on a +3 dB link (both
+                    # 2026-09-22 runs: 16/16 direct sends delivered) and reports
+                    # every frame at SNR 0.0, so neither route to the one-hop
+                    # path -- misses, or the weak-SNR prior -- can occur here;
+                    # a delivering path is kept by design. Informational.
+                    log(f"info  weak_direct: the direct path delivered {direct_rate:.0%} of its sends -- MeshBench cannot make it "
+                        f"weak; the one-hop expectation is informational on this run")
+                else:
+                    check(len(last) >= 6 and one_hop_last >= 5,
+                          f"sender's last six DIRECT sends are at one hop (via R): {last}")
+                check(bool(selected), f"the scoreboard recorded its decisions: {len(selected)} path_selected record(s)")
+                by_hops = collections.Counter(r.get("out_path_len") for r in sends)
+                ok_by_hops = collections.Counter(r.get("out_path_len") for r in sends if r.get("ok"))
+                direct_snr = [r.get("snr") for r in recs if r.get("event") == "rx_log" and r.get("route_type") in (2, 3)
+                              and r.get("path_len") == 0 and r.get("snr") is not None]
+                measurements.update(sends_by_out_path_len=dict(by_hops), ok_by_out_path_len=dict(ok_by_hops),
+                                    path_selected=[(r.get("previous_path_len"), r.get("path_len"), r.get("reason")) for r in selected],
+                                    direct_rx_snr_median=(statistics.median(direct_snr) if direct_snr else None))
+                log(f"info  weak_direct: sends by out_path_len {dict(by_hops)} (ok {dict(ok_by_hops)}); selections "
+                    f"{measurements['path_selected']}; direct rx SNR median {measurements['direct_rx_snr_median']}")
             for name in repeaters:
                 stopped_forever = any(a.action == "stop" and a.node == name and not any(
                     b.action == "start" and b.node == name for b in actions) for a in actions)

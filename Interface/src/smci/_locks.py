@@ -52,14 +52,33 @@ class _PriorityAsyncLock:
     # the yielded exchange resumes ahead of everything but the handshakes
     # that pre-empted it (tiers are compared numerically; a float sorts).
     YIELDED_PRIORITY = 0.5
+    # Alpha 0.1.5 (item 6): the tier a raw window resumes at after yielding
+    # between two of its parts to a queued completion REPORT -- behind the
+    # report's own ANSWER tier (1), ahead of every ordinary waiter (2), so
+    # the report goes out and the window continues before anything else.
+    REPORT_YIELDED_PRIORITY = 1.5
 
     def __init__(self):
         self._locked = False
         self._waiters: "dict[int, collections.deque]" = {}
         # Pre-emption (phase 1, 2026-09-20): futures of waiters that asked
         # to pre-empt an idle holder, and the event an idle holder watches.
-        self._preempt_waiters: set = set()
+        # Alpha 0.1.7 (item 1): waiter -> its tier, so a yielding holder
+        # can resume BEHIND the tier that pre-empted it (a fresh plain PROOF
+        # pre-empts from the ANSWER tier, a handshake from tier 0).
+        self._preempt_waiters: dict = {}
         self._preempt_event: "Optional[asyncio.Event]" = None
+        # Alpha 0.1.7 (item 1, second cut): the same for tier-0 pre-emptors
+        # only -- the holds that keep this node silent while a repeater
+        # relays its own frame (the no-ACK report hold, the QUERY quiet
+        # hold) are cut for a Link handshake, not for a fresh plain PROOF.
+        self._handshake_event: "Optional[asyncio.Event]" = None
+        # Alpha 0.1.5 (item 6): a second class -- completion REPORTs this
+        # node owes the far sender -- that a raw window yields to between
+        # its parts (never inside a part's burst, never at the other idle
+        # points a handshake pre-empts).
+        self._report_waiters: set = set()
+        self._report_event: "Optional[asyncio.Event]" = None
 
     def locked(self) -> bool:
         return self._locked
@@ -68,43 +87,101 @@ class _PriorityAsyncLock:
         """A waiter that may pre-empt idle holds is queued (2026-09-20)."""
         return bool(self._preempt_waiters)
 
-    def preempt_event(self) -> "asyncio.Event":
+    def preempt_event(self, handshake_only: bool = False) -> "asyncio.Event":
         """The event set while a pre-empting waiter is queued; created on
-        the running loop the first time it is asked for."""
+        the running loop the first time it is asked for. With
+        `handshake_only` (alpha 0.1.7, item 1), the event set only while a
+        TIER-0 pre-emptor (a Link handshake) is queued: a fresh plain PROOF
+        at the ANSWER tier does not set it."""
+        if handshake_only:
+            if self._handshake_event is None:
+                self._handshake_event = asyncio.Event()
+                if self._handshake_waiting():
+                    self._handshake_event.set()
+            return self._handshake_event
         if self._preempt_event is None:
             self._preempt_event = asyncio.Event()
             if self._preempt_waiters:
                 self._preempt_event.set()
         return self._preempt_event
 
-    def _preempt_add(self, fut) -> None:
-        self._preempt_waiters.add(fut)
+    def _handshake_waiting(self) -> bool:
+        return any(p <= 0 for p in self._preempt_waiters.values())
+
+    def _preempt_add(self, fut, priority) -> None:
+        self._preempt_waiters[fut] = priority
         if self._preempt_event is not None:
             self._preempt_event.set()
+        if priority <= 0 and self._handshake_event is not None:
+            self._handshake_event.set()
 
     def _preempt_remove(self, fut) -> None:
-        self._preempt_waiters.discard(fut)
+        self._preempt_waiters.pop(fut, None)
         if not self._preempt_waiters and self._preempt_event is not None:
             self._preempt_event.clear()
+        if self._handshake_event is not None and not self._handshake_waiting():
+            self._handshake_event.clear()
 
-    async def yield_to_preempt(self) -> None:
+    def preempt_resume_priority(self) -> float:
+        """The tier a holder resumes at after yielding to whatever is
+        pre-empting it (alpha 0.1.7, item 1): half a step behind the
+        highest-priority pre-empting waiter -- YIELDED_PRIORITY 0.5 behind a
+        handshake (tier 0), REPORT_YIELDED_PRIORITY 1.5 behind a fresh plain
+        PROOF (the ANSWER tier, 1). A resume at 0.5 would put the holder
+        back ahead of a tier-1 pre-emptor still queued behind another
+        waiter, so the yield would buy that proof nothing."""
+        if not self._preempt_waiters:
+            return self.YIELDED_PRIORITY
+        return min(self._preempt_waiters.values()) + 0.5
+
+    def report_requested(self) -> bool:
+        """A completion REPORT is queued for the lock (alpha 0.1.5, item 6)."""
+        return bool(self._report_waiters)
+
+    def report_event(self) -> "asyncio.Event":
+        """The event set while a REPORT waiter is queued (item 6), for the
+        holder's radio-free idle phases -- created on the running loop the
+        first time it is asked for, like `preempt_event`."""
+        if self._report_event is None:
+            self._report_event = asyncio.Event()
+            if self._report_waiters:
+                self._report_event.set()
+        return self._report_event
+
+    def _report_add(self, fut) -> None:
+        self._report_waiters.add(fut)
+        if self._report_event is not None:
+            self._report_event.set()
+
+    def _report_remove(self, fut) -> None:
+        self._report_waiters.discard(fut)
+        if not self._report_waiters and self._report_event is not None:
+            self._report_event.clear()
+
+    async def yield_to_preempt(self, resume_priority: Optional[float] = None) -> None:
         """Called by a holder at an idle point when `preempt_requested()`:
         hands the lock over and re-acquires it at YIELDED_PRIORITY, so
         the pre-empting handshake goes first and this exchange resumes
         before any ordinary waiter that queued meanwhile (review,
         2026-09-20: a plain release + re-acquire at NORMAL would splice a
-        whole other exchange into a raw burst)."""
+        whole other exchange into a raw burst). `resume_priority` lets a
+        holder yielding to a REPORT (item 6) resume behind the report's
+        tier instead."""
+        if resume_priority is None:
+            resume_priority = self.preempt_resume_priority()
         self.release()
-        await self.acquire(self.YIELDED_PRIORITY)
+        await self.acquire(resume_priority)
 
-    async def acquire(self, priority: int, preempt: bool = False) -> None:
+    async def acquire(self, priority: int, preempt: bool = False, report: bool = False) -> None:
         if not self._locked:
             self._locked = True
             return
         fut = asyncio.get_running_loop().create_future()
         self._waiters.setdefault(priority, collections.deque()).append(fut)
         if preempt:
-            self._preempt_add(fut)
+            self._preempt_add(fut, priority)
+        if report:
+            self._report_add(fut)
         try:
             await fut
         except asyncio.CancelledError:
@@ -133,6 +210,8 @@ class _PriorityAsyncLock:
         finally:
             if preempt:
                 self._preempt_remove(fut)
+            if report:
+                self._report_remove(fut)
 
     def release(self) -> None:
         if not self._wake_next():
@@ -154,8 +233,8 @@ class _PriorityAsyncLock:
             del self._waiters[tier]
         return False
 
-    def __call__(self, priority: int, preempt: bool = False) -> "_PriorityLockContext":
-        return _PriorityLockContext(self, priority, preempt)
+    def __call__(self, priority: int, preempt: bool = False, report: bool = False) -> "_PriorityLockContext":
+        return _PriorityLockContext(self, priority, preempt, report)
 
 
 class _PriorityLockContext:
@@ -166,15 +245,16 @@ class _PriorityLockContext:
     `async with` block despite `acquire`/`release` being its own real
     methods."""
 
-    __slots__ = ("_lock", "_priority", "_preempt")
+    __slots__ = ("_lock", "_priority", "_preempt", "_report")
 
-    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False):
+    def __init__(self, lock: _PriorityAsyncLock, priority: int, preempt: bool = False, report: bool = False):
         self._lock = lock
         self._priority = priority
         self._preempt = preempt
+        self._report = report
 
     async def __aenter__(self) -> None:
-        await self._lock.acquire(self._priority, preempt=self._preempt)
+        await self._lock.acquire(self._priority, preempt=self._preempt, report=self._report)
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._lock.release()
@@ -319,37 +399,82 @@ class _DutyCycleLimiter:
     oldest sample is due to age out of the window (not a fixed poll
     interval), so it wakes only as often as actually necessary."""
 
-    def __init__(self, window_s: float, max_fraction: float):
+    def __init__(self, window_s: float, max_fraction: float, max_fraction_total: Optional[float] = None):
+        """`max_fraction` caps the RELAYED ledger -- every frame a repeater
+        will relay (any DIRECT frame with a routed path, every CHANNEL
+        flood); `max_fraction_total` caps the TOTAL ledger, which every
+        frame is charged to. Alpha 0.1.5 (2026-09-21, the owner's decision):
+        two budgets over the same window, 30% for what touches a
+        repeater and 85% for zero-hop DIRECT traffic -- the second
+        number is what the field's zero-hop page transfer was actually
+        limited by (109 of 147 s were duty-cycle waits), and a frame
+        between two adjacent radios costs nobody else's repeater any air.
+        Omitting `max_fraction_total` gives the pre-0.1.5 behaviour: one
+        cap for everything."""
         self._window_s = window_s
         self._max_busy_s = window_s * max_fraction
-        self._samples: "collections.deque" = collections.deque()
+        self._max_total_s = window_s * (max_fraction if max_fraction_total is None else max_fraction_total)
+        self._samples: "collections.deque" = collections.deque()          # every frame: (start, duration)
+        self._relayed: "collections.deque" = collections.deque()          # relayed frames only
+
+    @staticmethod
+    def _prune_deque(samples: "collections.deque", cutoff: float) -> None:
+        while samples and samples[0][0] < cutoff:
+            samples.popleft()
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._window_s
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
+        self._prune_deque(self._samples, cutoff)
+        self._prune_deque(self._relayed, cutoff)
 
     def _busy_s(self, now: float) -> float:
+        """Total busy time in the trailing window (every frame)."""
         self._prune(now)
         return sum(duration for _start, duration in self._samples)
 
-    async def wait_for_budget(self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None) -> float:
+    def _relayed_busy_s(self, now: float) -> float:
+        """Relayed busy time in the trailing window."""
+        self._prune(now)
+        return sum(duration for _start, duration in self._relayed)
+
+    def limiting_ledger(self, estimated_duration_s: float, relayed: bool, now: Optional[float] = None) -> Optional[str]:
+        """Which budget would hold `estimated_duration_s` of airtime back
+        right now: "relayed" (the 30% cap, checked first because it is the
+        stricter one and the one the frame class exists for), "total" (the
+        zero-hop cap), or None when the frame may go. Pure: no waiting."""
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        if relayed and self._relayed and self._relayed_busy_s(now) + estimated_duration_s > self._max_busy_s:
+            return "relayed"
+        if self._samples and self._busy_s(now) + estimated_duration_s > self._max_total_s:
+            return "total"
+        return None
+
+    async def wait_for_budget(
+        self, estimated_duration_s: float, interrupt: "Optional[asyncio.Event]" = None, relayed: bool = True,
+    ) -> "tuple[float, Optional[str]]":
         """Sleeps until sending for `estimated_duration_s` would not push
-        the trailing window's cumulative busy time over the cap. Returns
-        the total delay actually applied (0.0 if none was needed) --
-        capture/debug-only, never affects whether the send itself
-        proceeds. A single transmission longer than the entire cap on its
-        own (shouldn't happen in practice -- every real frame this
-        interface sends is small) is let through once the window is
-        otherwise empty, rather than waiting forever for room that will
-        never exist."""
+        the trailing window's cumulative busy time over the cap -- the
+        relayed cap when `relayed`, and the total cap always. Returns
+        `(delay, ledger)`: the total delay actually applied (0.0 if none
+        was needed) and which ledger held the frame back longest-ago
+        ("relayed" / "total" / None) -- capture/debug-only, never affects
+        whether the send itself proceeds. A single transmission longer than
+        the entire cap on its own (shouldn't happen in practice -- every
+        real frame this interface sends is small) is let through once the
+        window is otherwise empty, rather than waiting forever for room
+        that will never exist."""
         total_wait = 0.0
+        charged_to: Optional[str] = None
         while True:
             now = time.monotonic()
-            self._prune(now)
-            if self._busy_s(now) + estimated_duration_s <= self._max_busy_s or not self._samples:
-                return total_wait
-            oldest_start, _oldest_duration = self._samples[0]
+            ledger = self.limiting_ledger(estimated_duration_s, relayed, now)
+            if ledger is None:
+                return total_wait, charged_to
+            if charged_to is None:
+                charged_to = ledger
+            samples = self._relayed if ledger == "relayed" else self._samples
+            oldest_start, _oldest_duration = samples[0]
             wait_s = max(0.01, (oldest_start + self._window_s) - now)
             if interrupt is not None:
                 # Phase 1 (2026-09-20): a raw burst's throttle wait is the
@@ -369,5 +494,10 @@ class _DutyCycleLimiter:
             await asyncio.sleep(wait_s)
             total_wait += wait_s
 
-    def record(self, duration_s: float) -> None:
-        self._samples.append((time.monotonic(), duration_s))
+    def record(self, duration_s: float, relayed: bool = True) -> None:
+        """Charge `duration_s` of airtime: to the total ledger always, and
+        to the relayed ledger when a repeater will relay the frame."""
+        now = time.monotonic()
+        self._samples.append((now, duration_s))
+        if relayed:
+            self._relayed.append((now, duration_s))

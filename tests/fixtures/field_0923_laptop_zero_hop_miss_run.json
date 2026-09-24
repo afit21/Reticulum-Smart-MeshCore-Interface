@@ -1,0 +1,1303 @@
+{
+"source": "fieldtests/raw/Alpha0.1.9/a_capture_Smart_MeshCore_Interface_20260923T220958.jsonl",
+"description": "Session 2 of 2026-09-23 evening, laptop (node a): every direct_attempt_result after its last ACKed attempt at 22:18, to the capture's end (the restart). All on the zero-hop path (hop_count 0). ts is the record's wall-clock time (at the attempt's RESULT); offset_s is from the first.",
+"first_ts": 1790167704.9155085,
+"attempts": [
+{
+"offset_s": 0.0,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 5.932,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 21.222,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 26.63,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 42.729,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 48.243,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 63.152,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 68.797,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 84.625,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 90.641,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 105.375,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 110.856,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 126.298,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 131.552,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 147.889,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 153.566,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 168.864,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 174.879,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 189.304,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 194.658,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 210.894,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 216.606,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 231.91,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 237.167,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 252.747,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 258.519,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 273.823,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 279.133,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 294.608,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 300.326,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 315.821,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 321.542,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 331.24,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 337.038,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 342.686,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 348.193,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 2
+},
+{
+"offset_s": 353.69,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 359.695,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 3
+},
+{
+"offset_s": 365.485,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 371.484,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 378.955,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 384.483,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 399.827,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 405.417,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 421.211,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 426.578,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 442.145,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 447.496,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 462.771,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 468.587,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 484.108,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 489.895,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 505.243,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 511.117,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 526.047,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 532.033,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 547.212,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 553.042,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 568.658,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 574.303,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 589.14,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 594.667,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 610.176,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 615.9,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 631.442,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 636.876,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 652.326,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 658.355,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 673.436,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 678.822,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 691.236,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 697.074,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 702.845,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 708.084,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 714.038,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 2
+},
+{
+"offset_s": 719.444,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 2
+},
+{
+"offset_s": 725.226,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 3
+},
+{
+"offset_s": 730.63,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 3
+},
+{
+"offset_s": 736.026,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 742.044,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 747.906,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 753.207,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 758.782,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 764.369,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 770.263,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 775.916,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 781.401,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 786.931,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 799.442,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 804.776,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 820.756,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 826.338,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 841.942,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 847.307,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 862.694,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 868.481,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 884.222,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 889.584,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 904.783,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 910.118,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 926.02,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 931.877,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 947.372,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 952.818,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 958.092,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 964.766,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 2
+},
+{
+"offset_s": 970.424,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 976.409,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 982.345,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 3
+},
+{
+"offset_s": 989.344,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 994.789,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1000.18,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1012.703,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1018.222,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1023.622,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1029.925,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 2
+},
+{
+"offset_s": 1035.901,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1041.862,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1052.176,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1057.967,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1073.418,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1078.847,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1093.992,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1099.291,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1115.076,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1120.463,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1136.496,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1142.172,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1157.168,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1163.038,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1178.54,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1183.944,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1199.638,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1204.912,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1220.785,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1226.436,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1241.651,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1247.372,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1262.362,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1267.919,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1283.842,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 0
+},
+{
+"offset_s": 1289.345,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": null,
+"hop_count": 0,
+"attempt": 1
+},
+{
+"offset_s": 1305.199,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 3
+},
+{
+"offset_s": 1317.145,
+"ok": false,
+"ack_timeout_source": "firmware",
+"ack_timeout_s": 5.0,
+"kind": "completion_query",
+"hop_count": 0,
+"attempt": 0
+}
+]
+}

@@ -266,9 +266,9 @@ class SenderKeepsAMidBurstReportAsTheFallback(_OneHopRawSend):
         report, gets nothing, and applies the kept one -- capture record
         `completion_check_result` outcome `reported_stale`, stage `raw0`,
         held [0, 1] -- then round 1 re-drives exactly fragment 2 and no
-        QUERY is ever sent. The record's `complete` field is `None`:
-        `_capture_completion_check_result` only records it for outcome
-        "answered" (the code as it is; the docstring does not say so)."""
+        QUERY is ever sent. Since alpha 0.1.5 (2c) the mid-burst report is
+        applied as progress when it arrives and acted on only once the
+        report wait has expired; the record is the report's own."""
         iface = self.iface
         pkt_id, frag_total = 501, 3
         queries = []
@@ -309,7 +309,11 @@ class SenderKeepsAMidBurstReportAsTheFallback(_OneHopRawSend):
             self.assertEqual(stale["answer_version"], iface.COMPLETION_PROTOCOL_VERSION)
             self.assertEqual(stale["peer_prefix"], PEER)
             self.assertEqual(stale["pkt_id"], pkt_id)
-            self.assertIsNone(stale["complete"], "as coded: complete is only recorded for outcome 'answered'")
+            # Alpha 0.1.5 (2c): the early report is acted on inside
+            # _await_completion_report after the wait expired, so the record
+            # now carries the report's own fields, `early_reports` included.
+            self.assertFalse(stale["complete"])
+            self.assertEqual(stale["early_reports"], 1)
             self.assertIs(checks[1]["complete"], True)
             self.assertNotIn((PEER, pkt_id), iface._completion_query_waiters, "the waiter is cleared after the send")
         finally:

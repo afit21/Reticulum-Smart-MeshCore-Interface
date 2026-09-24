@@ -1,5 +1,7 @@
 """Routing decisions and the two funnels: process_outgoing / the outgoing worker (queue hygiene, duplicate suppression, expiry), _send_outgoing_packet and _dispatch_outgoing_packet (LRPROOF delay, path-request and announce rate limits, the local announce cache, DIRECT-primary versus broadcast-plus-supplement versus small-mesh DIRECT-to-all, the unknown-destination backoff), the CHANNEL sends, the supplement targets and spacing, the receive callbacks and frame demux, and process_incoming."""
 import asyncio
+import json
+import os
 import queue
 import random
 import time
@@ -121,8 +123,11 @@ class _RoutingMixin:
                 RNS.LOG_WARNING,
             )
         seq = next(self._outqueue_seq)
+        enqueued_at = time.monotonic()
         try:
-            self._outqueue.put_nowait((priority, seq, raw, header, time.monotonic(), inflight_key))
+            self._outqueue.put_nowait((priority, seq, raw, header, enqueued_at, inflight_key))
+            if header is not None and header.destination_hash and self._plain_proof(header):
+                self._note_proof_enqueued(header.destination_hash, enqueued_at)
         except queue.Full:
             self._release_inflight(inflight_key)
             self._outgoing_dropped_total += 1
@@ -442,6 +447,109 @@ class _RoutingMixin:
             self._unknown_dest_backoff_until.pop(h, None)
             self._unknown_dest_last_attempt.pop(h, None)
 
+    # -- The announce cache across restarts (alpha 0.1.8, item 4) --------
+
+    def _announce_cache_file_path(self) -> Optional[str]:
+        """Beside the peer cache, under `RNS.Reticulum.storagepath` and by
+        the same rules (`_peer_cache_file_path`)."""
+        if self.announce_cache_path:
+            return self.announce_cache_path
+        base = getattr(RNS, "Reticulum", None)
+        base = getattr(base, "storagepath", None) if base is not None else None
+        if not base:
+            return None
+        return os.path.join(base, "smci_announces.json")
+
+    def _load_announce_cache(self) -> None:
+        """Restore the announce cache at start, so a restart does not put
+        a path request on the air for every destination this node already
+        holds an announce for. The laptop restarted three times in the
+        2026-09-22 evening session and each restart at two hops cost about
+        three minutes of path requests (8 transmitted and 9 rate-limited
+        between 22:29:07 and 22:32:33), answered by the desktop with
+        three-fragment announce windows through two repeaters -- for
+        destinations the desktop had announced before 22:20 and the laptop
+        had already cached in its previous process.
+
+        Ages are persisted as wall-clock (`time.time()`), since
+        `time.monotonic()` has no meaning across a restart, and converted
+        back on load. An entry older than `announce_cache_ttl` is dropped
+        here exactly as `_announce_cache_sweep` would drop it -- that TTL
+        (an hour by default) is the age cap, and it is far inside RNS's
+        own: `Transport.PATHFINDER_E` keeps a restored path a week,
+        `AP_PATH_TIME` a day and `ROAMING_PATH_TIME` six hours
+        (`RNS/Transport.py`), and RNS restores each entry with its own
+        original timestamp and expiry rather than refreshing it.
+
+        Each restored entry is stamped as verified AT THE RESTORE INSTANT
+        rather than at its original cache time: coming up is not evidence
+        that the destination died, so the first request after a restart is
+        answered from the cache and the next over-the-air verification
+        falls due one interval later."""
+        if self.announce_cache_ttl_s <= 0:
+            return
+        path = self._announce_cache_file_path()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            now_wall, now_mono = time.time(), time.monotonic()
+            restored = dropped = 0
+            for entry in data.get("announces", [])[-self.ANNOUNCE_CACHE_MAX_KEYS:]:
+                try:
+                    dst = bytes.fromhex(str(entry["destination_hash"]))
+                    raw = bytes.fromhex(str(entry["raw"]))
+                    source_peer = str(entry["source_peer"])
+                    age_s = now_wall - float(entry["cached_at_wall"])
+                except (KeyError, ValueError, TypeError):
+                    dropped += 1
+                    continue
+                if not dst or not raw or age_s < 0 or age_s > self.announce_cache_ttl_s:
+                    dropped += 1
+                    continue
+                self._announce_cache[dst] = (raw, now_mono - age_s, source_peer, now_mono)
+                restored += 1
+            RNS.log(
+                f"{self}: restored {restored} cached announce(s) from {path}"
+                + (f" ({dropped} dropped as stale or unreadable)." if dropped else "."),
+                RNS.LOG_DEBUG,
+            )
+        except Exception as exc:
+            RNS.log(
+                f"{self}: failed to load the announce cache ({path}): {exc} -- "
+                f"starting with an empty one.",
+                RNS.LOG_WARNING,
+            )
+
+    def _save_announce_cache(self) -> None:
+        """Written the way the peer cache is (tmp file + os.replace), and
+        only when something changed since the last write."""
+        if self.announce_cache_ttl_s <= 0 or not self._announce_cache_dirty:
+            return
+        path = self._announce_cache_file_path()
+        if not path:
+            return
+        try:
+            now_wall, now_mono = time.time(), time.monotonic()
+            data = {"announces": [
+                {
+                    "destination_hash": dst.hex(),
+                    "raw": raw.hex(),
+                    "source_peer": source_peer,
+                    "cached_at_wall": now_wall - (now_mono - cached_at),
+                }
+                for dst, (raw, cached_at, source_peer, _verified_at) in self._announce_cache.items()
+                if now_mono - cached_at <= self.announce_cache_ttl_s
+            ]}
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+            self._announce_cache_dirty = False
+        except Exception as exc:
+            RNS.log(f"{self}: failed to save the announce cache ({path}): {exc}", RNS.LOG_WARNING)
+
     def _cache_announce(self, data: bytes, header: Optional[_RnsHeader], sender_peer_prefix: Optional[str]) -> None:
         """Remember an ANNOUNCE a bound peer delivered DIRECT (phase 1,
         2026-09-20), bytes exactly as received. CHANNEL announces are never
@@ -451,13 +559,21 @@ class _RoutingMixin:
                 or sender_peer_prefix is None or sender_peer_prefix not in self._peers
                 or self.announce_cache_ttl_s <= 0):
             return
+        now = time.monotonic()
         self._announce_cache.pop(header.destination_hash, None)
-        self._announce_cache[header.destination_hash] = (bytes(data), time.monotonic(), sender_peer_prefix)
+        # Alpha 0.1.8 (item 4): the fourth field is when this destination
+        # was last VERIFIED -- a live announce is itself a verification, so
+        # it starts equal to the cache time; a restored entry is stamped
+        # with the restore instant (`_load_announce_cache`) and a path
+        # request that goes on the air re-stamps it. It is deliberately
+        # separate from the cache time, which stays truthful for the TTL.
+        self._announce_cache[header.destination_hash] = (bytes(data), now, sender_peer_prefix, now)
         while len(self._announce_cache) > self.ANNOUNCE_CACHE_MAX_KEYS:
             self._announce_cache.popitem(last=False)
+        self._announce_cache_dirty = True
 
     def _announce_cache_sweep(self, now: float) -> None:
-        stale = [k for k, (_raw, t, _src) in self._announce_cache.items() if now - t > self.announce_cache_ttl_s]
+        stale = [k for k, entry in self._announce_cache.items() if now - entry[1] > self.announce_cache_ttl_s]
         for k in stale:
             del self._announce_cache[k]
         stale = [k for k, t in self._path_request_local_answer_at.items() if now - t > self.path_request_local_answer_min_interval_s]
@@ -477,17 +593,27 @@ class _RoutingMixin:
         entry = self._announce_cache.get(requested_hash)
         if entry is None:
             return None
-        raw, cached_at, source_peer = entry
+        raw, cached_at, source_peer, verified_at = entry
         now = time.monotonic()
         if now - cached_at > self.announce_cache_ttl_s:
             self._announce_cache.pop(requested_hash, None)
             return None
         if source_peer not in self._peers or self._path_discovery_in_backoff(source_peer):
             return None
-        last = self._path_request_local_answer_at.get(requested_hash)
-        if last is not None and now - last < self.path_request_local_answer_min_interval_s:
-            # The second re-request inside the interval is the one that
-            # verifies the destination over the air.
+        if now - verified_at >= self.path_request_local_answer_min_interval_s:
+            # Alpha 0.1.8 (item 4): ONE verification per interval goes over
+            # the air; every other request in between is answered from the
+            # cache. This is the inverse of the 0.1.6 rule, which capped the
+            # LOCAL answers at one per interval and let everything else
+            # transmit -- with RNS re-requesting every 30-70 s, that put the
+            # majority on the air. The laptop's 2026-09-22 capture, for the
+            # one destination `6b9f66014d98` over an hour: 20 requests
+            # transmitted against 12 answered locally, and the pair at
+            # 22:37:02 / 22:37:38 went out 70 s and 106 s after a local
+            # answer for exactly that reason. The verification itself is
+            # kept -- a genuinely dead destination must still be re-checked
+            # (the 0.1.6 rule's purpose) -- it is now rate-limited instead
+            # of inverted. `_note_path_request_on_air` re-stamps it.
             return None
         header = self._parse_rns_header(raw)
         if header is None:
@@ -507,6 +633,17 @@ class _RoutingMixin:
         self._path_request_local_answer_at[requested_hash] = now
         self.process_incoming(bytes(answer), transport="local_announce_cache", sender_peer_prefix=source_peer)
         return source_peer
+
+    def _note_path_request_on_air(self, requested_hash: Optional[bytes]) -> None:
+        """A path request for `requested_hash` is being transmitted: that
+        IS the periodic verification, so the cached announce may answer
+        every request for the next `path_request_local_answer_min_interval`
+        (alpha 0.1.8, item 4)."""
+        if requested_hash is None:
+            return
+        entry = self._announce_cache.get(requested_hash)
+        if entry is not None:
+            self._announce_cache[requested_hash] = entry[:3] + (time.monotonic(),)
 
     def _path_request_rate_limited(self, requested_hash: Optional[bytes]) -> bool:
         """PATH_REQUEST_RATE_LIMIT_WINDOW_S -- same shape and fail-open
@@ -645,6 +782,21 @@ class _RoutingMixin:
             f"destination_hash={header.destination_hash.hex() if header and header.destination_hash else None}."
         )
 
+        # Alpha 0.1.9 (item 2): a PROOF that replaced a window's complete
+        # report waits out the sender's burst tail before it is dispatched.
+        # See `_proof_tail_hold_s` for why one fragment spacing and why
+        # this does not touch the 0.1.7 second cut (nothing is on the air
+        # yet, so no hold is being cut).
+        tail_hold_s = self._proof_tail_hold_remaining(header)
+        if tail_hold_s > 0:
+            self._capture_outgoing(header, data, "proof_tail_hold")
+            task = self._spawn_background_task(
+                self._send_proof_after_burst_tail(data, header, tail_hold_s, expires_at)
+            )
+            if spawned is not None:
+                spawned.append(task)
+            return
+
         # User-requested fix (2026-09-15, real NomadNet field testing):
         # RNS.Link's own keepalive/staleness timing (Link.py) is computed
         # exactly once, from the initial LINK_REQUEST<->LRPROOF handshake
@@ -746,6 +898,8 @@ class _RoutingMixin:
                 )
                 return
             answered_from = self._answer_path_request_locally(requested)
+            if answered_from is None:
+                self._note_path_request_on_air(requested)
             if answered_from is not None:
                 # Phase 1 (2026-09-20): answered from the cached announce,
                 # nothing transmitted -- see announce_cache_ttl.
@@ -774,20 +928,81 @@ class _RoutingMixin:
 
         await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=spawned)
 
+    def _proof_tail_hold_remaining(self, header: Optional[_RnsHeader]) -> float:
+        """Seconds this plain PROOF still owes the sender's burst tail, and
+        0.0 for everything else (alpha 0.1.9, item 2). Reads the deadline
+        the receiver armed in `_note_proof_tail_hold` and CLEARS it, so one
+        proof waits once: a small-mesh DIRECT-to-all proof goes to several
+        peers off one queue entry, and the tail belongs to the one sender
+        whose window this proof completes."""
+        if not self._plain_proof(header) or not header.destination_hash:
+            return 0.0
+        deadline = self._proof_tail_hold_until.pop(bytes(header.destination_hash), None)
+        if deadline is None:
+            return 0.0
+        return max(0.0, deadline - time.monotonic())
+
+    async def _send_proof_after_burst_tail(
+        self, data: bytes, header: _RnsHeader, wait_s: float, expires_at: Optional[float] = None,
+    ) -> None:
+        """Sleep out the sender's burst tail, then dispatch the proof
+        normally (alpha 0.1.9, item 2). Shaped exactly like
+        `_send_delayed_link_proof`: the sleep happens in a spawned task so
+        the outgoing worker keeps draining, the radio lock is never held
+        across it, and whatever the dispatch spawns is awaited here so the
+        packet's in-flight entry covers the whole send.
+
+        The wait is recorded for the attempt record rather than passed
+        down, mirroring how `proof_enqueued_at` is looked up per attempt."""
+        key = bytes(header.destination_hash) if header.destination_hash else None
+        try:
+            await asyncio.sleep(wait_s)
+            if self.detached or not self.online:
+                return
+            if key is not None:
+                self._proof_tail_hold_waited[key] = round(wait_s, 3)
+                while len(self._proof_tail_hold_waited) > self.PROOF_TAIL_HOLD_MAX_KEYS:
+                    self._proof_tail_hold_waited.popitem(last=False)
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if key is not None:
+                self._proof_tail_hold_waited.pop(key, None)
+
     async def _send_delayed_link_proof(
         self, data: bytes, header: _RnsHeader, expires_at: Optional[float] = None,
     ) -> None:
-        await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
-        if self.detached or not self.online:
-            return
-        inner: list = []
-        await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
-        # Finish everything the dispatch spawned before this task ends, so
-        # the packet's in-flight entry (released when THIS task finishes)
-        # really covers the whole send.
-        live = [t for t in inner if t is not None]
-        if live:
-            await asyncio.gather(*live, return_exceptions=True)
+        # Alpha 0.1.6 (item 2): registered for supersession for the whole
+        # delay and send, so a newer LINKREQUEST from the peer expires it.
+        link_id = bytes(header.destination_hash) if header.destination_hash else None
+        peer = self._rns_token_peer.get(header.destination_hash) if link_id is not None else None
+        if peer is not None:
+            self._pending_link_proofs.setdefault(peer, set()).add(link_id)
+        try:
+            await asyncio.sleep(self.LINK_PROOF_RTT_INFLATION_DELAY_S)
+            if self.detached or not self.online:
+                return
+            if peer is not None and self._send_superseded(self.LRPROOF_KEY_PREFIX + link_id):
+                self._capture_outgoing(header, data, "lrproof_superseded")
+                return
+            inner: list = []
+            await self._dispatch_outgoing_packet(data, header, expires_at=expires_at, spawned=inner)
+            # Finish everything the dispatch spawned before this task ends, so
+            # the packet's in-flight entry (released when THIS task finishes)
+            # really covers the whole send.
+            live = [t for t in inner if t is not None]
+            if live:
+                await asyncio.gather(*live, return_exceptions=True)
+        finally:
+            if peer is not None:
+                pending = self._pending_link_proofs.get(peer)
+                if pending is not None:
+                    pending.discard(link_id)
+                    if not pending:
+                        self._pending_link_proofs.pop(peer, None)
 
     async def _dispatch_outgoing_packet(
         self, data: bytes, header: Optional[_RnsHeader], expires_at: Optional[float] = None,
@@ -1179,7 +1394,10 @@ class _RoutingMixin:
         `_send_direct_to_all_peers`, which is the one caller that has no
         broadcast running alongside to cover for a False and therefore needs
         to know)."""
-        resolved = self._resolved_paths.get(peer_prefix)
+        # Alpha 0.1.6 (item 1): the same scoreboard decision `_send_direct_
+        # packet` makes -- this is the other place a send decides resolved-
+        # versus-discover (a DIRECT-to-all copy never reaches it).
+        resolved = await self._select_path(peer_prefix)
         if resolved is None:
             if not trigger_discovery:
                 return False

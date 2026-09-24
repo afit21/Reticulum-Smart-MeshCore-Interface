@@ -103,7 +103,7 @@ class LocalAnnounceCache(SingleNodeCase):
             self.assertNotIn(DEST, iface._announce_cache, "unbound sender: not cached")
             self.on_loop(lambda: iface.process_incoming(announce, transport="direct_raw_multifragment", sender_peer_prefix=PEER))
             self.assertIn(DEST, iface._announce_cache)
-            raw, _t, src = iface._announce_cache[DEST]
+            raw, _t, src, _verified_at = iface._announce_cache[DEST]
             self.assertEqual(raw, announce)
             self.assertEqual(src, PEER)
         finally:
@@ -133,21 +133,34 @@ class LocalAnnounceCache(SingleNodeCase):
             ctx = (2 + 2 * 16) if header.header_type == 1 else (2 + 16)
             self.assertEqual(got[:ctx] + got[ctx + 1:], announce[:ctx] + announce[ctx + 1:], "every other byte as received")
 
-            # The second request inside the interval goes over the air: it
-            # is the one that verifies the destination.
+            # Reversed by alpha 0.1.8 (item 4): a re-request INSIDE the
+            # interval is answered from the cache too. The old rule capped
+            # the local answers at one per interval and let every other
+            # request transmit; with RNS re-requesting every 30-70 s the
+            # laptop's 2026-09-22 capture put 20 requests on the air for
+            # this one destination against 12 answered locally.
             iface._path_request_last_sent_at.clear()
             request2 = self._request(DEST)
             self.node.run_on_loop(iface._send_outgoing_packet(request2, iface._parse_rns_header(request2)), timeout=10.0)
-            self.assertEqual(len(dispatched), 1)
-            self.assertEqual(len(owner.received), 1)
+            self.assertEqual(dispatched, [], "still answered locally inside the interval")
+            self.assertEqual(len(owner.received), 2)
 
-            # Past the interval it is answered locally again.
-            iface._path_request_local_answer_at[DEST] -= 121.0
+            # Past the interval ONE request goes over the air: the
+            # verification is kept, it is only rate-limited now.
+            raw, cached_at, src, verified_at = iface._announce_cache[DEST]
+            iface._announce_cache[DEST] = (raw, cached_at, src, verified_at - 121.0)
             iface._path_request_last_sent_at.clear()
             request3 = self._request(DEST)
             self.node.run_on_loop(iface._send_outgoing_packet(request3, iface._parse_rns_header(request3)), timeout=10.0)
-            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(len(dispatched), 1, "the periodic verification")
             self.assertEqual(len(owner.received), 2)
+
+            # ... and that verification re-arms the cache for the next one.
+            iface._path_request_last_sent_at.clear()
+            request4 = self._request(DEST)
+            self.node.run_on_loop(iface._send_outgoing_packet(request4, iface._parse_rns_header(request4)), timeout=10.0)
+            self.assertEqual(len(dispatched), 1, "answered locally again")
+            self.assertEqual(len(owner.received), 3)
         finally:
             iface.path_request_local_answer_min_interval_s = saved_interval
             restore()
@@ -178,8 +191,8 @@ class LocalAnnounceCache(SingleNodeCase):
             self.assertEqual(len(dispatched), 3, "source peer no longer bound: on air")
             iface._peers[PEER] = self.module._PeerRecord(pubkey_prefix=PEER, has_upstream_rns=False, last_seen=time.time())
 
-            raw, t, src = iface._announce_cache[DEST]
-            iface._announce_cache[DEST] = (raw, t - iface.announce_cache_ttl_s - 1.0, src)
+            raw, t, src, _verified_at = iface._announce_cache[DEST]
+            iface._announce_cache[DEST] = (raw, t - iface.announce_cache_ttl_s - 1.0, src, t)
             send(DEST)
             self.assertEqual(len(dispatched), 4, "expired entry: on air")
             self.assertNotIn(DEST, iface._announce_cache, "and evicted")
@@ -205,6 +218,22 @@ class LocalAnnounceCache(SingleNodeCase):
             iface._capture_event = original
             iface._packet_capture_file = original_file
 
+    @staticmethod
+    def _wait_for_path(dest_hash, want=True, timeout=3.0):
+        """`RNS.Transport.inbound` hands the packet to a worker rather than
+        processing it on the caller's thread (`preprocess_inbound` on the
+        installed RNS), so a path appears a few tens of milliseconds after
+        the call returns -- measured at ~50 ms here. Asserting synchronously
+        made this test depend on whatever else had run first; it passed in a
+        full suite and failed on its own, on every build, until 2026-09-23.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if RNS.Transport.has_path(dest_hash) == want:
+                return True
+            time.sleep(0.02)
+        return RNS.Transport.has_path(dest_hash) == want
+
     def test_real_rns_transport_accepts_the_re_injected_announce(self):
         """Against the real `RNS.Transport` of the test process (a hermetic
         `RNS.Reticulum`, non-transport): a signed announce re-injected with
@@ -218,6 +247,31 @@ class LocalAnnounceCache(SingleNodeCase):
         packet.pack()
         raw = bytes(packet.raw)
         iface = self.iface
+        # Two things this test needs from RNS that the unit harness does not
+        # provide, both found on 2026-09-23 when the test began failing in
+        # the full suite (it had always failed on its own, on every build --
+        # it was relying on state left by whichever tests ran before it).
+        #
+        # `Transport.preprocess_inbound` reads `interface.ifac_size`, which
+        # `RNS.Reticulum` sets when IT configures an interface; None is what
+        # it sets for an interface with no IFAC, which is this one
+        # (`RNS/Reticulum.py`) -- the interface now sets that itself, so
+        # this test exercises the shipped default rather than patching it.
+        #
+        # And a PATH_RESPONSE is only accepted on a NON-TRANSPORT node for a
+        # destination RNS actually has an outstanding request for -- which is
+        # also what exempts it from the interface's announce ingress limiter
+        # ("Skipping ingress limit check ... due to waiting path requests").
+        # That is exactly the production situation: this cache answers a path
+        # request RNS itself just made, so `Transport.path_requests` holds the
+        # hash. The second half of this test already sets it up that way and
+        # says so; the first injection was relying on state left by whichever
+        # tests happened to run before it, which is why it failed on its own
+        # on every build.
+        self.assertTrue(hasattr(iface, "ifac_size"),
+                        "RNS 1.5 reads ifac_size on every inbound frame; the interface must define it")
+        with RNS.Transport.path_requests_lock:
+            RNS.Transport.path_requests[dest.hash] = time.time()
         # Not a local destination as far as Transport is concerned, or it
         # would answer from the destinations map instead of the path table.
         RNS.Transport.deregister_destination(dest)
@@ -228,9 +282,10 @@ class LocalAnnounceCache(SingleNodeCase):
             answer = bytearray(raw)
             answer[ctx] = RNS.Packet.PATH_RESPONSE
             RNS.Transport.inbound(bytes(answer), iface)
-            self.assertTrue(RNS.Transport.has_path(dest.hash), "an unknown destination's announce is added")
+            self.assertTrue(self._wait_for_path(dest.hash), "an unknown destination's announce is added")
             entry_before = list(RNS.Transport.path_table[dest.hash])
             RNS.Transport.inbound(bytes(answer), iface)
+            time.sleep(0.2)
             self.assertEqual(RNS.Transport.path_table[dest.hash][0], entry_before[0], "a duplicate while the path exists is ignored")
             RNS.Transport.expire_path(dest.hash)
             # Cull what expire_path marked (Transport.jobs does this on its
@@ -247,7 +302,7 @@ class LocalAnnounceCache(SingleNodeCase):
             with RNS.Transport.path_requests_lock:
                 RNS.Transport.path_requests[dest.hash] = time.time()
             RNS.Transport.inbound(bytes(answer), iface)
-            self.assertTrue(RNS.Transport.has_path(dest.hash), "accepted again once the path was expired and culled")
+            self.assertTrue(self._wait_for_path(dest.hash), "accepted again once the path was expired and culled")
         finally:
             with RNS.Transport.path_table_lock:
                 RNS.Transport.path_table.pop(dest.hash, None)
@@ -257,8 +312,13 @@ class LocalAnnounceCache(SingleNodeCase):
     def test_shipped_defaults(self):
         bare = self.module.SmartMeshCoreInterface.__new__(self.module.SmartMeshCoreInterface)
         bare._configure_path_discovery({})
-        self.assertEqual(bare.announce_cache_ttl_s, 3600.0)
-        self.assertEqual(bare.path_request_local_answer_min_interval_s, 120.0)
+        # Both re-pinned by alpha 0.1.9 (item 3): 3600 s was shorter than a
+        # field day, so every entry cached at the 2026-09-23 session's first
+        # stop had expired before the second two hours later, and 120 s made
+        # the on-air verification cost six requests for three destinations in
+        # three and a half minutes. See tests/test_field_day_cache_defaults_0923.py.
+        self.assertEqual(bare.announce_cache_ttl_s, 604800.0)
+        self.assertEqual(bare.path_request_local_answer_min_interval_s, 600.0)
         self.assertEqual(self.module.SmartMeshCoreInterface.ANNOUNCE_CACHE_MAX_KEYS, 256)
 
 

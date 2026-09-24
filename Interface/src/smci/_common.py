@@ -151,7 +151,7 @@ class _ReassemblyBucket:
     staleness metric, and also the sort key §5.3's oldest-by-last-progress
     capacity eviction uses."""
 
-    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity")
+    __slots__ = ("frag_total", "coop", "fragments", "last_progress", "parity", "flagged_seen")
 
     def __init__(self, frag_total: int, coop: bool):
         self.frag_total = frag_total
@@ -161,6 +161,10 @@ class _ReassemblyBucket:
         # Phase 3 M4 (2026-09-20): coverage mask -> (last_covered_len, xor
         # bytes) of the raw parity fragments held for this bucket.
         self.parity: dict = {}
+        # Alpha 0.1.5 (2b): a report-flagged frame (data or parity) of this
+        # packet has arrived -- the burst's tail is here, so a completion
+        # reports at once rather than waiting out the "still arriving" hold.
+        self.flagged_seen = False
 
 
 class _RnsHeader(NamedTuple):
@@ -215,6 +219,53 @@ class _BindFrame(NamedTuple):
     pubkey_prefix: str
 
 
+class _PathCandidate:
+    """One candidate path to a peer on its scoreboard (alpha 0.1.6, item 1,
+    `_paths.py`): the route, where it was learned, when, its send outcomes
+    (the delivery rate is computed over `samples` at scoring time), the
+    signal of the last frame received over it (the last leg only for a
+    relayed path), and the switching bookkeeping."""
+
+    __slots__ = ("path_hex", "hops", "hash_size", "source", "first_seen", "last_seen", "samples", "ack_latencies",
+                 "last_success_at", "last_failure_at", "consecutive_misses", "snr", "rssi", "signal_at",
+                 "cooldown_until", "peer_rate", "peer_rate_at", "trials")
+
+    def __init__(self, path_hex: str, hops: int, hash_size: int, source: str, now: float):
+        self.path_hex = path_hex
+        self.hops = hops
+        self.hash_size = hash_size
+        self.source = source
+        self.first_seen = now
+        self.last_seen = now
+        self.samples = collections.deque(maxlen=8)      # (monotonic time, ok)
+        self.ack_latencies = collections.deque(maxlen=8)
+        self.last_success_at = None
+        self.last_failure_at = None
+        self.consecutive_misses = 0
+        self.snr = None
+        self.rssi = None
+        self.signal_at = None
+        self.cooldown_until = 0.0
+        self.peer_rate = None
+        self.peer_rate_at = None
+        self.trials = 0
+
+
+class _PathBoard:
+    """A peer's scoreboard of candidate paths (`_paths.py`)."""
+
+    __slots__ = ("candidates", "current", "device_path", "last_reason", "peer_path_len", "peer_rate", "peer_report_at")
+
+    def __init__(self):
+        self.candidates = {}        # path hex -> _PathCandidate
+        self.current = None         # the primary path's hex
+        self.device_path = None     # what change_contact_path last set on the contact (None: unknown)
+        self.last_reason = ""
+        self.peer_path_len = None   # the peer's reported path length to us (a "Q" v5 header)
+        self.peer_rate = None
+        self.peer_report_at = None
+
+
 class _CompletionFrame(NamedTuple):
     """The decoded `"Q"`-marker DIRECT-delivery-completion-check control
     frame (see `_encode_completion_frame`'s own docstring for why this
@@ -241,6 +292,12 @@ class _CompletionFrame(NamedTuple):
     # also mirrored into pkt_id / frag_total / complete / held above so
     # single-part code reads a v4 frame unchanged. Empty below v4.
     entries: tuple = ()
+    # v5 (2026-09-22, alpha 0.1.6 item 1): the sender's current path length
+    # to this node and its measured delivery rate on it -- its view of the
+    # symmetric path, evidence for the receiver's scoreboard. None below
+    # v5, or when the sender had no path / no measurement.
+    peer_path_len: Optional[int] = None
+    peer_rate: Optional[float] = None
 
 
 class _PeerRecord:
