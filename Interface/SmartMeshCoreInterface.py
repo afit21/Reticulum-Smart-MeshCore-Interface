@@ -13,7 +13,23 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- alpha 0.1.9 (alpha 0.1.8 plus the corrections its own first
+STATUS -- 1.0.0 (2026-09-24): the first release. It is the alpha 0.1.9
+second-pass build (`35a6c22`, RNS 1.5.4) after its field session of
+2026-09-24 morning (`fieldtests/raw/Alpha0.1.9/`: zero hop at home, a
+one-hop trial, then a two-and-a-half-hour two-hop stop) showed both
+defects that pass targeted fixed in the field -- 7 path decisions in four
+hours against 45 on the 0.1.9 drive, one of them wasted, the longest
+zero-hop miss run 12 against 144, no proof held at zero hop -- and the
+best two-hop numbers this project has recorded (attempt success 73 %,
+part time 18 s median, 0.20 QUERY attempts per raw send, 2.24 on-air bytes
+per delivered byte). The release itself changes no behaviour: the
+routine INFO logs (the periodic [STATS] line, path discovery and path
+decisions, cache restores, feature availability notes) moved to DEBUG so
+rnsd's log shows only connection state, identity, radio and channel
+setup, peers binding and expiring, and packet capture; the update script
+installs from `main` and `update-interface-dev.sh` from `development`.
+No wire change -- alpha 0.1.9 and 1.0.0 nodes interoperate. Alpha 0.1.9
+was alpha 0.1.8 plus the corrections its own first
 field session, 2026-09-23, asked for: a completion report that was skipped
 because RNS's PROOF replaces it now counts as reported, so the parity
 fragment in the sender's burst tail no longer sends it after all; that
@@ -3108,7 +3124,7 @@ class _ObservabilityMixin:
                     f"raw_fragments_rx={self._raw_fragments_received} raw_frames_ignored={self._raw_frames_ignored} "
                     f"raw_unsupported_paths={list(self._raw_unsupported_paths)} "
                     f"ack_rtt={{{', '.join(f'{p!r}: srtt={st['srtt']:.2f}s rttvar={st['rttvar']:.2f}s n={st['samples']}' for p, st in self._ack_rtt.items())}}}",
-                    RNS.LOG_INFO,
+                    RNS.LOG_DEBUG,
                 )
                 # Per-bucket fragment counts/ages (docs/interface_architecture.md's
                 # observability requirements ask for these specifically) --
@@ -3224,7 +3240,7 @@ class _ObservabilityMixin:
         with no `rx_log` records can be told apart from a mesh that was
         genuinely silent."""
         if not self.rx_log_observe_enabled:
-            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_INFO)
+            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_DEBUG)
             return
         if not hasattr(self._EventType, "RX_LOG_DATA"):
             RNS.log(
@@ -3239,7 +3255,7 @@ class _ObservabilityMixin:
             f"{self}: subscribed to the firmware's raw-RX log feed (RX_LOG_DATA) -- "
             f"observe-only; overheard packets are counted in [STATS] and, when "
             f"packet capture is on, recorded as 'rx_log' events.",
-            RNS.LOG_INFO,
+            RNS.LOG_DEBUG,
         )
 
     # -- Step 4 (2026-09-18): airtime model and predicted-busy holds -------
@@ -3401,7 +3417,7 @@ class _ObservabilityMixin:
         except Exception as exc:
             if not self._radio_stats_unsupported:
                 self._radio_stats_unsupported = True
-                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_INFO)
+                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_DEBUG)
             return None
         record = self._radio_stats_record(reason, radio, packets)
         self._debug(
@@ -4482,7 +4498,7 @@ class _PeerStateMixin:
                     raw_fragments=entry.get("raw_fragments"),
                 )
                 count += 1
-            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_INFO)
+            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_DEBUG)
         except Exception as exc:
             RNS.log(
                 f"{self}: failed to load peer cache ({path}): {exc} -- "
@@ -5695,7 +5711,7 @@ class _PathDiscoveryMixin:
                     RNS.log(
                         f"{self}: path discovered to {pubkey_prefix!r} in "
                         f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
-                        RNS.LOG_INFO,
+                        RNS.LOG_DEBUG,
                     )
                     await self._persist_resolved_path(contact, resolved, peer_prefix=pubkey_prefix)
                     return resolved
@@ -6407,7 +6423,7 @@ class _PathDiscoveryMixin:
                     f"{self}: path to {peer_prefix!r} switched to {path_hex or '<zero-hop>'} ({cand.hops} hop(s), "
                     f"score {scores[path_hex]:.2f}) from {previous.path_hex or '<zero-hop>' if previous else '?'} "
                     f"(score {scores.get(previous.path_hex, 0.0) if previous else 0.0:.2f}) for good.",
-                    RNS.LOG_INFO,
+                    RNS.LOG_DEBUG,
                 )
 
     def _capture_path_selected(self, peer_prefix: str, reason: str, cand: "Optional[_PathCandidate]",
@@ -6507,7 +6523,7 @@ class _PathDiscoveryMixin:
                 + (f" instead of {previous.path_hex or '<zero-hop>'} ({previous.hops} hop(s), "
                    f"{previous.consecutive_misses} miss(es))" if previous is not None and previous is not cand else "")
                 + ".",
-                RNS.LOG_INFO if reason != "trial" else RNS.LOG_DEBUG,
+                RNS.LOG_DEBUG,
             )
         board.last_reason = reason
         if changed:
@@ -11936,7 +11952,7 @@ class _RoutingMixin:
             RNS.log(
                 f"{self}: restored {restored} cached announce(s) from {path}"
                 + (f" ({dropped} dropped as stale or unreadable)." if dropped else "."),
-                RNS.LOG_INFO,
+                RNS.LOG_DEBUG,
             )
         except Exception as exc:
             RNS.log(
@@ -14780,7 +14796,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                 if result is not None and result.type == self._EventType.SELF_INFO:
                     self._apply_self_info(result.payload if isinstance(result.payload, dict) else {})
                     if attempt > 1:
-                        RNS.log(f"{self}: handshake answered on attempt {attempt}.", RNS.LOG_INFO)
+                        RNS.log(f"{self}: handshake answered on attempt {attempt}.", RNS.LOG_DEBUG)
                     return True
                 reason = None
                 if result is not None and isinstance(result.payload, dict):
@@ -14854,7 +14870,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                         f"radio settings.", RNS.LOG_WARNING)
         else:
             RNS.log(f"{self}: no radio override configured -- using the node's currently stored radio settings.",
-                    RNS.LOG_INFO)
+                    RNS.LOG_DEBUG)
 
         try:
             secret_bytes = bytes.fromhex(self.channel_secret_hex)
@@ -14882,7 +14898,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                 f"{self}: telemetry_mode_base set to per-contact-flags -- path discovery "
                 f"(docs/path_discovery_spec.md) is a telemetry request under the hood, and only answers a "
                 f"peer whose own contact entry has been granted the base permission bit.",
-                RNS.LOG_INFO,
+                RNS.LOG_DEBUG,
             )
         except Exception as exc:
             RNS.log(f"{self}: setting telemetry_mode_base failed: {exc} -- this node may not answer other nodes' "

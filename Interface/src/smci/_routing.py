@@ -513,7 +513,7 @@ class _RoutingMixin:
             RNS.log(
                 f"{self}: restored {restored} cached announce(s) from {path}"
                 + (f" ({dropped} dropped as stale or unreadable)." if dropped else "."),
-                RNS.LOG_INFO,
+                RNS.LOG_DEBUG,
             )
         except Exception as exc:
             RNS.log(

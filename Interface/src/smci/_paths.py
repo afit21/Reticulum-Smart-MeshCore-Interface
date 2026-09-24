@@ -548,7 +548,7 @@ class _PathDiscoveryMixin:
                     RNS.log(
                         f"{self}: path discovered to {pubkey_prefix!r} in "
                         f"{attempt} attempt(s): out_path_len={resolved.out_path_len}.",
-                        RNS.LOG_INFO,
+                        RNS.LOG_DEBUG,
                     )
                     await self._persist_resolved_path(contact, resolved, peer_prefix=pubkey_prefix)
                     return resolved
@@ -1260,7 +1260,7 @@ class _PathDiscoveryMixin:
                     f"{self}: path to {peer_prefix!r} switched to {path_hex or '<zero-hop>'} ({cand.hops} hop(s), "
                     f"score {scores[path_hex]:.2f}) from {previous.path_hex or '<zero-hop>' if previous else '?'} "
                     f"(score {scores.get(previous.path_hex, 0.0) if previous else 0.0:.2f}) for good.",
-                    RNS.LOG_INFO,
+                    RNS.LOG_DEBUG,
                 )
 
     def _capture_path_selected(self, peer_prefix: str, reason: str, cand: "Optional[_PathCandidate]",
@@ -1360,7 +1360,7 @@ class _PathDiscoveryMixin:
                 + (f" instead of {previous.path_hex or '<zero-hop>'} ({previous.hops} hop(s), "
                    f"{previous.consecutive_misses} miss(es))" if previous is not None and previous is not cand else "")
                 + ".",
-                RNS.LOG_INFO if reason != "trial" else RNS.LOG_DEBUG,
+                RNS.LOG_DEBUG,
             )
         board.last_reason = reason
         if changed:

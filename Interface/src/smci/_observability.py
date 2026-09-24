@@ -561,7 +561,7 @@ class _ObservabilityMixin:
                     f"raw_fragments_rx={self._raw_fragments_received} raw_frames_ignored={self._raw_frames_ignored} "
                     f"raw_unsupported_paths={list(self._raw_unsupported_paths)} "
                     f"ack_rtt={{{', '.join(f'{p!r}: srtt={st['srtt']:.2f}s rttvar={st['rttvar']:.2f}s n={st['samples']}' for p, st in self._ack_rtt.items())}}}",
-                    RNS.LOG_INFO,
+                    RNS.LOG_DEBUG,
                 )
                 # Per-bucket fragment counts/ages (docs/interface_architecture.md's
                 # observability requirements ask for these specifically) --
@@ -677,7 +677,7 @@ class _ObservabilityMixin:
         with no `rx_log` records can be told apart from a mesh that was
         genuinely silent."""
         if not self.rx_log_observe_enabled:
-            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_INFO)
+            RNS.log(f"{self}: raw-RX log observation disabled by config (rx_log_observe_enabled=no).", RNS.LOG_DEBUG)
             return
         if not hasattr(self._EventType, "RX_LOG_DATA"):
             RNS.log(
@@ -692,7 +692,7 @@ class _ObservabilityMixin:
             f"{self}: subscribed to the firmware's raw-RX log feed (RX_LOG_DATA) -- "
             f"observe-only; overheard packets are counted in [STATS] and, when "
             f"packet capture is on, recorded as 'rx_log' events.",
-            RNS.LOG_INFO,
+            RNS.LOG_DEBUG,
         )
 
     # -- Step 4 (2026-09-18): airtime model and predicted-busy holds -------
@@ -854,7 +854,7 @@ class _ObservabilityMixin:
         except Exception as exc:
             if not self._radio_stats_unsupported:
                 self._radio_stats_unsupported = True
-                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_INFO)
+                RNS.log(f"{self}: radio statistics unavailable from this firmware ({exc}) -- not polled again.", RNS.LOG_DEBUG)
             return None
         record = self._radio_stats_record(reason, radio, packets)
         self._debug(

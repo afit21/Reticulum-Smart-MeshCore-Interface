@@ -107,7 +107,7 @@ class PathDecisionRows(unittest.TestCase):
 
 
 DRIVE = os.path.join(REPO_ROOT, "fieldtests", "raw", "Alpha0.1.9-drive")
-SESSION2 = os.path.join(REPO_ROOT, "fieldtests", "raw", "Alpha0.1.9")
+SESSION2 = os.path.join(REPO_ROOT, "fieldtests", "raw", "Alpha0.1.9-home")
 
 
 @unittest.skipUnless(os.path.isdir(DRIVE), "session 1 captures not recovered locally")

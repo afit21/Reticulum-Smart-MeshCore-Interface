@@ -1418,7 +1418,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                 if result is not None and result.type == self._EventType.SELF_INFO:
                     self._apply_self_info(result.payload if isinstance(result.payload, dict) else {})
                     if attempt > 1:
-                        RNS.log(f"{self}: handshake answered on attempt {attempt}.", RNS.LOG_INFO)
+                        RNS.log(f"{self}: handshake answered on attempt {attempt}.", RNS.LOG_DEBUG)
                     return True
                 reason = None
                 if result is not None and isinstance(result.payload, dict):
@@ -1492,7 +1492,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                         f"radio settings.", RNS.LOG_WARNING)
         else:
             RNS.log(f"{self}: no radio override configured -- using the node's currently stored radio settings.",
-                    RNS.LOG_INFO)
+                    RNS.LOG_DEBUG)
 
         try:
             secret_bytes = bytes.fromhex(self.channel_secret_hex)
@@ -1520,7 +1520,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                 f"{self}: telemetry_mode_base set to per-contact-flags -- path discovery "
                 f"(docs/path_discovery_spec.md) is a telemetry request under the hood, and only answers a "
                 f"peer whose own contact entry has been granted the base permission bit.",
-                RNS.LOG_INFO,
+                RNS.LOG_DEBUG,
             )
         except Exception as exc:
             RNS.log(f"{self}: setting telemetry_mode_base failed: {exc} -- this node may not answer other nodes' "

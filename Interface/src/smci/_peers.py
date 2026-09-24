@@ -136,7 +136,7 @@ class _PeerStateMixin:
                     raw_fragments=entry.get("raw_fragments"),
                 )
                 count += 1
-            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_INFO)
+            RNS.log(f"{self}: restored {count} peer(s) from cache ({path}).", RNS.LOG_DEBUG)
         except Exception as exc:
             RNS.log(
                 f"{self}: failed to load peer cache ({path}): {exc} -- "

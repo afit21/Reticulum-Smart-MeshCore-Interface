@@ -5627,3 +5627,101 @@ added, no wire change, the version stays alpha 0.1.9.
     untried candidates always trialled, zero-hop attempts counted); the inter-fragment gap
     default is `yes` again; "Fragment Reconciliation" (no proof tail hold at zero hop).
 
+
+
+**1.0.0 (2026-09-24): the first release, from the alpha 0.1.9 second pass's
+field session of 2026-09-24 morning.** The session (`fieldtests/raw/Alpha0.1.9/`,
+desktop 08:23-12:13, laptop 08:27-12:13, build `35a6c22` on both radios, RNS
+1.5.4) had three parts: zero hop at home until 09:00, the laptop moving from
+09:00 to 09:40 with a one-hop trial and idle stretches, then a two-hop stop
+from 09:44 to 12:13 with both nodes on two-hop paths (`1902` on the desktop,
+`0219` on the laptop). No one-hop stop, no three hops, no gap A/B. Read with
+`testscripts/field_ab_compare.py --set 018=fieldtests/raw/Alpha0.1.8 --set
+019s1=fieldtests/raw/Alpha0.1.9-drive --set 019b=fieldtests/raw/Alpha0.1.9
+--radio 7,62.5,8`. The 2026-09-23 home session it is also compared against
+now lives under `fieldtests/raw/Alpha0.1.9-home/` (restored from commit
+`2b71cf5`; it had been dropped from `Alpha0.1.9/` when this session's
+captures went in, and `test_field_ab_compare_path_rows_0924` had been
+skipping its 144-miss-run pin).
+
+What the session established, against the 0.1.9 first-pass drive:
+
+- **Both defects the second pass targeted are fixed in the field.** Path
+  decisions: 45 on the 57-minute drive (desktop 23, laptop 22) against 7 in
+  about four hours (laptop 4, desktop 3). Decisions that never delivered: 16
+  on the desktop (84 attempts, 626 s of timeouts) against 1 (laptop, below).
+  Longest zero-hop miss run: 144, never ended by a decision, against 12 on
+  the laptop and 4 on the desktop, each ended by a decision. Proof tail
+  holds at zero hop: 0.96-2.27 s before, none now; all 11 holds were at two
+  hops (2.1-5.0 s). The desktop's move to two hops at 09:44:11 is the second
+  cut of item 2 working as designed: its zero-hop path was stale-weak with 4
+  misses, it trialled `1902`, a never-tried candidate scored 0.8, and
+  switched to it for good 5 s later.
+- **Two hops, the best numbers recorded on this project** (0.1.8 two-hop stop
+  / 0.1.9 drive / this session): attempt success 58 % (n=250) / 41 % (n=282)
+  / 73 % (n=403); ACK latency median 3.33 / 4.06 / 3.85 s; lock wait p90
+  11.0 / 118.1 / 7.4 s; QUERY attempts per raw send 0.72 / 0.23 / 0.20; part
+  time median 19.8 / 26.9 / 18.0 s and p90 54.2 / 138.9 / 40.3 s; proof
+  first-attempt success 17/26 / 17/30 / 37/53; link handshakes inside
+  MeshChat's 15 s window 2/8 / 15/18 / 7/8 (5.6 s median); direct sends
+  ok/failed 98/18 / 426/107 / 288/18; round-1 data fragments per part 0.45 /
+  0.84 / 0.27; on-air bytes per delivered RNS byte 4.33 / 2.38 / 2.24. Two
+  caveats: it is a stationary stop, and RNS 1.5.4 is in the mix (control
+  frames per raw send fell 5.72 to 1.47, mostly RNS's own path-request
+  behaviour and the announce cache, not this pass). The miss diagnosis at
+  two hops is still dominated by downstream loss (61 of 110), the repeater
+  side of the path. The proof populations are too thin to read the tail
+  hold at two hops (0 and 3 first-attempt samples in the two windows).
+- **The one wasted decision: a trial of a STALE candidate once the current
+  path was dead.** At 09:04:00 the laptop's zero-hop path was dead (12
+  misses) and the only other candidate was `19` (one hop, evidence aged out,
+  weak prior 0.25, no misses). By design a stale candidate is excluded only
+  from beating a live current path, so it was trialled: 8 QUERY attempts
+  missed (09:04:26-09:05:03 and 09:34:25-09:35:02 with an idle stretch
+  between), the board exhausted at 09:43:58, and discovery found `0219` (two
+  hops) 2 s later. The wall-clock cost was about ten minutes of live traffic,
+  not the 45 s of attempts, because misses accrue only when there is
+  something to send. The counter-case is 0.1.8's desktop at 11:41:22, whose
+  trial of the stale `1902` delivered; with one case each way the rule is
+  kept, and the next sessions should count stale trials, their outcome and
+  their time on the path.
+- **The laptop's zero-hop miss run was 12, not 8,** because selection runs
+  once per send: two 4-attempt sends had already chosen the zero-hop path
+  when it went dead at the 8th miss (08:54:05) and ran out their attempts.
+  Low priority unless a session shows it large.
+- **Two rows of the comparison are measurement artefacts.** "LXMF
+  duplicates: 55 repeat copies" and "frames per completed raw window 20.9"
+  are one paced stream: the laptop sent 51 packets of 115 B (plaintext of
+  at most 15 bytes) to the desktop's LXMF delivery destination between
+  09:45 and 10:31, median 15 s apart, each answered by a different proof --
+  the shape of `rnprobe` with a repeat count. `duplicate_deliveries()` keys
+  on (node, destination, size), so it reads the stream as re-sends; the fix
+  (copies only when the answering proofs share a hash) is analysis-script
+  work for a later pass.
+
+The release changes no behaviour. What it does change: the routine INFO logs
+moved to DEBUG (`_stats_loop`'s periodic `[STATS]` line, `path discovered`,
+`path switched ... for good` and the other path decisions -- trials were
+already DEBUG -- `restored N peer(s) from cache`, `restored N cached
+announce(s)`, the raw-RX log feed subscription and its disabled-by-config
+note, `no radio override configured`, `telemetry_mode_base set`, `radio
+statistics unavailable` and `handshake answered on attempt N`), so rnsd's
+log at its default level shows only connection state (connected, online,
+the reconnect countdown, not-online-yet, detached), node identity, a radio
+override applied, channel setup and the default-channel notice, peers
+binding and expiring, and where packet capture is writing. `_debug()` is
+unchanged: `debug_logs` still emits the interface's own diagnostics at
+INFO, gated by that flag alone, so they can be turned on without RNS core's
+DEBUG level. `update-interface.sh` now installs from `main`;
+`update-interface-dev.sh` is the same script defaulting to `development`.
+No wire change; alpha 0.1.9 and 1.0.0 nodes interoperate. Open from the
+second pass and unchanged here: capture hop labels can be stale during a
+trial (the attempt carries the path chosen when the send started);
+`_receiver_hops_to` does not age the peer's reported path length;
+`PATH_PRIOR_WEAK` is uncalibrated against real two-to-four-hop candidates;
+the gap A/B has never run; three hops is untested on this build;
+`test_local_announce_cache_0920` is intermittent on RNS 1.5.4;
+`repeater_returns` reached its RNS path in 1.5.4's slow mode 4 of 4 times on
+the item-2 builds. readme may need updating: the version heading and the
+"New in" lists, and the install instructions if they name the update
+script.

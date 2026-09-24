@@ -20,7 +20,7 @@ The project also aims to be as easy as possible to configure on your RNS nodes. 
 ## TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
 
 <<<<<<< HEAD
-This project intentionally caps performance out of respect for the regular MeshCore users. Airtime is capped over a rolling 60 second window, with two numbers since alpha 0.1.5:
+This project intentionally caps performance out of respect for the regular MeshCore users. Airtime is capped over a rolling 60 second window, with two numbers since 0.1.0:
 
 - **30%** for anything a repeater relays: multi-hop direct traffic and every channel broadcast (announces, path requests, peer discovery). This is the number that matters to everyone else on the mesh, and it is not going up.
 - **85%** for zero-hop direct traffic between two adjacent radios. A frame that no repeater carries costs nobody else's infrastructure any air, and the field tests showed the 30% cap, not the radio, was the ceiling there (a zero-hop page transfer spent 109 of 147 seconds waiting on it).
@@ -33,36 +33,9 @@ As this project is under a GPL license, there is nothing stopping you from lifti
 
 In the future I plan on making this interface hostile to other peers transmitting more than their fair share to discourage this.
 
-## Features (Version alpha0.1.7)
+## Features (Version 0.1.0)
 
 In short, this version lets you send LXMF messages and browse NomadNet sites over MeshCore. It has been tested over 1, 2 and 3 MeshCore repeater hops with two RNS nodes communicating over this interface. See the [testing section](#field-testing) for more details.
-
-New in alpha 0.1.7 (no wire change; alpha 0.1.6 and 0.1.7 nodes work together):
-
-- a delivery proof answering a message that just arrived goes ahead of bulk traffic on the radio, the way a link handshake does, so LXMF stops re-sending messages that were already delivered (`proof_fresh_s`, default 8 s; 0 turns it off).
-- the interface no longer learns a route to its own destinations from the messages addressed to them.
-- capture records carry the other node's reported path length and delivery rate, and the field comparison script reports proof turnaround and duplicate deliveries.
-
-New in alpha 0.1.6 (**wire change: both nodes must run alpha 0.1.6** -- the fragment-reconciliation frames now carry each node's view of its path to the other):
-
-- path selection by measured reliability replaces shorter-path adoption: every route a node learns to a peer (discovered, seen on the peer's own floods, direct, or reported by the peer) is scored by airtime per delivered byte from its measured delivery rate, a delivering path is kept, a path that misses twice is trialled against the best alternative, and a weak direct signal is scored below a repeater path (`path_selection_enabled`, `path_weak_snr_db`, `path_switch_after_misses`, `path_switch_margin`, `path_switch_cooldown`; `path_adopt_window` is gone, `path_adopt_enabled` still works as an alias).
-- through repeaters a fragment window runs at most two reconcile rounds before falling back (`direct_raw_window_max_rounds`), a link proof the other side has already re-requested is dropped instead of retried, and a completion report owed to the other side also goes out during a reconcile query's quiet hold -- link handshakes at two hops no longer wait a minute or more for the radio.
-- a resilient serial connection: the interface opens the port itself, waits out the radio's reset, retries the handshake, and reconnects forever with backoff after a USB drop or a laptop suspend instead of going dead after three seconds; a garbled frame from the radio no longer fails the command in flight ("event failed"), and it warns when another process is reading the same port (`connect_retry_min`, `connect_retry_max`, `serial_open_settle`, `handshake_attempts`, `handshake_timeout`, `command_timeout`, `serial_noise_warn_per_min`; `max_reconnect_attempts` now means the supervisor's cap, 0 = forever).
-- one completion report per fragment window at zero hop: the receiver's gaps report waits a full fragment spacing and is dropped when the last fragment lands inside it, and the same packet is no longer reported twice.
-
-New in alpha 0.1.5 (no wire change from 0.1.4; both nodes should still run the same build):
-
-- zero-hop direct traffic may use up to 85% of channel time while anything a repeater relays stays at 30% (see the airtime section above; `duty_cycle_max_fraction_zero_hop`).
-- the sender tracks when its radio has actually finished transmitting a burst, paces zero-hop bursts to the radio (`direct_raw_burst_queue_ahead`), the receiver sends one completion report per window instead of one per part (`direct_report_hold_during_burst`), and a report that arrives early is progress rather than the end of the wait -- the field session's unnecessary re-sends are what this removes.
-- shorter-path adoption from a peer's own floods (`path_adopt_enabled`, `path_adopt_window`).
-- a lone packet no longer waits the window-collect time (`direct_raw_window_collect` is now a maximum), and a completion report owed to the other side goes out between the parts of this node's own window.
-- capture files are named after the MeshCore node (`packet_capture_label`), the radio's own transmit statistics are recorded (`radio_stats_interval`), and `direct_raw_gap_own_airtime` exists for the one-hop gap field A/B (default unchanged).
-
-New in alpha 0.1.4:
-
-- less airtime per delivered byte. Fragment reports no longer wait for a MeshCore ACK, one report covers a whole window of parts, a large packet is three raw fragments instead of four, and from one hop up each burst carries a parity fragment so a single lost fragment is repaired without a retry round.
-
-- ~60 % less airtime per delivered byte on multi-fragment transfers, with about five times the delivery rate 
 
 **Battle Tested** - Tested and confident this is reliable.
 

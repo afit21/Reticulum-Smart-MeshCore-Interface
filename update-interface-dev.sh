@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
 #
-# update-interface.sh -- install the RELEASED SmartMeshCoreInterface.py (the
-# main branch) from GitHub into a Reticulum install's interfaces/ directory.
-# update-interface-dev.sh is the same script for the development branch.
+# update-interface-dev.sh -- install the DEVELOPMENT SmartMeshCoreInterface.py
+# (the development branch) from GitHub into a Reticulum install's interfaces/
+# directory. update-interface.sh is the same script for the released main
+# branch; keep the two identical apart from the default branch.
 #
-# Defaults to the main branch and ~/.reticulum. The downloaded file is
+# Defaults to the development branch and ~/.reticulum. The downloaded file is
 # checked before it replaces anything: a truncated download, an HTML error page
 # or a Python syntax error leaves the installed interface untouched, because a
 # broken interface file stops rnsd/MeshChat from starting at all.
 #
-#   ./update-interface.sh                      # main -> ~/.reticulum
-#   ./update-interface.sh --branch development # (or use update-interface-dev.sh)
-#   ./update-interface.sh --config-dir ~/.reticulum_test
-#   ./update-interface.sh --check              # report only, install nothing
-#   ./update-interface.sh --force              # reinstall even if unchanged
+#   ./update-interface-dev.sh                  # development -> ~/.reticulum
+#   ./update-interface-dev.sh --branch main    # (or use update-interface.sh)
+#   ./update-interface-dev.sh --config-dir ~/.reticulum_test
+#   ./update-interface-dev.sh --check          # report only, install nothing
+#   ./update-interface-dev.sh --force          # reinstall even if unchanged
 #
 # Remote hosts: run it over ssh, e.g.
-#   ssh -i ~/claudtolaptop afi@192.168.20.44 'bash -s' < update-interface.sh
+#   ssh -i ~/claudtolaptop afi@192.168.20.44 'bash -s' < update-interface-dev.sh
 #
 set -euo pipefail
 
 REPO="afit21/Reticulum-Smart-MeshCore-Interface"
-BRANCH="main"
+BRANCH="development"
 SRC_PATH="Interface/SmartMeshCoreInterface.py"
 CONFIG_DIR="${RNS_CONFIG_DIR:-$HOME/.reticulum}"
 KEEP_BACKUPS=5
@@ -39,7 +40,7 @@ while [ $# -gt 0 ]; do
     -d|--config-dir) CONFIG_DIR="${2:?--config-dir needs a value}"; shift 2 ;;
     -c|--check)      CHECK_ONLY=1; shift ;;
     -f|--force)      FORCE=1; shift ;;
-    -h|--help)       sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)       sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)               die "unknown option: $1 (try --help)" ;;
   esac
 done

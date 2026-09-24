@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.0 (2026-09-24)
+
+The first release: the alpha 0.1.9 second-pass build (`35a6c22`), unchanged in behaviour, after its
+2026-09-24 field session (`fieldtests/raw/Alpha0.1.9/`) showed the two defects that pass targeted
+fixed in the field and the best two-hop numbers recorded on this project (the dated record is
+`docs/history.md`, "1.0.0"). No wire change; alpha 0.1.9 and 1.0.0 nodes interoperate. No default
+changed (`tests/test_shipped_defaults.py` is untouched).
+
+- **Routine logs moved from INFO to DEBUG.** The periodic `[STATS]` line, path discovery results and
+  path decisions (switches were INFO, trials already DEBUG), the peer and announce cache restores,
+  the raw-RX log feed subscription, the "no radio override" and telemetry-mode notes, "radio
+  statistics unavailable" and "handshake answered on attempt N". Still at INFO: connected, online,
+  detached, the reconnect countdown, node identity, a radio override applied, channel configured
+  and the default-channel notice, peer bound and peer expired, and where packet capture is writing.
+  The `debug_logs` flag is unchanged: it still emits the interface's own diagnostics at INFO so they
+  can be turned on without RNS core's DEBUG level.
+- **Two update scripts.** `update-interface.sh` now installs from the `main` branch (the release);
+  `update-interface-dev.sh` is the same script defaulting to `development`. Both keep `--branch`.
+- **The 2026-09-23 home-session captures are back**, under `fieldtests/raw/Alpha0.1.9-home/`
+  (they were removed from `Alpha0.1.9/` when the 2026-09-24 captures went in, and
+  `test_field_ab_compare_path_rows_0924` had been skipping its 144-miss-run pin without them).
+
 ## alpha-0.1.9 (2026-09-23)
 
 From the alpha 0.1.8 field session (`fieldtests/raw/Alpha0.1.8/`, 2026-09-23: a three-hop stop and a
