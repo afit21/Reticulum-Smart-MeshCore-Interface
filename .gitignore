@@ -172,7 +172,6 @@ cython_debug/
 
 #Official Meshcore Implementations for reference
 referenceprojects/
-fieldtests/
 
 # Claude Code project notes -- guidance for the AI assistant, not meant
 # to be published/tracked in this repo. Fieldtests stay tracked; this is
@@ -187,3 +186,4 @@ CLAUDE.local.md
 claudtolaptop
 claudtolaptop.pub
 
+fieldtests/

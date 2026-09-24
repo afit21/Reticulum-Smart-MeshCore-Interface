@@ -1,31 +1,50 @@
 #!/usr/bin/env bash
 #
-# update-interface.sh -- install the RELEASED SmartMeshCoreInterface.py (the
-# main branch) from GitHub into a Reticulum install's interfaces/ directory.
-# update-interface-dev.sh is the same script for the development branch.
+# install-interface-dev.sh -- install the DEVELOPMENT SmartMeshCoreInterface.py (the
+# development branch on GitHub) into a Reticulum
+# install's interfaces/ directory, and make sure the `meshcore` python library
+# it needs is installed for the python that runs rnsd. Run it straight from
+# GitHub:
 #
-# Defaults to the main branch and ~/.reticulum. The downloaded file is
-# checked before it replaces anything: a truncated download, an HTML error page
-# or a Python syntax error leaves the installed interface untouched, because a
-# broken interface file stops rnsd/MeshChat from starting at all.
-# The interface imports the `meshcore` python library at startup and panics
-# rnsd without it, so the script also makes sure that library is importable by
-# the python that runs rnsd, installing it with pip if it is not.
+#   curl -fsSL https://raw.githubusercontent.com/afit21/Reticulum-Smart-MeshCore-Interface/development/dev-tools/install-interface-dev.sh | bash
 #
-#   ./update-interface.sh                      # main -> ~/.reticulum
-#   ./update-interface.sh --branch development # (or use update-interface-dev.sh)
-#   ./update-interface.sh --config-dir ~/.reticulum_test
-#   ./update-interface.sh --check              # report only, install nothing
-#   ./update-interface.sh --force              # reinstall even if unchanged
-#   ./update-interface.sh --skip-deps          # don't check/install the meshcore library
-#
-# Remote hosts: run it over ssh, e.g.
-#   ssh -i ~/claudtolaptop afi@192.168.20.44 'bash -s' < update-interface.sh
+# or download it and run ./install-interface-dev.sh; --help lists the options.
+# install-interface.sh at the repository root is the same script for the released main branch;
+# keep the two identical apart from the default branch.
 #
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+install-interface-dev.sh -- install SmartMeshCoreInterface.py from GitHub (development
+branch) into a Reticulum install's interfaces/ directory.
+
+Defaults to the development branch and ~/.reticulum. The downloaded file is checked
+before it replaces anything: a truncated download, an HTML error page or a
+Python syntax error leaves the installed interface untouched, because a broken
+interface file stops rnsd/MeshChat from starting at all. The interface imports
+the `meshcore` python library at startup and panics rnsd without it, so the
+script also makes sure that library is importable by the python that runs
+rnsd, installing it with pip if it is not.
+
+  ./install-interface-dev.sh                   # development -> ~/.reticulum
+  ./install-interface-dev.sh --branch main      # (or use install-interface.sh)
+  ./install-interface-dev.sh --config-dir ~/.reticulum_test
+  ./install-interface-dev.sh --check           # report only, install nothing
+  ./install-interface-dev.sh --force           # reinstall even if unchanged
+  ./install-interface-dev.sh --skip-deps       # don't check/install the meshcore library
+
+Straight from GitHub (options go after `bash -s --`):
+  curl -fsSL https://raw.githubusercontent.com/afit21/Reticulum-Smart-MeshCore-Interface/development/dev-tools/install-interface-dev.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/afit21/Reticulum-Smart-MeshCore-Interface/development/dev-tools/install-interface-dev.sh | bash -s -- --check
+
+Remote hosts: run it over ssh, e.g.
+  ssh -i ~/claudtolaptop afi@192.168.20.44 'bash -s' < dev-tools/install-interface-dev.sh
+USAGE
+}
+
 REPO="afit21/Reticulum-Smart-MeshCore-Interface"
-BRANCH="main"
+BRANCH="development"
 SRC_PATH="Interface/SmartMeshCoreInterface.py"
 CONFIG_DIR="${RNS_CONFIG_DIR:-$HOME/.reticulum}"
 KEEP_BACKUPS=5
@@ -45,7 +64,7 @@ while [ $# -gt 0 ]; do
     -c|--check)      CHECK_ONLY=1; shift ;;
     -f|--force)      FORCE=1; shift ;;
     -s|--skip-deps)  SKIP_DEPS=1; shift ;;
-    -h|--help)       sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)       usage; exit 0 ;;
     *)               die "unknown option: $1 (try --help)" ;;
   esac
 done

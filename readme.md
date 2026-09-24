@@ -11,24 +11,34 @@
 </div>
 
 
-## Overview
+# Overview
 This project aims to let you access Nomadnet and send LXMF messages over a MeshCore network as a 'last mile' RNS hop without flooding MeshCore with traffic. In summary this is achieved by using direct messages where possible, limiting traffic, only sending whats necessary, artificially delaying, and prioritizing some RNS traffic.
 
 The project also aims to be as easy as possible to configure on your RNS nodes. In most situations, a minimal config is needed, just setup your MeshCore companion radio with the MeshCore app before using the interface.
 
-
-## TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
-
-This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.4) I have airtime capped at 30% which results in a usable experience.
-As more testing is done, the project will move towards dynamic airtime limiting, however please don't remove the limits unless you know what you're doing or your local user base is fine with it.
+# Installation & Setup
 
 ## Requirements
 
 - A MeshCore-flashed LoRa radio (serial, BLE, or TCP-connected), reachable via the [`meshcore`](https://pypi.org/project/meshcore/) Python library.
+
+- [`meshcore`](https://pypi.org/project/meshcore/) Python library. (installed by install script)
+
 - [Reticulum](https://pypi.org/project/rns/) (`pip install rns`).
+
 - Python 3.9+.
 
-## Installation
+## Install Script (Install Option A)
+
+One liner command to install the interface (Linux only):
+`curl -fsSL https://raw.githubusercontent.com/afit21/Reticulum-Smart-MeshCore-Interface/main/install-interface.sh | bash`
+
+Update your RNS config file (see 'Configuration' section below)
+
+## Manual (Install Option B)
+
+Install [`meshcore`](https://pypi.org/project/meshcore/) Python library:
+`pip install meshcore`
 
 Copy the interface into your Reticulum install's interfaces directory:
 
@@ -36,9 +46,14 @@ Copy the interface into your Reticulum install's interfaces directory:
 cp Interface/SmartMeshCoreInterface.py ~/.reticulum/interfaces/SmartMeshCoreInterface.py
 ```
 
-Then add a block to `~/.reticulum/config`, under `[interfaces]`. A minimal real-world example. Please just use the reference config if you're not sure if your local MeshCore operators would be chill with you experimenting (serial-connected radio):
+
+## Configuration
+
+Add a block to `~/.reticulum/config`, under `[interfaces]`. A minimal real-world example. Please just use the reference config if you're not sure if your local MeshCore operators would be chill with you experimenting (serial-connected radio):
 
 Reference config for a transfer node - by default, the interface will use the MeshCore settings saved to your companion:
+
+Remember - The interface will use the radio options configured on your MeshCore companion.
 
 ```ini
   [[Smart MeshCore Interface]]
@@ -66,7 +81,7 @@ Reference config for a non-transfer node:
 
 Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~140 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
 
-## Features (Version 1.0.0)
+# Features (Version 1.0.0)
 
 **Battle Tested** - Tested and confident this is reliable.
 
@@ -97,14 +112,16 @@ Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The f
 This diagram isn't 100% accurate to how the interface works but should give you a basic idea :)
 <img width="1056" height="600" alt="senddiagram" src="https://github.com/user-attachments/assets/f5efbb53-4530-4287-ad89-6438dbd2a88f" />
 
-## Reliability in the field
+# Reliability in the field
+
+More data needed. If you use this interface, please consider enabling packet capture and sending them my way.
 
 In the current state, you can expect up to 3 repeaters in a path to be usable at the following or similar settings SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz. (Data Rate 1.71kbps)
 The main issue with routing over MeshCore is latency. Latency quickly adds up over repeaters.
 Other radio settings are untested as of writing this, however, I suspect that settings with a higher resultant bitrate would work better in real scenarios. Please look at the contributing section if you'd like to test radio settings for me.
 
 This table summarizes the real world scenarios that I've tested the interface against.
-Hops in this table refer to MeshCore Hops. Note - These results were measured with airtime capped at 30% for everything (the alpha 0.1.4 cap); since alpha 0.1.5 zero-hop direct traffic may use 85% while anything a repeater relays stays at 30% (see the airtime section above).
+Hops in this table refer to the number of MeshCore repeaters.
 
 All tests were conducted on Heltec V3 MeshCore companions over a fairly quiet MeshCore network.
 MeshCore radio settings were: SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz:
@@ -114,11 +131,10 @@ MeshCore radio settings were: SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz:
 | 0 Hops (direct) | Works Well               | Works Well    |
 | 1 Hop           | Works Well               | Works Well    |
 | 2 Hops          | Works Well               | Works Well    |
-| 3 Hops          | Works Well               | Slow    |
+| 3 Hops          | Slow               | Slow    |
 
 
 Reference speeds - SF7, BW 62.5 kHz, CR 4/8, 916.575 MHz:
-More data needed
 |         | One Direction | Bidirectional | RNS Latency |
 | ------- | ------------- | ------------- | ----------- |
 | 0 Hops  | 391bps        | 338 bps       | 1700ms      |
@@ -128,7 +144,7 @@ More data needed
 
 Please keep in mind that this project is in early stages. However, this interface currently works better than all others I've been able to test.
 
-## Roadmap (in no particular order)
+# Roadmap (in no particular order)
 
 - Airtime efficiency improvements - Always looking to optimise airtime usage
 
@@ -145,7 +161,7 @@ Please keep in mind that this project is in early stages. However, this interfac
 - Better compatability with LXMF clients other than MeshChat
 
 
-## Credits
+# Credits
 
 - [comms-engineer/RNS_Over_Meshcore](https://github.com/comms-engineer/RNS_Over_Meshcore) — inspiration taken from this project for the discovery protocol.
 
@@ -155,9 +171,7 @@ Please keep in mind that this project is in early stages. However, this interfac
 
 - [MeshBench](https://meshbench.github.io/) - MeshCore simulator used for simulated benchmarks
 
-## Contributing
-Pull requests are always welcomed.
-
+# Contributing
 Packet captures from your field tests are always appreciated:
 
 Enable packet captures with:
@@ -170,6 +184,16 @@ The capture file is named after your MeshCore node (`<node name>_capture_..._<ti
 Default location is; . ~/.reticulum/storage/meshcore_packet_capture/
 
 You can send these to me by opening an issue, discord at 'afit21', or my lxmf: d4c70c4b0a7e67265fa8982e36b43c05
+
+If you'd like to contribute code, feel free to fork this repo and open a pull request :)
+
+# Speed limited our of respect for MeshCore users
+
+TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
+
+
+This project intentionally caps performance out of respect for the regular MeshCore users. In the current version (alpha0.1.4) I have airtime capped at 30% which results in a usable experience.
+As more testing is done, the project will move towards dynamic airtime limiting, however please don't remove the limits unless you know what you're doing or your local user base is fine with it.
 
 ## AI Usage
 
