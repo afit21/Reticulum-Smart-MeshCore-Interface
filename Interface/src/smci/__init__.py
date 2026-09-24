@@ -13,7 +13,7 @@ tuned into working. Nothing in this file is built on that code; it is a
 fresh implementation against the design docs, referring back to the old
 implementation only as a record of what was tried and why it didn't work.
 
-STATUS -- 1.0.0 (2026-09-24): the first release. It is the alpha 0.1.9
+STATUS -- 0.1.0 (2026-09-24): the first release. It is the alpha 0.1.9
 second-pass build (`35a6c22`, RNS 1.5.4) after its field session of
 2026-09-24 morning (`fieldtests/raw/Alpha0.1.9/`: zero hop at home, a
 one-hop trial, then a two-and-a-half-hour two-hop stop) showed both
@@ -28,7 +28,7 @@ decisions, cache restores, feature availability notes) moved to DEBUG so
 rnsd's log shows only connection state, identity, radio and channel
 setup, peers binding and expiring, and packet capture; the update script
 installs from `main` and `update-interface-dev.sh` from `development`.
-No wire change -- alpha 0.1.9 and 1.0.0 nodes interoperate. Alpha 0.1.9
+No wire change -- alpha 0.1.9 and 0.1.0 nodes interoperate. Alpha 0.1.9
 was alpha 0.1.8 plus the corrections its own first
 field session, 2026-09-23, asked for: a completion report that was skipped
 because RNS's PROOF replaces it now counts as reported, so the parity

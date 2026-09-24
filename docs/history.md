@@ -5629,7 +5629,7 @@ added, no wire change, the version stays alpha 0.1.9.
 
 
 
-**1.0.0 (2026-09-24): the first release, from the alpha 0.1.9 second pass's
+**0.1.0 (2026-09-24): the first release, from the alpha 0.1.9 second pass's
 field session of 2026-09-24 morning.** The session (`fieldtests/raw/Alpha0.1.9/`,
 desktop 08:23-12:13, laptop 08:27-12:13, build `35a6c22` on both radios, RNS
 1.5.4) had three parts: zero hop at home until 09:00, the laptop moving from
@@ -5714,7 +5714,7 @@ unchanged: `debug_logs` still emits the interface's own diagnostics at
 INFO, gated by that flag alone, so they can be turned on without RNS core's
 DEBUG level. `update-interface.sh` now installs from `main`;
 `update-interface-dev.sh` is the same script defaulting to `development`.
-No wire change; alpha 0.1.9 and 1.0.0 nodes interoperate. Open from the
+No wire change; alpha 0.1.9 and 0.1.0 nodes interoperate. Open from the
 second pass and unchanged here: capture hop labels can be stale during a
 trial (the attempt carries the path chosen when the send started);
 `_receiver_hops_to` does not age the peer's reported path length;

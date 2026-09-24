@@ -1,11 +1,11 @@
 # Changelog
 
-## 1.0.0 (2026-09-24)
+## 0.1.0 (2026-09-24)
 
 The first release: the alpha 0.1.9 second-pass build (`35a6c22`), unchanged in behaviour, after its
 2026-09-24 field session (`fieldtests/raw/Alpha0.1.9/`) showed the two defects that pass targeted
 fixed in the field and the best two-hop numbers recorded on this project (the dated record is
-`docs/history.md`, "1.0.0"). No wire change; alpha 0.1.9 and 1.0.0 nodes interoperate. No default
+`docs/history.md`, "0.1.0"). No wire change; alpha 0.1.9 and 0.1.0 nodes interoperate. No default
 changed (`tests/test_shipped_defaults.py` is untouched).
 
 - **Routine logs moved from INFO to DEBUG.** The periodic `[STATS]` line, path discovery results and
