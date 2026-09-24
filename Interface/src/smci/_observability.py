@@ -20,8 +20,11 @@ class _ObservabilityMixin:
     # Packet capture (user-requested, 2026-09-15) -- off by default
     # (packet_capture_enabled). One JSON object per line (JSONL: easy to
     # tail -f, grep, or load with any per-line JSON reader) per in/out
-    # RNS packet, written to packet_capture_dir (default: a
-    # "packet_capture" subdirectory of this node's own RNS storage path).
+    # RNS packet, written to packet_capture_dir (default since 0.1.0:
+    # `meshcore_packet_capture` under this node's own RNS storage path,
+    # ~/.reticulum/storage/meshcore_packet_capture for a default install).
+    # The first record of every file is a `capture_header` (0.1.0): the
+    # interface's effective settings and the radio SELF_INFO reported.
     # Deliberately synchronous, unbuffered writes: this transport's own
     # real throughput ceiling (docs/reliability_engine_design.md's field
     # data: tens of bytes/sec) means packets are inherently rare relative
@@ -45,20 +48,84 @@ class _ObservabilityMixin:
         label = safe(label.strip()) if label else ""
         return f"{label}_{base}" if label else base
 
+    CAPTURE_DEFAULT_SUBDIR = "meshcore_packet_capture"
+    # Settings whose value is never written to a capture (captures get
+    # shared and committed): the name matches, the value is replaced.
+    CAPTURE_REDACTED_SETTINGS = ("secret", "password", "passphrase")
+    # The SELF_INFO fields a capture header keeps: the radio and the node,
+    # not the advertised position (adv_lat/adv_lon).
+    CAPTURE_SELF_INFO_FIELDS = (
+        "name", "public_key", "adv_type", "tx_power", "max_tx_power", "radio_freq", "radio_bw",
+        "radio_sf", "radio_cr", "multi_acks", "manual_add_contacts", "telemetry_mode_base",
+        "telemetry_mode_loc", "telemetry_mode_env",
+    )
+
+    def _capture_dir(self) -> str:
+        """Where capture files go (0.1.0): packet_capture_dir when set
+        (`~` expanded), else `meshcore_packet_capture` under the RNS
+        storage path -- ~/.reticulum/storage when RNS has none, so
+        `packet_capture_enabled = yes` is the only setting a capture needs."""
+        if self.packet_capture_dir:
+            return os.path.expanduser(str(self.packet_capture_dir))
+        base = getattr(RNS.Reticulum, "storagepath", None) or os.path.expanduser("~/.reticulum/storage")
+        return os.path.join(base, self.CAPTURE_DEFAULT_SUBDIR)
+
+    @classmethod
+    def _capture_safe_value(cls, name: str, value):
+        """A setting's value as a capture header writes it: redacted by
+        name, sets as sorted lists, anything not plain JSON as its repr."""
+        if any(word in name.lower() for word in cls.CAPTURE_REDACTED_SETTINGS):
+            return "<redacted>" if value else value
+        if isinstance(value, (set, frozenset)):
+            value = sorted(value, key=repr)
+        if isinstance(value, (list, tuple)):
+            return [v if isinstance(v, (str, int, float, bool)) or v is None else repr(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return repr(value)
+
+    def _settings_snapshot(self, before: set) -> dict:
+        """Every attribute the `_configure_*` calls set (the ones not in
+        `before`), as a capture header writes them. Callables, locks and
+        handles are dropped."""
+        out = {}
+        for key in sorted(set(vars(self)) - before):
+            value = getattr(self, key)
+            if callable(value) or hasattr(value, "acquire") or hasattr(value, "write"):
+                continue
+            out[key] = self._capture_safe_value(key, value)
+        return out
+
+    def _capture_self_info(self) -> dict:
+        info = self._self_info or {}
+        return {k: info[k] for k in self.CAPTURE_SELF_INFO_FIELDS if k in info}
+
+    def _capture_header_record(self) -> dict:
+        """The first record of every capture file (0.1.0): the settings the
+        interface runs with (`settings`, every value `_configure_*` set,
+        defaults included), the keys the config block gave (`config_given`),
+        what the radio reported at the handshake (`radio`) and the radio
+        parameters the airtime model uses (`radio_params`, which follow a
+        freq/bw/sf/cr override)."""
+        given = {}
+        for key, value in dict(self._config_given or {}).items():
+            given[str(key)] = self._capture_safe_value(str(key), value)
+        params = self._radio_params
+        return {
+            "event": "capture_header",
+            "interface": self.name,
+            "interface_class": type(self).__name__,
+            "rns_version": getattr(RNS, "__version__", None),
+            "radio": self._capture_self_info(),
+            "radio_override": bool(self.radio_freq and self.radio_bw and self.radio_sf and self.radio_cr),
+            "radio_params": list(params) if params is not None else None,
+            "config_given": given,
+            "settings": dict(self._settings_at_start or {}),
+        }
+
     def _open_packet_capture(self) -> None:
         try:
-            capture_dir = self.packet_capture_dir
-            if not capture_dir:
-                base = getattr(RNS.Reticulum, "storagepath", None)
-                if not base:
-                    RNS.log(
-                        f"{self}: packet_capture_enabled but no packet_capture_dir "
-                        f"configured and no RNS storage path available -- capture "
-                        f"disabled for this run.",
-                        RNS.LOG_WARNING,
-                    )
-                    return
-                capture_dir = os.path.join(base, "packet_capture")
+            capture_dir = self._capture_dir()
             os.makedirs(capture_dir, exist_ok=True)
             # Item 7: the node label -- packet_capture_label, else the
             # MeshCore node name SELF_INFO gave (known by now: the capture
@@ -68,6 +135,8 @@ class _ObservabilityMixin:
             path = os.path.join(capture_dir, filename)
             self._packet_capture_file = open(path, "a", buffering=1)
             RNS.log(f"{self}: packet capture enabled -- writing to {path}", RNS.LOG_INFO)
+            self._capture_event("out", self._capture_header_record())
+            self._captured_radio = self._capture_self_info()
             # Alpha 0.1.6 (item 4): connection_state records from before
             # the node had a name (the capture needs the handshake).
             pending, self._pending_capture_events = self._pending_capture_events, []

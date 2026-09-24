@@ -64,7 +64,7 @@ class OpenUsesTheNodeName(SingleNodeCase):
         self.assertEqual(len(files), 1)
         self.assertTrue(files[0].startswith("afipc_capture_"), files[0])
         from simmesh.harness import read_capture
-        self.assertEqual([r["event"] for r in read_capture(tmp, self.iface.name)], ["probe"],
+        self.assertEqual([r["event"] for r in read_capture(tmp, self.iface.name)], ["capture_header", "probe"],
                          "the harness reader finds the labelled file")
         from field_ab_compare import node_of
         self.assertEqual(node_of(files[0]), "afipc")

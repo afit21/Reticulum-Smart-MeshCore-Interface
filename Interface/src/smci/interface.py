@@ -532,6 +532,14 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
 
         self.owner = owner
         cfg = configuration
+        # 0.1.0: what a capture file's header records -- the keys the
+        # config block gave, and every setting the _configure_* calls
+        # below produce (defaults included).
+        try:
+            self._config_given = dict(cfg)
+        except Exception:
+            self._config_given = {}
+        settings_before = set(vars(self))
 
         self._configure_identity(cfg)
         self._configure_transport(cfg)
@@ -542,6 +550,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         self._configure_path_discovery(cfg)
         self._configure_peer_discovery(cfg)
         self._configure_observability(cfg)
+        self._settings_at_start = self._settings_snapshot(settings_before)
         # Field-diagnosed fix (2026-09-18, see module docstring): these
         # timing knobs are spread across five different _configure_*
         # methods above, each independently tunable, but they aren't
@@ -723,6 +732,10 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # extends. Always maintained; only acted on when rx_log_holds_
         # enabled (see that config's own comment).
         self._radio_params = None
+        # 0.1.0: the last SELF_INFO payload, and the radio fields the
+        # capture last recorded (a `radio_settings` record follows a change).
+        self._self_info = None
+        self._captured_radio = None
         self._medium_busy_until = 0.0
         self._medium_busy_reason = None
         self._stats_task = None
@@ -1451,6 +1464,13 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
                 RNS.LOG_WARNING,
             )
         RNS.log(f"{self}: node identity '{self._own_node_name}' key={node_key[:16]}...", RNS.LOG_INFO)
+        self._self_info = dict(info)
+        if getattr(self, "_packet_capture_file", None) is not None:
+            radio = self._capture_self_info()
+            if radio != self._captured_radio:
+                self._captured_radio = radio
+                self._capture_event("out", {"event": "radio_settings", "radio": radio,
+                                            "radio_params": list(self._radio_params) if self._radio_params else None})
 
     async def _fetch_own_identity(self) -> None:
         """Re-asks the radio for SELF_INFO while the identity is still

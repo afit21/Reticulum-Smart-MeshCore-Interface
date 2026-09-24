@@ -22,6 +22,21 @@ changed (`tests/test_shipped_defaults.py` is untouched).
   (they were removed from `Alpha0.1.9/` when the 2026-09-24 captures went in, and
   `test_field_ab_compare_path_rows_0924` had been skipping its 144-miss-run pin without them).
 
+- **Packet capture opens with a header, and needs only `packet_capture_enabled = yes`** (user
+  request, same day). Every capture file's first record is now `event: "capture_header"`: `settings`
+  (every value the `_configure_*` calls set, defaults included, 165 of them), `config_given` (the
+  keys the config block gave), `radio` (what the radio's SELF_INFO reported: frequency, bandwidth,
+  SF, CR, TX power, node name and key -- not the advertised position) and `radio_params` (what the
+  airtime model uses, following a freq/bw/sf/cr override). Anything named like a secret, password
+  or passphrase is written as `<redacted>`, including `channel_secret_hex`. A later SELF_INFO with
+  different radio fields writes a `radio_settings` record. The default directory is now
+  `meshcore_packet_capture` under the RNS storage path (`~/.reticulum/storage/meshcore_packet_capture`
+  for a default install; it was `packet_capture`), with `~/.reticulum/storage` as the fallback when
+  RNS gives no storage path (capture used to switch itself off). `packet_capture_dir` still
+  overrides it, and `~` in it is now expanded. The analysis scripts select by `event` and are
+  unaffected. Tests: `tests/test_capture_header_0924.py`; `test_capture_label_0921` now expects the
+  header first.
+
 ## alpha-0.1.9 (2026-09-23)
 
 From the alpha 0.1.8 field session (`fieldtests/raw/Alpha0.1.8/`, 2026-09-23: a three-hop stop and a

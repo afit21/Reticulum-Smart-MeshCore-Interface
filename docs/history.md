@@ -5725,3 +5725,41 @@ the gap A/B has never run; three hops is untested on this build;
 the item-2 builds. readme may need updating: the version heading and the
 "New in" lists, and the install instructions if they name the update
 script.
+
+**0.1.0, 2026-09-24 (afternoon): capture header and default directory.**
+User request: "packet capture to append the interface config and radio
+settings detected at the top of the file" and "ensure the default location is
+in ~/.reticulum/storage/meshcore_packet_capture, but keep the option to
+configure a custom location (the only setting required should be
+packet_capture_enabled = yes)". Until now a capture said nothing about the
+settings its build ran with or the radio's parameters, and the 2026-09-18
+airtime work had to read SF/BW/CR from the radio separately because "the
+interface never logs them". `_open_packet_capture` now writes a
+`capture_header` record first (seq 1). `settings` is every attribute the
+`_configure_*` calls set, taken in `__init__` by diffing `vars(self)` around
+them (the same method `tests/test_shipped_defaults.py` uses, done in
+`__init__` so the snapshot attribute doesn't show up in that test's
+per-method diff). `config_given` is the config block as RNS passed it,
+including the keys RNS adds (`name`, `selected_interface_mode`,
+`configured_bitrate`). `radio` is the SELF_INFO fields from `name` through
+`radio_cr`, and `radio_params` is the (sf, bw, cr) the airtime model uses.
+Two things are deliberately kept out because captures are committed under
+`fieldtests/raw/`: values whose name contains secret, password or passphrase
+(`channel_secret_hex` among them) become `<redacted>`, and SELF_INFO's
+`adv_lat`/`adv_lon` are dropped. `_apply_self_info` writes a `radio_settings`
+record when a later SELF_INFO (a reconnect) changes those fields. The default
+directory moved from `<storagepath>/packet_capture` to
+`<storagepath>/meshcore_packet_capture` (`_capture_dir`, a pure rule).
+Without a storage path it now falls back to `~/.reticulum/storage` instead
+of disabling capture. A configured `packet_capture_dir` wins and has `~`
+expanded. Existing captures under `packet_capture/` are not moved. Checked by
+loading the user's two reference config blocks (serial, `mode =
+access_point`, `declares_upstream_rns = yes`, an inline `#` comment on
+`port`) plus `packet_capture_enabled = yes` in a real `RNS.Reticulum` with a
+throwaway config dir and a nonexistent port: the block parses, the comment is
+stripped, the directory resolves to `<configdir>/storage/meshcore_packet_capture`,
+and the secret is redacted in the snapshot. Fast suite: 560 tests, OK (7
+skipped). No wire change, no default changed, no MeshBench run (capture is
+observability only; no send path reads it). readme may need updating: its
+capture section doesn't give the directory.
+
