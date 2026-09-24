@@ -1,26 +1,33 @@
 <div align="center">
 
-  <img width="450" height="110" alt="rnsmeshcoreinterface" src="https://github.com/user-attachments/assets/63093ecc-61b0-43d4-8db7-619bf3d7f8f3" />
+  <img width="450" height="110" alt="Smart MeshCore Interface for Reticulum logo" src="https://github.com/user-attachments/assets/63093ecc-61b0-43d4-8db7-619bf3d7f8f3" />
 
   <h1>Smart MeshCore Interface for Reticulum</h1>
 
-  <p>
-    A <a href="https://reticulum.network/">Reticulum</a> (RNS) interface that lets RNS nodes communicate over a <a href="https://meshcore.co.uk/">MeshCore</a> LoRa mesh without nuking your local MeshCore network!
-  </p>
+  <p>Run Reticulum (RNS) over a MeshCore LoRa mesh: send LXMF messages and browse NomadNet through MeshCore repeaters, without flooding your local MeshCore network.</p>
   
 </div>
 
+# What is Smart MeshCore Interface?
 
-# Overview
+Smart MeshCore Interface is a custom Reticulum interface that uses a MeshCore
+companion radio (e.g. Heltec V3) as a transport. It turns MeshCore into a
+"last mile" RNS link using direct messages, fragmentation, and airtime limits,
+so RNS traffic stays polite to regular MeshCore users.
+
 This project aims to let you access Nomadnet and send LXMF messages over a MeshCore network as a 'last mile' RNS hop without flooding MeshCore with traffic. In summary this is achieved by using direct messages where possible, limiting traffic, only sending whats necessary, artificially delaying, and prioritizing some RNS traffic.
 
 The project also aims to be as easy as possible to configure on your RNS nodes. In most situations, a minimal config is needed, just setup your MeshCore companion radio with the MeshCore app before using the interface.
 
-# Installation & Setup
+Highlights:
+- Doesn't flood the MeshCore network
+- NomadNet accessible over MeshCore repeaters
+
+# How to install the MeshCore interface for Reticulum
 
 ## Requirements
 
-- A MeshCore-flashed LoRa radio (serial, BLE, or TCP-connected), reachable via the [`meshcore`](https://pypi.org/project/meshcore/) Python library.
+- A MeshCore-flashed LoRa radio (serial, BLE, or TCP-connected), reachable via the [`meshcore`](https://pypi.org/project/meshcore/) Python library. (Heltec V3, Heltec V4, RAK WisBlock, Seeed Studio SenseCAP, etc)
 
 - [`meshcore`](https://pypi.org/project/meshcore/) Python library. (installed by install script)
 
@@ -31,6 +38,7 @@ The project also aims to be as easy as possible to configure on your RNS nodes. 
 ## Install Script (Install Option A)
 
 One liner command to install the interface (Linux only):
+
 `curl -fsSL https://raw.githubusercontent.com/afit21/Reticulum-Smart-MeshCore-Interface/main/install-interface.sh | bash`
 
 Update your RNS config file (see 'Configuration' section below)
@@ -47,7 +55,7 @@ cp Interface/SmartMeshCoreInterface.py ~/.reticulum/interfaces/SmartMeshCoreInte
 ```
 
 
-## Configuration
+## How to configure the MeshCore interface
 
 Add a block to `~/.reticulum/config`, under `[interfaces]`. A minimal real-world example. Please just use the reference config if you're not sure if your local MeshCore operators would be chill with you experimenting (serial-connected radio):
 
@@ -146,19 +154,19 @@ Please keep in mind that this project is in early stages. However, this interfac
 
 # Roadmap (in no particular order)
 
-- Airtime efficiency improvements - Always looking to optimise airtime usage
+- Airtime efficiency improvements - Always looking to optimize airtime usage
 
-- Dynamic airtime limiter (adjust airtime limit situationally)
+- Dynamic airtime limiter (adjust airtime limit based on traffic)
 
 - Improve security - Security so far has not been a focus.
 
-- Option to automatically update MeshCore companion settings to optimise for this interface
+- Option to automatically update MeshCore companion settings to optimize for this interface
 
 - Compatibility with other MeshCore interfaces - I'd like to make this interface automatically detect other popular MeshCore interfaces and translate our own direct transmits to be able to speak with them
 
-- Better accounting for radio conditions. This interface will adapt to radio conditions. More testing in the real world is required inorder to improve this capability.
+- Better accounting for radio conditions. This interface will adapt to radio conditions. More testing in the real world is required in-order to improve this capability.
 
-- Better compatability with LXMF clients other than MeshChat
+- Better comparability with LXMF clients other than MeshChat
 
 
 # Credits
@@ -183,11 +191,11 @@ Enable packet captures with:
 The capture file is named after your MeshCore node (`<node name>_capture_..._<timestamp>.jsonl`); set `packet_capture_label = <name>` to use a different label.
 Default location is; . ~/.reticulum/storage/meshcore_packet_capture/
 
-You can send these to me by opening an issue, discord at 'afit21', or my lxmf: d4c70c4b0a7e67265fa8982e36b43c05
+You can send these to me by opening an issue, discord at 'afit21', or my LXMF: d4c70c4b0a7e67265fa8982e36b43c05
 
 If you'd like to contribute code, feel free to fork this repo and open a pull request :)
 
-# Speed limited our of respect for MeshCore users
+# Speed limited out of respect for MeshCore users
 
 TLDR: Please Respect MeshCore Users (don't remove airtime limiters)
 
