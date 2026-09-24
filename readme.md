@@ -49,6 +49,7 @@ Reference config for a transfer node - by default, the interface will use the Me
     baudrate = 115200
     declares_upstream_rns = yes
     mode = access_point
+    #packet_capture_enabled = yes
 ```
 
 Reference config for a non-transfer node:
@@ -60,6 +61,7 @@ Reference config for a non-transfer node:
     transport = serial
     port = /dev/ttyUSB0 #Please verify this is your MeshCore radio
     baudrate = 115200
+    #packet_capture_enabled = yes
 ```
 
 Restart `rnsd` (or the app hosting your Reticulum instance) to pick it up. The full config surface (~140 options — retry budgets, timeouts, spacing tiers, duty cycle, RX-log behaviour, packet capture, etc.) is documented inline in the interface's own `_configure_*` methods. None of it is required; the defaults are what the field tests ran on.
