@@ -1171,6 +1171,78 @@ class _DirectSendMixin:
             pass
         return None, True
 
+    def _ack_after_echo_s(self, hop_count: Optional[int]) -> Optional[float]:
+        """How long the ACK wait runs once the first repeater's echo of the
+        frame has been heard (pass 1 item 1, 2026-09-25): `direct_ack_after_
+        echo_base` + `direct_ack_after_echo_per_hop` x hops, or None when
+        the echo deadline does not apply (disabled, zero or unknown hops --
+        no repeater, no echo). See the config's comment for the evidence."""
+        if not self.direct_ack_echo_deadline_enabled or hop_count is None or hop_count < 1:
+            return None
+        after_s = self.direct_ack_after_echo_base_s + self.direct_ack_after_echo_per_hop_s * hop_count
+        return after_s if after_s > 0 else None
+
+    async def _wait_for_ack_event_or_echo_deadline(
+        self, ack_filters: dict, timeout_s: float, cancel_event: "Optional[asyncio.Event]",
+        rx_window: dict, ack_wait_start: float, after_echo_s: Optional[float],
+    ):
+        """`_wait_for_ack_event`, but one continuous ACK wait whose end moves
+        in to `ack_wait_start + echo + after_echo_s` the moment the echo is
+        heard (pass 1 item 1, 2026-09-25) -- never later than `timeout_s`
+        from now. One subscription for the whole wait, so an ACK arriving
+        while the deadline moves cannot fall between two waits. Returns
+        `(ack_event_or_None, answered, echo_cut)`; `echo_cut` is True when
+        the moved deadline, not `timeout_s`, ended a wait with no ACK."""
+        if after_echo_s is None:
+            ack_event, answered = await self._wait_for_ack_event(ack_filters, timeout_s, cancel_event)
+            return ack_event, answered, False
+        if cancel_event is not None and cancel_event.is_set():
+            return None, True, False
+        loop = asyncio.get_running_loop()
+        end = time.monotonic() + timeout_s
+        full_end = end
+        ack_task = loop.create_task(self._mc_ready.wait_for_event(
+            self._EventType.ACK, attribute_filters=ack_filters, timeout=timeout_s,
+        ))
+        cancel_task = loop.create_task(cancel_event.wait()) if cancel_event is not None else None
+        echo_event = rx_window.get("echo_event")
+        echo_task = (loop.create_task(echo_event.wait())
+                     if echo_event is not None and not echo_event.is_set() else None)
+        result = (None, False, False)
+        try:
+            while True:
+                echo_s = rx_window.get("echo_seen_s")
+                if echo_s is not None:
+                    end = min(end, ack_wait_start + float(echo_s) + after_echo_s)
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    result = (None, False, end < full_end)
+                    break
+                waits = {ack_task}
+                if cancel_task is not None:
+                    waits.add(cancel_task)
+                if echo_task is not None and not echo_task.done():
+                    waits.add(echo_task)
+                done, _pending = await asyncio.wait(waits, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                if ack_task in done:
+                    ev = ack_task.result()
+                    result = (ev, False, False) if ev is not None else (None, False, False)
+                    break
+                if cancel_task is not None and cancel_task in done:
+                    result = (None, True, False)
+                    break
+                # The echo arrived (the loop moves the deadline) or the
+                # current deadline passed (the loop ends the wait).
+        finally:
+            for t in (ack_task, cancel_task, echo_task):
+                if t is not None and not t.done():
+                    t.cancel()
+            try:
+                await ack_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        return result
+
     def _ack_preempt_floor_s(self, peer_prefix: Optional[str], hop_count: Optional[int]) -> float:
         """How long a best-effort ANSWER/REPORT's ACK wait runs before a
         queued handshake may cut it (phase 1, 2026-09-20): the peer's
@@ -1270,8 +1342,14 @@ class _DirectSendMixin:
                 elif ack_timeout_source == "measured":
                     self._backoff_ack_rtt(peer_prefix, "missed ACK under measured timeout")
                 return ok, ok or ack_timeout_source != "measured", timeout_s, ack_timeout_source, ack_latency_s, None
+            # Pass 1 item 1 (2026-09-25): once the first repeater's echo is
+            # heard, the wait ends at echo + `_ack_after_echo_s` (never later
+            # than the ceiling above) -- see direct_ack_echo_deadline_enabled.
+            after_echo_s = self._ack_after_echo_s(hop_count)
+            echo_cut = False
             first_wait_s = hop1_abort_deadline_s if hop1_abort_deadline_s is not None else timeout_s
-            ack_event, answered = await self._wait_for_ack_event(ack_filters, first_wait_s, cancel_event)
+            ack_event, answered, echo_cut = await self._wait_for_ack_event_or_echo_deadline(
+                ack_filters, first_wait_s, cancel_event, rx_window, ack_wait_start, after_echo_s)
             aborted = False
             if answered:
                 # Phase 1 (2026-09-20): the reply this frame exists to elicit
@@ -1281,7 +1359,7 @@ class _DirectSendMixin:
                 # and `waited_full_timeout` False (no evidence about the path
                 # beyond the reply itself, which the receipt path recorded).
                 return True, False, timeout_s, "answered", None, hop1_abort_deadline_s
-            if ack_event is None and hop1_abort_deadline_s is not None:
+            if ack_event is None and hop1_abort_deadline_s is not None and not echo_cut:
                 # Audit refinement (2026-09-19, field evidence):
                 # the abort's premise -- and the reason
                 # `direct_hop1_abort_enabled`'s own comment says
@@ -1313,8 +1391,9 @@ class _DirectSendMixin:
                             f"itself was heard transmitting during the wait -- not silence, "
                             f"so waiting out the remaining ACK timeout instead of aborting."
                         )
-                    ack_event, answered = await self._wait_for_ack_event(
+                    ack_event, answered, echo_cut = await self._wait_for_ack_event_or_echo_deadline(
                         ack_filters, max(0.01, timeout_s - first_wait_s), cancel_event,
+                        rx_window, ack_wait_start, after_echo_s,
                     )
                     if answered:
                         return True, False, timeout_s, "answered", None, hop1_abort_deadline_s
@@ -1322,6 +1401,10 @@ class _DirectSendMixin:
             ack_timeout_s = hop1_abort_deadline_s if aborted else timeout_s
             if aborted:
                 ack_timeout_source = "hop1_abort"
+            elif not ok and echo_cut:
+                # The capture's ack_timeout_s is the wait actually used.
+                ack_timeout_s = round(float(rx_window["echo_seen_s"]) + after_echo_s, 3)
+                ack_timeout_source = "echo_deadline"
             if ok:
                 ack_latency_s = time.monotonic() - ack_wait_start
                 self._record_ack_rtt(peer_prefix, ack_latency_s)
@@ -1533,12 +1616,16 @@ class _DirectSendMixin:
                 # read with the lock held just before it is sent -- the
                 # caller's `hop_count` is the path of when the send started.
                 tx_path_hex, tx_hops = self._tx_path(peer_prefix)
+                # Pass 1 item 1 (2026-09-25): and it is that path's hop count
+                # the ACK wait, the echo deadline, the duty-cycle class and
+                # the miss diagnosis are sized for, not the send-start one.
+                ack_hops = tx_hops if tx_hops is not None else hop_count
                 rx_window = self._open_rx_log_window(target)
                 try:
                     sent = await self._send_direct_frame(
                         target, frame, attempt, time_critical=time_critical, gate_telemetry=gate_telemetry,
                         duty_cycle_exempt=self._duty_cycle_exempt(priority),
-                        hop_count=hop_count, peer_prefix=peer_prefix,
+                        hop_count=ack_hops, peer_prefix=peer_prefix,
                     )
                     ack_wait_start = time.monotonic()
                     rx_window["tx_at"] = ack_wait_start
@@ -1547,7 +1634,7 @@ class _DirectSendMixin:
 
                     (ok, waited_full_timeout, ack_timeout_s, ack_timeout_source,
                      ack_latency_s, hop1_abort_deadline_s) = await self._await_direct_ack(
-                        sent, peer_prefix, hop_count, rx_window, ack_wait_start, cancel_event=cancel_event,
+                        sent, peer_prefix, ack_hops, rx_window, ack_wait_start, cancel_event=cancel_event,
                         preemptible=preemptible, ack_timeout_max_s=ack_timeout_max_s,
                     )
                     preempted = ack_timeout_source == "preempted"
@@ -1590,8 +1677,8 @@ class _DirectSendMixin:
                 # captured; it only *chooses* the hold when rx_log_holds_
                 # enabled. Otherwise the flat ranges above still apply.
                 if rx_window["echo_seen_s"] is not None:
-                    self._record_echo(peer_prefix, hop_count, rx_window["echo_seen_s"])
-                miss_diagnosis = None if ok else self._diagnose_missed_ack(rx_window, hop_count)
+                    self._record_echo(peer_prefix, ack_hops, rx_window["echo_seen_s"])
+                miss_diagnosis = None if ok else self._diagnose_missed_ack(rx_window, ack_hops)
                 medium_busy_remaining_s = self._medium_busy_remaining_s()
                 listen_delay_s = self._post_attempt_listen_s(ok, miss_diagnosis)
                 if preempted:

@@ -47,6 +47,22 @@
   `tests/test_answer_report_class_0925.py`; `test_report_yield_between_parts_0921` re-pinned. No
   wire change, no default changed.
 
+- **Pass 1, item 1: a missed ACK through repeaters is given up on sooner** (2026-09-25). Through
+  repeaters the interface usually hears the first repeater forward its frame (the echo, about 2 s
+  after sending), and in every field capture to 2026-09-24 the ACK then arrived within 4.21 s at one
+  hop, 5.94 s at two and 7.54 s at three (2,337 ACKs). Waits after a miss ran to the hop cap: 8 / 11
+  / 14 s. Once the echo is heard the wait now ends at echo + 2.0 s + 2.5 s per hop (4.5 / 7 / 9.5 s
+  after it), never later than the cap. Replayed over every capture this ends 15-27 % of the waiting
+  on missed ACKs through repeaters sooner (two hops: 1.7-2.0 s per miss; three hops: about 5 s)
+  without cutting any ACK that arrived. A miss under it is captured as
+  `ack_timeout_source="echo_deadline"` and counts on the path scoreboard like a full-timeout miss. The
+  ACK wait, the echo deadline, the duty-cycle class (85 % zero hop / 30 % through repeaters) and the
+  miss diagnosis now use the hop count of the path the frame actually goes over (item 4), not the
+  one at the start of the send. New config keys `direct_ack_echo_deadline_enabled` (yes),
+  `direct_ack_after_echo_base` (2.0) and `direct_ack_after_echo_per_hop` (2.5). Regression test
+  `tests/test_echo_ack_deadline_0925.py` with `tests/fixtures/field_ack_after_echo_0925.json`;
+  shipped defaults and the golden snapshot re-pinned. No wire change.
+
 ## 0.1.0 (2026-09-24)
 
 The first release: the alpha 0.1.9 second-pass build (`35a6c22`), unchanged in behaviour, after its

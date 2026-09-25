@@ -5891,3 +5891,79 @@ goes before the holder resumes), and the old pin re-pinned the other way
 with a companion test that a QUERY still does not. No wire change, no
 default changed.
 
+**2026-09-25: pass 1, item 1 -- the echo deadline on the ACK wait.** User
+request (pass 1, "detect losses sooner"). The 2026-09-24 morning session
+spent 1,101 s waiting out ACKs that never came against 1,106 s receiving
+the ones that did; at two hops a miss waited a median of 10.1 s, 65 of 110
+of them on the firmware bound (the hop cap `direct_ack_timeout_base` 5 +
+`_per_hop` 3 s, or the firmware's suggestion under it). The plan was to let
+the measured estimate govern more often. It could not: that estimate is
+`direct_ack_rtt_timeout_multiplier` (2.0) x (srtt + 4 rttvar), and at two
+hops, with ACKs spread from 2 to 7 s, it is about 14 s -- above the cap --
+and after one miss the backoff puts the next wait on the cap anyway. A
+replay of the 0.1.7-0.1.9 captures' ACKs through the estimator saved 5 %
+of the two-hop miss waiting at multiplier 1.25 and 11 % at 1.0, the latter
+cutting 1.1 % of real ACKs. Nor could the cap move much: over every capture
+the slowest ACK was 4.50 s at zero hop, 6.84 at one, 8.98 at two and 9.24 at
+three, so a cap cutting none saves about 1.5 s per two-hop miss (and the
+7.5 s two-hop cap this pass first proposed, from the 2026-09-24 session's
+7.16 s maximum alone, would have cut real ACKs). What does separate is the
+time after the echo: once the first repeater's forward of the frame is
+heard (`rx_echo_seen_s`, median 1.9-2.0 s at one to three hops), the ACK
+followed within at most 4.21 s at one hop (1,162 ACKs with an echo),
+5.94 s at two (1,044) and 7.54 s at three (131) --
+`tests/fixtures/field_ack_after_echo_0925.json` keeps the ten largest per
+hop. `_await_direct_ack` now waits through
+`_wait_for_ack_event_or_echo_deadline`: one continuous ACK subscription
+(so an ACK cannot fall between two waits) raced against an `echo_event`
+the RX-log window sets with `echo_seen_s`; when it fires, the end moves in
+to echo + `_ack_after_echo_s(hops)` = `direct_ack_after_echo_base` 2.0 +
+`direct_ack_after_echo_per_hop` 2.5 x hops (4.5 / 7 / 9.5 s), never later
+than the ceiling. It applies in both halves of the hop-1-abort wait; an
+echo cut skips the abort branch (an echo was heard, so the abort's premise
+does not hold). A miss under it is `ack_timeout_source="echo_deadline"`
+with `ack_timeout_s` the wait actually used, `waited_full_timeout` True, and
+is in `PATH_ATTEMPT_MISS_SOURCES`: it ends only after the longest
+ACK-after-echo in the history, so it is as much evidence as the cap. Zero
+hop has no repeater and no echo, and is unchanged; so are preemptible
+ANSWER/REPORT waits (their own floor governs). Replayed over every
+capture: misses with an echo 313 / 689 / 151 at one / two / three hops, and
+15-27 % of the waiting on missed ACKs through repeaters ends sooner (1,085 /
+1,288 / 695 s; 3.7 / 2.0 / 4.9 s per shortened miss); the 2026-09-24
+morning two-hop stop: 118 of 768 s. With item 4's `_tx_path` in place, the
+ACK wait, the echo deadline, `_send_direct_frame`'s duty-cycle class (the
+85 % zero-hop against the 30 % multi-hop cap), `_record_echo` and
+`_diagnose_missed_ack` now take the hop count of the path the frame
+actually goes over (`ack_hops`), not the send-start one. Config (in
+`_configure_peer_discovery` beside the other ACK keys):
+`direct_ack_echo_deadline_enabled` yes, `direct_ack_after_echo_base` 2.0,
+`direct_ack_after_echo_per_hop` 2.5, tuned for SF7/BW62.5/CR8 like every
+absolute second here; `tests/test_shipped_defaults.py` and
+`tests/golden/config_defaults.json` re-pinned. Tests:
+`tests/test_echo_ack_deadline_0925.py` (the allowance per hop, disabled,
+the fixture's ACKs all inside it, the miss source; the deadline moving on
+the echo, an ACK inside it received, no echo waits the ceiling, a late
+echo changes nothing; `_await_direct_ack` returning `echo_deadline` with
+the used wait). No wire change. readme may need updating: three new
+config keys.
+
+**2026-09-25: pass 1, item 2 (path finding) -- not implemented.** User
+request: stop re-trying a path that has never worked, from this pass's
+reading that the one-hop path `19` to the laptop went 0 for 22 on
+2026-09-24. That reading was per interface run on that day only: the
+2026-09-23 evening laptop delivered 53 of 94 and 51 of 114 one-hop attempts
+over `19` from where it was then. On 2026-09-24 `19` was trialled once per
+run (the morning laptop 09:04, eight misses; the afternoon laptop 16:04,
+seven), each its first try in that process, and once again by the desktop
+at 16:54, eight minutes after five misses at 16:46, re-opened by the
+120 s cooldown with an unknown measured rate. A "never delivered in this
+process" hold (after `path_switch_after_misses` misses, lifted by fresh
+evidence or the sample window, never on the last eligible candidate) was
+written and tested, and withdrawn: in the one re-trial it could touch, no
+other candidate was eligible (the laptop's radio had dropped out at
+16:42), so the last-candidate rule let `19` through anyway, and without
+that rule the alternative is a discovery flood. It would have changed no
+recorded decision. Left open for the owner: whether a stale candidate
+should be trialled before discovery (the handover's open question), which
+needs a counting row first.
+

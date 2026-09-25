@@ -28,7 +28,13 @@ decisions, cache restores, feature availability notes) moved to DEBUG so
 rnsd's log shows only connection state, identity, radio and channel
 setup, peers binding and expiring, and packet capture; the update script
 installs from `main` and `update-interface-dev.sh` from `development`.
-No wire change -- alpha 0.1.9 and 0.1.0 nodes interoperate. Alpha 0.1.9
+No wire change -- alpha 0.1.9 and 0.1.0 nodes interoperate. Since the
+release, on `development` (2026-09-25, pass 1): through repeaters, a
+missed ACK is given up on at the first repeater's echo + 2.0 s + 2.5 s
+per hop instead of the hop cap (new keys `direct_ack_echo_deadline_enabled`
+yes, `direct_ack_after_echo_base` 2.0, `direct_ack_after_echo_per_hop`
+2.5); every attempt is labelled, scored and timed by the path it actually
+went over; and a QUERY's ANSWER takes the report lock class. Alpha 0.1.9
 was alpha 0.1.8 plus the corrections its own first
 field session, 2026-09-23, asked for: a completion report that was skipped
 because RNS's PROOF replaces it now counts as reported, so the parity

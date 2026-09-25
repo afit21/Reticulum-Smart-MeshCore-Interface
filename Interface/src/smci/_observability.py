@@ -687,6 +687,7 @@ class _ObservabilityMixin:
             "target_hash_byte": (target or "")[:2].lower() or None,
             "expected_ack": None,         # hex, set once MSG_SENT returns it
             "echo_seen_s": None,          # our own frame re-heard (repeater forwarded it)
+            "echo_event": asyncio.Event(),  # set with echo_seen_s: shortens the ACK wait (pass 1 item 1)
             "echo_path_len": None,
             "ack_seen_on_air_s": None,    # bare ACK with our expected_ack code
             "path_reply_seen_s": None,    # PATH from target to us (the flood-mode ACK carrier)
@@ -732,6 +733,8 @@ class _ObservabilityMixin:
             if w["echo_seen_s"] is None:
                 w["echo_seen_s"] = t
                 w["echo_path_len"] = fields.get("path_len")
+                if w.get("echo_event") is not None:
+                    w["echo_event"].set()
             return
         if (
             ptype == self._RX_LOG_PAYLOAD_TYPE_PATH

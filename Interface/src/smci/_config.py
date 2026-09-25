@@ -1317,6 +1317,21 @@ class _ConfigMixin:
         # RTO backoff), still never above the firmware value, and the next
         # real ACK resets it. <= 1 restores the discard behaviour.
         self.direct_ack_rtt_miss_backoff = float(cfg.get("direct_ack_rtt_miss_backoff", 2.0))
+        # Pass 1 item 1 (2026-09-25): the echo deadline. Through repeaters,
+        # once this radio hears the first repeater forward its frame (the
+        # echo, median 1.9-2.0 s after the send at one to three hops), the
+        # ACK follows within a much tighter window than the whole wait: in
+        # every field capture to 2026-09-24, ACK time after the echo was at
+        # most 4.21 s at one hop (1,162 ACKs), 5.94 s at two (1,044) and
+        # 7.54 s at three (131), against caps of 8 / 11 / 14 s. So once the
+        # echo is heard the wait ends at echo + base + per_hop x hops
+        # (4.5 / 7 / 9.5 s after it) -- never later than the cap, and above
+        # every ACK in the history. A miss under it is path evidence like a
+        # full-timeout miss ("echo_deadline" is in PATH_ATTEMPT_MISS_SOURCES).
+        # Tuned for SF7/BW62.5/CR8. Zero hop has no echo and is unchanged.
+        self.direct_ack_echo_deadline_enabled = _cfg_bool(cfg.get("direct_ack_echo_deadline_enabled", "yes"))
+        self.direct_ack_after_echo_base_s = float(cfg.get("direct_ack_after_echo_base", 2.0))
+        self.direct_ack_after_echo_per_hop_s = float(cfg.get("direct_ack_after_echo_per_hop", 2.5))
 
     def _configure_observability(self, cfg):
         # Per-interface debug logging, independent of RNS core's global

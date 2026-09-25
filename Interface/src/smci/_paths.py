@@ -35,7 +35,10 @@ PATH_EXHAUST_MISSES = 8
 # "answered", "answered_before_send", "expired" and "noack" (a no-ACK frame
 # has no outcome at all). "hop1_abort" IS included deliberately: its premise
 # is silence where a forward was due, which is exactly a path failure.
-PATH_ATTEMPT_MISS_SOURCES = ("firmware", "hop1_abort")
+# "echo_deadline" (pass 1 item 1, 2026-09-25) too: it ends the wait only
+# after the longest ACK-after-echo time in the field history, so a miss under
+# it is as much evidence as one under the cap it shortens.
+PATH_ATTEMPT_MISS_SOURCES = ("firmware", "hop1_abort", "echo_deadline")
 
 
 class _PathDiscoveryMixin:
