@@ -5967,3 +5967,22 @@ recorded decision. Left open for the owner: whether a stale candidate
 should be trialled before discovery (the handover's open question), which
 needs a counting row first.
 
+**2026-09-25: pass 1 -- verification.** Full unit suite on `beee499`
+(items 4, 3 and 1): 583 tests, OK. MeshBench on RNS 1.5.4, the eight
+scenarios of `2026-09-24-meshbench-ac637dd.md` plus `three_hop` and
+`page_transfer_bidir`, seeds 7 and 11 (`tests/baselines/2026-09-25-meshbench-beee499.md`):
+16 of 20 PASS. `large_payload-s7` (A never bound its peer; every send a
+CHANNEL bootstrap) and `shortcut_appears-s7` (probes never started) were
+bring-up failures untouched by this pass and PASSed on re-run.
+`page_transfer_bidir` failed both seeds (0/3), as on every build since
+alpha 0.1.7; links inside 15 s 50 % against 0 %. Against ac637dd:
+`two_hop` 81 % delivered, RTT median 9.1 s (69 %, 21.2 s); `relay` 100 %
+(81 %); `repeater_returns` 54 %, RTT 5.8 s (67 %, 14.2 s); the rest inside
+the reference's spread -- two runs each, a direction only. The echo
+deadline ended 79 missed-ACK waits (50 / 6 / 23 at one / two / three
+hops), about 137 s against the hop cap, with no ACK seen on air in the
+post-attempt window of any. Next: a field session, read with
+`field_ab_compare.py` against 2026-09-24 (`fieldtests/raw/Alpha0.1.9/`):
+the two-hop missed-ACK timeout row, the new relabelled-attempt and
+PATH_UPDATE rows, and any ACK heard after an `echo_deadline` miss.
+
