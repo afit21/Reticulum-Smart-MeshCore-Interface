@@ -2255,6 +2255,16 @@ class _ReconcileMixin:
             )
         )
 
+    # Pass 1 item 3 (2026-09-25): the frames that take the radio lock in the
+    # REPORT class (alpha 0.1.5 item 6), which a raw window yields to
+    # between its parts, during its report wait and during a QUERY's quiet
+    # hold. A QUERY's ANSWER joins the REPORT: both are what the far sender
+    # is waiting on before it re-sends, both are one short frame, and the
+    # 2026-09-24 morning captures had ANSWERs waiting 13 s (laptop) and
+    # 42 s (desktop) behind this node's own raw bursts while the querier's
+    # answer budget ran out.
+    REPORT_CLASS_KINDS = ("completion_report", "completion_answer")
+
     async def _send_completion_answer(
         self, sender_token: str, pkt_id: int, frag_total: int, complete: bool,
         held: "Optional[set]" = None, version: Optional[int] = None,
@@ -2381,7 +2391,9 @@ class _ReconcileMixin:
                     # queued Link handshake may cut this ACK wait once the
                     # peer's expected ACK time has passed.
                     preemptible=True,
-                    report=report,
+                    # Pass 1 item 3 (2026-09-25): an ANSWER takes the lock
+                    # in the report class too (see REPORT_CLASS_KINDS).
+                    report=True,
                     ack_timeout_max_s=ack_max_s,
                 )
                 if ok:

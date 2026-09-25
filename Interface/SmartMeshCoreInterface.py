@@ -2892,6 +2892,7 @@ class _ObservabilityMixin:
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
         proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
         proof_tail_hold_s: Optional[float] = None,
+        path_hex: Optional[str] = None, hop_count_at_send_start: Optional[int] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -2921,6 +2922,12 @@ class _ObservabilityMixin:
         (`_send_direct_packet`/`_send_direct_supplement`) already had in
         hand, not re-looked-up here; `None` if no path was resolved yet
         (e.g. this attempt is itself part of establishing one).
+        Since pass 1 item 4 (2026-09-25) a text frame's `hop_count` and
+        `path_hex` are the path it actually went over (`_tx_path`, read
+        with the radio lock held just before sending), and
+        `hop_count_at_send_start` is the caller's value described above;
+        they differ when a path trial or a firmware PATH_UPDATE moved the
+        contact mid-send.
 
         `time_critical`/`quiet_defer_wait_s`/`duty_cycle_wait_s`/
         `pass_number` (2026-09-18, user-requested field-tuning data,
@@ -2963,6 +2970,8 @@ class _ObservabilityMixin:
             "frag_total": frag_total,
             "listen_delay_s": round(listen_delay_s, 3) if listen_delay_s is not None else None,
             "hop_count": hop_count,
+            "path_hex": path_hex,
+            "hop_count_at_send_start": hop_count_at_send_start,
             "time_critical": time_critical,
             "pass_number": pass_number,
             "quiet_defer_wait_s": round(quiet_defer_wait_s, 3) if quiet_defer_wait_s is not None else None,
@@ -6250,6 +6259,64 @@ class _PathDiscoveryMixin:
             self._path_boards[peer_prefix] = board
         return board
 
+    def _tx_path(self, peer_prefix: Optional[str]) -> "tuple[Optional[str], Optional[int]]":
+        """The path a text frame to `peer_prefix` goes over if it is sent
+        now, as (path hex, hops) -- (None, None) when nothing is known
+        (pass 1 item 4, 2026-09-25).
+
+        Text frames ("R" and "Q") are routed by the path stored on the
+        device contact, not by anything the frame carries, so the answer
+        is what `_select_path` last set there (`device_path`), falling back
+        to `_resolved_paths` when that is unknown (path selection off, a
+        failed `change_contact_path`, or a firmware PATH_UPDATE since --
+        `_on_path_update`). Read with the radio lock held, just before the
+        frame is sent: the caller's `hop_count` is the path resolved when
+        the SEND started, and another send's `_select_path` can move the
+        contact to a trial path while this one is still retrying. The
+        2026-09-24 captures had attempts labelled hop 1 whose own echo came
+        back at path length 3."""
+        if not peer_prefix:
+            return None, None
+        board = self._path_boards.get(peer_prefix)
+        resolved = self._resolved_paths.get(peer_prefix)
+        if board is not None and board.device_path is not None:
+            cand = board.candidates.get(board.device_path)
+            if cand is not None:
+                return cand.path_hex, cand.hops
+            if resolved is not None and (resolved.out_path_hex or "").lower() == board.device_path:
+                return board.device_path, resolved.out_path_len
+        if resolved is not None:
+            return (resolved.out_path_hex or "").lower(), resolved.out_path_len
+        return None, None
+
+    def _on_path_update(self, event) -> None:
+        """The firmware's PATH_UPDATE push (pass 1 item 4, 2026-09-25): it
+        rewrote a contact's stored path on its own -- a path returned after
+        a flood-routed send. The interface never subscribed to this, so
+        `device_path` kept naming the path `_select_path` had set while
+        text frames went over the firmware's, and every attempt was
+        labelled and scored against the wrong path. The new path's bytes
+        are not in the event, so this only marks the contact's path
+        unknown: the next `_select_path` puts the scoreboard's choice back
+        (the one place that decides stays the one place), and the capture
+        says it happened."""
+        try:
+            payload = event.payload if isinstance(getattr(event, "payload", None), dict) else {}
+            key = str(payload.get("public_key") or "").lower()
+            if len(key) < self.BIND_PUBKEY_PREFIX_BYTES * 2:
+                return
+            peer_prefix = key[:self.BIND_PUBKEY_PREFIX_BYTES * 2]
+            board = self._path_boards.get(peer_prefix)
+            if board is None:
+                return
+            previous = board.device_path
+            board.device_path = None
+            if self._packet_capture_file is not None:
+                self._capture_event("in", {"event": "contact_path_changed", "peer_prefix": peer_prefix,
+                                           "previous_device_path": previous})
+        except Exception as exc:
+            RNS.log(f"{self}: PATH_UPDATE handling failed: {exc}", RNS.LOG_WARNING)
+
     def _path_view(self, cand: "_PathCandidate") -> dict:
         return {
             "path_hex": cand.path_hex, "hops": cand.hops, "samples": list(cand.samples), "snr": cand.snr,
@@ -6357,7 +6424,8 @@ class _PathDiscoveryMixin:
         return int(resolved.out_path_len), rate
 
     def _note_path_attempt_result(self, peer_prefix: Optional[str], ok: bool, waited_full_timeout: bool,
-                                  ack_timeout_source: str, ack_latency_s: Optional[float] = None) -> None:
+                                  ack_timeout_source: str, ack_latency_s: Optional[float] = None,
+                                  tx_path_hex: Optional[str] = None) -> None:
         """One ATTEMPT's outcome on the path it went over (alpha 0.1.9,
         item 4). Moves `consecutive_misses` only: the delivery-rate samples
         stay one per send.
@@ -6419,8 +6487,11 @@ class _PathDiscoveryMixin:
                 return          # no real ACK came back: not evidence either way
         elif not (waited_full_timeout and ack_timeout_source in PATH_ATTEMPT_MISS_SOURCES):
             return
+        # Pass 1 item 4 (2026-09-25): the path the frame actually went over
+        # (`_tx_path`, read when it was sent), else the resolved one.
         resolved = self._resolved_paths.get(peer_prefix)
-        path_hex = (resolved.out_path_hex or "").lower() if resolved is not None else None
+        path_hex = tx_path_hex if tx_path_hex is not None else (
+            (resolved.out_path_hex or "").lower() if resolved is not None else None)
         # Alpha 0.1.9, second pass (item 1): "" IS a path -- the zero-hop
         # one -- so only a missing resolved path returns here. The first
         # pass wrote `if not path_hex`, which dropped every zero-hop attempt
@@ -8315,6 +8386,10 @@ class _DirectSendMixin:
                 send_cmd_latency_s = None
                 hop1_abort_deadline_s = None
                 ack_done_at = None
+                # Pass 1 item 4 (2026-09-25): the path this frame goes over,
+                # read with the lock held just before it is sent -- the
+                # caller's `hop_count` is the path of when the send started.
+                tx_path_hex, tx_hops = self._tx_path(peer_prefix)
                 rx_window = self._open_rx_log_window(target)
                 try:
                     sent = await self._send_direct_frame(
@@ -8486,11 +8561,14 @@ class _DirectSendMixin:
                 # QUERY/ANSWER sends that bypass `_send_direct_with_attempts`
                 # and were therefore never counted at all.
                 self._note_path_attempt_result(peer_prefix, ok, waited_full_timeout,
-                                               ack_timeout_source, ack_latency_s=ack_latency_s)
+                                               ack_timeout_source, ack_latency_s=ack_latency_s,
+                                               tx_path_hex=tx_path_hex)
                 self._capture_direct_attempt_result(
                     peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,
-                    hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
+                    hop_count=tx_hops if tx_hops is not None else hop_count,
+                    time_critical=time_critical, pass_number=pass_number,
+                    path_hex=tx_path_hex, hop_count_at_send_start=hop_count,
                     quiet_defer_wait_s=gate_telemetry.get("quiet_defer_wait_s"),
                     duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
                     duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
@@ -8502,7 +8580,7 @@ class _DirectSendMixin:
                     proof_tail_hold_s=proof_tail_hold_s, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
-                    on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)
+                    on_air_bytes=(self._text_frame_on_air_bytes(frame, (tx_hops if tx_hops is not None else hop_count) or 0)
                                   if send_exc is None else None),
                 )
                 if send_exc is not None:
@@ -8518,7 +8596,8 @@ class _DirectSendMixin:
                     # this frame is the last frame received over the path
                     # it went on -- its signal is the candidate's.
                     _r = self._resolved_paths.get(peer_prefix)
-                    self._note_path_signal(peer_prefix, _r.out_path_hex if _r is not None else None,
+                    self._note_path_signal(peer_prefix, tx_path_hex if tx_path_hex is not None else (
+                                               _r.out_path_hex if _r is not None else None),
                                            rx_window.get("ack_snr"), rx_window.get("ack_rssi"))
                 return ok, waited_full_timeout
         finally:
@@ -8559,8 +8638,10 @@ class _DirectSendMixin:
         try:
             # Item 6 (alpha 0.1.5): a completion REPORT queues as the report
             # class, which a raw window this node is sending yields to
-            # between two of its parts (`_run_raw_window_rounds`).
-            async with self._direct_exchange_lock(priority, report=(kind == "completion_report")):
+            # between two of its parts (`_run_raw_window_rounds`). Pass 1
+            # item 3 (2026-09-25): so does a QUERY's ANSWER -- see
+            # `_send_completion_answer`.
+            async with self._direct_exchange_lock(priority, report=kind in self.REPORT_CLASS_KINDS):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 gate_telemetry: dict = {}
@@ -10944,6 +11025,16 @@ class _ReconcileMixin:
             )
         )
 
+    # Pass 1 item 3 (2026-09-25): the frames that take the radio lock in the
+    # REPORT class (alpha 0.1.5 item 6), which a raw window yields to
+    # between its parts, during its report wait and during a QUERY's quiet
+    # hold. A QUERY's ANSWER joins the REPORT: both are what the far sender
+    # is waiting on before it re-sends, both are one short frame, and the
+    # 2026-09-24 morning captures had ANSWERs waiting 13 s (laptop) and
+    # 42 s (desktop) behind this node's own raw bursts while the querier's
+    # answer budget ran out.
+    REPORT_CLASS_KINDS = ("completion_report", "completion_answer")
+
     async def _send_completion_answer(
         self, sender_token: str, pkt_id: int, frag_total: int, complete: bool,
         held: "Optional[set]" = None, version: Optional[int] = None,
@@ -11070,7 +11161,9 @@ class _ReconcileMixin:
                     # queued Link handshake may cut this ACK wait once the
                     # peer's expected ACK time has passed.
                     preemptible=True,
-                    report=report,
+                    # Pass 1 item 3 (2026-09-25): an ANSWER takes the lock
+                    # in the report class too (see REPORT_CLASS_KINDS).
+                    report=True,
                     ack_timeout_max_s=ack_max_s,
                 )
                 if ok:
@@ -13176,6 +13269,8 @@ class _RoutingMixin:
         self._mc_ready.subscribe(self._EventType.CONTACT_MSG_RECV, self._on_contact_msg_recv)
         if hasattr(self._EventType, "RAW_DATA"):
             self._mc_ready.subscribe(self._EventType.RAW_DATA, self._on_raw_data)
+        if hasattr(self._EventType, "PATH_UPDATE"):
+            self._mc_ready.subscribe(self._EventType.PATH_UPDATE, self._on_path_update)
         self._subscribe_rx_log_events()
 
     def _on_raw_data(self, event) -> None:

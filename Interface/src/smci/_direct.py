@@ -1529,6 +1529,10 @@ class _DirectSendMixin:
                 send_cmd_latency_s = None
                 hop1_abort_deadline_s = None
                 ack_done_at = None
+                # Pass 1 item 4 (2026-09-25): the path this frame goes over,
+                # read with the lock held just before it is sent -- the
+                # caller's `hop_count` is the path of when the send started.
+                tx_path_hex, tx_hops = self._tx_path(peer_prefix)
                 rx_window = self._open_rx_log_window(target)
                 try:
                     sent = await self._send_direct_frame(
@@ -1700,11 +1704,14 @@ class _DirectSendMixin:
                 # QUERY/ANSWER sends that bypass `_send_direct_with_attempts`
                 # and were therefore never counted at all.
                 self._note_path_attempt_result(peer_prefix, ok, waited_full_timeout,
-                                               ack_timeout_source, ack_latency_s=ack_latency_s)
+                                               ack_timeout_source, ack_latency_s=ack_latency_s,
+                                               tx_path_hex=tx_path_hex)
                 self._capture_direct_attempt_result(
                     peer_prefix, attempt, ok, queue_depth_at_acquire, lock_wait_s, ack_timeout_s,
                     pkt_id=pkt_id, frag_idx=frag_idx, frag_total=frag_total, listen_delay_s=listen_delay_s,
-                    hop_count=hop_count, time_critical=time_critical, pass_number=pass_number,
+                    hop_count=tx_hops if tx_hops is not None else hop_count,
+                    time_critical=time_critical, pass_number=pass_number,
+                    path_hex=tx_path_hex, hop_count_at_send_start=hop_count,
                     quiet_defer_wait_s=gate_telemetry.get("quiet_defer_wait_s"),
                     duty_cycle_wait_s=gate_telemetry.get("duty_cycle_wait_s"),
                     duty_cycle_ledger=gate_telemetry.get("duty_cycle_ledger"),
@@ -1716,7 +1723,7 @@ class _DirectSendMixin:
                     proof_tail_hold_s=proof_tail_hold_s, hop1_abort_deadline_s=hop1_abort_deadline_s,
                     duty_cycle_exempt=bool(gate_telemetry.get("duty_cycle_exempt", False)),
                     quiet_hold_s=quiet_hold_s,
-                    on_air_bytes=(self._text_frame_on_air_bytes(frame, hop_count or 0)
+                    on_air_bytes=(self._text_frame_on_air_bytes(frame, (tx_hops if tx_hops is not None else hop_count) or 0)
                                   if send_exc is None else None),
                 )
                 if send_exc is not None:
@@ -1732,7 +1739,8 @@ class _DirectSendMixin:
                     # this frame is the last frame received over the path
                     # it went on -- its signal is the candidate's.
                     _r = self._resolved_paths.get(peer_prefix)
-                    self._note_path_signal(peer_prefix, _r.out_path_hex if _r is not None else None,
+                    self._note_path_signal(peer_prefix, tx_path_hex if tx_path_hex is not None else (
+                                               _r.out_path_hex if _r is not None else None),
                                            rx_window.get("ack_snr"), rx_window.get("ack_rssi"))
                 return ok, waited_full_timeout
         finally:
@@ -1773,8 +1781,10 @@ class _DirectSendMixin:
         try:
             # Item 6 (alpha 0.1.5): a completion REPORT queues as the report
             # class, which a raw window this node is sending yields to
-            # between two of its parts (`_run_raw_window_rounds`).
-            async with self._direct_exchange_lock(priority, report=(kind == "completion_report")):
+            # between two of its parts (`_run_raw_window_rounds`). Pass 1
+            # item 3 (2026-09-25): so does a QUERY's ANSWER -- see
+            # `_send_completion_answer`.
+            async with self._direct_exchange_lock(priority, report=kind in self.REPORT_CLASS_KINDS):
                 lock_wait_s = time.monotonic() - wait_start
                 queue_depth_at_acquire = self._direct_exchange_queue_depth
                 gate_telemetry: dict = {}

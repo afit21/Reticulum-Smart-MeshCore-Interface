@@ -1649,6 +1649,8 @@ class _RoutingMixin:
         self._mc_ready.subscribe(self._EventType.CONTACT_MSG_RECV, self._on_contact_msg_recv)
         if hasattr(self._EventType, "RAW_DATA"):
             self._mc_ready.subscribe(self._EventType.RAW_DATA, self._on_raw_data)
+        if hasattr(self._EventType, "PATH_UPDATE"):
+            self._mc_ready.subscribe(self._EventType.PATH_UPDATE, self._on_path_update)
         self._subscribe_rx_log_events()
 
     def _on_raw_data(self, event) -> None:

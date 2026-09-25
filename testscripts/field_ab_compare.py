@@ -66,7 +66,10 @@ WHAT IS COMPARED (per set, per hop, with n)
                  completed (`direct_send_result ok=true`, `size_bytes`). The headline metric of that
                  pass, lower is better; the MeshBench ledger (`meshbench_report.py`) is the
                  all-nodes equivalent. Captures without `on_air_bytes` print the ratio with a '~'.
-  stale paths    `direct_send_result` failures and consecutive-failure triples (the stale-path reset trigger)
+  stale paths    `direct_send_result` failures and consecutive-failure triples (the stale-path reset trigger);
+                 since 2026-09-25 (pass 1 item 4) the attempts whose text frame went over another path than
+                 the send started on (`hop_count` != `hop_count_at_send_start`) and the firmware
+                 PATH_UPDATEs (`contact_path_changed`)
   path decisions `path_selected` records per node; the longest run of consecutive counted misses
                  (`firmware` / `hop1_abort`) on one path per hop count and what ended it; and the
                  decisions that chose a path and got zero successes before the next one (count,
@@ -219,6 +222,14 @@ def analyse_set(recs: list, hop_filter=None, radio=(7, 62.5, 8)) -> dict:
             if streak[peer] == 3:
                 triples += 1
     out["fail_triples"] = triples
+    # Pass 1 item 4 (2026-09-25): attempts whose text frame went over a
+    # different path than the send started on (a trial or a firmware
+    # PATH_UPDATE moved the contact mid-send), and the PATH_UPDATEs. Builds
+    # before 2026-09-25 have no `hop_count_at_send_start`: counted as None.
+    labelled = [r for r in att if "hop_count_at_send_start" in r]
+    out["relabelled"] = (sum(1 for r in labelled if r.get("hop_count") != r.get("hop_count_at_send_start")),
+                         len(labelled)) if labelled else None
+    out["contact_path_changed"] = sum(1 for r in recs if r.get("event") == "contact_path_changed")
     # part time per pkt_id (first raw fragment -> known complete), by hop.
     # Alpha 0.1.9 (item 5): keyed by CAPTURE FILE as well as node. pkt_id is
     # per-process and restarts from 0, so a node that restarted mid-session
@@ -921,6 +932,9 @@ def print_comparison(sets: dict, min_n: int) -> None:
     row("unknown_dest_backoff_drop (near PROOFs)", [f"{s['backoff_drops']} ({s['backoff_drops_near_proofs']})" for s in sets.values()])
     row("direct sends ok / failed", [f"{s['send_ok']} / {s['send_fail']}" for s in sets.values()])
     row("failure triples (stale-path reset trigger)", [s["fail_triples"] for s in sets.values()])
+    row("attempts on another path than the send started on",
+        [f"{s['relabelled'][0]} of {s['relabelled'][1]}" if s.get("relabelled") else "- (older build)" for s in sets.values()])
+    row("firmware PATH_UPDATEs (contact_path_changed)", [s.get("contact_path_changed", 0) for s in sets.values()])
     # Alpha 0.1.9, second pass (item 5): 2026-09-23 evening, session 2's
     # laptop ran 144 zero-hop misses with no decision; session 1's desktop
     # had 16 decisions that never delivered (84 attempts, 626 s).

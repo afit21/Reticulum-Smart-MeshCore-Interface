@@ -329,6 +329,7 @@ class _ObservabilityMixin:
         quiet_hold_s: Optional[float] = None, on_air_bytes: Optional[int] = None,
         proof_age_s: Optional[float] = None, proof_fresh: Optional[bool] = None,
         proof_tail_hold_s: Optional[float] = None,
+        path_hex: Optional[str] = None, hop_count_at_send_start: Optional[int] = None,
     ) -> None:
         """User-requested observability addition (2026-09-15, post-alpha-
         0.1.0 2-hop field test): one record per individual DIRECT send
@@ -358,6 +359,12 @@ class _ObservabilityMixin:
         (`_send_direct_packet`/`_send_direct_supplement`) already had in
         hand, not re-looked-up here; `None` if no path was resolved yet
         (e.g. this attempt is itself part of establishing one).
+        Since pass 1 item 4 (2026-09-25) a text frame's `hop_count` and
+        `path_hex` are the path it actually went over (`_tx_path`, read
+        with the radio lock held just before sending), and
+        `hop_count_at_send_start` is the caller's value described above;
+        they differ when a path trial or a firmware PATH_UPDATE moved the
+        contact mid-send.
 
         `time_critical`/`quiet_defer_wait_s`/`duty_cycle_wait_s`/
         `pass_number` (2026-09-18, user-requested field-tuning data,
@@ -400,6 +407,8 @@ class _ObservabilityMixin:
             "frag_total": frag_total,
             "listen_delay_s": round(listen_delay_s, 3) if listen_delay_s is not None else None,
             "hop_count": hop_count,
+            "path_hex": path_hex,
+            "hop_count_at_send_start": hop_count_at_send_start,
             "time_critical": time_critical,
             "pass_number": pass_number,
             "quiet_defer_wait_s": round(quiet_defer_wait_s, 3) if quiet_defer_wait_s is not None else None,

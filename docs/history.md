@@ -5826,3 +5826,68 @@ spread of the start, that a new interface counts on from it and wraps, and
 the restart collision rate. Full suite: 567 tests, OK. MeshBench `zero_hop`
 PASS 7/8 (RTT med 2.25 s), inside the latest baseline's range; A's
 fragmented sends carried pkt_ids from 34230.
+
+**2026-09-25: pass 1, item 4 -- an attempt is labelled and scored by the
+path it went over.** User request: the first of the four pass 1 items
+("detect losses sooner, path finding, parity"; this one is the
+measurement fix the other three are judged by). Text frames ("R", "Q") are
+routed by the device contact's stored path. `direct_attempt_result.hop_count`
+was the `out_path_len` the caller resolved when the SEND started, threaded
+down unchanged, and `_note_path_attempt_result` credited
+`_resolved_paths[peer]` when the attempt ENDED. Two things move the
+contact in between: another queued send's `_select_path` setting a trial
+path (it runs before that send waits for the radio lock, so while an
+earlier send is still retrying), and the firmware itself -- MeshCore's
+`onContactPathRecv` overwrites a contact's `out_path` when a path comes
+back after a flood-routed send and pushes PATH_UPDATE, an event the
+interface never subscribed to, so `device_path` went on naming the path
+`_select_path` had set. The 2026-09-24 captures show attempts labelled
+hop 1 whose own echo (`rx_echo_path_len`) came back at 3, and the
+0.1.9 handover listed the stale label as open. `_tx_path(peer)` now
+answers "which path does a text frame take if sent now": the contact's
+`device_path` when known, looked up on the scoreboard for its hop count,
+else the resolved path. `_send_direct_frame_and_wait_for_ack` reads it
+with the lock held, just before `_send_direct_frame`, and uses it for the
+capture (`hop_count`, new `path_hex`, and the caller's value kept as
+`hop_count_at_send_start`), the on-air byte count, the attempt's miss
+count and the ACK's signal sample. The ACK wait and the duty-cycle
+estimate still use the caller's `hop_count`: those are behaviour, and the
+ACK wait is item 1's. `_on_path_update` handles the firmware push: it
+sets the contact's `device_path` to unknown (the event carries only the
+key, not the new path), so `_tx_path` falls back to the resolved path
+and the next `_select_path` re-applies the scoreboard's choice -- the one
+place that decides stays the one place -- and captures
+`contact_path_changed`. `field_ab_compare.py` has two new rows under
+"backoff and stale paths": attempts whose frame went over another path
+than the send started on, and PATH_UPDATEs; older captures print "older
+build". `tests/test_tx_path_label_0925.py` pins the rule, a mid-send trial
+relabelling and re-crediting an attempt, and the PATH_UPDATE handling.
+No wire change, no default changed.
+
+**2026-09-25: pass 1, item 3 -- a QUERY's ANSWER takes the report lock
+class.** User request (pass 1). Reading the 2026-09-24 morning captures
+for how long sends queued for the radio lock (1,314 s over the session),
+the waiting done behind this node's own raw bursts was mostly not by
+ordinary packets (about 48 s in five hours) but by the reconcile control
+frames: the desktop's QUERYs 206 s (three waits, one of 99 s), ANSWERs
+42 s on the desktop and 13 s on the laptop. Alpha 0.1.5's item 6 gave the
+completion REPORT a lock class of its own that a raw window yields to
+between parts (`_run_raw_window_rounds`), during its report wait
+(`_await_completion_report`, `also_reports=True`) and during a QUERY's
+quiet hold, because the far sender is stalled on it; an ANSWER is the
+same case -- the querier waits on it for a few seconds before it
+re-drives -- and had been deliberately left out
+(`test_report_yield_between_parts_0921`, "a QUERY ANSWER does not"). It
+is now in: `REPORT_CLASS_KINDS = ("completion_report",
+"completion_answer")` sets the class in `_send_direct_noack_frame` (the
+default carrier) and `_send_completion_answer` passes `report=True` on
+the acknowledged one. The risk is the one reports already carry: a frame
+keyed into a burst's gap while the first repeater relays. The QUERY waits
+are left for later: a QUERY about an earlier window stuck behind a later
+window to the same peer is an ordering question, not a lock-class one.
+Tests: `tests/test_answer_report_class_0925.py` (the acknowledged ANSWER
+passes `report=True`; a queued no-ACK ANSWER shows as a report waiter and
+goes before the holder resumes), and the old pin re-pinned the other way
+with a companion test that a QUERY still does not. No wire change, no
+default changed.
+

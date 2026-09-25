@@ -18,7 +18,8 @@ Pinned:
     the report first and resumes before a NORMAL waiter that queued
     meanwhile; a handshake queued at the same time still goes first;
   * `_send_direct_noack_frame(kind="completion_report")` acquires as the
-    report class, a QUERY ANSWER does not;
+    report class (and since pass 1 item 3, 2026-09-25, so does a QUERY
+    ANSWER -- `tests/test_answer_report_class_0925.py`);
   * a report queued mid-window goes out before the next part starts (all of
     the current part's fragments first), counted as `report_yields` on the
     `raw_fragment_sent` records that follow;
@@ -135,8 +136,15 @@ class NoAckFrameUsesTheReportClass(SingleNodeCase):
         self.assertTrue(calls[0]["report"])
         self.assertFalse(calls[0]["preempt"])
 
-    def test_completion_answer_does_not(self):
+    def test_completion_answer_acquires_as_report_too(self):
+        # Pass 1 item 3 (2026-09-25): an ANSWER joined the report class.
         calls = self._run_noack("completion_answer")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["report"])
+        self.assertFalse(calls[0]["preempt"])
+
+    def test_other_noack_frames_do_not(self):
+        calls = self._run_noack("completion_query")
         self.assertEqual(len(calls), 1)
         self.assertFalse(calls[0]["report"])
 

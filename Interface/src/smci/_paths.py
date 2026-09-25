@@ -1005,6 +1005,64 @@ class _PathDiscoveryMixin:
             self._path_boards[peer_prefix] = board
         return board
 
+    def _tx_path(self, peer_prefix: Optional[str]) -> "tuple[Optional[str], Optional[int]]":
+        """The path a text frame to `peer_prefix` goes over if it is sent
+        now, as (path hex, hops) -- (None, None) when nothing is known
+        (pass 1 item 4, 2026-09-25).
+
+        Text frames ("R" and "Q") are routed by the path stored on the
+        device contact, not by anything the frame carries, so the answer
+        is what `_select_path` last set there (`device_path`), falling back
+        to `_resolved_paths` when that is unknown (path selection off, a
+        failed `change_contact_path`, or a firmware PATH_UPDATE since --
+        `_on_path_update`). Read with the radio lock held, just before the
+        frame is sent: the caller's `hop_count` is the path resolved when
+        the SEND started, and another send's `_select_path` can move the
+        contact to a trial path while this one is still retrying. The
+        2026-09-24 captures had attempts labelled hop 1 whose own echo came
+        back at path length 3."""
+        if not peer_prefix:
+            return None, None
+        board = self._path_boards.get(peer_prefix)
+        resolved = self._resolved_paths.get(peer_prefix)
+        if board is not None and board.device_path is not None:
+            cand = board.candidates.get(board.device_path)
+            if cand is not None:
+                return cand.path_hex, cand.hops
+            if resolved is not None and (resolved.out_path_hex or "").lower() == board.device_path:
+                return board.device_path, resolved.out_path_len
+        if resolved is not None:
+            return (resolved.out_path_hex or "").lower(), resolved.out_path_len
+        return None, None
+
+    def _on_path_update(self, event) -> None:
+        """The firmware's PATH_UPDATE push (pass 1 item 4, 2026-09-25): it
+        rewrote a contact's stored path on its own -- a path returned after
+        a flood-routed send. The interface never subscribed to this, so
+        `device_path` kept naming the path `_select_path` had set while
+        text frames went over the firmware's, and every attempt was
+        labelled and scored against the wrong path. The new path's bytes
+        are not in the event, so this only marks the contact's path
+        unknown: the next `_select_path` puts the scoreboard's choice back
+        (the one place that decides stays the one place), and the capture
+        says it happened."""
+        try:
+            payload = event.payload if isinstance(getattr(event, "payload", None), dict) else {}
+            key = str(payload.get("public_key") or "").lower()
+            if len(key) < self.BIND_PUBKEY_PREFIX_BYTES * 2:
+                return
+            peer_prefix = key[:self.BIND_PUBKEY_PREFIX_BYTES * 2]
+            board = self._path_boards.get(peer_prefix)
+            if board is None:
+                return
+            previous = board.device_path
+            board.device_path = None
+            if self._packet_capture_file is not None:
+                self._capture_event("in", {"event": "contact_path_changed", "peer_prefix": peer_prefix,
+                                           "previous_device_path": previous})
+        except Exception as exc:
+            RNS.log(f"{self}: PATH_UPDATE handling failed: {exc}", RNS.LOG_WARNING)
+
     def _path_view(self, cand: "_PathCandidate") -> dict:
         return {
             "path_hex": cand.path_hex, "hops": cand.hops, "samples": list(cand.samples), "snr": cand.snr,
@@ -1112,7 +1170,8 @@ class _PathDiscoveryMixin:
         return int(resolved.out_path_len), rate
 
     def _note_path_attempt_result(self, peer_prefix: Optional[str], ok: bool, waited_full_timeout: bool,
-                                  ack_timeout_source: str, ack_latency_s: Optional[float] = None) -> None:
+                                  ack_timeout_source: str, ack_latency_s: Optional[float] = None,
+                                  tx_path_hex: Optional[str] = None) -> None:
         """One ATTEMPT's outcome on the path it went over (alpha 0.1.9,
         item 4). Moves `consecutive_misses` only: the delivery-rate samples
         stay one per send.
@@ -1174,8 +1233,11 @@ class _PathDiscoveryMixin:
                 return          # no real ACK came back: not evidence either way
         elif not (waited_full_timeout and ack_timeout_source in PATH_ATTEMPT_MISS_SOURCES):
             return
+        # Pass 1 item 4 (2026-09-25): the path the frame actually went over
+        # (`_tx_path`, read when it was sent), else the resolved one.
         resolved = self._resolved_paths.get(peer_prefix)
-        path_hex = (resolved.out_path_hex or "").lower() if resolved is not None else None
+        path_hex = tx_path_hex if tx_path_hex is not None else (
+            (resolved.out_path_hex or "").lower() if resolved is not None else None)
         # Alpha 0.1.9, second pass (item 1): "" IS a path -- the zero-hop
         # one -- so only a missing resolved path returns here. The first
         # pass wrote `if not path_hex`, which dropped every zero-hop attempt

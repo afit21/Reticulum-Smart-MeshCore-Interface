@@ -23,6 +23,30 @@
   recorded session was affected. Regression test `tests/test_report_wait_no_spin_0925.py`. No wire
   change, no default changed.
 
+- **Pass 1, item 4: an attempt is labelled and scored by the path it actually went over**
+  (2026-09-25). Text frames follow the path stored on the device contact, and that can change in
+  the middle of a send: another send's path trial moves it, or the firmware rewrites it after a path
+  comes back from a flood (its PATH_UPDATE push, which the interface never subscribed to). The
+  capture labelled each attempt with the path of when the send started and the scoreboard credited
+  the path of when it ended, so the 2026-09-24 captures have attempts labelled hop 1 whose own echo
+  came back at path length 3. The path is now read with the radio lock held, just before the frame
+  is sent (`_tx_path`): `direct_attempt_result` records it as `hop_count` and `path_hex` (the old
+  value stays as `hop_count_at_send_start`), and the scoreboard's miss count and signal go to it. A
+  PATH_UPDATE now marks the contact's path unknown, so the next send puts the scoreboard's choice
+  back, and is captured as `contact_path_changed`. `field_ab_compare.py` counts both. Regression
+  test `tests/test_tx_path_label_0925.py`. No wire change, no default changed.
+
+- **Pass 1, item 3: a completion ANSWER can go in a raw burst's gaps, like a completion report**
+  (2026-09-25). A burst this node is sending already hands the radio over between its parts, and
+  during its wait for the receiver's report, to a completion REPORT this node owes the other side,
+  because that side is waiting on it before it re-sends. The ANSWER to the other side's QUERY is
+  the same kind of frame, but it queued as an ordinary send and waited out the whole burst: 13 s on
+  the laptop and 42 s on the desktop in the 2026-09-24 morning session. It now takes the same lock
+  class (`REPORT_CLASS_KINDS`), on both the no-ACK carrier and the acknowledged one. It carries the
+  same collision risk reports have carried since alpha 0.1.5. Regression test
+  `tests/test_answer_report_class_0925.py`; `test_report_yield_between_parts_0921` re-pinned. No
+  wire change, no default changed.
+
 ## 0.1.0 (2026-09-24)
 
 The first release: the alpha 0.1.9 second-pass build (`35a6c22`), unchanged in behaviour, after its
