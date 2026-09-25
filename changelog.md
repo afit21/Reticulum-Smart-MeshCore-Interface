@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased (development)
+
+- **The packet id counter starts at a random value** (2026-09-25, found in a code review). It
+  started at 0 in every process, and a receiver remembers delivered packets by (sender, pkt_id,
+  fragment count) for 150 s -- by the key alone, not the bytes. So after an rnsd restart inside
+  that time (the usual step after installing a build) the first new fragmented packets reused the
+  previous run's ids: the receiver dropped them as duplicates and still reported them complete, a
+  silent loss, or merged them with a stale partial bucket into a corrupt packet. A random 16-bit
+  start makes that about a 1-in-1,700 chance per restart (for 20 fragmented packets sent in the
+  last 150 s before it) instead of a certainty. Regression test
+  `tests/test_random_pkt_id_start_0925.py`. No wire change (the id stays an opaque 16-bit value),
+  no default changed.
+- **The raw window's report wait no longer freezes the event loop** (2026-09-25, found in a code
+  review). With one packet of a raw window proved and another not, the wait for the completion
+  report returned at once on the proof already received and looped without ever yielding, so the
+  whole interface -- ACKs, inbound frames, the second PROOF and the report itself -- stood still
+  until the report deadline (4 s + 2.5 s per hop) and the window then ran a QUERY anyway. It now
+  waits only on the proofs still outstanding. It needs a window mixing a proved DATA packet with
+  another part (two LXMF messages over 119 B together, or LXMF alongside an announce or a Resource
+  part); none of the 62 multi-part windows in the alpha 0.1.8-0.1.9 field captures was one, so no
+  recorded session was affected. Regression test `tests/test_report_wait_no_spin_0925.py`. No wire
+  change, no default changed.
+
 ## 0.1.0 (2026-09-24)
 
 The first release: the alpha 0.1.9 second-pass build (`35a6c22`), unchanged in behaviour, after its

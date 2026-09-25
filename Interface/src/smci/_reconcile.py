@@ -264,16 +264,21 @@ class _ReconcileMixin:
         """The report future against the events this window's PROOFs set,
         with the radio already released (alpha 0.1.8, item 1). Returns the
         report if it arrived, else None -- the caller re-checks whether a
-        proof completed the window and, if not, keeps waiting."""
+        proof completed the window and, if not, keeps waiting.
+
+        Only the events still unset are waited on (2026-09-25 review): an
+        event that is already set has had its re-check, and returning at
+        once for it made the caller's loop spin without ever suspending --
+        one part proved and another not froze the whole event loop until
+        the report deadline. With none left unset this waits on the report
+        future alone."""
         if fut.done():
             return fut.result()
         if timeout_s <= 0:
             return None
-        if any(e.is_set() for e in events):
-            return None
         loop = asyncio.get_running_loop()
         fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
-        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events if not e.is_set()]
         try:
             await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -389,7 +394,8 @@ class _ReconcileMixin:
                     elif proved_events:
                         # Radio-free, so no lock event is consulted here
                         # (one that stayed set would spin): the report
-                        # future against the proof events, whichever first.
+                        # future against the proof events still unset,
+                        # whichever first.
                         got = await self._wait_future_or_proof(fut, remaining, proved_events)
                         if got is None and (time.monotonic() - started) < deadline_s - 0.001:
                             # A proof woke this, not the deadline: re-check

@@ -768,7 +768,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # between RNS's calling thread and this event loop) so two
         # same-priority items never need Python to compare their `data`/
         # `header` fields to break a tie.
-        self._pkt_id_counter = 0
+        self._pkt_id_counter = self._initial_pkt_id()
         # Field fix (2026-09-18 evening, page-load capture): truncated hash
         # of every RNS packet currently queued or being sent -> enqueue
         # time. process_outgoing (RNS's thread) drops a packet whose bytes

@@ -1,4 +1,5 @@
 """Wire format: payload budgets, the R / P / Q text-frame encoders and decoders, the raw binary fragment header, payload chunking and spacing tiers, and the RNS header parse plus the packet classifications derived from it (priority tier, link class, handshake class, plain proof, path-request target). Every encoded byte is pinned by tests/golden/wire_format.json."""
+import random
 from typing import Optional
 
 import RNS
@@ -466,6 +467,19 @@ class _WireFormatMixin:
         # For a parity fragment frag_idx is the coverage mask (M4).
         header = _FrameHeader(self.PROTOCOL_VERSION, True, False, pkt_id, frag_idx, frag_total, attempt)
         return header, bytes(raw[self.RAW_HEADER_SIZE:]), src_prefix_hex, bytes(dst)
+
+    @staticmethod
+    def _initial_pkt_id() -> int:
+        """Where this process's pkt_id counter starts (2026-09-25 review):
+        a random 16-bit value, not 0. A receiver keeps whole-packet dedup
+        entries keyed (sender, pkt_id, frag_total) for
+        `whole_packet_dedup_ttl` (150 s) and idle reassembly buckets longer,
+        so a sender whose rnsd restarted inside that time and counted from
+        0 again had its first new fragmented packets dropped as duplicates
+        -- and reported complete, a silent loss -- or merged into a stale
+        bucket. A random start makes a collision with the previous run's
+        few recent ids ~k/65536 instead of certain."""
+        return random.randrange(0x10000)
 
     def _next_pkt_id(self) -> int:
         # Only ever called from this interface's own dedicated event loop

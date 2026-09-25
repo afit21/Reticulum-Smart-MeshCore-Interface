@@ -4141,6 +4141,19 @@ class _WireFormatMixin:
         header = _FrameHeader(self.PROTOCOL_VERSION, True, False, pkt_id, frag_idx, frag_total, attempt)
         return header, bytes(raw[self.RAW_HEADER_SIZE:]), src_prefix_hex, bytes(dst)
 
+    @staticmethod
+    def _initial_pkt_id() -> int:
+        """Where this process's pkt_id counter starts (2026-09-25 review):
+        a random 16-bit value, not 0. A receiver keeps whole-packet dedup
+        entries keyed (sender, pkt_id, frag_total) for
+        `whole_packet_dedup_ttl` (150 s) and idle reassembly buckets longer,
+        so a sender whose rnsd restarted inside that time and counted from
+        0 again had its first new fragmented packets dropped as duplicates
+        -- and reported complete, a silent loss -- or merged into a stale
+        bucket. A random start makes a collision with the previous run's
+        few recent ids ~k/65536 instead of certain."""
+        return random.randrange(0x10000)
+
     def _next_pkt_id(self) -> int:
         # Only ever called from this interface's own dedicated event loop
         # (via _send_channel, itself only invoked by _outgoing_worker
@@ -8940,16 +8953,21 @@ class _ReconcileMixin:
         """The report future against the events this window's PROOFs set,
         with the radio already released (alpha 0.1.8, item 1). Returns the
         report if it arrived, else None -- the caller re-checks whether a
-        proof completed the window and, if not, keeps waiting."""
+        proof completed the window and, if not, keeps waiting.
+
+        Only the events still unset are waited on (2026-09-25 review): an
+        event that is already set has had its re-check, and returning at
+        once for it made the caller's loop spin without ever suspending --
+        one part proved and another not froze the whole event loop until
+        the report deadline. With none left unset this waits on the report
+        future alone."""
         if fut.done():
             return fut.result()
         if timeout_s <= 0:
             return None
-        if any(e.is_set() for e in events):
-            return None
         loop = asyncio.get_running_loop()
         fut_wait = loop.create_task(asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s))
-        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events]
+        waits = [fut_wait] + [loop.create_task(e.wait()) for e in events if not e.is_set()]
         try:
             await asyncio.wait(set(waits), return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -9065,7 +9083,8 @@ class _ReconcileMixin:
                     elif proved_events:
                         # Radio-free, so no lock event is consulted here
                         # (one that stayed set would spin): the report
-                        # future against the proof events, whichever first.
+                        # future against the proof events still unset,
+                        # whichever first.
                         got = await self._wait_future_or_proof(fut, remaining, proved_events)
                         if got is None and (time.monotonic() - started) < deadline_s - 0.001:
                             # A proof woke this, not the deadline: re-check
@@ -14215,7 +14234,7 @@ class SmartMeshCoreInterface(_ConfigMixin, _ObservabilityMixin, _WireFormatMixin
         # between RNS's calling thread and this event loop) so two
         # same-priority items never need Python to compare their `data`/
         # `header` fields to break a tie.
-        self._pkt_id_counter = 0
+        self._pkt_id_counter = self._initial_pkt_id()
         # Field fix (2026-09-18 evening, page-load capture): truncated hash
         # of every RNS packet currently queued or being sent -> enqueue
         # time. process_outgoing (RNS's thread) drops a packet whose bytes

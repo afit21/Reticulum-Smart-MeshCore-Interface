@@ -5763,3 +5763,66 @@ skipped). No wire change, no default changed, no MeshBench run (capture is
 observability only; no send path reads it). readme may need updating: its
 capture section doesn't give the directory.
 
+
+**2026-09-25: the raw window's report wait no longer spins on a proof
+that is already in.** Found by a multi-agent code review the user asked for
+and confirmed before fixing. `_wait_future_or_proof` (alpha 0.1.8, item 1)
+returned None without awaiting anything whenever ANY of the window's PROOF
+events was already set, and `_await_completion_report` answers None before
+the deadline with `continue`. `_window_all_proved` stays False until every
+outstanding part is proved (and forever when one of them has no proof key),
+so a window with one part proved and another not looped without ever
+suspending. Nothing else on the interface's event loop ran until the report
+deadline (4 s + 2.5 s per hop): no ACKs, no inbound frames, not even the
+second PROOF or the report that would have ended the wait, and the window
+then fell back to a QUERY. The fix waits only on the events still unset (a
+set one has already had the caller's re-check) and on the report future
+alone when none are left; the lock-held branch
+(`_wait_future_or_preempt`) returns once on a set event, releases the radio
+and cannot loop, so it is unchanged. Trigger: a raw window of two or more
+parts with at least one plain PROOF expected, e.g. two opportunistic LXMF
+messages over 119 B to one peer collected together, or one LXMF message
+windowed with an announce or a Resource part. Field exposure since alpha
+0.1.8 (`fieldtests/raw/Alpha0.1.8`, `Alpha0.1.9`, `-drive`, `-home`): 231
+raw windows, 62 with two or more parts, and every one of those was an
+announce pair or a batch of Resource parts, neither of which RNS proves
+with a plain PROOF, so the spinning branch was never entered; the one
+multi-part window that saw a plain PROOF inbound was an announce pair and
+its `rx_log` records kept flowing. So no recorded session lost anything to
+it; it was latent, one mixed window away. `tests/test_report_wait_no_spin_0925.py`
+pins it (a 20 ms ticker must keep running through a 1 s wait with one event
+set, and a pending PROOF or a report must still end the wait early); all
+four tests failed before the fix (0 ticks; neither wakeup could run). Full
+suite: 564 tests, OK. MeshBench `large_payload` PASS 4/6 (RTT med 32.8 s)
+and `relay` PASS 7/8 (RTT med 18.4 s), single runs inside the latest
+baseline's delivery ranges; neither formed a multi-part window, so they
+check for regressions only, not the fixed path. No wire change, no default
+changed.
+
+**2026-09-25: the pkt_id counter starts at a random value.** User request
+("start the packet id on a random number"), fixing the second finding of
+the same day's code review. `_pkt_id_counter` started at 0 in every
+process. The receiver's whole-packet dedup (`_dedup_add` /
+`_dedup_contains`) is keyed `(mode, sender, pkt_id, frag_total)` for
+`whole_packet_dedup_ttl` (150 s) and never compares the bytes, and an idle
+reassembly bucket lives longer still, so a sender whose rnsd restarted
+inside that time -- the usual step after installing a build -- reused the
+previous run's ids for its first fragmented packets. The receiver dropped
+them as duplicates while answering complete (a flagged raw fragment
+triggers a complete report, a QUERY finds the key in dedup), so the sender
+counted them delivered and RNS never saw them; against a stale partial
+bucket old and new fragments merged into a corrupt packet (the
+same-index collision check only catches identical indices). The review
+agent reproduced the silent drop on the one-node fixture. The start is now
+`_initial_pkt_id()`, `random.randrange(0x10000)`: with k fragmented packets
+in the previous run's last 150 s a restart collides with probability about
+(2k-1)/65536, 1 in 1,700 for k = 20, instead of always. Nothing orders
+pkt_ids by value (the recent-packet table sorts by time; `live_pkts[0]` is
+only the QUERY's representative id, and the QUERY lists every entry), and
+the counter already wrapped at 16 bits, so a start near the wrap adds no
+new case. The id stays an opaque 16-bit field: no wire change, no default
+changed. `tests/test_random_pkt_id_start_0925.py` pins the range and
+spread of the start, that a new interface counts on from it and wraps, and
+the restart collision rate. Full suite: 567 tests, OK. MeshBench `zero_hop`
+PASS 7/8 (RTT med 2.25 s), inside the latest baseline's range; A's
+fragmented sends carried pkt_ids from 34230.
