@@ -1,0 +1,162 @@
+/*
+ * Terminal-style rendering for Micron pages produced by micron/parser.py.
+ *
+ * Every page is a <form class="mu-page">. Colours that the page itself sets
+ * arrive as inline styles; everything else comes from the variables below,
+ * so a host app can restyle pages by overriding them.
+ */
+
+.mu-page {
+  --mu-font: "JetBrains Mono", "Cascadia Mono", "Fira Code", "DejaVu Sans Mono",
+             ui-monospace, Menlo, Consolas, monospace;
+  --mu-font-size: 15px;
+  --mu-lh: 1.3em;
+  --mu-default-bg: #121417;
+  --mu-page-bg: var(--mu-default-bg);
+  --mu-link: #7aa7ff;
+  --mu-field-bg: rgba(255, 255, 255, 0.06);
+  --mu-field-border: rgba(255, 255, 255, 0.18);
+  --mu-focus: #7aa7ff;
+
+  display: block;
+  margin: 0;
+  padding: 1ch 0;
+  font-family: var(--mu-font);
+  font-size: var(--mu-font-size);
+  line-height: var(--mu-lh);
+  color: var(--mu-page-fg);
+  background: var(--mu-page-bg);
+  font-variant-ligatures: none;
+  tab-size: 8;
+}
+
+.mu-page.mu-theme-light {
+  --mu-default-bg: #f4f4f1;
+  --mu-link: #1f5fd1;
+  --mu-field-bg: rgba(0, 0, 0, 0.05);
+  --mu-field-border: rgba(0, 0, 0, 0.25);
+  --mu-focus: #1f5fd1;
+}
+
+/* ---- lines ------------------------------------------------------------ */
+
+.mu-line {
+  min-height: var(--mu-lh);
+  padding-inline: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mu-line[hidden] { display: none; }
+
+.mu-b { font-weight: 700; }
+.mu-i { font-style: italic; }
+.mu-u { text-decoration: underline; text-underline-offset: 0.15em; }
+
+.mu-heading { font-weight: 400; }
+
+.mu-divider {
+  white-space: nowrap;
+  overflow: hidden;
+}
+.mu-rule { user-select: none; }
+
+.mu-anchor { scroll-margin-top: 2em; }
+
+/* ---- links ------------------------------------------------------------ */
+
+.mu-link {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.mu-link.mu-u { text-decoration: underline; }
+.mu-link:hover,
+.mu-link:focus-visible {
+  outline: 1px solid var(--mu-focus);
+  outline-offset: 0;
+}
+/* Links that resolve to something we can't open still show a hint. */
+.mu-link:not([href]) { cursor: help; }
+
+/* ---- fields -----------------------------------------------------------
+ * A field starts at the size the page asked for (`<40x5|name`> is 40
+ * columns by 5 rows), can be dragged larger or smaller with the resize
+ * handle, and grows downwards as the user types (micron.js).
+ */
+
+.mu-field {
+  box-sizing: content-box;
+  width: calc(var(--mu-w, 24) * 1ch);
+  height: calc(var(--mu-r, 1) * var(--mu-lh));
+  min-width: 4ch;
+  max-width: calc(100% - 6px);
+  min-height: var(--mu-lh);
+  margin: 0;
+  padding: 0 2px;
+  vertical-align: top;
+  font: inherit;
+  line-height: var(--mu-lh);
+  color: inherit;
+  background-color: var(--mu-field-bg);
+  border: 1px solid var(--mu-field-border);
+  border-radius: 2px;
+  resize: both;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.mu-field:focus {
+  outline: 1px solid var(--mu-focus);
+  outline-offset: 0;
+}
+/* Password inputs can't be resized by the browser. */
+.mu-field.mu-masked { resize: none; }
+
+.mu-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5ch;
+  cursor: pointer;
+}
+.mu-choice input {
+  margin: 0;
+  width: 1em;
+  height: 1em;
+  accent-color: var(--mu-focus);
+}
+
+/* ---- collapsible headings -------------------------------------------- */
+
+.mu-collapsible { cursor: pointer; user-select: none; }
+.mu-fold {
+  all: unset;
+  display: inline-block;
+  width: 2ch;
+  cursor: pointer;
+}
+.mu-fold::before { content: "\25BE"; }                      /* ▾ */
+.mu-collapsible[data-collapsed="true"] .mu-fold::before { content: "\25B8"; } /* ▸ */
+.mu-fold:focus-visible { outline: 1px solid var(--mu-focus); }
+
+/* ---- tables, partials, images ---------------------------------------- */
+
+.mu-table-wrap { white-space: normal; }
+.mu-table-center .mu-table { margin-inline: auto; }
+.mu-table-right .mu-table { margin-inline-start: auto; }
+.mu-table {
+  border-collapse: collapse;
+  font: inherit;
+  color: inherit;
+}
+.mu-table th,
+.mu-table td {
+  padding: 0 1ch;
+  border: 1px solid var(--mu-field-border);
+  text-align: left;
+  vertical-align: top;
+  white-space: pre-wrap;
+}
+.mu-table th { font-weight: 700; }
+
+.mu-pending,
+.mu-image-alt { opacity: 0.6; }
